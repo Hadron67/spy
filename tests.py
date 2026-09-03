@@ -27,8 +27,10 @@ from . import (
     CompileError,
     JitContext,
     TypeMismatchError,
+    astgen,
     compile_log,
     f64,
+    hir,
     i32,
     u64,
 )
@@ -627,4 +629,89 @@ class SpyExampleTest(TestCase):
         self.assertIn('not bound yet', str(ctx.exception))
 
 
-all_tests = [SpyExampleTest]
+def _make_rls_pair():
+    """Factory: the returned caller calls the sibling ``inner_add`` of the
+    same factory scope (captured, so the callee resolves like a spy
+    function callee would)."""
+
+    def inner_add(a, b):
+        return a + b
+
+    def outer(x):
+        return inner_add(x, 1)
+
+    return outer
+
+
+def _make_type_caller():
+    """Factory: the returned caller uses the compile-time builtin
+    ``spy.type`` (a module global of this test module) in a value
+    context."""
+
+    def outer(x):
+        return spy_type(x) == i32
+
+    return outer
+
+
+class RlsHirTest(TestCase):
+    """The HIR that ``astgen`` produces under result-location semantics
+    (RLS): a call writes its result into the slot of a
+    ``hir.CallInplace``, and the value context allocates the temporary
+    slot up front and loads the value back right after the call."""
+
+    def _single_call(self, fn) -> tuple[astgen.FunctionIR, hir.CallInplace]:
+        ir = astgen.parse_function(fn)
+        calls = [i for i in ir.body if isinstance(i, hir.CallInplace)]
+        self.assertEqual(len(calls), 1)
+        return ir, calls[0]
+
+    def test_value_context_call_shape(self) -> None:
+        outer = _make_rls_pair()
+        ir, call = self._single_call(outer)
+        # the callee is generated as a reference: the compile-time object
+        # of the captured sibling function
+        callee = call.callee
+        assert isinstance(callee, hir.Const)
+        self.assertEqual(callee.value.__name__, 'inner_add')
+        # the arguments are by-value values: a load of the parameter slot
+        # and the literal 1
+        self.assertEqual(len(call.args), 2)
+        self.assertIsInstance(call.args[0], hir.Load)
+        arg = call.args[1]
+        assert isinstance(arg, hir.Const)
+        self.assertEqual(arg.value, 1)
+        # the result location is a temporary slot; the instructions right
+        # after the call load it back and return that value
+        self.assertIsInstance(call.ret, hir.Alloca)
+        idx = list(ir.body).index(call)
+        load = ir.body[idx + 1]
+        ret = ir.body[idx + 2]
+        assert isinstance(load, hir.Load)
+        assert isinstance(ret, hir.Ret)
+        self.assertIs(load.ptr, call.ret)
+        self.assertIs(ret.value, load)
+
+    def test_comptime_call_through_result_slot(self) -> None:
+        # a compile-time builtin (spy.type) goes through the same
+        # temporary-slot + load shape: the interpreter records its
+        # compile-time result in the slot and the matching Load passes it
+        # on without giving the slot memory
+        outer = _make_type_caller()
+        ir, call = self._single_call(outer)
+        callee = call.callee
+        assert isinstance(callee, hir.Const)
+        self.assertIs(callee.value, spy_type)
+        self.assertEqual(len(call.args), 1)
+        self.assertIsInstance(call.args[0], hir.Load)
+        self.assertIsInstance(call.ret, hir.Alloca)
+        idx = list(ir.body).index(call)
+        load = ir.body[idx + 1]
+        cmp = ir.body[idx + 2]
+        assert isinstance(load, hir.Load)
+        assert isinstance(cmp, hir.Compare)
+        self.assertIs(load.ptr, call.ret)
+        self.assertIs(cmp.lhs, load)
+
+
+all_tests = [SpyExampleTest, RlsHirTest]

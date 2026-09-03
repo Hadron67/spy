@@ -12,7 +12,9 @@ source expressions are never re-evaluated.
 
 Like ``symlat.jit.llvm`` the body is one *linear* list of instructions;
 expression evaluation appends temporary instructions to the list and
-returns the instruction object whose register holds the value.
+returns the instruction object whose register holds the value - or,
+with a result location (RLS, see ``_Builder._gen_expr``), writes the
+value into a caller-provided slot and returns nothing.
 
 ``astgen`` performs *almost* all name resolution.  Since every parameter
 is addressable, the translated body starts with an
@@ -101,17 +103,17 @@ class _Builder:
             case ast.Return():
                 if node.value is None:
                     raise CompileError(f"bare 'return' is not supported yet in spy function {fn_name}")
-                self.add(hir.Ret(self._gen_expr(node.value)))
+                self.add(hir.Ret(self._gen_value(node.value)))
             case ast.Pass():
                 pass
             case ast.Expr():
-                self._gen_expr(node.value)
+                self._gen_value(node.value)
             case ast.Assign():
                 raise CompileError(
                     f"local variables are not supported yet in spy function {fn_name}"
                 )
             case ast.If():
-                cond = self._gen_expr(node.test)
+                cond = self._gen_value(node.test)
                 then_body = self._gen_body(node.body)
                 else_body = self._gen_body(node.orelse)
                 self.add(hir.If(cond, tuple(then_body), tuple(else_body)))
@@ -166,7 +168,93 @@ class _Builder:
             f"name '{name}' is not defined in the scope of function {self._fn_ir.name}"
         )
 
-    def _gen_expr(self, node: ast.expr) -> hir.Value:
+    def _gen_expr(
+        self,
+        node: ast.expr,
+        is_ref: bool = False,
+        result_loc: hir.Value | None = None,
+    ) -> hir.Value | None:
+        """Translate one expression, with result-location semantics (RLS).
+
+        Of the four flag combinations only three are meaningful
+        (``is_ref=True`` together with ``result_loc`` is an error):
+
+        * ``is_ref=False, result_loc=None`` (the default): produce the
+          expression value in a register and return it;
+        * ``is_ref=False, result_loc=<pointer>``: write the expression's
+          result into the pointer and return ``None`` - the caller
+          already has a slot for it (a local variable, the result slot
+          of an enclosing statement, ...);
+        * ``is_ref=True, result_loc=None``: produce a *reference* to the
+          result - a pointer, not a value.  Addressable names yield
+          their slot, resolved globals (functions, types, ...) are
+          compile-time objects that already are references, and any
+          other expression is evaluated into a fresh slot whose pointer
+          is returned (so the callee of a call is generated with
+          ``is_ref=True``, as a callee must be addressable).
+
+        A call in value context therefore allocates a temporary slot,
+        emits a :class:`hir.CallInplace` writing into it and loads the
+        value back; with a ``result_loc`` the call writes straight into
+        it.
+        """
+        assert not (is_ref and result_loc is not None)
+        if is_ref:
+            return self._gen_ref(node)
+        if result_loc is not None:
+            self._gen_into(node, result_loc)
+            return None
+        return self._gen_value(node)
+
+    def _gen_ref(self, node: ast.expr) -> hir.Value:
+        """A reference to the value of ``node`` (see ``_gen_expr``):
+        addressable names give their slot, everything else gives a
+        pointer to a freshly allocated slot holding its value."""
+        match node:
+            case ast.Name():
+                alloca = self._env.get(node.id)
+                if alloca is not None:
+                    # an addressable variable: its slot *is* the reference
+                    return alloca
+                # a global: its resolved compile-time object (functions,
+                # types, captured constants, ...) is an identity, i.e.
+                # already a reference
+                return self._resolve_global(node.id)
+            case ast.Attribute():
+                # attribute chains on compile-time objects fold to a
+                # ``hir.Const`` leaf, which is its own reference
+                return self._gen_value(node)
+            case _:
+                loc = self.add(hir.Alloca())
+                self._gen_into(node, loc)
+                return loc
+
+    def _gen_into(self, node: ast.expr, result_loc: hir.Value) -> None:
+        """Evaluate ``node`` writing its result into ``result_loc``
+        (result-location semantics); no value register is produced."""
+        fn_name = self._fn_ir.name
+        match node:
+            case ast.Call():
+                if len(node.keywords) > 0:
+                    raise CompileError(
+                        f"calls with keyword arguments inside spy functions are not supported yet "
+                        f"(function {fn_name})"
+                    )
+                # the callee must be addressable (a reference), the
+                # arguments are by-value values
+                callee = self._gen_ref(node.func)
+                args = tuple(self._gen_value(a) for a in node.args)
+                self.add(hir.CallInplace(callee, args, result_loc))
+            case _:
+                # every other expression computes a value first; only the
+                # call (and, later, the ``if`` expression) can write
+                # through a result location without materializing a value
+                value = self._gen_value(node)
+                self.add(hir.Store(result_loc, value))
+
+    def _gen_value(self, node: ast.expr) -> hir.Value:
+        """Evaluate ``node`` producing its value in a register (the plain
+        by-value context)."""
         fn_name = self._fn_ir.name
         match node:
             case ast.Constant():
@@ -180,7 +268,7 @@ class _Builder:
                     return self.add(hir.Load(alloca))
                 return self._resolve_global(node.id)
             case ast.Attribute():
-                base = self._gen_expr(node.value)
+                base = self._gen_value(node.value)
                 if isinstance(base, hir.Const) and not isinstance(
                     base.value, (int, float, str, bool, type(None))
                 ):
@@ -202,36 +290,41 @@ class _Builder:
                         f"calls with keyword arguments inside spy functions are not supported yet "
                         f"(function {fn_name})"
                     )
-                callee = self._gen_expr(node.func)
-                args = tuple(self._gen_expr(a) for a in node.args)
-                return self.add(hir.Call(callee, args))
+                # value context: call into a temporary slot and load the
+                # value back (RLS); the callee must be addressable (a
+                # reference), the arguments are by-value values
+                callee = self._gen_ref(node.func)
+                args = tuple(self._gen_value(a) for a in node.args)
+                loc = self.add(hir.Alloca())
+                self.add(hir.CallInplace(callee, args, loc))
+                return self.add(hir.Load(loc))
             case ast.BinOp():
                 op = _BIN_OPS.get(type(node.op))
                 if op is None:
                     raise CompileError(
                         f"unsupported binary operator {type(node.op).__name__} in spy function {fn_name}"
                     )
-                lhs = self._gen_expr(node.left)
-                rhs = self._gen_expr(node.right)
+                lhs = self._gen_value(node.left)
+                rhs = self._gen_value(node.right)
                 return self.add(hir.Binary(op, lhs, rhs))
             case ast.BoolOp():
                 op = _BOOL_OPS.get(type(node.op))
                 if op is None:
                     raise CompileError(f"unsupported boolean operator in spy function {fn_name}")
-                result: hir.Value = self._gen_expr(node.values[0])
-                for v in node.values[1:]:
-                    rhs = self._gen_expr(v)
-                    result = self.add(hir.BoolOp(op, result, rhs))
+                values = [self._gen_value(v) for v in node.values]
+                result: hir.Value = values[0]
+                for v in values[1:]:
+                    result = self.add(hir.BoolOp(op, result, v))
                 return result
             case ast.UnaryOp():
                 if isinstance(node.op, ast.UAdd):
-                    return self._gen_expr(node.operand)
+                    return self._gen_value(node.operand)
                 op = _UNARY_OPS.get(type(node.op))
                 if op is None:
                     raise CompileError(
                         f"unsupported unary operator {type(node.op).__name__} in spy function {fn_name}"
                     )
-                return self.add(hir.Unary(op, self._gen_expr(node.operand)))
+                return self.add(hir.Unary(op, self._gen_value(node.operand)))
             case ast.Compare():
                 if len(node.ops) != 1 or len(node.comparators) != 1:
                     raise CompileError(
@@ -242,8 +335,8 @@ class _Builder:
                     raise CompileError(
                         f"unsupported comparison {type(node.ops[0]).__name__} in spy function {fn_name}"
                     )
-                lhs = self._gen_expr(node.left)
-                rhs = self._gen_expr(node.comparators[0])
+                lhs = self._gen_value(node.left)
+                rhs = self._gen_value(node.comparators[0])
                 return self.add(hir.Compare(op, lhs, rhs))
             case _:
                 raise CompileError(

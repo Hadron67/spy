@@ -3,10 +3,16 @@
 Like ``symlat.jit.llvm``, the HIR is a *linear* stream of instructions:
 every instruction object is also its own result register (instructions
 have identity; operands of later instructions reference earlier
-instruction objects).  ``astgen`` flattens expressions into temporary
+operand objects).  ``astgen`` flattens expressions into temporary
 instructions, so no instruction is ever nested inside another one.
 There are no types anywhere in the HIR: typing happens only when the
 interpreter *runs* the instructions with the concrete argument types.
+
+Calls follow *result location semantics* (RLS): a call writes its
+result into the slot of its ``ret`` operand (:class:`CallInplace`) and
+produces no register of its own.  A caller that needs the value
+allocates a slot and loads it back; the interpreter keeps scalar and
+compile-time results in the slot without giving it real memory.
 
 ``astgen`` performs all name resolution: a variable (parameter) read
 becomes a :class:`Load` of the variable's :class:`Alloca`, a global name
@@ -72,9 +78,11 @@ class Inst(Value):
 
 @dataclass(eq=False)
 class Alloca(Inst):
-    """Reserve an addressable slot for one value.  The slot type is fixed
-    by the first store that targets it; function bodies start with one
-    Alloca/Store pair per parameter."""
+    """Reserve an addressable slot for one value.  The slot is untyped
+    until it is used: the first ``Store`` that targets it types and
+    allocates it, while a ``CallInplace`` result (RLS) is only recorded
+    in it - scalar and compile-time results are never given real memory.
+    Function bodies start with one Alloca/Store pair per parameter."""
 
 
 @dataclass(eq=False)
@@ -93,9 +101,17 @@ class Store(Inst):
 
 
 @dataclass(eq=False)
-class Call(Inst):
+class CallInplace(Inst):
+    """A call whose result is written into a *result location* (RLS),
+    like Zig: ``ret`` is the pointer the callee's result goes to and the
+    instruction itself produces no register.  The ``callee`` is a
+    reference to the function value (see ``astgen``'s ``is_ref``
+    context), the ``args`` are by-value leaves/registers.  A consumer
+    that needs the value loads it back from ``ret``."""
+
     callee: Value
     args: tuple[Value, ...]
+    ret: Value
 
 
 @dataclass(eq=False)

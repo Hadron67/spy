@@ -130,10 +130,19 @@ class RuntimeVal(InterpVal):
 class PendingSlot(InterpVal):
     """The value of an executed ``hir.Alloca``: an addressable slot whose
     concrete type is fixed by its first store (the interpreter emits the
-    typed MIR alloca at that moment)."""
+    typed MIR alloca at that moment).  A slot that receives the result of
+    a ``hir.CallInplace`` (RLS) first only *records* the value: scalar
+    and compile-time results are never given real memory - the matching
+    ``Load`` hands the recorded value out directly - and memory is
+    allocated only when the slot really must hold its value at a fixed
+    address (a later plain ``Store``, or an aggregate result, neither of
+    which an RLS slot hits yet)."""
 
     type: Type | None = None
     ptr: mir.Value | None = None
+    # the value an RLS call result recorded in the slot; ``Load`` returns
+    # it while no memory has been allocated yet
+    value: InterpVal | None = None
 
 
 @dataclass
@@ -317,7 +326,7 @@ class HirRunner:
                     return self._run_list(chosen)
                 return self._exec_runtime_if(inst, cond)
             case hir.Load():
-                self._regs[inst] = RuntimeVal(self._exec_load(inst))
+                self._regs[inst] = self._exec_load(inst)
                 return FLOW_FALL, None
             case hir.Alloca():
                 self._regs[inst] = PendingSlot()
@@ -337,8 +346,8 @@ class HirRunner:
             case hir.Unary():
                 self._regs[inst] = self._eval_unary(inst)
                 return FLOW_FALL, None
-            case hir.Call():
-                self._regs[inst] = self._exec_call(inst)
+            case hir.CallInplace():
+                self._exec_call_inplace(inst)
                 return FLOW_FALL, None
             case _:
                 raise CompileError(f"unsupported instruction {type(inst).__name__}")
@@ -367,25 +376,40 @@ class HirRunner:
     def _push_frame(self, arg_values: tuple[mir.Value, ...]) -> None:
         self._frames.append(Frame(arg_values))
 
-    def _exec_load(self, inst: hir.Load) -> mir.Value:
+    def _exec_load(self, inst: hir.Load) -> InterpVal:
         ptr = self._operand(inst.ptr)
         if isinstance(ptr, PendingSlot):
-            if ptr.ptr is None or ptr.type is None:
-                raise CompileError(
-                    'cannot load from a slot before any store to it executed'
-                )
-            return self._emit(mir.Load(ptr.ptr, ptr.type))
+            if ptr.ptr is None:
+                # an un-materialized RLS slot: the recorded value of the
+                # ``CallInplace`` that initialized it is the load result
+                if ptr.value is None:
+                    raise CompileError(
+                        'cannot load from a slot before any store to it executed'
+                    )
+                return ptr.value
+            assert ptr.type is not None
+            return RuntimeVal(self._emit(mir.Load(ptr.ptr, ptr.type)))
         if isinstance(ptr, RuntimeVal):
             ptype = typeof(ptr.value)
             if not isinstance(ptype, PointerType):
                 raise CompileError(f"cannot load from a {type_str(ptype)} value")
-            return self._emit(mir.Load(ptr.value, ptype.elem))
+            return RuntimeVal(self._emit(mir.Load(ptr.value, ptype.elem)))
         raise CompileError('cannot load from a compile-time pointer')
 
     def _exec_store(self, inst: hir.Store) -> None:
         ptr = self._operand(inst.ptr)
         value = self._operand(inst.value)
         if isinstance(ptr, PendingSlot):
+            if ptr.ptr is None and ptr.value is not None:
+                # the slot holds an RLS call result that was only
+                # recorded: materialize it before overwriting the slot
+                recorded = ptr.value
+                ptr.value = None
+                v0 = self._to_runtime(recorded, None)
+                t0 = typeof(v0)
+                ptr.ptr = self._emit(mir.Alloca(PointerType(t0)))
+                ptr.type = t0
+                self._emit(mir.Store(ptr.ptr, v0))
             # the first store types the slot
             v = self._to_runtime(value, None)
             t = typeof(v)
@@ -571,6 +595,25 @@ class HirRunner:
             return self._const_of_py(ev.obj, to_mir_type(t))
         raise CompileError('cannot return this value')
 
+    def _to_slot(self, ev: InterpVal, type: Type) -> mir.Value:
+        """Materialize ``ev`` as a value of exactly ``type`` for a store
+        into an already-typed slot (the strict sibling of
+        ``_to_runtime``, whose messages talk about returns)."""
+        match ev:
+            case RuntimeVal(value):
+                if typeof(value) != type:
+                    raise CompileError(
+                        f"cannot store a {type_str(typeof(value))} value into a "
+                        f"slot of type {type_str(type)}"
+                    )
+                return value
+            case ComptimeVal(obj):
+                return self._const_of_py(obj, type)
+            case _:
+                raise CompileError(
+                    f"cannot store this value into a slot of type {type_str(type)}"
+                )
+
     # -- compile-time (comptime) operators ------------------------------------
 
     def _comptime_py_op(self, op: str, lhs: Any, rhs: Any) -> Any:
@@ -716,8 +759,45 @@ class HirRunner:
 
     # -- calls ----------------------------------------------------------------
 
-    def _exec_call(self, inst: hir.Call) -> InterpVal:
+    def _exec_call_inplace(self, inst: hir.CallInplace) -> None:
+        """Run one call whose result is written into the result location
+        ``inst.ret`` (RLS).  The call is dispatched like a by-value call
+        and its result is handed to the slot: scalar and compile-time
+        results are only *recorded* in the slot (no memory, no extra
+        MIR - the matching ``Load`` passes the recorded value on); a
+        slot that already has memory receives a real store.  (An
+        aggregate result - an array or a struct, not implemented yet -
+        would instead be returned through the result pointer, with the
+        callee returning void.)"""
         callee = self._operand(inst.callee)
+        ev = self._dispatch_call(callee, inst)
+        ret = self._operand(inst.ret)
+        if isinstance(ret, PendingSlot):
+            if ret.ptr is None:
+                ret.value = ev
+                return
+            # the slot already has memory (its address escaped or it was
+            # stored before): write the call result into it
+            assert ret.type is not None
+            v = self._to_slot(ev, ret.type)
+            self._emit(mir.Store(ret.ptr, v))
+            return
+        if isinstance(ret, RuntimeVal):
+            ptype = typeof(ret.value)
+            if not isinstance(ptype, PointerType):
+                raise CompileError(
+                    f"cannot write a call result through a {type_str(ptype)} value"
+                )
+            v = self._to_slot(ev, ptype.elem)
+            self._emit(mir.Store(ret.value, v))
+            return
+        raise CompileError('cannot write a call result into a compile-time location')
+
+    def _dispatch_call(self, callee: InterpVal, inst: hir.CallInplace) -> InterpVal:
+        """Resolve one call by its callee value and run it, returning its
+        value.  Spy functions compile to a native ``call`` producing a
+        typed register, plain Python functions are inlined, and the spy
+        builtins are evaluated at compile time."""
         if not isinstance(callee, ComptimeVal):
             raise CompileError(
                 "calls through runtime function values are not supported yet"
@@ -751,7 +831,7 @@ class HirRunner:
             "functions and the spy builtins can be called"
         )
 
-    def _call_builtin_type(self, inst: hir.Call) -> InterpVal:
+    def _call_builtin_type(self, inst: hir.CallInplace) -> InterpVal:
         if len(inst.args) != 1:
             raise CompileError('spy.type takes exactly one argument')
         arg = self._operand(inst.args[0])
@@ -768,7 +848,7 @@ class HirRunner:
             )
         return ComptimeVal(type)
 
-    def _call_builtin_compile_log(self, inst: hir.Call) -> InterpVal:
+    def _call_builtin_compile_log(self, inst: hir.CallInplace) -> InterpVal:
         objs: list[Any] = []
         for arg in inst.args:
             ev = self._operand(arg)
@@ -838,7 +918,7 @@ class HirRunner:
                 values.append(self._const_of_py(param.default_value, formal_types[i]))
         return tuple(values), formal
 
-    def _call_spy_function(self, entry: FunctionEntry, inst: hir.Call) -> InterpVal:
+    def _call_spy_function(self, entry: FunctionEntry, inst: hir.CallInplace) -> InterpVal:
         if entry.context is not self._resolver:
             raise CompileError(
                 f"cannot call function {entry.fn.__name__} from another JitContext"
@@ -849,7 +929,7 @@ class HirRunner:
         value = self._emit(mir.Call(callee, values, ret_type))
         return RuntimeVal(value)
 
-    def _call_plain_function(self, fn: Any, inst: hir.Call) -> InterpVal:
+    def _call_plain_function(self, fn: Any, inst: hir.CallInplace) -> InterpVal:
         fn_ir = self._resolver.hir_of(fn)
         if any(f.fn is fn for f in self._inline_stack):
             raise CompileError(

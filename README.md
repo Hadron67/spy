@@ -105,7 +105,6 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 | `fn.py` | 函数值/注册条目：`LazyJitFunction`（jit）、`FunctionValue`（aot） |
 | `type.py` | spy 类型系统与 Python 值 → 类型的映射 |
 | `errors.py` | `CompileError`、`TypeMismatchError`（`TypeMismatchError` 同时是 `TypeError` 子类） |
-| `instructions.md` | 更详细的中文示例文档 |
 
 ## 尚未实现 / 已知限制
 
