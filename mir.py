@@ -91,9 +91,8 @@ class StructType(Type):
     ) -> None:
         self.spy_type = spy_type
         self.fields = fields
-        # the ctypes Structure subclass of the spy struct (set by the
-        # host when it builds the Python-side representation; used by
-        # ``lower`` to marshal by-value arguments)
+        # the ctypes Structure subclass mirroring the struct layout
+        # (the Python class of the instances, ``spy_type._py_cls``)
         self.ctype: Any = None
 
     def __eq__(self, value: object, /) -> bool:

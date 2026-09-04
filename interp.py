@@ -265,17 +265,6 @@ def to_spy_type(type: Type) -> SpyType:
 # ---------------------------------------------------------------------------
 
 
-def _param_value(index: int, arg: mir.FormalArg) -> mir.Value:
-    """The runtime register of one argument of the function proper: a
-    by-value struct argument arrives as a pointer to the caller's
-    struct (the callee's prologue copy, ``HirRunner._exec_store``, turns
-    it into its own inline copy); every other argument arrives as its
-    value."""
-    if isinstance(arg.type, StructType):
-        return mir.Param(index, PointerType(arg.type), arg.name)
-    return mir.Param(index, arg.type, arg.name)
-
-
 def _field_index(type: StructType, name: str) -> int:
     """The declaration index of the field ``name`` of a struct type."""
     for i, field in enumerate(type.fields):
@@ -359,33 +348,6 @@ def _unsupported_type_error(op: str, type: Type | None) -> CompileError:
         return CompileError(f"cannot apply '{op}' to a compile-time object")
     return CompileError(f"cannot apply '{op}' to {type_str(type)} values")
 
-
-def _native_call_args(
-    callee: mir.Value, values: tuple[mir.Value, ...]
-) -> tuple[mir.Value, ...]:
-    """The native argument values of one call: a by-value struct
-    formal receives the *address* of the caller's struct (the callee
-    copies it into its own storage at entry - native boundaries pass
-    structs as pointers); every other formal receives its value.
-    """
-    fn_type = typeof(callee)
-    if not isinstance(fn_type, PointerType) or not isinstance(
-        fn_type.elem, mir.FunctionType
-    ):
-        raise CompileError('internal error: call target has no signature')
-    args: list[mir.Value] = []
-    for expected, value in zip(fn_type.elem.args, values):
-        if isinstance(expected, StructType):
-            # a struct value is always the load of its storage
-            if isinstance(value, mir.Load):
-                args.append(value.ptr)
-            else:
-                raise CompileError(
-                    'internal error: cannot take the address of a struct argument'
-                )
-        else:
-            args.append(value)
-    return tuple(args)
 
 
 def _to_runtime(ev: InterpVal, target: Type | None) -> mir.Value:
@@ -539,7 +501,7 @@ class HirRunner:
         the return sites when none is declared.
         """
         param_values = tuple(
-            _param_value(i, arg) for i, arg in enumerate(fn.args)
+            mir.Param(i, arg.type, arg.name) for i, arg in enumerate(fn.args)
         )
         self._push_frame(param_values)
         self._ret_type = None
@@ -547,14 +509,6 @@ class HirRunner:
         self._saw_void_return = False
         self._ret_emit = True
         self._regions = [fn.insts]
-
-        # the by-value struct parameters: their ABI value is the address
-        # of the caller's struct, which the prologue copy turns into this
-        # function's own inline copy (see ``_exec_store``)
-        self._byval_struct_args: dict[int, StructType] = {}
-        for i, arg in enumerate(fn.args):
-            if isinstance(arg.type, StructType):
-                self._byval_struct_args[i] = arg.type
 
         flow, _ = self._run_list(fn_ir.body)
         declared = fn.ret_type
@@ -625,7 +579,7 @@ class HirRunner:
                     return self._run_list(chosen)
                 return self._exec_runtime_if(inst, cond)
             case hir.Load():
-                self._regs[inst] = self._exec_load(inst)
+                self._regs[inst] = self._load(self._operand(inst.ptr))
                 return Flow.FALL, None
             case hir.Alloca():
                 self._regs[inst] = PendingSlot()
@@ -706,8 +660,7 @@ class HirRunner:
     def _push_frame(self, arg_values: tuple[mir.Value, ...]) -> None:
         self._frames.append(Frame(arg_values))
 
-    def _exec_load(self, inst: hir.Load) -> InterpVal:
-        ptr = self._operand(inst.ptr)
+    def _load(self, ptr: InterpVal) -> InterpVal:
         if isinstance(ptr, PendingSlot):
             if ptr.ptr is None:
                 # an un-materialized RLS slot: the recorded value of the
@@ -729,23 +682,6 @@ class HirRunner:
     def _exec_store(self, inst: hir.Store) -> None:
         ptr = self._operand(inst.ptr)
         value = self._operand(inst.value)
-        if (
-            self._ret_emit
-            and isinstance(inst.value, hir.Arg)
-            and inst.value.index in self._byval_struct_args
-        ):
-            # the prologue store of a by-value struct parameter: the
-            # argument is the address of the caller's struct - copy it
-            # into this function's own slot, so that the parameter
-            # behaves like a C by-value parameter (mutations stay local)
-            struct = self._byval_struct_args[inst.value.index]
-            if not isinstance(value, RuntimeVal) or not isinstance(
-                typeof(value.value), PointerType
-            ):
-                raise CompileError(
-                    'internal error: a by-value struct argument is not a pointer'
-                )
-            value = RuntimeVal(self._emit(mir.Load(value.value, struct)))
         if isinstance(ptr, PendingSlot):
             if ptr.ptr is None and ptr.value is not None:
                 # the slot holds an RLS call result that was only
@@ -1304,8 +1240,7 @@ class HirRunner:
             formal = self._solve_types(fn_ir, evals2, 'jit')
             values = _convert_evals(fn_ir, evals2, formal)
         callee, ret_type = self._resolver.resolve_call(entry, formal)
-        args = _native_call_args(callee, values)
-        value = self._emit(mir.Call(callee, args, ret_type))
+        value = self._emit(mir.Call(callee, values, ret_type))
         if ret_type == VoidType():
             return ComptimeVal(None)
         return RuntimeVal(value)
@@ -1388,8 +1323,7 @@ class HirRunner:
         fn_ir = entry.hir
         values, formal = self._arg_values_of(fn_ir, inst.args, entry.kind)
         callee, ret_type = self._resolver.resolve_call(entry, formal)
-        args = _native_call_args(callee, values)
-        value = self._emit(mir.Call(callee, args, ret_type))
+        value = self._emit(mir.Call(callee, values, ret_type))
         if ret_type == VoidType():
             # a void call produces no value: it only has effects
             return ComptimeVal(None)

@@ -96,18 +96,10 @@ class _ModuleTypes:
     def struct_types(self) -> list[sllvm.Type]:
         return list(self._structs.values())
 
-    def arg_llvm(self, type: Type) -> sllvm.Type:
-        """The LLVM type of one *parameter*: a by-value struct parameter
-        arrives as a pointer to the caller's struct (structs cross native
-        boundaries as pointers - ``ctypes`` and the LLVM ABI disagree on
-        aggregate by-value passing on some platforms)."""
-        if isinstance(type, StructType):
-            return sllvm.PointerType(self.to_llvm(type))
-        return self.to_llvm(type)
-
 
 def to_ctype(type: Type) -> type[ctypes._CDataType] | None:
-    """The ctypes type of a *result*."""
+    """The ctypes type of a *result* of the native boundary (``None``
+    for a void result); arguments use ``py_entry_arg_ctype``."""
     match type:
         case BoolType():
             return ctypes.c_bool
@@ -127,14 +119,6 @@ def to_ctype(type: Type) -> type[ctypes._CDataType] | None:
             return type.ctype
         case _:
             raise CompileError(f"type {type_str(type)} has no ctypes mapping")
-
-
-def arg_ctype(type: Type) -> type[ctypes._CDataType]:
-    """The ctypes type of one *argument*: structs are passed as pointers
-    at native boundaries (see ``_ModuleTypes.arg_llvm``)."""
-    if isinstance(type, StructType):
-        return ctypes.c_void_p
-    return to_ctype(type)  # type: ignore[return-value]
 
 
 class _Lowerer:
@@ -248,7 +232,7 @@ class _Lowerer:
         if decl is None:
             fn_type = sllvm.fn_type(
                 self._to_llvm(symbol.fn_type.return_type),
-                *(self._types.arg_llvm(t) for t in symbol.fn_type.args),
+                *(self._to_llvm(t) for t in symbol.fn_type.args),
             )
             decl = sllvm.DeclareFunction(symbol.name, fn_type)
             self._declarations[symbol.name] = decl
@@ -331,6 +315,54 @@ class _Lowerer:
             self._lowered[id(inst)] = result
 
 
+def py_entry_arg_ctype(type: Type) -> type[ctypes._CDataType]:
+    """The ctypes type of one *argument of the Python-facing entry* of
+    a native function: a by-value struct formal is passed as a pointer
+    there (the entry is a generated thunk - see :func:`compile_module` -
+    that loads the struct and calls the by-value function)."""
+    if isinstance(type, StructType):
+        return ctypes.c_void_p
+    return to_ctype(type)  # type: ignore[return-value]
+
+
+def _ctypes_thunk(
+    types: _ModuleTypes, value_fn: sllvm.Function, fn: mir.Function
+) -> sllvm.Function:
+    """The Python-facing entry of one MIR function that takes a
+    by-value struct parameter: a pointer-form wrapper that loads each
+    struct argument and calls the by-value (value-form) function.
+
+    ctypes and the LLVM ABI disagree on the machine convention of
+    aggregate by-value arguments (LLVM classifies IR-level aggregates
+    itself instead of following the platform C ABI), so a struct cannot
+    be handed to a JIT-compiled function by value through ctypes; the
+    Python boundary passes the *address* of the instance and the wrapper
+    performs the copy.  Spy-to-spy calls never go through it: they call
+    the value-form function directly."""
+    assert any(isinstance(a.type, StructType) for a in fn.args)
+    assert fn.ret_type is not None, f'function {fn.name} is not fully typed'
+    thunk = sllvm.Function(f'{fn.name}.py')
+    arg_types = tuple(
+        sllvm.PointerType(types.to_llvm(a.type))
+        if isinstance(a.type, StructType)
+        else types.to_llvm(a.type)
+        for a in fn.args
+    )
+    args = thunk.add_args(*arg_types)
+    thunk.set_return_type(types.to_llvm(fn.ret_type))
+    block = thunk.entry
+    call_args = tuple(
+        block.load(arg) if isinstance(a.type, StructType) else arg
+        for a, arg in zip(fn.args, args)
+    )
+    if isinstance(fn.ret_type, VoidType):
+        block.call(value_fn, *call_args)
+        block.ret(None)
+    else:
+        block.ret(block.call(value_fn, *call_args))
+    return thunk
+
+
 def compile_module(
     fns: Sequence[mir.Function],
     extern: dict[str, NativeFn],
@@ -358,7 +390,7 @@ def compile_module(
                 f'supported yet (function {fn.name}): return its fields instead'
             )
         llvm_fn = sllvm.Function(fn.name)
-        llvm_fn.add_args(*(types.arg_llvm(a.type) for a in fn.args))
+        llvm_fn.add_args(*(types.to_llvm(a.type) for a in fn.args))
         llvm_fn.set_return_type(types.to_llvm(fn.ret_type))
         llvm_fns[fn.name] = llvm_fn
 
@@ -366,8 +398,18 @@ def compile_module(
     for fn in fns:
         lowerer.lower(fn)
 
+    # the Python-facing entry of every function with a by-value struct
+    # parameter is a pointer-form thunk (see ``_ctypes_thunk``)
+    thunk_by_fn: dict[str, sllvm.Function] = {}
+    for fn in fns:
+        if any(isinstance(a.type, StructType) for a in fn.args):
+            thunk = _ctypes_thunk(types, llvm_fns[fn.name], fn)
+            thunk_by_fn[fn.name] = thunk
+
     mod = sllvm.Module()
-    mod.add_recursively(values=[llvm_fns[fn.name] for fn in fns])
+    module_values: list[sllvm.Value] = [llvm_fns[fn.name] for fn in fns]
+    module_values.extend(thunk_by_fn.values())
+    mod.add_recursively(values=module_values)
     # register every struct type the module refers to (its writer needs
     # the ``%struct = type {...}`` definitions)
     mod.add_recursively(types=types.struct_types())
@@ -397,14 +439,24 @@ def compile_module(
     rets: list[NativeFn] = []
     for fn in fns:
         assert fn.ret_type is not None, f'function {fn.name} is not fully typed'
-        addr = engine.get_function_address(fn.name)
-        arg_ctypes = tuple(arg_ctype(t) for t in (a.type for a in fn.args))
+        # spy-to-spy calls (in-module, recursive or across modules)
+        # link to the value-form function, whose arguments are by value;
+        # the ctypes entry bound below is the pointer-form thunk, when
+        # one exists (see ``_ctypes_thunk``)
+        value_addr = engine.get_function_address(fn.name)
+        thunk = thunk_by_fn.get(fn.name)
+        entry_addr = (
+            engine.get_function_address(thunk.name)
+            if thunk is not None
+            else value_addr
+        )
+        arg_ctypes = tuple(py_entry_arg_ctype(t) for t in (a.type for a in fn.args))
         restype = to_ctype(fn.ret_type)
         proto = ctypes.CFUNCTYPE(restype, *arg_ctypes)  # type: ignore[arg-type]
-        entry = ctypes.cast(addr, proto)
+        entry = ctypes.cast(entry_addr, proto)
         ret = NativeFn(fn.name, tuple(a.type for a in fn.args), fn.ret_type, lines)
         ret._engine = engine
-        ret._addr = addr
+        ret._addr = value_addr
         ret._entry = entry
         rets.append(ret)
     return rets

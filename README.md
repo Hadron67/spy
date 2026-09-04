@@ -150,7 +150,7 @@ assert bar.foo.a == 35
 | `hir.py` | 无类型 HIR 指令定义 |
 | `interp.py` | 编译期运行 HIR → 有类型 MIR（comptime 语义所在）；结构体的字段寻址、方法分发与构造 |
 | `mir.py` | MIR 类型（含结构体类型）、指令与区域树定义 |
-| `lower.py` | MIR → LLVM IR → 机器码（MCJIT）；结构体按指针传参 |
+| `lower.py` | MIR → LLVM IR → 机器码（MCJIT）；结构体按值传参 |
 | `fn.py` | 函数值/注册条目：`LazyJitFunction`（jit）、`FunctionValue`（aot） |
 | `type.py` | spy 类型系统（含结构体类型）与 Python 值 → 类型的映射 |
 | `errors.py` | `CompileError`、`TypeMismatchError`（`TypeMismatchError` 同时是 `TypeError` 子类） |

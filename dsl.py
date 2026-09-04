@@ -208,9 +208,10 @@ def _marshal(fn_name: str, param_name: str, value: object, target: Type) -> obje
         value = _coerce_py(value, target.elem, what)
         return ctypes.addressof(value)  # type: ignore[arg-type]
     if isinstance(target, SpyStructType):
-        # a by-value struct parameter: the callee copies it into its own
-        # storage at entry, so the instance is passed by reference and
-        # never modified
+        # a by-value struct parameter: the Python-facing entry is a
+        # pointer-form thunk (see ``lower._ctypes_thunk``) that loads
+        # the struct and calls the by-value function, so the instance is
+        # passed by reference and never modified
         value = _coerce_py(value, target, what)
         return ctypes.addressof(value)  # type: ignore[arg-type]
     return _coerce_py(value, target, what)
@@ -443,6 +444,47 @@ def _build_instance_class(cls: type, desc: SpyStructType) -> type:
     py_cls.__spy_struct_type__ = desc  # type: ignore[attr-defined]
     return py_cls
 
+def _copy_memory(instance: StructInstance, field: str, value: Any) -> None:
+    """Copy the native memory of a nested struct instance into a
+    struct field of another instance."""
+    view = getattr(instance, field)
+    ctypes.memmove(ctypes.addressof(view), ctypes.addressof(value), ctypes.sizeof(view))
+
+def _write_fields(
+    desc: SpyStructType,
+    instance: StructInstance,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Write Python arguments into the fields of a fresh struct
+    instance (in declaration order; keyword arguments by field
+    name)."""
+    fields = desc.fields
+    bound: list[Any] = []
+    names = [f.name for f in fields]
+    if len(args) > len(fields):
+        raise TypeError(
+            f'{desc.name}() takes at most {len(fields)} arguments '
+            f'({len(args)} given)'
+        )
+    for i, value in enumerate(args):
+        bound.append((fields[i], value))
+    for key, value in kwargs.items():
+        if key not in names:
+            raise TypeError(f"{desc.name}() got an unexpected keyword argument '{key}'")
+        if key in [b[0].name for b in bound]:
+            raise TypeError(f"{desc.name}() got multiple values for argument '{key}'")
+        bound.append((fields[names.index(key)], value))
+    if len(bound) != len(fields):
+        missing = [n for n in names if n not in [b[0].name for b in bound]]
+        raise TypeError(f"{desc.name}() missing required argument '{missing[0]}'")
+    for field, value in bound:
+        converted = _coerce_py(value, field.type, f"field '{field.name}' of {desc.name}")
+        if isinstance(field.type, SpyStructType):
+            # copy the memory of the nested struct into the field
+            _copy_memory(instance, field.name, converted)
+        else:
+            setattr(instance, field.name, converted)
 
 class JitContext(FunctionResolver):
     """A cache of compiled spy functions; functions decorated by the
@@ -601,54 +643,10 @@ class JitContext(FunctionResolver):
                 self._dispatch_method(handle, instance, args, kwargs)
                 return instance
             # the default constructor: arguments are the fields
-            self._write_fields(desc, instance, args, kwargs)
+            _write_fields(desc, instance, args, kwargs)
             return instance
 
         desc._py_init = construct
-
-    def _write_fields(
-        self,
-        desc: SpyStructType,
-        instance: StructInstance,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> None:
-        """Write Python arguments into the fields of a fresh struct
-        instance (in declaration order; keyword arguments by field
-        name)."""
-        fields = desc.fields
-        bound: list[Any] = []
-        names = [f.name for f in fields]
-        if len(args) > len(fields):
-            raise TypeError(
-                f'{desc.name}() takes at most {len(fields)} arguments '
-                f'({len(args)} given)'
-            )
-        for i, value in enumerate(args):
-            bound.append((fields[i], value))
-        for key, value in kwargs.items():
-            if key not in names:
-                raise TypeError(f"{desc.name}() got an unexpected keyword argument '{key}'")
-            if key in [b[0].name for b in bound]:
-                raise TypeError(f"{desc.name}() got multiple values for argument '{key}'")
-            bound.append((fields[names.index(key)], value))
-        if len(bound) != len(fields):
-            missing = [n for n in names if n not in [b[0].name for b in bound]]
-            raise TypeError(f"{desc.name}() missing required argument '{missing[0]}'")
-        for field, value in bound:
-            converted = _coerce_py(value, field.type, f"field '{field.name}' of {desc.name}")
-            if isinstance(field.type, SpyStructType):
-                # copy the memory of the nested struct into the field
-                self._copy_memory(instance, field.name, converted)
-            else:
-                setattr(instance, field.name, converted)
-
-    @staticmethod
-    def _copy_memory(instance: StructInstance, field: str, value: Any) -> None:
-        """Copy the native memory of a nested struct instance into a
-        struct field of another instance."""
-        view = getattr(instance, field)
-        ctypes.memmove(ctypes.addressof(view), ctypes.addressof(value), ctypes.sizeof(view))
 
     def _dispatch_method(
         self,

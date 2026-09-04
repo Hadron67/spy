@@ -1055,7 +1055,7 @@ class StructTest(TestCase):
     def test_cross_module_by_value_struct_call(self) -> None:
         # ``read_bar`` is compiled first; ``call_read`` references it as
         # an extern symbol of an earlier module (its struct parameter is
-        # passed by pointer across the module boundary)
+        # passed by value across the module boundary)
         @self.cache.aot()
         def read_bar(b: self.Bar) -> i32:  # type: ignore[name-defined]
             return b.h
