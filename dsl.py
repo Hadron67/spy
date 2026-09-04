@@ -363,6 +363,17 @@ class _RegisteredFunction:
     def __repr__(self) -> str:
         return f'<spy {self._kind} function {self._fn.__name__}>'
 
+def _native_spec(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> NativeFn | None:
+    """The compiled native function of one specialization, or None
+    when it is not (yet) compiled.
+
+    An aot function has exactly one specialization, fixed by its
+    annotations and lowered at its first use: its native function is
+    stored on the value (the value also keeps the MIR, in
+    ``mir_fn``)."""
+    if isinstance(entry, FunctionValue):
+        return entry.native_fn
+    return entry.specs.get(arg_types)
 
 class JitContext(FunctionResolver):
     """A cache of compiled spy functions; functions decorated by the
@@ -706,18 +717,6 @@ class JitContext(FunctionResolver):
             self._inline_fn_hir_cache[fn] = ir
         return ir
 
-    def _native_spec(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> NativeFn | None:
-        """The compiled native function of one specialization, or None
-        when it is not (yet) compiled.
-
-        An aot function has exactly one specialization, fixed by its
-        annotations and lowered at its first use: its native function is
-        stored on the value (the value also keeps the MIR, in
-        ``mir_fn``)."""
-        if isinstance(entry, FunctionValue):
-            return entry.native_fn
-        return entry.specs.get(arg_types)
-
     def ensure_spec(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> NativeFn:
         """Compile (or look up) the specialization of ``entry`` for
         ``arg_types`` and return its native function.
@@ -727,7 +726,7 @@ class JitContext(FunctionResolver):
         together into one LLVM module (``define``s); specializations
         compiled in earlier modules are referenced as external symbols.
         """
-        native = self._native_spec(entry, arg_types)
+        native = _native_spec(entry, arg_types)
         if native is not None:
             return native
         message: str | None = None
@@ -738,8 +737,7 @@ class JitContext(FunctionResolver):
             message = entry.failed.get(arg_types)
         if message is not None:
             raise CompileError(message)
-        if self._module is not None:
-            raise CompileError('internal error: nested module compilation')
+        assert self._module is None, 'internal error: nested module compilation'
 
         self._module = {}
         try:
@@ -861,7 +859,7 @@ class JitContext(FunctionResolver):
         compiled when the call is a recursive one - or a
         :class:`mir.Symbol` of a specialization compiled in an earlier
         module."""
-        native = self._native_spec(entry, arg_types)
+        native = _native_spec(entry, arg_types)
         if native is not None:
             fn_type = MirFunctionType(native.arg_types, native.ret_type)
             return MirSymbol(native.name, fn_type), native.ret_type
