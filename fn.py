@@ -66,7 +66,7 @@ class LazyJitFunction(Value):
 
     kind = 'jit'
 
-    def __init__(self, fn: PyFunctionType) -> None:
+    def __init__(self, fn: PyFunctionType, hir: FunctionIR) -> None:
         self.fn = fn
         # the hosting JitContext (set when the value is registered),
         # only used when checking whether the function is called within
@@ -75,7 +75,7 @@ class LazyJitFunction(Value):
         # the context-unique base name of the native symbols
         self.name_base = ''
         # the parsed HIR of the function (see ``JitContext.hir_of``)
-        self.hir: FunctionIR | None = None
+        self.hir = hir
         # spy argument types -> the typed MIR function of the
         # specialization.  The function is registered here - with an
         # empty body - before its body is typed, so a recursive call
@@ -122,6 +122,7 @@ class FunctionValue(Value):
     def __init__(
         self,
         fn: PyFunctionType,
+        hir: FunctionIR,
         args: tuple[FormalArg, ...],
         ret: Type,
         mir_fn: mir.Function | None = None,
@@ -134,7 +135,7 @@ class FunctionValue(Value):
         # the context-unique base name of the native symbols
         self.name_base = ''
         # the parsed HIR of the function (see ``JitContext.hir_of``)
-        self.hir: FunctionIR | None = None
+        self.hir = hir
         self.args = args
         self.ret = ret
         self.mir_fn = mir_fn
