@@ -568,6 +568,138 @@ class SpyExampleTest(TestCase):
         self.assertEqual(self.v_fn(41), 42)
         self.assertEqual(self.v_fn(1), 2)
 
+    # -- local variables and block scope --------------------------------------
+
+    def test_local_variables(self) -> None:
+        @self.cache.jit()
+        def local(x, y):
+            s = x + y
+            return s
+        self.assertEqual(local(1, 2), 3)
+        self.assertEqual(local(0.5, 0.25), 0.75)
+
+    def test_reassignment_in_the_same_block(self) -> None:
+        @self.cache.jit()
+        def reuse(x):
+            y = x
+            y = y * 2
+            return y
+        self.assertEqual(reuse(4), 8)
+        self.assertEqual(reuse(1.5), 3.0)
+
+    def test_augmented_assignment(self) -> None:
+        @self.cache.jit()
+        def aug(x):
+            y = x
+            y += 1
+            y += 2
+            return y
+        self.assertEqual(aug(4), 7)
+        self.assertEqual(aug(1.5), 4.5)
+
+    def test_parameter_reassignment_at_function_scope(self) -> None:
+        # the function body is the outermost block: its scope already
+        # holds the parameter slots, so a top-level assignment to a
+        # parameter name stores into the parameter slot
+        @self.cache.jit()
+        def bump(x):
+            x = x + 1
+            x += 1
+            return x
+        self.assertEqual(bump(4), 6)
+
+    def test_block_scope_shadowing(self) -> None:
+        # an ``if`` body is a block of its own: the first ``=`` on a
+        # name inside it declares a block-local variable shadowing the
+        # outer one (the outer binding is untouched after the block)
+        @self.cache.jit()
+        def pick(x):
+            s = 1
+            if spy_type(x) == i32:
+                s = x
+                s += 100
+                return s
+            return s
+        self.assertEqual(pick(5), 105)
+        # float specialization: the branch is not taken and the outer s
+        # still holds its initial value
+        self.assertEqual(pick(2.0), 1)
+
+    def test_branch_declared_variable_is_visible_in_nested_blocks(self) -> None:
+        @self.cache.jit()
+        def nested(x):
+            if x > 0:
+                s = x
+                if x > 10:
+                    s2 = s + 5
+                    return s2
+                return s
+            return 0
+        self.assertEqual(nested(20), 25)
+        self.assertEqual(nested(5), 5)
+        self.assertEqual(nested(-1), 0)
+
+    def test_local_variables_in_runtime_if_branches(self) -> None:
+        @self.cache.jit()
+        def rt(x):
+            if x > 0:
+                y = x * 2
+                y += 1
+                return y
+            return 0
+        self.assertEqual(rt(3), 7)
+        self.assertEqual(rt(-1), 0)
+
+    def test_self_referencing_declaration_is_unbound(self) -> None:
+        # the first ``=`` declares the variable, so reading it in its own
+        # initializer sees an uninitialized slot (like an unbound local)
+        @self.cache.jit()
+        def bad(x):
+            y = y + 1
+            return y
+        with self.assertRaises(CompileError) as ctx:
+            bad(1)
+        self.assertIn('before any store', str(ctx.exception))
+
+    def test_nested_block(self) -> None:
+        @self.cache.jit()
+        def foo(x):
+            s = x
+            if x > 0:
+                s += 1
+                return s
+            return s
+        self.assertEqual(foo(0), 0)
+        self.assertEqual(foo(1), 2)
+
+    def test_augassign_requires_a_prior_declaration(self) -> None:
+        @self.cache.jit()
+        def bad(x):
+            y += 1
+            return y
+        with self.assertRaises(CompileError) as ctx:
+            bad(1)
+        self.assertIn("name 'y' is not defined in the scope", str(ctx.exception))
+
+    def test_only_plus_equals_augmentation(self) -> None:
+        @self.cache.jit()
+        def bad(x):
+            y = x
+            y -= 1
+            return y
+        with self.assertRaises(CompileError) as ctx:
+            bad(1)
+        self.assertIn("only '+='", str(ctx.exception))
+
+    def test_chained_assignment_rejected(self) -> None:
+        @self.cache.jit()
+        def bad(x):
+            a = b = x
+            return a + b
+        with self.assertRaises(CompileError) as ctx:
+            bad(1)
+        self.assertIn('chained assignments', str(ctx.exception))
+
     # -- closure variables ---------------------------------------------------
 
     def test_closure_value_is_compile_time_constant(self) -> None:

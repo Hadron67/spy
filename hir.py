@@ -14,18 +14,24 @@ produces no register of its own.  A caller that needs the value
 allocates a slot and loads it back; the interpreter keeps scalar and
 compile-time results in the slot without giving it real memory.
 
-``astgen`` performs all name resolution: a variable (parameter) read
-becomes a :class:`Load` of the variable's :class:`Alloca`, a global name
-becomes a :class:`Const` holding the resolved Python object (spy types,
-the ``spy`` module functions, functions to call/inline, ...), and
-attribute access on such compile-time objects is evaluated there as
-well.  The HIR never carries a variable *name*.
+``astgen`` performs all name resolution: a read of a variable - a
+parameter or a block-local declaration - becomes a :class:`Load` of
+the variable's :class:`Alloca`, a global name becomes a :class:`Const`
+holding the resolved Python object (spy types, the ``spy`` module
+functions, functions to call/inline, ...), and attribute access on
+such compile-time objects is evaluated there as well.  The HIR never
+carries a variable *name*.
 
 Because every parameter is addressable, the instruction list of a
 function body begins with one ``Alloca``/``Store`` pair per parameter::
 
     %a = Alloca();  Store(%a, Arg(0))
     %b = Alloca();  Store(%b, Arg(1))
+
+A local variable is declared the same way at its first assignment - the
+``Alloca``/``Store`` pair sits at the declaration point instead of in
+the prologue - and a later assignment to it is a plain ``Store`` of
+its slot.
 
 (:class:`Arg` refers to the i-th by-value argument of the function being
 executed.)  The interpreter *types* an ``Alloca`` when its first store

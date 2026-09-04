@@ -20,16 +20,22 @@ value into a caller-provided slot and returns nothing.
 is addressable, the translated body starts with an
 ``Alloca``/``Store`` prologue per parameter (storing the by-value
 ``Arg(i)``), and a read of a parameter becomes a ``Load`` of its Alloca.
-Global names - everything that is not a parameter - are resolved here to
-their Python objects and embedded as ``hir.Const`` leaves; a name
-captured from an enclosing Python scope (a spy function may be defined
-inside a factory) is read from its closure cell and embedded the same
-way.  Attributes on such compile-time objects (``spy.type``,
-``spy.u64``, ...) are evaluated here as well.  Whether a function object
-denotes a registered spy function - and which function value it stands
-for - is decided by the interpreter when a call runs: a function body
-may be parsed before its callees, or even itself (an aot function parses
-its own body while it is being registered), are registered.
+Local variables are addressable the same way: ``name = expr`` declares a
+block-local variable - a fresh ``Alloca`` - when ``name`` is not yet
+bound in the current block, and stores into the existing slot
+otherwise.  Every ``if`` body is a lexical block of its own (a child of
+the enclosing block): a declaration inside it shadows outer bindings
+within the block and is invisible after it.  Global names - everything
+that is not a variable in scope - are resolved here to their Python
+objects and embedded as ``hir.Const`` leaves; a name captured from an
+enclosing Python scope (a spy function may be defined inside a factory)
+is read from its closure cell and embedded the same way.  Attributes on
+such compile-time objects (``spy.type``, ``spy.u64``, ...) are
+evaluated here as well.  Whether a function object denotes a registered
+spy function - and which function value it stands for - is decided by
+the interpreter when a call runs: a function body may be parsed before
+its callees, or even itself (an aot function parses its own body while
+it is being registered), are registered.
 
 ``solve_call_types`` computes the concrete spy types of all formal
 parameters of one call:
@@ -76,19 +82,48 @@ _CMP_OPS = {
 }
 
 
+class _Scope:
+    """One lexical block of a spy function: the variable bindings of the
+    block (name -> the Alloca of its slot), chained to the enclosing
+    block.  A *read* resolves through the chain; an assignment binds in
+    the current block: into the slot of a name the block already holds,
+    or - the first ``=`` on a name - into a fresh block-local slot that
+    shadows any outer binding of the same name.  A declaration is never
+    visible outside its block."""
+
+    __slots__ = ('bindings', 'parent')
+
+    def __init__(self, parent: '_Scope | None') -> None:
+        self.parent = parent
+        self.bindings: dict[str, hir.Inst] = {}
+
+    def lookup(self, name: str) -> hir.Inst | None:
+        """The Alloca of the nearest binding of ``name``, or None when
+        the name is not bound in this or any enclosing block."""
+        scope = self
+        while scope is not None:
+            slot = scope.bindings.get(name)
+            if slot is not None:
+                return slot
+            scope = scope.parent
+        return None
+
+
 class _Builder:
     """Translates the AST of one function body into one linear
     instruction list of the untyped HIR.
 
-    All builders of one function (including the sub-lists of ``if``
-    branches) share the same ``env``: a static map from variable names
-    to their parameter ``Alloca`` instructions, built by
-    ``parse_function`` before translation.
+    Each builder translates one *block* - the function body, or the
+    body of one ``if`` branch - and carries the lexical scope of that
+    block: a child of the enclosing block's scope whose bindings (the
+    parameters, for the function body; local declarations, in every
+    block) are added as the block is translated.  Expression builders
+    of nested blocks look up names through the chain.
     """
 
-    def __init__(self, fn_ir: FunctionIR, env: dict[str, hir.Inst]) -> None:
+    def __init__(self, fn_ir: FunctionIR, scope: _Scope) -> None:
         self._fn_ir = fn_ir
-        self._env = env
+        self._scope = scope
         self.insts: list[hir.Inst] = []
 
     def add(self, inst: hir.Inst) -> hir.Inst:
@@ -109,9 +144,13 @@ class _Builder:
             case ast.Expr():
                 self._gen_value(node.value)
             case ast.Assign():
-                raise CompileError(
-                    f"local variables are not supported yet in spy function {fn_name}"
-                )
+                if len(node.targets) != 1:
+                    raise CompileError(
+                        f"chained assignments are not supported yet in spy function {fn_name}"
+                    )
+                self._gen_assign(node.targets[0], node.value)
+            case ast.AugAssign():
+                self._gen_augassign(node)
             case ast.If():
                 cond = self._gen_value(node.test)
                 then_body = self._gen_body(node.body)
@@ -123,13 +162,42 @@ class _Builder:
                 )
 
     def _gen_body(self, stmts: list[ast.stmt]) -> list[hir.Inst]:
-        """Translate a statement block into its own linear instruction list
-        (the sub-builder shares the variable environment of the enclosing
-        function, so parameter reads resolve to the same Allocas)."""
-        sub = _Builder(self._fn_ir, self._env)
+        """Translate a statement block into its own linear instruction
+        list.  A block is a lexical scope of its own - a child of the
+        enclosing block - so declarations inside it shadow outer
+        bindings and are not visible after the block."""
+        sub = _Builder(self._fn_ir, _Scope(self._scope))
         for stmt in stmts:
             sub._gen_stmt(stmt)
         return sub.insts
+
+    # -- variables ------------------------------------------------------------
+
+    def _gen_assign(self, target: ast.expr, value: ast.expr) -> None:
+        """One ``name = expr`` statement.  The first ``=`` on ``name``
+        in the current block declares a block-local variable (a fresh
+        slot, shadowing any outer binding); later assignments in the
+        block only store into its slot."""
+        if isinstance(target, ast.Name) and self._scope.bindings.get(target.id) is None:
+            # the slot is bound before the initializer is generated, so
+            # a self-referencing declaration (``y = y + 1``) reads the
+            # not-yet-stored slot - a compile error when it runs, like
+            # an unbound local - instead of silently reading an outer
+            # ``y``
+            self._scope.bindings[target.id] = self.add(hir.Alloca())
+        self.add(hir.Store(self._gen_ref(target), self._gen_value(value)))
+
+    def _gen_augassign(self, node: ast.AugAssign) -> None:
+        """One ``name += expr`` statement: read the slot of ``name``,
+        add the value, store the result back.  ``+=`` never declares: it
+        requires the name to be declared."""
+        fn_name = self._fn_ir.name
+        if not isinstance(node.op, ast.Add):
+            raise CompileError(f"only '+=' is supported yet in spy function {fn_name}")
+
+        lhs = self._gen_ref(node.target)
+        rhs = self._gen_value(node.value)
+        self.add(hir.Store(lhs, self.add(hir.Binary('+', self.add(hir.Load(lhs)), rhs))))
 
     # -- expressions ----------------------------------------------------------
 
@@ -212,10 +280,10 @@ class _Builder:
         pointer to a freshly allocated slot holding its value."""
         match node:
             case ast.Name():
-                alloca = self._env.get(node.id)
-                if alloca is not None:
+                slot = self._scope.lookup(node.id)
+                if slot is not None:
                     # an addressable variable: its slot *is* the reference
-                    return alloca
+                    return slot
                 # a global: its resolved compile-time object (functions,
                 # types, captured constants, ...) is an identity, i.e.
                 # already a reference
@@ -262,10 +330,10 @@ class _Builder:
                     return hir.Const(node.value)
                 raise CompileError(f"unsupported constant {node.value!r} in spy function {fn_name}")
             case ast.Name():
-                alloca = self._env.get(node.id)
-                if alloca is not None:
-                    # reading a parameter: load its slot
-                    return self.add(hir.Load(alloca))
+                slot = self._scope.lookup(node.id)
+                if slot is not None:
+                    # reading a variable (parameter or local): load its slot
+                    return self.add(hir.Load(slot))
                 return self._resolve_global(node.id)
             case ast.Attribute():
                 base = self._gen_value(node.value)
@@ -400,18 +468,20 @@ def parse_function(fn: Callable) -> FunctionIR:
     ir = FunctionIR(fn, node.name, tuple(type_params), tuple(params), annotations.get('return'), ())
 
     # prologue: every parameter is addressable, so allocate one slot per
-    # parameter and store its by-value argument into it.  ``env`` maps
-    # each parameter name to its Alloca; the interpreter types an Alloca
-    # when its first store runs.
-    env: dict[str, hir.Inst] = {}
+    # parameter and store its by-value argument into it.  The function
+    # body is the outermost block: its scope is pre-populated with the
+    # parameter slots, so an assignment to a parameter name at the top
+    # level stores into the parameter slot.  The interpreter types an
+    # Alloca when its first store runs.
+    scope = _Scope(None)
     prologue: list[hir.Inst] = []
     for i, param in enumerate(params):
         alloca = hir.Alloca()
         prologue.append(alloca)
         prologue.append(hir.Store(alloca, hir.Arg(i)))
-        env[param.name] = alloca
+        scope.bindings[param.name] = alloca
 
-    builder = _Builder(ir, env)
+    builder = _Builder(ir, scope)
     for stmt in node.body:
         builder._gen_stmt(stmt)
     ir.body = tuple(prologue + builder.insts)
