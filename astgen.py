@@ -202,7 +202,7 @@ class _Builder:
         if is_ref:
             return self._gen_ref(node)
         if result_loc is not None:
-            self._gen_into(node, result_loc)
+            self._gen_result_loc(node, result_loc)
             return None
         return self._gen_value(node)
 
@@ -226,10 +226,10 @@ class _Builder:
                 return self._gen_value(node)
             case _:
                 loc = self.add(hir.Alloca())
-                self._gen_into(node, loc)
+                self._gen_result_loc(node, loc)
                 return loc
 
-    def _gen_into(self, node: ast.expr, result_loc: hir.Value) -> None:
+    def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value) -> None:
         """Evaluate ``node`` writing its result into ``result_loc``
         (result-location semantics); no value register is produced."""
         fn_name = self._fn_ir.name
@@ -284,20 +284,6 @@ class _Builder:
                 raise CompileError(
                     f"attribute access on values is not supported yet in spy function {fn_name}"
                 )
-            case ast.Call():
-                if len(node.keywords) > 0:
-                    raise CompileError(
-                        f"calls with keyword arguments inside spy functions are not supported yet "
-                        f"(function {fn_name})"
-                    )
-                # value context: call into a temporary slot and load the
-                # value back (RLS); the callee must be addressable (a
-                # reference), the arguments are by-value values
-                callee = self._gen_ref(node.func)
-                args = tuple(self._gen_value(a) for a in node.args)
-                loc = self.add(hir.Alloca())
-                self.add(hir.CallInplace(callee, args, loc))
-                return self.add(hir.Load(loc))
             case ast.BinOp():
                 op = _BIN_OPS.get(type(node.op))
                 if op is None:
@@ -338,6 +324,10 @@ class _Builder:
                 lhs = self._gen_value(node.left)
                 rhs = self._gen_value(node.comparators[0])
                 return self.add(hir.Compare(op, lhs, rhs))
+            case ast.Call():
+                loc = self.add(hir.Alloca())
+                self._gen_result_loc(node, loc)
+                return self.add(hir.Load(loc))
             case _:
                 raise CompileError(
                     f"unsupported expression {type(node).__name__} in spy function {fn_name}"
