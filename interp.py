@@ -162,8 +162,34 @@ class PendingSlot(InterpVal):
 @dataclass
 class InPlaceResult(InterpVal):
     """The result of a call that wrote its result into the result slot
-    itself (a struct constructor): the interpreter must not store it
-    again."""
+    itself (a struct constructor, or a call whose result goes through a
+    result pointer): the interpreter must not store it again."""
+
+
+@dataclass
+class RetLocVal(InterpVal):
+    """The value of the result location of the function currently being
+    typed (its ``hir.ResultLoc``): the location the return statements of
+    the function write into, and whose content the terminating ``Ret``
+    turns into the function's return.
+
+    For a *direct-return* function the location only records the value
+    of the path being typed (no memory - like the recorded result of an
+    RLS scalar call); it is given real memory only when a writer needs
+    an address (a constructor writing in place).  For a *result-pointer*
+    function the location *is* the result pointer parameter of the
+    function (``ptr`` is preset to it): a write is a store through it
+    and the return is void."""
+
+    # the value written by the last write of the current path: a typed
+    # MIR value when the function proper is being typed, the raw
+    # InterpVal of the return expression for an inlined body
+    value: InterpVal | None = None
+    # the memory of the location, when it has any (a direct-return
+    # function whose result is written in place, or the result pointer
+    # parameter of a result-pointer function); its static type is ``type``
+    ptr: mir.Value | None = None
+    type: Type | None = None
 
 
 @dataclass
@@ -474,6 +500,9 @@ class HirRunner:
         self._regs: dict[hir.Inst, InterpVal] = {}
         self._inline_stack: list[astgen.FunctionIR] = []
         self._inline_depth = 0
+        # the function proper whose body is currently being typed (see
+        # ``_bind_result_ptr``)
+        self._fn: mir.Function | None = None
         self._ret_type: Type | None = None
         self._ret_target: Type | None = None
         # True when a path of the function proper ended in a void return
@@ -486,6 +515,25 @@ class HirRunner:
         # the emission regions (see ``_emit``): a stack of lists whose
         # top is the region currently being typed
         self._regions: list[list[mir.Inst]] = []
+        # the result locations of the function bodies being executed (see
+        # ``RetLocVal``), keyed by their ``hir.ResultLoc`` leaf: the top
+        # is the body whose instructions are currently being typed
+        self._ret_locs: list[tuple[hir.ResultLoc, RetLocVal]] = []
+        # the return type of the function proper declared by its
+        # annotation (its logical MIR type, or None when it is inferred
+        # from the body); the target every return site is checked against
+        # the return mode of the function proper: 'ptr' when its return
+        # type is delivered through a result pointer (the function then
+        # has a trailing result pointer formal and returns void), 'value'
+        # when it returns the value directly; None while the return type
+        # is still unknown (a body that never returns a value is void)
+        self._result_mode: str | None = None
+        # the result pointer parameter of a result-pointer function
+        # proper (its trailing formal; see ``_bind_result_ptr``)
+        self._result_ptr: mir.Value | None = None
+        # True when the return statement of the path currently being
+        # typed has written its value into the result location
+        self._ret_written = False
 
     # -- entry point ---------------------------------------------------------
 
@@ -496,22 +544,41 @@ class HirRunner:
         one is declared, its return type) and registered it *before*
         running the body, so a call the body makes to the function
         itself - recursion - resolves to ``fn``, whose signature is
-        already fixed.  This fills ``fn.insts`` and fixes
-        ``fn.ret_type``: the declared type, or the type inferred from
-        the return sites when none is declared.
+        already fixed.  This fills ``fn.insts`` and fixes ``fn.ret_type``:
+        the declared type, or the type inferred from the return sites
+        when none is declared.
+
+        The return convention of the function is decided here, from its
+        logical return type (see ``mir.via_result_ptr``), and
+        lowered into the MIR signature of ``fn``: a function that
+        returns through a result pointer gets a trailing result pointer
+        formal appended to ``fn.args`` and a ``void`` return, and its
+        return type is kept in ``fn.result_type``.
         """
+        self._fn = fn
+        # push the result location of the function's return statements
+        self._ret_locs.append((fn_ir.ret_loc, RetLocVal()))
+        self._ret_target = fn.ret_type
+        self._result_mode = None
+        self._result_ptr = None
+        self._ret_written = False
+        declared = fn.ret_type
+        if declared is not None and mir.via_result_ptr(declared):
+            # the declared return type is delivered through a result
+            # pointer: lower the signature before the body is typed, so
+            # that recursive calls the body makes see the final form
+            assert isinstance(declared, StructType)
+            self._bind_result_ptr(fn, declared)
         param_values = tuple(
             mir.Param(i, arg.type, arg.name) for i, arg in enumerate(fn.args)
         )
         self._push_frame(param_values)
         self._ret_type = None
-        self._ret_target = fn.ret_type
         self._saw_void_return = False
         self._ret_emit = True
         self._regions = [fn.insts]
 
         flow, _ = self._run_list(fn_ir.body)
-        declared = fn.ret_type
         if flow is not Flow.RET:
             # a path falls off the end of the body: allowed only for a
             # void function (declared, or inferred when the body never
@@ -541,9 +608,143 @@ class HirRunner:
             assert ret_type is not None
             if declared is not None:
                 # a declared return type is enforced at the return sites
-                # (see ``_finish_return``), so the two must agree
+                # (see ``_write_result``), so the two must agree
                 assert declared == ret_type
+        self._ret_locs.pop()
+        if self._result_mode == 'ptr':
+            # a result-pointer function: its MIR signature was lowered to
+            # a trailing result pointer formal and a void return when the
+            # mode was bound (see ``_bind_result_ptr``)
+            fn.ret_type = VoidType()
+            return
         fn.ret_type = ret_type
+
+    def _bind_result_ptr(self, fn: mir.Function, logical: StructType) -> None:
+        """Lower the signature of the function proper to its result
+        pointer form: append the trailing result pointer formal and fix
+        the return type to void.  ``logical`` is the type of the value
+        the function returns (kept in ``fn.result_type``)."""
+        index = len(fn.args)
+        formal = mir.FormalArg('$result', PointerType(logical))
+        fn.args = fn.args + (formal,)
+        fn.result_type = logical
+        param = mir.Param(index, formal.type, formal.name)
+        self._result_ptr = param
+        self._result_mode = 'ptr'
+        # the result location of the function is its result pointer: return
+        # values are written through it and the function returns void
+        retloc = self._result_loc_of()
+        retloc.ptr = param
+        retloc.type = logical
+
+    # -- return statements ------------------------------------------------
+
+    def _result_loc_of(self) -> RetLocVal:
+        assert len(self._ret_locs) > 0, 'internal error: no function result location'
+        return self._ret_locs[-1][1]
+
+    def _write_result(self, ev: InterpVal) -> None:
+        """The value of one return expression of the function proper is
+        written into its result location: a direct-return function
+        records it (the terminating ``Ret`` turns it into the return
+        value), a result-pointer function stores it through its result
+        pointer.  This is where every return site is typed (against the
+        declared return type) and cross-path consistency is checked."""
+        retloc = self._result_loc_of()
+        target = self._ret_target
+        if target is VoidType():
+            raise CompileError(
+                'cannot return a value from a void function (its return '
+                'type is None)'
+            )
+        if isinstance(ev, ComptimeVal) and ev.obj is None and target is None:
+            # the value of a void expression (e.g. a call of a void
+            # function) in return position: the function is void
+            return
+        if isinstance(ev, ComptimeVal) and ev.obj is None:
+            raise CompileError('cannot return None (functions must return a value)')
+        value = _to_runtime(ev, target)
+        t = typeof(value)
+        if self._ret_type is not None and self._ret_type != t:
+            raise CompileError(
+                f"function returns values of conflicting types "
+                f"{type_str(self._ret_type)} and {type_str(t)}"
+            )
+        self._ret_type = t
+        if self._result_mode is None:
+            # the return type is inferred from this site: decide the
+            # return convention from it
+            if mir.via_result_ptr(t):
+                assert isinstance(t, StructType)
+                # the signature is still being typed and nothing has
+                # referenced the function yet (an inferred function can
+                # never be recursive), so appending the formal is safe
+                fn = self._fn
+                assert fn is not None
+                self._bind_result_ptr(fn, t)
+            else:
+                self._result_mode = 'value'
+        if self._result_mode == 'ptr':
+            assert self._result_ptr is not None
+            self._emit(mir.Store(self._result_ptr, value))
+            self._ret_written = True
+            return
+        # a direct-return function: the value of the path is recorded and
+        # the terminating ``Ret`` returns it
+        assert self._result_mode == 'value'
+        retloc.value = RuntimeVal(value)
+        self._ret_written = True
+
+    def _note_inplace_ret(self, type: Type) -> None:
+        """A return-path write that happened in place (a constructor or
+        a result-pointer callee wrote straight into the result location):
+        the cross-path return-type bookkeeping, without a value."""
+        if self._ret_type is not None and self._ret_type != type:
+            raise CompileError(
+                f"function returns values of conflicting types "
+                f"{type_str(self._ret_type)} and {type_str(type)}"
+            )
+        self._ret_type = type
+        self._ret_written = True
+
+    def _finish_path(self) -> None:
+        """One path of the function proper ends in its ``return``: emit
+        the return of the path - the recorded value of a direct-return
+        function, a ``ret void`` of a result-pointer function (whose
+        result was stored through the result pointer) - or check the
+        bare ``return`` of a void path."""
+        written = self._ret_written
+        self._ret_written = False
+        if self._result_mode == 'ptr':
+            if not written:
+                # a result-pointer function always returns a value
+                ptr = self._result_ptr
+                assert ptr is not None
+                logical = typeof(ptr)
+                assert isinstance(logical, PointerType)
+                raise CompileError(
+                    'cannot return without a value where '
+                    f'{type_str(logical.elem)} is expected'
+                )
+            self._emit(mir.Ret(None))
+            return
+        if not written:
+            self._finish_void()
+            return
+        retloc = self._result_loc_of()
+        if retloc.ptr is not None:
+            # the value was written in place (a constructor): load it
+            # back to return it
+            assert retloc.type is not None
+            value = self._emit(mir.Load(retloc.ptr, retloc.type))
+            retloc.ptr = None
+            retloc.type = None
+            self._emit(mir.Ret(value))
+            return
+        value = retloc.value
+        retloc.value = None
+        assert isinstance(value, RuntimeVal)
+        self._emit(mir.Ret(value.value))
 
     # -- running instruction lists -------------------------------------------
 
@@ -560,18 +761,26 @@ class HirRunner:
     def _exec_inst(self, inst: hir.Inst) -> tuple[Flow, InterpVal | None]:
         match inst:
             case hir.Ret():
-                if inst.value is None:
-                    # a bare ``return``: a void return of the function
-                    if self._ret_emit:
-                        self._finish_void()
-                        return Flow.RET, None
-                    return Flow.RET, ComptimeVal(None)
-                ev = self._operand(inst.value)
-                if self._ret_emit:
-                    self._finish_return(ev)
-                    return Flow.RET, None
-                # an inlined callee: the return just yields the value
-                return Flow.RET, ev
+                if not self._ret_emit:
+                    # an inlined callee ends: yield the value its return
+                    # statements wrote into its result location (the raw
+                    # return expression value, or None for a void body)
+                    retloc = self._result_loc_of()
+                    if retloc.ptr is not None:
+                        # the value was written in place (a constructor):
+                        # load it back to yield it
+                        assert retloc.type is not None
+                        value: InterpVal | None = RuntimeVal(
+                            self._emit(mir.Load(retloc.ptr, retloc.type))
+                        )
+                        retloc.ptr = None
+                        retloc.type = None
+                        return Flow.RET, value
+                    value = retloc.value
+                    retloc.value = None
+                    return Flow.RET, value if value is not None else ComptimeVal(None)
+                self._finish_path()
+                return Flow.RET, None
             case hir.If():
                 cond = self._operand(inst.cond)
                 if isinstance(cond, ComptimeVal):
@@ -585,7 +794,7 @@ class HirRunner:
                 self._regs[inst] = PendingSlot()
                 return Flow.FALL, None
             case hir.Store():
-                self._exec_store(inst)
+                self._store(self._operand(inst.ptr), self._operand(inst.value))
                 return Flow.FALL, None
             case hir.Binary():
                 self._regs[inst] = self._eval_binary(inst)
@@ -647,6 +856,14 @@ class HirRunner:
                 if index >= len(frame.arg_values):
                     raise CompileError('internal error: Arg index out of range')
                 return RuntimeVal(frame.arg_values[index])
+            case hir.ResultLoc():
+                # the result location of the innermost body being typed
+                # whose leaf this is (its own, or - during an inlined
+                # call - the callee's)
+                for leaf, retloc in reversed(self._ret_locs):
+                    if leaf is value:
+                        return retloc
+                raise CompileError('internal error: result location outside of any function')
             case hir.Inst():
                 reg = self._regs.get(value)
                 if reg is None:
@@ -679,9 +896,20 @@ class HirRunner:
             return RuntimeVal(self._emit(mir.Load(ptr.value, ptype.elem)))
         raise CompileError('cannot load from a compile-time pointer')
 
-    def _exec_store(self, inst: hir.Store) -> None:
-        ptr = self._operand(inst.ptr)
-        value = self._operand(inst.value)
+    def _store(self, ptr: InterpVal, value: InterpVal) -> None:
+        if isinstance(ptr, RetLocVal):
+            # a store into the function result location (the expression
+            # of a ``return`` statement that is not a call): a
+            # direct-return function records the value of the path, a
+            # result-pointer function stores it through its result
+            # pointer
+            if self._ret_emit:
+                self._write_result(value)
+            else:
+                # an inlined body: the return expression is only recorded
+                # and yielded at its ``Ret``
+                ptr.value = value
+            return
         if isinstance(ptr, PendingSlot):
             if ptr.ptr is None and ptr.value is not None:
                 # the slot holds an RLS call result that was only
@@ -804,27 +1032,6 @@ class HirRunner:
             # every path returns: whatever follows in this region is dead
             return Flow.RET, None
         return Flow.FALL, None
-
-    def _finish_return(self, ev: InterpVal) -> None:
-        """Materialize the value of one return site: runtime values must
-        match the (annotation) target, compile-time values adopt it (or
-        their Python type mapping), and all return sites of one function
-        must agree on the return type."""
-        target = self._ret_target
-        if target is VoidType():
-            raise CompileError(
-                'cannot return a value from a void function (its return '
-                'type is None)'
-            )
-        value = _to_runtime(ev, target)
-        ret_type = typeof(value)
-        if self._ret_type is not None and self._ret_type != ret_type:
-            raise CompileError(
-                f"function returns values of conflicting types "
-                f"{type_str(self._ret_type)} and {type_str(ret_type)}"
-            )
-        self._ret_type = ret_type
-        self._emit(mir.Ret(value))
 
     def _finish_void(self) -> None:
         """End one path of the function proper with a void return (a bare
@@ -1023,9 +1230,11 @@ class HirRunner:
         and its result is handed to the slot: scalar and compile-time
         results are only *recorded* in the slot (no memory, no extra
         MIR - the matching ``Load`` passes the recorded value on); a
-        slot that already has memory receives a real store; and a struct
-        constructor writes its result into the slot itself (in place),
-        so no result is handed back at all."""
+        slot that already has memory receives a real store; a struct
+        value is materialized into the slot (its address may escape);
+        and a constructor - or a call whose result goes through a result
+        pointer - writes into the slot itself (in place), so no result
+        is handed back at all."""
         callee = self._operand(inst.callee)
         ev = self._dispatch_call(callee, inst)
         self._store_result(ev, inst.ret)
@@ -1033,13 +1242,37 @@ class HirRunner:
     def _store_result(self, ev: InterpVal, ret: hir.Value) -> None:
         """The RLS tail of a call: hand the returned value of a call to
         its result location (see ``_exec_call_inplace``)."""
+        slot = self._operand(ret)
+        if isinstance(slot, RetLocVal):
+            # the call is the expression of a ``return`` statement: its
+            # result goes into the function result location
+            if isinstance(ev, InPlaceResult):
+                # the callee (a constructor, or a call whose result goes
+                # through a result pointer) wrote into the location itself
+                if self._ret_emit and slot.type is not None:
+                    self._note_inplace_ret(slot.type)
+                return
+            if self._ret_emit:
+                self._write_result(ev)
+            else:
+                # an inlined body: the return value is only recorded and
+                # yielded at its ``Ret``
+                slot.value = ev
+            return
         if isinstance(ev, InPlaceResult):
             # the callee (a struct constructor) already wrote the result
             # into the result location itself
             return
-        slot = self._operand(ret)
         if isinstance(slot, PendingSlot):
             if slot.ptr is None:
+                if isinstance(ev, RuntimeVal) and isinstance(typeof(ev.value), StructType):
+                    # a struct call result needs real memory (its address
+                    # may escape: fields are accessed and values passed on)
+                    struct = typeof(ev.value)
+                    assert isinstance(struct, StructType)
+                    ptr = self._materialize_location(slot, struct)
+                    self._emit(mir.Store(ptr, ev.value))
+                    return
                 slot.value = ev
                 return
             # the slot already has memory (its address escaped or it was
@@ -1123,22 +1356,63 @@ class HirRunner:
 
     # -- struct constructors and methods ----------------------------------------
 
-    def _materialize_struct_slot(self, slot: PendingSlot, struct: StructType) -> mir.Value:
-        """Give an untyped result slot the memory of a struct value and
-        return its address; a slot that already holds a struct is reused."""
-        if slot.ptr is None:
-            if slot.value is not None:
-                # the slot only recorded a scalar call result that was
-                # never materialized: it is discarded by this assignment
-                slot.value = None
-            slot.ptr = self._emit(mir.Alloca(PointerType(struct)))
-            slot.type = struct
-        elif slot.type is None or slot.type != struct:
-            raise CompileError(
-                f'cannot write a {type_str(struct)} value into a slot that '
-                f'already holds a {type_str(slot.type)} value'  # type: ignore[arg-type]
-            )
-        return slot.ptr
+    def _materialize_location(self, loc: InterpVal, struct: StructType) -> mir.Value:
+        """The address one call writes a struct result of type ``struct``
+        into - the result location of the enclosing statement: a slot that
+        is given the memory of the struct when it has none yet (a slot
+        that already holds a struct is reused), or the result pointer of
+        a result-pointer function."""
+        if isinstance(loc, PendingSlot):
+            if loc.ptr is None:
+                if loc.value is not None:
+                    # the slot only recorded a scalar call result that was
+                    # never materialized: it is discarded by this assignment
+                    loc.value = None
+                loc.ptr = self._emit(mir.Alloca(PointerType(struct)))
+                loc.type = struct
+            elif loc.type is None or loc.type != struct:
+                raise CompileError(
+                    f'cannot write a {type_str(struct)} value into a slot that '
+                    f'already holds a {type_str(loc.type)} value'  # type: ignore[arg-type]
+                )
+            return loc.ptr
+        if isinstance(loc, RetLocVal):
+            if loc.ptr is None:
+                if self._ret_emit and self._result_mode is None and mir.via_result_ptr(struct):
+                    # the function proper turns out to return this struct
+                    # through a result pointer: return through it instead
+                    # of an extra local copy
+                    assert self._fn is not None
+                    self._bind_result_ptr(self._fn, struct)
+                    assert loc.ptr is not None
+                    return loc.ptr
+                # a direct-return function (or an inlined body) returning
+                # a value written in place: give the location memory
+                loc.ptr = self._emit(mir.Alloca(PointerType(struct)))
+                loc.type = struct
+                loc.value = None
+            elif loc.type is None or loc.type != struct:
+                raise CompileError(
+                    f'cannot write a {type_str(struct)} value into the result '
+                    f'location that already holds a {type_str(loc.type)} value'  # type: ignore[arg-type]
+                )
+            return loc.ptr
+        raise CompileError('cannot write a struct value into this location')
+
+    def _call_result_addr(self, ret: hir.Value, struct: StructType) -> mir.Value:
+        """The address a call whose result is delivered through a result
+        pointer (a function returning a large struct) writes into: its
+        result location."""
+        loc = self._operand(ret)
+        if isinstance(loc, RuntimeVal):
+            ptype = typeof(loc.value)
+            if not isinstance(ptype, PointerType) or ptype.elem != struct:
+                raise CompileError(
+                    f'cannot write a {type_str(struct)} value through a '
+                    f'{type_str(ptype)} pointer'
+                )
+            return loc.value
+        return self._materialize_location(loc, struct)
 
     def _call_constructor(self, desc: SpyStructType, inst: hir.CallInplace) -> InterpVal:
         """A struct constructor ``Bar(a, b)``: the result slot receives a
@@ -1146,12 +1420,12 @@ class HirRunner:
         to it with ``self`` pointing at the result slot; otherwise every
         argument is written into the field of the same declaration index
         (the default constructor).  Either way the value is written into
-        the result slot in place - no value is handed back."""
+        the result location in place - no value is handed back."""
         struct = struct_mir_type(desc)
         ret = self._operand(inst.ret)
-        if not isinstance(ret, PendingSlot):
+        if not isinstance(ret, (PendingSlot, RetLocVal)):
             raise CompileError('a constructor must write into a variable slot')
-        ptr = self._materialize_struct_slot(ret, struct)
+        ptr = self._materialize_location(ret, struct)
         init = self._resolver.resolve_method(desc, '__init__')
         if init is not None:
             # a user-provided ``__init__``: call it with ``self`` bound to
@@ -1240,6 +1514,14 @@ class HirRunner:
             formal = self._solve_types(fn_ir, evals2, 'jit')
             values = _convert_evals(fn_ir, evals2, formal)
         callee, ret_type = self._resolver.resolve_call(entry, formal)
+        if ret_type is not None and mir.via_result_ptr(ret_type):
+            # the method returns a large struct: it writes into the
+            # result location, whose address is passed as its trailing
+            # result pointer argument, and returns void
+            assert isinstance(ret_type, StructType)
+            dest = self._call_result_addr(inst.ret, ret_type)
+            self._emit(mir.Call(callee, values + (dest,), VoidType()))
+            return InPlaceResult()
         value = self._emit(mir.Call(callee, values, ret_type))
         if ret_type == VoidType():
             return ComptimeVal(None)
@@ -1323,6 +1605,14 @@ class HirRunner:
         fn_ir = entry.hir
         values, formal = self._arg_values_of(fn_ir, inst.args, entry.kind)
         callee, ret_type = self._resolver.resolve_call(entry, formal)
+        if ret_type is not None and mir.via_result_ptr(ret_type):
+            # the callee returns a large struct: it writes into the
+            # result location, whose address is passed as its trailing
+            # result pointer argument, and returns void
+            assert isinstance(ret_type, StructType)
+            dest = self._call_result_addr(inst.ret, ret_type)
+            self._emit(mir.Call(callee, values + (dest,), VoidType()))
+            return InPlaceResult()
         value = self._emit(mir.Call(callee, values, ret_type))
         if ret_type == VoidType():
             # a void call produces no value: it only has effects
@@ -1337,6 +1627,7 @@ class HirRunner:
         value of its ``return``, or ``None`` for a void body."""
         self._inline_stack.append(fn_ir)
         self._inline_depth += 1
+        self._ret_locs.append((fn_ir.ret_loc, RetLocVal()))
         self._push_frame(values)
         saved_ret_emit = self._ret_emit
         self._ret_emit = False
@@ -1344,6 +1635,7 @@ class HirRunner:
             flow, value = self._run_list(fn_ir.body)
         finally:
             self._ret_emit = saved_ret_emit
+            self._ret_locs.pop()
             self._frames.pop()
             self._inline_depth -= 1
             self._inline_stack.pop()

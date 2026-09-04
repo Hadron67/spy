@@ -101,6 +101,13 @@ class FunctionType(Type):
     args: tuple[FormalArg, ...]
     return_type: Type
 
+    @property
+    def via_result_ptr(self) -> bool:
+        """Whether a call of a function of this signature delivers its
+        result by writing into a caller-provided result location (see
+        :func:`returns_via_result_ptr`)."""
+        return returns_via_result_ptr(self.return_type)
+
 
 @dataclass(frozen=True)
 class StructField:
@@ -239,6 +246,78 @@ def type_str(type: Type) -> str:
             return type.name
         case _:
             return str(type)
+
+
+# ---------------------------------------------------------------------------
+# the return convention of a type: whether a function returning it returns a
+# value, or writes the result into a caller-provided result location
+# ---------------------------------------------------------------------------
+
+# an aggregate of at most this many bytes is returned by value by default;
+# larger ones are returned through a result pointer (the limit matches the
+# size that the C ABIs of the supported targets pass in registers)
+_AGGREGATE_VALUE_RETURN_LIMIT = 16
+
+
+def _alignment_of(type: Type) -> int:
+    """The natural alignment of a type, in bytes (the layout rules of
+    the ctypes instances - and of the LLVM structs they mirror - for the
+    types that may occur in a struct)."""
+    match type:
+        case BoolType():
+            return 1
+        case IntType():
+            return type.bits // 8
+        case FloatType():
+            return type.bits // 8
+        case StructType():
+            return max(_alignment_of(f.type) for f in type.fields)
+        case _:
+            raise SpyError(f"type {type_str(type)} has no layout")
+
+
+def _size_of(type: Type) -> int:
+    """The size of a type in bytes, rounded up to its alignment (the
+    natural layout the ctypes instances - and the LLVM structs they
+    mirror - use)."""
+    match type:
+        case BoolType():
+            return 1
+        case IntType():
+            return type.bits // 8
+        case FloatType():
+            return type.bits // 8
+        case StructType():
+            offset = 0
+            for field in type.fields:
+                align = _alignment_of(field.type)
+                offset = (offset + align - 1) // align * align
+                offset += _size_of(field.type)
+            align = _alignment_of(type)
+            return (offset + align - 1) // align * align
+        case _:
+            raise SpyError(f"type {type_str(type)} has no layout")
+
+
+def returns_via_result_ptr(type: Type) -> bool:
+    """Whether a function returning ``type`` delivers its result by
+    writing into a caller-provided result location (a hidden result
+    pointer parameter) instead of returning the value directly.
+
+    The convention is a property of the *return type*, decided here once
+    and consulted everywhere a function's signature is lowered (the
+    function type is the single source of the decision - never the
+    registration entry).  The default policy: aggregates are returned by
+    value while they are small (up to
+    :data:`_AGGREGATE_VALUE_RETURN_LIMIT` bytes) and through a result
+    pointer once they outgrow it; a future per-struct override or a new
+    aggregate kind (arrays) only needs to extend this function.  Scalars
+    are always returned by value."""
+    match type:
+        case StructType():
+            return _size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
+        case _:
+            return False
 
 
 # ---------------------------------------------------------------------------

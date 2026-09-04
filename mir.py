@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import CompileError
+from .type import returns_via_result_ptr as spy_returns_via_result_ptr
 
 # ---------------------------------------------------------------------------
 # static types
@@ -39,6 +40,20 @@ from .errors import CompileError
 
 class Type:
     pass
+
+
+def via_result_ptr(type: Type) -> bool:
+    """The MIR mirror of ``type.returns_via_result_ptr``: whether a
+    function returning ``type`` delivers its result through a result
+    pointer instead of returning it as a value.  This is where the return
+    convention is decided *once* for the MIR side; the lowering of a
+    function signature into its MIR form (an extra result pointer formal
+    and a void return, or a plain typed return) follows it."""
+    match type:
+        case StructType():
+            return spy_returns_via_result_ptr(type.spy_type)
+        case _:
+            return False
 
 
 @dataclass(frozen=True)
@@ -344,16 +359,45 @@ class Function(Value):
     at creation when the function declares one; otherwise it stays
     ``None`` until the body has been typed (a function still being
     typed and without a declared return type can only be observed by a
-    recursive call, which then is a compile error)."""
+    recursive call, which then is a compile error).
+
+    The signature the object carries is the *lowered* (MIR) form: a
+    function whose return type is returned through a result pointer (see
+    :func:`returns_via_result_ptr`) has its trailing result pointer
+    formal appended to ``args`` and a ``void`` ``ret_type`` - the
+    original return type is then kept in ``result_type`` - while a
+    direct-return function returns its value type.  ``interp`` performs
+    this lowering when it decides the return type; ``args``/``ret_type``
+    are the python formals and the logical return type before that."""
 
     name: str
     args: tuple[FormalArg, ...]
     ret_type: Type | None
     insts: list[Inst]
+    # the return type of a function that delivers its result through a
+    # result pointer (``returns_via_result_ptr``): ``ret_type`` is then
+    # ``void`` and ``args`` carries the trailing result pointer formal;
+    # None for a direct-return function
+    result_type: Type | None = None
+
+    @property
+    def logical_ret(self) -> Type | None:
+        """The logical return type of the function: the type its callers
+        see - ``result_type`` when the result is written through a result
+        pointer, ``ret_type`` otherwise."""
+        return self.result_type if self.result_type is not None else self.ret_type
 
     @property
     def type(self) -> Type:
         """The type of the function value: a pointer to the function's
-        signature."""
-        assert self.ret_type is not None, 'the function is still being typed'
-        return PointerType(FunctionType(tuple(a.type for a in self.args), self.ret_type))
+        (logical) signature - the callee side of calls in the MIR is
+        always the *lowered* form, so this logical view is only used by
+        the host."""
+        ret = self.logical_ret
+        assert ret is not None, 'the function is still being typed'
+        args = self.args
+        if self.result_type is not None:
+            # drop the lowered trailing result pointer formal
+            assert len(args) > 0
+            args = args[:-1]
+        return PointerType(FunctionType(tuple(a.type for a in args), ret))

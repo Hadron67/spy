@@ -788,8 +788,10 @@ def _make_type_caller():
 class RlsHirTest(TestCase):
     """The HIR that ``astgen`` produces under result-location semantics
     (RLS): a call writes its result into the slot of a
-    ``hir.CallInplace``, and the value context allocates the temporary
-    slot up front and loads the value back right after the call."""
+    ``hir.CallInplace`` - the result location of the enclosing statement,
+    or the function result location (``hir.ResultLoc``) of a ``return`` -
+    and the value context allocates the temporary slot up front and
+    loads the value back right after the call."""
 
     def _single_call(self, fn) -> tuple[astgen.FunctionIR, hir.CallInplace]:
         ir = astgen.parse_function(fn)
@@ -812,16 +814,15 @@ class RlsHirTest(TestCase):
         arg = call.args[1]
         assert isinstance(arg, hir.Const)
         self.assertEqual(arg.value, 1)
-        # the result location is a temporary slot; the instructions right
-        # after the call load it back and return that value
-        self.assertIsInstance(call.ret, hir.Alloca)
+        # the result location is the function's result location: a
+        # ``return`` statement evaluates its expression into the location
+        # the function returns through (result-location semantics), and
+        # the ``Ret`` right after the call terminates the path
+        self.assertIsInstance(call.ret, hir.ResultLoc)
         idx = list(ir.body).index(call)
-        load = ir.body[idx + 1]
-        ret = ir.body[idx + 2]
-        assert isinstance(load, hir.Load)
+        ret = ir.body[idx + 1]
         assert isinstance(ret, hir.Ret)
-        self.assertIs(load.ptr, call.ret)
-        self.assertIs(ret.value, load)
+        self.assertIs(ir.ret_loc, call.ret)
 
     def test_comptime_call_through_result_slot(self) -> None:
         # a compile-time builtin (spy.type) goes through the same
@@ -1220,6 +1221,305 @@ class StructTest(TestCase):
         with self.assertRaises(CompileError) as ctx:
             fn(Wrong(0))
         self.assertIn("no field named 'y'", str(ctx.exception))
+
+    # -- returning structs ---------------------------------------------------
+    # a function may return a struct either directly (a small struct is
+    # returned by value) or through a result pointer (a large one); the
+    # convention is decided from the return type (see ``type.py``) and
+    # lowered into the MIR signature
+
+    def test_small_struct_returned_by_value(self) -> None:
+        # a 16-byte struct: returned by value (LLVM aggregate return)
+        @self.cache.struct()
+        class Pair:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+
+        @self.cache.aot()
+        def mk(x: i32) -> Pair:
+            return Pair(x, x + 1, x + 2, x + 3)
+
+        p = mk(10)
+        self.assertEqual((p.a, p.b, p.c, p.d), (10, 11, 12, 13))
+
+        @self.cache.aot()
+        def use(x: i32) -> i32:
+            q = mk(x)  # the returned copy is a by-value local
+            q.a += 100
+            r = mk(q.a)  # a nested call: the value flows into the argument
+            return r.a + q.b
+
+        self.assertEqual(use(1), 101 + 2)
+
+    def test_small_struct_return_via_local_and_chain(self) -> None:
+        @self.cache.struct()
+        class Pair:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+
+        @self.cache.aot()
+        def mk(x: i32) -> Pair:
+            p = Pair(0, 0, 0, 0)
+            p.a = x
+            p.b = x + 1
+            p.c = x + 2
+            p.d = x + 3
+            return p  # return of a local variable: a value copy
+
+        p = mk(7)
+        self.assertEqual((p.a, p.b, p.c, p.d), (7, 8, 9, 10))
+        # ``return mk(...)`` writes the callee result straight into the
+        # result location (RLS passthrough, no temporary round-trip)
+        @self.cache.aot()
+        def fwd(x: i32) -> Pair:
+            return mk(x)
+
+        q = fwd(3)
+        self.assertEqual((q.a, q.b), (3, 4))
+
+    def test_large_struct_returned_through_result_pointer(self) -> None:
+        # a 20-byte struct: returned through a result pointer (the callee
+        # writes into the caller's result location; the Python entry uses
+        # an out buffer)
+        @self.cache.struct()
+        class Big:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+            e: i32
+
+        @self.cache.aot()
+        def mk(x: i32) -> Big:
+            return Big(x, x + 1, x + 2, x + 3, x + 4)
+
+        b = mk(10)
+        self.assertEqual((b.a, b.b, b.c, b.d, b.e), (10, 11, 12, 13, 14))
+        # the returned value is a by-value copy: mutating it stays local
+        @self.cache.aot()
+        def use(x: i32) -> i32:
+            q = mk(x)
+            q.e += 1000
+            r = mk(q.a)
+            return q.e + r.a
+
+        self.assertEqual(use(1), 1005 + 1)
+
+    def test_large_struct_return_via_local_and_chain(self) -> None:
+        @self.cache.struct()
+        class Big:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+            e: i32
+
+        @self.cache.aot()
+        def mk(x: i32) -> Big:
+            b = Big(0, 0, 0, 0, 0)
+            b.a = x
+            b.e = x + 4
+            return b
+
+        @self.cache.aot()
+        def fwd(x: i32) -> Big:
+            # RLS passthrough: mk writes straight into fwd's result location
+            return mk(x)
+
+        b = fwd(5)
+        self.assertEqual((b.a, b.e), (5, 9))
+
+    def test_struct_return_cross_module(self) -> None:
+        # ``mk`` is compiled first; ``call_mk`` references it as an extern
+        # symbol of an earlier module (the struct return crosses the module
+        # boundary: by value when small, through the result pointer when
+        # large)
+        @self.cache.struct()
+        class Pair:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+
+        @self.cache.struct()
+        class Big:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+            e: i32
+
+        @self.cache.aot()
+        def mk_pair(x: i32) -> Pair:
+            return Pair(x, x, x, x)
+
+        @self.cache.aot()
+        def mk_big(x: i32) -> Big:
+            return Big(x, x, x, x, x)
+
+        self.assertEqual(mk_pair(3).a, 3)
+        self.assertEqual(mk_big(3).e, 3)
+
+        @self.cache.aot()
+        def call_pair(x: i32) -> i32:
+            p = mk_pair(x + 1)
+            return p.c
+
+        @self.cache.aot()
+        def call_big(x: i32) -> i32:
+            b = mk_big(x + 1)
+            return b.e
+
+        self.assertEqual(call_pair(4), 5)
+        self.assertEqual(call_big(4), 5)
+
+    def test_struct_return_recursion(self) -> None:
+        @self.cache.struct()
+        class Pair:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+
+        @self.cache.struct()
+        class Big:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+            e: i32
+
+        @self.cache.aot()
+        def pair_rec(n: i32) -> Pair:
+            if n <= 0:
+                return Pair(0, 0, 0, 0)
+            p = pair_rec(n - 1)
+            return Pair(p.a + 1, p.b + 1, p.c + 1, p.d + 1)
+
+        @self.cache.aot()
+        def big_rec(n: i32) -> Big:
+            if n <= 0:
+                return Big(0, 0, 0, 0, 0)
+            b = big_rec(n - 1)
+            return Big(b.a + 1, b.b + 1, b.c + 1, b.d + 1, b.e + 1)
+
+        p = pair_rec(3)
+        self.assertEqual((p.a, p.b, p.c, p.d), (3, 3, 3, 3))
+        b = big_rec(3)
+        self.assertEqual((b.a, b.b, b.c, b.d, b.e), (3, 3, 3, 3, 3))
+
+    def test_struct_return_in_runtime_branches(self) -> None:
+        @self.cache.struct()
+        class Pair:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+
+        @self.cache.struct()
+        class Big:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+            e: i32
+
+        @self.cache.aot()
+        def pair_sel(n: i32) -> Pair:
+            if n > 0:
+                return Pair(1, 1, 1, 1)
+            return Pair(0, 0, 0, 0)
+
+        @self.cache.aot()
+        def big_sel(n: i32) -> Big:
+            if n > 0:
+                return Big(1, 1, 1, 1, 1)
+            else:
+                return Big(0, 0, 0, 0, 0)
+
+        self.assertEqual(pair_sel(1).a, 1)
+        self.assertEqual(pair_sel(-1).a, 0)
+        self.assertEqual(big_sel(1).e, 1)
+        self.assertEqual(big_sel(-1).e, 0)
+
+    def test_method_returning_struct(self) -> None:
+        cache = self.cache
+
+        @cache.struct()
+        class Big:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+            e: i32
+
+            @cache.aot()
+            def shifted(self):  # by-value self; the return type is inferred
+                return Big(self.a + 1, self.b + 1, self.c + 1, self.d + 1, self.e + 1)
+
+            @cache.aot(ptr_self=True)
+            def scaled(self, k: i32):  # ptr_self: reads its own memory
+                return Big(self.a * k, self.b * k, self.c * k, self.d * k, self.e * k)
+
+        b = Big(1, 2, 3, 4, 5)
+        s = b.shifted()
+        self.assertEqual((s.a, s.e), (2, 6))
+        # the Python instance is untouched by the by-value self method
+        self.assertEqual(b.a, 1)
+        sc = b.scaled(3)
+        self.assertEqual((sc.a, sc.e), (3, 15))
+
+    def test_inferred_struct_return(self) -> None:
+        # a jit function without a return annotation: the return type (and
+        # with it the return convention) is inferred from the body
+        @self.cache.struct()
+        class Pair:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+
+        @self.cache.struct()
+        class Big:
+            a: i32
+            b: i32
+            c: i32
+            d: i32
+            e: i32
+
+        @self.cache.jit()
+        def mk_pair(x):
+            return Pair(x, x, x, x)
+
+        @self.cache.jit()
+        def mk_big(x):
+            return Big(x, x, x, x, x)
+
+        self.assertEqual(mk_pair(2).d, 2)
+        self.assertEqual(mk_big(2).e, 2)
+
+    def test_struct_return_with_nested_struct_value(self) -> None:
+        # a returned struct may contain a struct field
+        @self.cache.struct()
+        class Inner:
+            a: i32
+            b: i32
+
+        @self.cache.struct()
+        class Outer:
+            i: Inner
+            c: i32
+
+        @self.cache.aot()
+        def mk(x: i32) -> Outer:
+            return Outer(Inner(x, x + 1), x + 2)
+
+        o = mk(5)
+        self.assertEqual((o.i.a, o.i.b, o.c), (5, 6, 7))
 
 
 all_tests = [SpyExampleTest, RlsHirTest, StructTest]

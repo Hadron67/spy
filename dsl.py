@@ -916,9 +916,12 @@ class JitContext(FunctionResolver):
         native = _native_spec(entry, arg_types)
         if native is not None:
             fn_type = MirFunctionType(native.arg_types, native.ret_type)
-            return MirSymbol(native.name, fn_type), native.ret_type
+            logical = (
+                native.result_type if native.result_type is not None else native.ret_type
+            )
+            return MirSymbol(native.name, fn_type), logical
         fn = self._compile_mir(entry, arg_types)
-        ret = fn.ret_type
+        ret = fn.logical_ret
         if ret is None:
             # the callee is still being typed (a recursive call) and has
             # no declared return type: the call cannot be typed

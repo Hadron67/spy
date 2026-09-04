@@ -12,7 +12,12 @@ Calls follow *result location semantics* (RLS): a call writes its
 result into the slot of its ``ret`` operand (:class:`CallInplace`) and
 produces no register of its own.  A caller that needs the value
 allocates a slot and loads it back; the interpreter keeps scalar and
-compile-time results in the slot without giving it real memory.
+compile-time results in the slot without giving it real memory.  The
+return of a function is governed by the same semantics: its body ends
+with a write into the function's result location (:class:`ResultLoc`)
+followed by a value-less :class:`Ret` terminator; the interpreter turns
+the write into the return value of a direct-return function, or into a
+store through the result pointer of a result-pointer function.
 
 ``astgen`` performs all name resolution: a read of a variable - a
 parameter or a block-local declaration - becomes a :class:`Load` of
@@ -91,6 +96,19 @@ class Arg(Value):
     """The index-th by-value argument of the function being executed."""
 
     index: int
+
+
+@dataclass(eq=False)
+class ResultLoc(Value):
+    """The result location of the function whose body is being executed:
+    a per-function leaf that only ever appears as the *target* of a
+    return statement (see :class:`Ret`).  ``astgen`` evaluates the
+    expression of a ``return`` into this location (result-location
+    semantics, like the ``ret`` of a :class:`CallInplace`); the
+    interpreter types it and decides from the function's return type how
+    the value is delivered: written into the result pointer of a
+    result-pointer function, or handed back as the return value of a
+    direct-return function."""
 
 
 class Inst(Value):
@@ -206,10 +224,12 @@ class Unary(Inst):
 
 @dataclass(eq=False)
 class Ret(Inst):
-    """Return from the function.  ``value`` is None for a bare ``return``
-    of a void function."""
-
-    value: Value | None
+    """End one path of the function; a path is terminated by a ``return``
+    statement, whose expression was already evaluated into the function's
+    result location (:class:`ResultLoc`).  The value itself is carried by
+    the result location - the interpreter turns it into the function's
+    return value (a direct-return function) or leaves it in the result
+    pointer (a result-pointer function)."""
 
 
 @dataclass(eq=False)

@@ -14,7 +14,11 @@ Like ``symlat.jit.llvm`` the body is one *linear* list of instructions;
 expression evaluation appends temporary instructions to the list and
 returns the instruction object whose register holds the value - or,
 with a result location (RLS, see ``_Builder._gen_expr``), writes the
-value into a caller-provided slot and returns nothing.
+value into a caller-provided slot and returns nothing.  The result
+location of a function itself (``hir.ResultLoc``) is the target of its
+``return`` statements: ``return expr`` evaluates ``expr`` with the
+function's result location, so a call in return position writes its
+result straight into the location the function returns through.
 
 ``astgen`` performs *almost* all name resolution.  Since every parameter
 is addressable, the translated body starts with an
@@ -124,9 +128,12 @@ class _Builder:
     of nested blocks look up names through the chain.
     """
 
-    def __init__(self, fn_ir: FunctionIR, scope: _Scope) -> None:
+    def __init__(self, fn_ir: FunctionIR, scope: _Scope, ret_loc: hir.ResultLoc) -> None:
         self._fn_ir = fn_ir
         self._scope = scope
+        # the result location of the function: the target of its return
+        # statements (see ``_gen_stmt``)
+        self._ret_loc = ret_loc
         self.insts: list[hir.Inst] = []
 
     def add(self, inst: hir.Inst) -> hir.Inst:
@@ -139,8 +146,14 @@ class _Builder:
         fn_name = self._fn_ir.name
         match node:
             case ast.Return():
-                value = None if node.value is None else self._gen_value(node.value)
-                self.add(hir.Ret(value))
+                # the return expression is generated into the function's
+                # result location (result-location semantics): a call in
+                # return position writes its result straight into the
+                # location the function returns through, instead of
+                # materializing a temporary value first
+                if node.value is not None:
+                    self._gen_result_loc(node.value, self._ret_loc)
+                self.add(hir.Ret())
             case ast.Pass():
                 pass
             case ast.Expr():
@@ -168,7 +181,7 @@ class _Builder:
         list.  A block is a lexical scope of its own - a child of the
         enclosing block - so declarations inside it shadow outer
         bindings and are not visible after the block."""
-        sub = _Builder(self._fn_ir, _Scope(self._scope))
+        sub = _Builder(self._fn_ir, _Scope(self._scope), self._ret_loc)
         for stmt in stmts:
             sub._gen_stmt(stmt)
         return sub.insts
@@ -574,6 +587,7 @@ def parse_function(fn: Callable) -> FunctionIR:
         params.append(ParamDef(arg.arg, annotations.get(arg.arg), has_default, default_value))
 
     ir = FunctionIR(fn, node.name, tuple(type_params), tuple(params), ret_annotation, ())
+    ir.ret_loc = hir.ResultLoc()
 
     # prologue: every parameter is addressable, so allocate one slot per
     # parameter and store its by-value argument into it.  The function
@@ -589,7 +603,7 @@ def parse_function(fn: Callable) -> FunctionIR:
         prologue.append(hir.Store(alloca, hir.Arg(i)))
         scope.bindings[param.name] = alloca
 
-    builder = _Builder(ir, scope)
+    builder = _Builder(ir, scope, ir.ret_loc)
     for stmt in node.body:
         builder._gen_stmt(stmt)
     ir.body = tuple(prologue + builder.insts)

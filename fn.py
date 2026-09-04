@@ -1,4 +1,5 @@
 
+import ctypes
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import FunctionType as PyFunctionType
@@ -29,20 +30,42 @@ class FunctionIR:
     # The evaluated return annotation from ``fn.__annotations__``.
     ret_annotation: Any | None
     body: tuple[hir.Inst, ...]
+    # The result location the return statements of the body write into
+    # (see ``hir.ResultLoc``)
+    ret_loc: 'hir.ResultLoc' = None  # type: ignore[assignment]
 
 @dataclass
 class NativeFn:
-    """A compiled native function of one specialization."""
+    """A compiled native function of one specialization.
+
+    ``arg_types``/``ret_type`` are the *lowered* signature (see
+    ``mir.returns_via_result_ptr``): a function that returns through a
+    result pointer carries its trailing result pointer formal in
+    ``arg_types``, a void ``ret_type`` and its logical return type in
+    ``result_type``.  The Python-facing ``_entry`` is pointer-ABI form
+    (see ``lower.compile_module``)."""
 
     name: str
     arg_types: tuple[mir.Type, ...]
     ret_type: mir.Type
     lines: list[str] = field(default_factory=list)
+    # the return type of a result-pointer function (``ret_type`` is then
+    # void and ``arg_types`` carries the trailing result pointer formal);
+    # None for a direct-return function
+    result_type: mir.Type | None = None
     _engine: object = None  # type: ignore[assignment]
     _addr: int = 0
     _entry: Any = None
 
     def call(self, *values) -> object:
+        logical = self.result_type if self.result_type is not None else self.ret_type
+        if isinstance(logical, mir.StructType):
+            # the Python-facing entry writes the result into an out buffer
+            # (see ``lower.compile_module``): allocate the instance, pass
+            # its address as the trailing argument and return it
+            out = logical.ctype()
+            self._entry(*values, ctypes.addressof(out))
+            return out
         return self._entry(*values)
 
     @property
