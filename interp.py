@@ -131,6 +131,11 @@ class ComptimeVal(InterpVal):
 
 
 @dataclass
+class ComptimeRefVal(InterpVal):
+    obj: Any
+
+
+@dataclass
 class RuntimeVal(InterpVal):
     value: mir.Value
 
@@ -456,7 +461,7 @@ class HirRunner:
                 # ``Const`` value.
                 obj = value.value
                 resolved = self._resolver.resolve_global(obj)
-                return ComptimeVal(resolved if resolved is not None else obj)
+                return ComptimeRefVal(resolved if resolved is not None else obj)
             case hir.Arg(index):
                 if len(self._frames) == 0:
                     raise CompileError('internal error: Arg outside of any function frame')
@@ -701,6 +706,9 @@ class HirRunner:
             case ComptimeVal(obj):
                 t = value_type(obj)
                 return to_mir_type(t) if t is not None else None
+            case ComptimeRefVal(obj):
+                t = value_type(obj)
+                return PointerType(to_mir_type(t), True) if t is not None else None
             case _:
                 return None
 
@@ -1031,7 +1039,8 @@ class HirRunner:
         builtins are evaluated at compile time.  The callee constant of a
         registered spy function already resolved to its entry when the
         callee operand was evaluated (see ``_operand``)."""
-        if not isinstance(callee, ComptimeVal):
+        assert not isinstance(callee, ComptimeVal), "values cannot be called at compile time"
+        if not isinstance(callee, ComptimeRefVal):
             raise CompileError(
                 "calls through runtime function values are not supported yet"
             )

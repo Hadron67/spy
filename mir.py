@@ -106,7 +106,7 @@ class StructType(Type):
 @dataclass(frozen=True)
 class PointerType(Type):
     elem: Type
-
+    is_const: bool = False
 
 @dataclass(frozen=True)
 class FunctionType(Type):
