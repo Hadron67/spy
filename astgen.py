@@ -27,9 +27,12 @@ otherwise.  Every ``if`` body is a lexical block of its own (a child of
 the enclosing block): a declaration inside it shadows outer bindings
 within the block and is invisible after it.  Global names - everything
 that is not a variable in scope - are resolved here to their Python
-objects and embedded as ``hir.Const`` leaves; a name captured from an
-enclosing Python scope (a spy function may be defined inside a factory)
-is read from its closure cell and embedded the same way.  Attributes on
+objects.  Every global is an *immutable value*: in a value context a
+read embeds the object as a ``hir.Const`` leaf; in a reference context
+(``is_ref``, e.g. the callee of a call) it embeds a ``hir.ConstRef`` -
+a const reference to the value (see ``_gen_name``).  A name captured
+from an enclosing Python scope (a spy function may be defined inside a
+factory) is read from its closure cell the same way.  Attributes on
 such compile-time objects (``spy.type``, ``spy.u64``, ...) are
 evaluated here as well.  Whether a function object denotes a registered
 spy function - and which function value it stands for - is decided by
@@ -196,9 +199,10 @@ class _Builder:
             self.add(hir.Store(slot, self._gen_value(value)))
         elif isinstance(target, ast.Attribute):
             # assignment to a field of a runtime struct value (``x.h =
-            # e``): store through the address of the field
+            # e``): store through the address of the field (globals are
+            # immutable: their fields cannot be assigned)
             if self._attr_runtime(target):
-                self.add(hir.Store(self._addr_of(target), self._gen_value(value)))
+                self.add(hir.Store(self._gen_ref(target), self._gen_value(value)))
                 return
             raise CompileError(
                 f"cannot assign to the attribute of a compile-time value "
@@ -224,19 +228,20 @@ class _Builder:
 
     # -- expressions ----------------------------------------------------------
 
-    def _resolve_global(self, name: str) -> hir.Const:
+    def _resolve_closure(self, name: str) -> Any | None:
+        """The raw object of the name ``name`` captured from an
+        enclosing Python scope (a spy function may be defined inside a
+        factory, e.g. ``def make(k): @cache.jit() def f(x): return x *
+        k``), or None when the name is not a free variable.  A captured
+        variable behaves like a global: the value of its closure cell at
+        parse time is embedded as a compile-time constant."""
         fn = self._fn_ir.fn
-        # a variable captured from an enclosing Python scope (a spy
-        # function may be defined inside a factory, e.g. ``def make(k):
-        # @cache.jit() def f(x): return x * k``): it behaves like a
-        # global - the value of its closure cell at parse time is
-        # embedded as a compile-time constant
         closure = fn.__closure__
         if closure is not None:
             for i, free_var in enumerate(fn.__code__.co_freevars):
                 if free_var == name:
                     try:
-                        value = closure[i].cell_contents
+                        return closure[i].cell_contents
                     except ValueError:
                         if name == self._fn_ir.name:
                             # the function refers to its own name while
@@ -246,15 +251,25 @@ class _Builder:
                             # the name then holds the raw function
                             # object, which the interpreter resolves to
                             # the function value when a call runs
-                            return hir.Const(fn)
+                            return fn
                         raise CompileError(
                             f"captured variable '{name}' is not bound yet in the "
                             f"scope of function {self._fn_ir.name}"
                         ) from None
-                    return hir.Const(value)
+        return None
+
+    def _resolve_global(self, name: str) -> Any:
+        """The raw Python object the global name ``name`` resolves to:
+        the value of its closure cell, or of its module global.  The
+        object is embedded by ``_gen_name`` as a ``hir.Const`` (value
+        context) or a ``hir.ConstRef`` (reference context)."""
+        closure = self._resolve_closure(name)
+        if closure is not None:
+            return closure
+        fn = self._fn_ir.fn
         globals = fn.__globals__
         if name in globals:
-            return hir.Const(globals[name])
+            return globals[name]
         raise CompileError(
             f"name '{name}' is not defined in the scope of function {self._fn_ir.name}"
         )
@@ -278,11 +293,11 @@ class _Builder:
           of an enclosing statement, ...);
         * ``is_ref=True, result_loc=None``: produce a *reference* to the
           result - a pointer, not a value.  Addressable names yield
-          their slot, resolved globals (functions, types, ...) are
-          compile-time objects that already are references, and any
-          other expression is evaluated into a fresh slot whose pointer
-          is returned (so the callee of a call is generated with
-          ``is_ref=True``, as a callee must be addressable).
+          their slot; a global is an immutable value and yields a
+          ``hir.ConstRef`` (a const pointer) to it - the callee of a
+          call is generated this way, as a callee must be a reference -
+          and any other expression is evaluated into a fresh slot whose
+          pointer is returned.
 
         A call in value context therefore allocates a temporary slot,
         emits a :class:`hir.CallInplace` writing into it and loads the
@@ -300,25 +315,22 @@ class _Builder:
     def _gen_ref(self, node: ast.expr) -> hir.Value:
         """A reference to the value of ``node`` (see ``_gen_expr``):
         addressable names give their slot, the fields of a runtime
-        struct value give their address (a :class:`hir.FieldAddr`
-        chain), everything else gives a pointer to a freshly allocated
-        slot holding its value."""
+        struct value give their address (a :class:`hir.FieldAddr` chain
+        rooted at the storage of the base), globals - immutable values -
+        give a :class:`hir.ConstRef` to them, and everything else gives
+        a pointer to a freshly allocated slot holding its value."""
         match node:
             case ast.Name():
-                slot = self._scope.lookup(node.id)
-                if slot is not None:
-                    # an addressable variable: its slot *is* the reference
-                    return slot
-                # a global: its resolved compile-time object (functions,
-                # types, captured constants, ...) is an identity, i.e.
-                # already a reference
-                return self._resolve_global(node.id)
+                return self._gen_name(node.id, True)
             case ast.Attribute():
                 if self._attr_runtime(node):
-                    # the field of a runtime struct value: its address
-                    return self._addr_of(node)
+                    # the fields of a runtime struct value: the address
+                    # of the innermost field is the FieldAddr chain
+                    # rooted at the storage of the base value
+                    return self.add(hir.FieldAddr(self._gen_ref(node.value), node.attr))
                 # attribute chains on compile-time objects fold to a
-                # ``hir.Const`` leaf, which is its own reference
+                # ``hir.Const`` leaf, which is its own reference (the
+                # folded value is immutable)
                 return self._gen_value(node)
             case _:
                 loc = self.add(hir.Alloca())
@@ -344,31 +356,6 @@ class _Builder:
         ``spy.type``, ... - fold at compile time instead)."""
         root = self._attr_root(node) if isinstance(node, ast.Attribute) else None
         return root is not None and self._scope.lookup(root.id) is not None
-
-    def _addr_of(self, node: ast.expr) -> hir.Value:
-        """The address of the struct storage ``node`` denotes: the slot
-        of a variable, or the address of a nested field of one.  The
-        address of a chain ``x.f.g`` is the address of the innermost
-        field; the interpreter resolves each step from the static type it
-        has typed the storage with (a ``FieldAddr`` instruction carries
-        the field name only)."""
-        fn_name = self._fn_ir.name
-        match node:
-            case ast.Name():
-                slot = self._scope.lookup(node.id)
-                if slot is not None:
-                    return slot
-                raise CompileError(
-                    f"cannot access fields of the global value '{node.id}' in spy "
-                    f'function {fn_name}: only struct variables are addressable'
-                )
-            case ast.Attribute():
-                return self.add(hir.FieldAddr(self._addr_of(node.value), node.attr))
-            case _:
-                raise CompileError(
-                    f"attribute access on the result of an expression is not supported "
-                    f"yet in spy function {fn_name} (only on variables)"
-                )
 
     def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value) -> None:
         """Evaluate ``node`` writing its result into ``result_loc``
@@ -398,15 +385,34 @@ class _Builder:
             # a method of the struct ``base``: the method and its self
             # parameter are resolved by the interpreter from the static
             # type of the base; only the base's address is carried here
-            base = self._addr_of(node.func.value)
+            base = self._gen_ref(node.func.value)
             args = tuple(self._gen_value(a) for a in node.args)
-            self.add(hir.CallMethod(base, node.func.attr, args, result_loc))
+            self.add(hir.CallMethodInplace(base, node.func.attr, args, result_loc))
             return
         # the callee must be addressable (a reference), the arguments are
         # by-value values
         callee = self._gen_ref(node.func)
         args = tuple(self._gen_value(a) for a in node.args)
         self.add(hir.CallInplace(callee, args, result_loc))
+
+    def _gen_name(self, name: str, is_ref: bool) -> hir.Value:
+        """One reference to the name ``name``.  A variable (a parameter
+        or a block-local) is addressable: its slot *is* the reference,
+        and a value context reads it back with a :class:`hir.Load`.  A
+        global is an immutable *value*: in a value context the name is
+        embedded as a :class:`hir.Const` of the resolved object; in a
+        reference context it becomes a :class:`hir.ConstRef` - a const
+        reference (pointer) to the global.  A function value, whose type
+        is a runtime DST, is only legal behind such a reference (a
+        function pointer); it is an error to use it as a plain value."""
+        slot = self._scope.lookup(name)
+        if slot is not None:
+            # reading a variable (parameter or local): load its slot
+            return slot if is_ref else self.add(hir.Load(slot))
+        obj = self._resolve_global(name)
+        # a global: its resolved object is the immutable value of the
+        # name; a reference to it is a ``ConstRef`` of that object
+        return hir.ConstRef(obj) if is_ref else hir.Const(obj)
 
     def _gen_value(self, node: ast.expr) -> hir.Value:
         """Evaluate ``node`` producing its value in a register (the plain
@@ -418,18 +424,14 @@ class _Builder:
                     return hir.Const(node.value)
                 raise CompileError(f"unsupported constant {node.value!r} in spy function {fn_name}")
             case ast.Name():
-                slot = self._scope.lookup(node.id)
-                if slot is not None:
-                    # reading a variable (parameter or local): load its slot
-                    return self.add(hir.Load(slot))
-                return self._resolve_global(node.id)
+                return self._gen_name(node.id, False)
             case ast.Attribute():
                 if self._attr_runtime(node):
                     # a field of a runtime struct value: read it through
                     # the address of the (innermost) field - the chain is
                     # addressable, so no intermediate struct value is
                     # materialized
-                    return self.add(hir.Load(self._addr_of(node)))
+                    return self.add(hir.Load(self._gen_ref(node)))
                 base = self._gen_value(node.value)
                 if isinstance(base, hir.Const) and not isinstance(
                     base.value, (int, float, str, bool, type(None))

@@ -5,7 +5,7 @@ from types import FunctionType as PyFunctionType
 from typing import Any, TypeAlias, TypeVar, override
 
 from . import hir, mir
-from .type import AnyFunction, FormalArg, FunctionType, PointerType, Type, Value
+from .type import AnyFunction, FormalArg, FunctionType, Type, Value
 
 
 @dataclass(frozen=True)
@@ -152,9 +152,15 @@ class FunctionValue(Value):
 
     @override
     def type(self) -> Type:
+        """The spy type of the function *value*: its signature - a
+        function type.  A function type is a runtime DST (dynamically
+        sized type: it has no runtime representation of its own), so a
+        function value is never a legal runtime value by itself; it can
+        only be *referenced* - a ``hir.ConstRef`` of it, whose type is a
+        const pointer to this function type (a function pointer)."""
         ret = self.ret
         assert ret is not None, 'the function is still being typed'
-        return PointerType(FunctionType(self.args, ret), True)
+        return FunctionType(self.args, ret)
 
 
 # A registered spy function of either kind: the per-function entry of

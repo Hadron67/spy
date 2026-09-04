@@ -419,7 +419,7 @@ class HirRunner:
             case hir.CallInplace():
                 self._exec_call_inplace(inst)
                 return Flow.FALL, None
-            case hir.CallMethod():
+            case hir.CallMethodInplace():
                 self._exec_call_method(inst)
                 return Flow.FALL, None
             case hir.FieldAddr():
@@ -431,18 +431,32 @@ class HirRunner:
     def _operand(self, value: hir.Value) -> InterpVal:
         match value:
             case hir.Const():
-                obj = value.value
-                # a global referenced by a spy body may be a function
+                # the value of an immutable global (or a literal): an
+                # embedded Python object that may be a function
                 # registered in the host context - reached as the raw
                 # function object or through the callable view its
                 # decorated name binds to; it is resolved to its entry
                 # here, when the reference runs (see
                 # ``FunctionResolver.resolve_global``)
+                obj = value.value
                 if not isinstance(obj, (int, float, str, bool, type(None))):
                     resolved = self._resolver.resolve_global(obj)
                     if resolved is not None:
                         return ComptimeVal(resolved)
                 return ComptimeVal(obj)
+            case hir.ConstRef():
+                # a reference to an immutable global.  At compile time a
+                # reference to a global behaves exactly like the value it
+                # refers to (its static type is a ``type.PointerType`` of
+                # the referenced object - ``PointerType(typeof(expr),
+                # True)`` - but nothing dereferences a compile-time
+                # global at runtime yet, so the reference is only ever
+                # consumed as an identity: the callee of a call).  The
+                # referenced object is resolved to its entry like a
+                # ``Const`` value.
+                obj = value.value
+                resolved = self._resolver.resolve_global(obj)
+                return ComptimeVal(resolved if resolved is not None else obj)
             case hir.Arg(index):
                 if len(self._frames) == 0:
                     raise CompileError('internal error: Arg outside of any function frame')
@@ -1129,7 +1143,7 @@ class HirRunner:
             self._emit(mir.Store(field_ptr, value))
         return InPlaceResult()
 
-    def _exec_call_method(self, inst: hir.CallMethod) -> None:
+    def _exec_call_method(self, inst: hir.CallMethodInplace) -> None:
         """A method call ``x.h(...)``: the method is resolved from the
         static type of the struct ``x`` denotes and called with the
         ``self`` argument injected (by value, or - for a ``ptr_self``
@@ -1164,7 +1178,7 @@ class HirRunner:
         self,
         entry: FunctionEntry,
         ptr_self: bool,
-        inst: hir.CallMethod | hir.CallInplace,
+        inst: hir.CallMethodInplace | hir.CallInplace,
         struct: StructType,
         addr: mir.Value,
         evals: list[InterpVal],

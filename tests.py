@@ -797,10 +797,10 @@ class RlsHirTest(TestCase):
     def test_value_context_call_shape(self) -> None:
         outer = _make_rls_pair()
         ir, call = self._single_call(outer)
-        # the callee is generated as a reference: the compile-time object
-        # of the captured sibling function
+        # the callee is generated as a reference: a ``ConstRef`` of the
+        # compile-time object of the captured sibling function
         callee = call.callee
-        assert isinstance(callee, hir.Const)
+        assert isinstance(callee, hir.ConstRef)
         self.assertEqual(callee.value.__name__, 'inner_add')
         # the arguments are by-value values: a load of the parameter slot
         # and the literal 1
@@ -828,7 +828,7 @@ class RlsHirTest(TestCase):
         outer = _make_type_caller()
         ir, call = self._single_call(outer)
         callee = call.callee
-        assert isinstance(callee, hir.Const)
+        assert isinstance(callee, hir.ConstRef)
         self.assertIs(callee.value, spy_type)
         self.assertEqual(len(call.args), 1)
         self.assertIsInstance(call.args[0], hir.Load)

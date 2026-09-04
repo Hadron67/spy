@@ -16,10 +16,13 @@ compile-time results in the slot without giving it real memory.
 
 ``astgen`` performs all name resolution: a read of a variable - a
 parameter or a block-local declaration - becomes a :class:`Load` of
-the variable's :class:`Alloca`, a global name becomes a :class:`Const`
-holding the resolved Python object (spy types, the ``spy`` module
-functions, functions to call/inline, ...), and attribute access on
-such compile-time objects is evaluated there as well.  The HIR never
+the variable's :class:`Alloca`.  A global is an *immutable value*: in a
+value context the name becomes a :class:`Const` holding the resolved
+Python object (spy types, the ``spy`` module functions, functions to
+call/inline, ...), in a reference context it becomes a
+:class:`ConstRef` - a reference to that value (how callable callees
+are passed to :class:`CallInplace`).  Attribute access on such
+compile-time objects is evaluated there as well.  The HIR never
 carries a variable *name*.
 
 Because every parameter is addressable, the instruction list of a
@@ -39,7 +42,10 @@ executes, so the untyped HIR needs no type information.
 
 Operands of instructions are therefore either
 
-* :class:`Const` leaves - Python literals and resolved globals,
+* :class:`Const` leaves - Python literals and the values of immutable
+  globals,
+* :class:`ConstRef` leaves - references (const pointers) to immutable
+  globals,
 * :class:`Arg` leaves - the by-value arguments of the function,
 * instruction objects produced by earlier instructions.
 
@@ -60,7 +66,22 @@ class Value:
 
 @dataclass(frozen=True)
 class Const(Value):
-    """A leaf holding a Python object: a literal or a resolved global."""
+    """A leaf holding a Python object: a literal, or the *value* of an
+    immutable global (see :class:`ConstRef` for a reference to one)."""
+
+    value: Any
+
+
+@dataclass(frozen=True)
+class ConstRef(Value):
+    """A *reference* to an immutable global object: ``value`` is the
+    resolved global (a function entry, a spy type, a captured constant,
+    ...) as embedded by ``astgen`` in a reference context (``is_ref``).
+    It denotes a const pointer to the global: the interpreter types a
+    ``ConstRef(expr)`` as ``type.PointerType(typeof(expr), True)``.  A
+    function value - whose type is a runtime DST that cannot be used by
+    value - is only ever referenced through such a reference (a
+    function pointer)."""
 
     value: Any
 
@@ -119,7 +140,7 @@ class FieldAddr(Inst):
 
 
 @dataclass(eq=False)
-class CallMethod(Inst):
+class CallMethodInplace(Inst):
     """A call of the method ``name`` of the struct ``base`` points at
     (result-location semantics like :class:`CallInplace`): the method is
     resolved from the static type of the struct and the ``self``
