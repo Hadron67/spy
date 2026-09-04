@@ -4,7 +4,8 @@ from typing import Any
 
 from . import astgen, mir
 from .fn import FunctionEntry
-from .type import Type as SpyType, Value
+from .type import Type as SpyType
+from .type import Value
 
 
 class FunctionResolver:
@@ -18,8 +19,8 @@ class FunctionResolver:
     the fly).
     """
     @abstractmethod
-    def hir_of(self, fn: pytypes.FunctionType) -> astgen.FunctionIR:
-        """Parse (and cache) the HIR of a Python function."""
+    def hir_of_plain_fn(self, fn: pytypes.FunctionType) -> astgen.FunctionIR:
+        """Parse (and cache) the HIR of a Python function, does not work on registered functions: use FunctionEntry.hir instead."""
         raise NotImplementedError
 
     @abstractmethod

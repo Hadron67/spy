@@ -249,7 +249,7 @@ class JitContext(FunctionResolver):
         """Bind Python arguments to the formal parameters of ``entry``
         and call the (possibly just compiled) specialization; this is
         what the registration handle of a spy function forwards to."""
-        fn_ir = self.hir_of(entry.fn)
+        fn_ir = entry.hir
         name = entry.fn.__name__
         params = fn_ir.params
         param_names = [p.name for p in params]
@@ -291,13 +291,13 @@ class JitContext(FunctionResolver):
 
     # -- registry ------------------------------------------------------------
 
-    def hir_of(self, fn: FunctionType) -> astgen.FunctionIR:
+    @override
+    def hir_of_plain_fn(self, fn: FunctionType) -> astgen.FunctionIR:
         # the HIR of a registered function is parsed when its entry is
         # created (at its first use) and cached on the entry; a plain
         # function (which is only ever inlined) is parsed and cached by
         # the context
-        if fn in self._entries:
-            return self._entries[fn].entry().hir
+        assert fn not in self._entries
         ir = self._inline_fn_hir_cache.get(fn)
         if ir is None:
             ir = astgen.parse_function(fn)
@@ -388,7 +388,7 @@ class JitContext(FunctionResolver):
             module[key] = fn
             return fn
 
-        fn_ir = self.hir_of(entry.fn)
+        fn_ir = entry.hir
         assert len(arg_types) == len(fn_ir.params)
         # a declared return type - concrete, or naming a type parameter
         # bound by the parameters - fixes the return type of the
@@ -504,7 +504,7 @@ class JitContext(FunctionResolver):
         """
         if isinstance(entry, FunctionValue):
             return entry.ret
-        fn_ir = self.hir_of(entry.fn)
+        fn_ir = entry.hir
         ret_ann = fn_ir.ret_annotation
         if ret_ann is None:
             return None
@@ -523,7 +523,7 @@ class JitContext(FunctionResolver):
     def _recursion_ret_type_error(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> str:
         """Explain why the return type of a recursive specialization
         cannot be determined from its annotations."""
-        fn_ir = self.hir_of(entry.fn)
+        fn_ir = entry.hir
         ret_ann = fn_ir.ret_annotation
         name = entry.fn.__name__
         if ret_ann is None:

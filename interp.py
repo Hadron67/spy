@@ -904,14 +904,14 @@ class HirRunner:
             raise CompileError(
                 f"cannot call function {entry.fn.__name__} from another JitContext"
             )
-        fn_ir = self._resolver.hir_of(entry.fn)
+        fn_ir = entry.hir
         values, formal = self._arg_values_of(fn_ir, inst.args, entry.kind)
         callee, ret_type = self._resolver.resolve_call(entry, formal)
         value = self._emit(mir.Call(callee, values, ret_type))
         return RuntimeVal(value)
 
     def _call_plain_function(self, fn: Any, inst: hir.CallInplace) -> InterpVal:
-        fn_ir = self._resolver.hir_of(fn)
+        fn_ir = self._resolver.hir_of_plain_fn(fn)
         if any(f.fn is fn for f in self._inline_stack):
             raise CompileError(
                 f"a plain Python function cannot call itself recursively "
