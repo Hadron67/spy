@@ -313,6 +313,14 @@ def _make_cap(cache, threshold):
     return cap
 
 
+def _spec_lines(wrapper, arg_types) -> list[str]:
+    """The LLVM lines of the compiled specialization of one wrapper
+    (used by tests that inspect the generated code)."""
+    entry = wrapper._entry
+    spec = entry.specs[arg_types]
+    return spec.lines
+
+
 class SpyExampleTest(TestCase):
     # the registered sample wrappers of this test's context (built by
     # setUp from make_samples)
@@ -343,11 +351,6 @@ class SpyExampleTest(TestCase):
         self.cache = JitContext()
         for name, value in make_samples(self.cache).items():
             setattr(self, name, value)
-
-    def _spec_lines(self, wrapper, arg_types) -> list[str]:
-        entry = wrapper._entry
-        spec = entry.specs[arg_types]
-        return spec.lines
 
     # -- the example of instructions.md --------------------------------------
 
@@ -426,7 +429,7 @@ class SpyExampleTest(TestCase):
             result = self.foo(spy_as(1, u64), spy_as(2, u64))
         self.assertEqual(result, 3)
         self.assertEqual(buf.getvalue(), '')
-        lines = self._spec_lines(self.foo, (u64, u64))
+        lines = _spec_lines(self.foo, (u64, u64))
         self.assertTrue(any('call' in line and 'spy.add_aot.u64.u64' in line for line in lines))
 
     def test_foo_else_branch_inlines(self) -> None:
@@ -436,7 +439,7 @@ class SpyExampleTest(TestCase):
             # the specialization is cached: no second compile log
             self.assertEqual(self.foo(3, 4), 7)
         self.assertEqual(buf.getvalue(), 'add_inline was compiled\n')
-        lines = self._spec_lines(self.foo, (i32, i32))
+        lines = _spec_lines(self.foo, (i32, i32))
         self.assertFalse(any('spy.add_aot' in line for line in lines))
 
     def test_comptime_type_query(self) -> None:
@@ -516,7 +519,7 @@ class SpyExampleTest(TestCase):
 
     def test_recursion_is_a_native_recursive_call(self) -> None:
         self.assertEqual(self.fact(3), 6)
-        lines = self._spec_lines(self.fact, (i32,))
+        lines = _spec_lines(self.fact, (i32,))
         self.assertTrue(
             any('call' in line and 'spy.fact.i32' in line for line in lines), lines
         )

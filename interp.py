@@ -258,6 +258,230 @@ def to_spy_type(type: Type) -> SpyType:
 
 
 # ---------------------------------------------------------------------------
+# stateless helpers of the interpreter: pure functions over their arguments
+# (argument/prototype construction, Python-literal constants, compile-time
+# operators and operator error messages) - none of them uses instance state,
+# so none of them is a method of :class:`HirRunner`
+# ---------------------------------------------------------------------------
+
+
+def _param_value(index: int, arg: mir.FormalArg) -> mir.Value:
+    """The runtime register of one argument of the function proper: a
+    by-value struct argument arrives as a pointer to the caller's
+    struct (the callee's prologue copy, ``HirRunner._exec_store``, turns
+    it into its own inline copy); every other argument arrives as its
+    value."""
+    if isinstance(arg.type, StructType):
+        return mir.Param(index, PointerType(arg.type), arg.name)
+    return mir.Param(index, arg.type, arg.name)
+
+
+def _field_index(type: StructType, name: str) -> int:
+    """The declaration index of the field ``name`` of a struct type."""
+    for i, field in enumerate(type.fields):
+        if field.name == name:
+            return i
+    raise CompileError(
+        f"type {type_str(type)} has no field named '{name}'"
+    )
+
+
+def _const_of_py(obj: Any, type: Type) -> mir.Value:
+    """Turn a Python literal into a typed MIR constant."""
+    match type:
+        case BoolType():
+            if not isinstance(obj, bool):
+                raise CompileError(f"cannot use {obj!r} as a bool constant")
+            return BoolValue(obj)
+        case IntType():
+            if isinstance(obj, bool) or not isinstance(obj, int):
+                raise CompileError(f"cannot use {obj!r} as an integer constant")
+            if type.signed:
+                lo, hi = (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
+            else:
+                lo, hi = (0, 2 ** type.bits - 1)
+            if not lo <= obj <= hi:
+                raise CompileError(
+                    f"integer constant {obj} is out of range for {type_str(type)}"
+                )
+            return IntValue(obj, type.bits, type.signed)
+        case FloatType():
+            if isinstance(obj, bool) or not isinstance(obj, (int, float)):
+                raise CompileError(f"cannot use {obj!r} as a float constant")
+            return FloatValue(float(obj), type.bits)
+        case _:
+            raise CompileError(
+                f"cannot create a constant of type {type_str(type)} from {obj!r}"
+            )
+
+
+def _comptime_py_op(op: str, lhs: Any, rhs: Any) -> Any:
+    """Apply the Python operator ``op`` to two compile-time values."""
+    fn = _PY_OPS.get(op)
+    if fn is None:
+        raise CompileError(f"operator '{op}' is not supported at compile time")
+    try:
+        return fn(lhs, rhs)
+    except Exception as e:
+        raise CompileError(
+            f"cannot apply '{op}' to {lhs!r} and {rhs!r} at compile time: {e}"
+        ) from e
+
+
+def _binary_type(op: str, lt: Type, rt: Type, what: str) -> Type | None:
+    """The type a binary operation on ``lt``/``rt`` is performed on, or
+    None if the operand combination is not a number pair."""
+    if isinstance(lt, IntType) and isinstance(rt, IntType):
+        if lt != rt:
+            raise CompileError(
+                f"cannot {what} a {type_str(lt)} value with a {type_str(rt)} value "
+                "(different integer types)"
+            )
+        return lt
+    if isinstance(lt, FloatType) and isinstance(rt, FloatType):
+        return FloatType(max(lt.bits, rt.bits))
+    if isinstance(lt, IntType) and isinstance(rt, FloatType):
+        return rt
+    if isinstance(lt, FloatType) and isinstance(rt, IntType):
+        return lt
+    return None
+
+
+def _unsupported_type_error(op: str, type: Type | None) -> CompileError:
+    if isinstance(type, PointerType) and isinstance(type.elem, IntType) and type.elem.bits == 8:
+        return CompileError(
+            f"cannot apply '{op}' to string values "
+            "(strings are compiled as arrays of u8)"
+        )
+    if isinstance(type, PointerType):
+        return CompileError(f"cannot apply '{op}' to pointer values")
+    if type is None:
+        return CompileError(f"cannot apply '{op}' to a compile-time object")
+    return CompileError(f"cannot apply '{op}' to {type_str(type)} values")
+
+
+def _native_call_args(
+    callee: mir.Value, values: tuple[mir.Value, ...]
+) -> tuple[mir.Value, ...]:
+    """The native argument values of one call: a by-value struct
+    formal receives the *address* of the caller's struct (the callee
+    copies it into its own storage at entry - native boundaries pass
+    structs as pointers); every other formal receives its value.
+    """
+    fn_type = typeof(callee)
+    if not isinstance(fn_type, PointerType) or not isinstance(
+        fn_type.elem, mir.FunctionType
+    ):
+        raise CompileError('internal error: call target has no signature')
+    args: list[mir.Value] = []
+    for expected, value in zip(fn_type.elem.args, values):
+        if isinstance(expected, StructType):
+            # a struct value is always the load of its storage
+            if isinstance(value, mir.Load):
+                args.append(value.ptr)
+            else:
+                raise CompileError(
+                    'internal error: cannot take the address of a struct argument'
+                )
+        else:
+            args.append(value)
+    return tuple(args)
+
+
+def _to_runtime(ev: InterpVal, target: Type | None) -> mir.Value:
+    """Materialize a return value: runtime values must already have
+    the target type, compile-time values adopt it (or, without a
+    target, their Python type mapping)."""
+    if isinstance(ev, RuntimeVal):
+        value = ev.value
+        t = typeof(value)
+        if target is not None and t != target:
+            raise CompileError(
+                f"cannot return a {type_str(t)} value where {type_str(target)} "
+                "is expected"
+            )
+        return value
+    if isinstance(ev, ComptimeVal):
+        if ev.obj is None:
+            raise CompileError("cannot return None (functions must return a value)")
+        if target is not None:
+            return _const_of_py(ev.obj, target)
+        t = value_type(ev.obj)
+        if t is None:
+            raise CompileError(f"cannot return the compile-time value {ev.obj!r}")
+        return _const_of_py(ev.obj, to_mir_type(t))
+    raise CompileError('cannot return this value')
+
+
+def _to_slot(ev: InterpVal, type: Type) -> mir.Value:
+    """Materialize ``ev`` as a value of exactly ``type`` for a store
+    into an already-typed slot (the strict sibling of
+    ``_to_runtime``, whose messages talk about stores)."""
+    match ev:
+        case RuntimeVal(value):
+            if typeof(value) != type:
+                raise CompileError(
+                    f"cannot store a {type_str(typeof(value))} value into a "
+                    f"slot of type {type_str(type)}"
+                )
+            return value
+        case ComptimeVal(obj):
+            return _const_of_py(obj, type)
+        case _:
+            raise CompileError(
+                f"cannot store this value into a slot of type {type_str(type)}"
+            )
+
+
+def _convert_evals(
+    fn_ir: astgen.FunctionIR,
+    evals: list[InterpVal],
+    formal: tuple[SpyType, ...],
+) -> tuple[mir.Value, ...]:
+    """Materialize the (possibly defaulted) arguments of one call as
+    values of the given formal types."""
+    formal_types = tuple(to_mir_type(t) for t in formal)
+    values: list[mir.Value] = []
+    for i, param in enumerate(fn_ir.params):
+        if i < len(evals):
+            ev = evals[i]
+            if isinstance(ev, ComptimeVal):
+                values.append(_const_of_py(ev.obj, formal_types[i]))
+            elif isinstance(ev, RuntimeVal):
+                value = ev.value
+                if typeof(value) != formal_types[i]:
+                    raise CompileError(
+                        f"cannot pass a {type_str(typeof(value))} value as the "
+                        f"'{param.name}' argument of function {fn_ir.name} "
+                        f"(expected {type_str(formal_types[i])})"
+                    )
+                values.append(value)
+            else:
+                raise CompileError('cannot pass this value as an argument')
+        else:
+            assert param.has_default
+            values.append(_const_of_py(param.default_value, formal_types[i]))
+    return tuple(values)
+
+
+def _materialize_arg(ev: InterpVal, target: Type, what: str) -> mir.Value:
+    """Materialize one argument value of exactly the type ``target``
+    (used by constructors, whose parameters are the struct fields)."""
+    match ev:
+        case ComptimeVal(obj):
+            return _const_of_py(obj, target)
+        case RuntimeVal(value):
+            if typeof(value) != target:
+                raise CompileError(
+                    f"cannot pass a {type_str(typeof(value))} value as {what} "
+                    f"(expected {type_str(target)})"
+                )
+            return value
+        case _:
+            raise CompileError(f'cannot pass this value as {what}')
+
+
+# ---------------------------------------------------------------------------
 # the compile-time host interface
 # ---------------------------------------------------------------------------
 
@@ -315,7 +539,7 @@ class HirRunner:
         the return sites when none is declared.
         """
         param_values = tuple(
-            self._param_value(i, arg) for i, arg in enumerate(fn.args)
+            _param_value(i, arg) for i, arg in enumerate(fn.args)
         )
         self._push_frame(param_values)
         self._ret_type = None
@@ -482,16 +706,6 @@ class HirRunner:
     def _push_frame(self, arg_values: tuple[mir.Value, ...]) -> None:
         self._frames.append(Frame(arg_values))
 
-    def _param_value(self, index: int, arg: mir.FormalArg) -> mir.Value:
-        """The runtime register of one argument of the function proper: a
-        by-value struct argument arrives as a pointer to the caller's
-        struct (the prologue copy of ``_exec_store`` turns it into this
-        function's own inline copy); every other argument arrives as its
-        value."""
-        if isinstance(arg.type, StructType):
-            return mir.Param(index, PointerType(arg.type), arg.name)
-        return mir.Param(index, arg.type, arg.name)
-
     def _exec_load(self, inst: hir.Load) -> InterpVal:
         ptr = self._operand(inst.ptr)
         if isinstance(ptr, PendingSlot):
@@ -538,13 +752,13 @@ class HirRunner:
                 # recorded: materialize it before overwriting the slot
                 recorded = ptr.value
                 ptr.value = None
-                v0 = self._to_runtime(recorded, None)
+                v0 = _to_runtime(recorded, None)
                 t0 = typeof(v0)
                 ptr.ptr = self._emit(mir.Alloca(PointerType(t0)))
                 ptr.type = t0
                 self._emit(mir.Store(ptr.ptr, v0))
             # the first store types the slot
-            v = self._to_runtime(value, None)
+            v = _to_runtime(value, None)
             t = typeof(v)
             if ptr.ptr is None:
                 assert ptr.type is None
@@ -561,7 +775,7 @@ class HirRunner:
             ptype = typeof(ptr.value)
             if not isinstance(ptype, PointerType):
                 raise CompileError(f"cannot store through a {type_str(ptype)} value")
-            v = self._to_runtime(value, ptype.elem)
+            v = _to_runtime(value, ptype.elem)
             self._emit(mir.Store(ptr.value, v))
             return
         raise CompileError('cannot store through a compile-time pointer')
@@ -604,20 +818,11 @@ class HirRunner:
             case _:
                 raise CompileError('cannot access the fields of this value')
 
-    def _field_index(self, type: StructType, name: str) -> int:
-        """The declaration index of the field ``name`` of a struct type."""
-        for i, field in enumerate(type.fields):
-            if field.name == name:
-                return i
-        raise CompileError(
-            f"type {type_str(type)} has no field named '{name}'"
-        )
-
     def _exec_field_addr(self, inst: hir.FieldAddr) -> InterpVal:
         """One step of an attribute chain on a struct value: the address
         of the field ``inst.name`` of the struct ``inst.base`` denotes."""
         ptr, type = self._struct_addr_of(self._operand(inst.base))
-        index = self._field_index(type, inst.name)
+        index = _field_index(type, inst.name)
         value = self._emit(mir.Gep(ptr, index))
         return RuntimeVal(value)
 
@@ -675,7 +880,7 @@ class HirRunner:
                 'cannot return a value from a void function (its return '
                 'type is None)'
             )
-        value = self._to_runtime(ev, target)
+        value = _to_runtime(ev, target)
         ret_type = typeof(value)
         if self._ret_type is not None and self._ret_type != ret_type:
             raise CompileError(
@@ -720,40 +925,12 @@ class HirRunner:
             return 'an untyped value'
         return f'a {type_str(t)} value'
 
-    def _const_of_py(self, obj: Any, type: Type) -> mir.Value:
-        """Turn a Python literal into a typed MIR constant."""
-        match type:
-            case BoolType():
-                if not isinstance(obj, bool):
-                    raise CompileError(f"cannot use {obj!r} as a bool constant")
-                return BoolValue(obj)
-            case IntType():
-                if isinstance(obj, bool) or not isinstance(obj, int):
-                    raise CompileError(f"cannot use {obj!r} as an integer constant")
-                if type.signed:
-                    lo, hi = (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
-                else:
-                    lo, hi = (0, 2 ** type.bits - 1)
-                if not lo <= obj <= hi:
-                    raise CompileError(
-                        f"integer constant {obj} is out of range for {type_str(type)}"
-                    )
-                return IntValue(obj, type.bits, type.signed)
-            case FloatType():
-                if isinstance(obj, bool) or not isinstance(obj, (int, float)):
-                    raise CompileError(f"cannot use {obj!r} as a float constant")
-                return FloatValue(float(obj), type.bits)
-            case _:
-                raise CompileError(
-                    f"cannot create a constant of type {type_str(type)} from {obj!r}"
-                )
-
     def _coerce(self, ev: InterpVal, target: Type) -> mir.Value:
         """Materialize a value of type ``target``; numeric widening
         conversions (int -> float, float32 -> float64) are applied."""
         match ev:
             case ComptimeVal(obj):
-                return self._const_of_py(obj, target)
+                return _const_of_py(obj, target)
             case RuntimeVal(value):
                 from_type = typeof(value)
                 return self._convert(value, from_type, target)
@@ -779,93 +956,7 @@ class HirRunner:
             f"cannot convert a {type_str(from_type)} value to {type_str(to_type)}"
         )
 
-    def _to_runtime(self, ev: InterpVal, target: Type | None) -> mir.Value:
-        """Materialize a return value: runtime values must already have
-        the target type, compile-time values adopt it (or, without a
-        target, their Python type mapping)."""
-        if isinstance(ev, RuntimeVal):
-            value = ev.value
-            t = typeof(value)
-            if target is not None and t != target:
-                raise CompileError(
-                    f"cannot return a {type_str(t)} value where {type_str(target)} "
-                    "is expected"
-                )
-            return value
-        if isinstance(ev, ComptimeVal):
-            if ev.obj is None:
-                raise CompileError("cannot return None (functions must return a value)")
-            if target is not None:
-                return self._const_of_py(ev.obj, target)
-            t = value_type(ev.obj)
-            if t is None:
-                raise CompileError(f"cannot return the compile-time value {ev.obj!r}")
-            return self._const_of_py(ev.obj, to_mir_type(t))
-        raise CompileError('cannot return this value')
-
-    def _to_slot(self, ev: InterpVal, type: Type) -> mir.Value:
-        """Materialize ``ev`` as a value of exactly ``type`` for a store
-        into an already-typed slot (the strict sibling of
-        ``_to_runtime``, whose messages talk about returns)."""
-        match ev:
-            case RuntimeVal(value):
-                if typeof(value) != type:
-                    raise CompileError(
-                        f"cannot store a {type_str(typeof(value))} value into a "
-                        f"slot of type {type_str(type)}"
-                    )
-                return value
-            case ComptimeVal(obj):
-                return self._const_of_py(obj, type)
-            case _:
-                raise CompileError(
-                    f"cannot store this value into a slot of type {type_str(type)}"
-                )
-
-    # -- compile-time (comptime) operators ------------------------------------
-
-    def _comptime_py_op(self, op: str, lhs: Any, rhs: Any) -> Any:
-        fn = _PY_OPS.get(op)
-        if fn is None:
-            raise CompileError(f"operator '{op}' is not supported at compile time")
-        try:
-            return fn(lhs, rhs)
-        except Exception as e:
-            raise CompileError(
-                f"cannot apply '{op}' to {lhs!r} and {rhs!r} at compile time: {e}"
-            ) from e
-
     # -- operators ------------------------------------------------------------
-
-    def _binary_type(self, op: str, lt: Type, rt: Type, what: str) -> Type | None:
-        """The type a binary operation on ``lt``/``rt`` is performed on, or
-        None if the operand combination is not a number pair."""
-        if isinstance(lt, IntType) and isinstance(rt, IntType):
-            if lt != rt:
-                raise CompileError(
-                    f"cannot {what} a {type_str(lt)} value with a {type_str(rt)} value "
-                    "(different integer types)"
-                )
-            return lt
-        if isinstance(lt, FloatType) and isinstance(rt, FloatType):
-            return FloatType(max(lt.bits, rt.bits))
-        if isinstance(lt, IntType) and isinstance(rt, FloatType):
-            return rt
-        if isinstance(lt, FloatType) and isinstance(rt, IntType):
-            return lt
-        return None
-
-    def _unsupported_type_error(self, op: str, type: Type | None) -> CompileError:
-        if isinstance(type, PointerType) and isinstance(type.elem, IntType) and type.elem.bits == 8:
-            return CompileError(
-                f"cannot apply '{op}' to string values "
-                "(strings are compiled as arrays of u8)"
-            )
-        if isinstance(type, PointerType):
-            return CompileError(f"cannot apply '{op}' to pointer values")
-        if type is None:
-            return CompileError(f"cannot apply '{op}' to a compile-time object")
-        return CompileError(f"cannot apply '{op}' to {type_str(type)} values")
 
     def _bin_types(self, lhs: InterpVal, rhs: InterpVal) -> tuple[Type | None, Type | None]:
         """The static types of the two operands of a binary operation.  A
@@ -897,11 +988,11 @@ class HirRunner:
         lhs = self._operand(inst.lhs)
         rhs = self._operand(inst.rhs)
         if isinstance(lhs, ComptimeVal) and isinstance(rhs, ComptimeVal):
-            return ComptimeVal(self._comptime_py_op(op, lhs.obj, rhs.obj))
+            return ComptimeVal(_comptime_py_op(op, lhs.obj, rhs.obj))
         lt, rt = self._bin_types(lhs, rhs)
-        type = self._binary_type(op, lt, rt, f"apply '{op}' to") if lt is not None and rt is not None else None
+        type = _binary_type(op, lt, rt, f"apply '{op}' to") if lt is not None and rt is not None else None
         if type is None:
-            raise self._unsupported_type_error(op, lt)
+            raise _unsupported_type_error(op, lt)
         if isinstance(type, IntType):
             if op == '/':
                 raise CompileError(
@@ -932,11 +1023,11 @@ class HirRunner:
         lhs = self._operand(inst.lhs)
         rhs = self._operand(inst.rhs)
         if isinstance(lhs, ComptimeVal) and isinstance(rhs, ComptimeVal):
-            return ComptimeVal(self._comptime_py_op(op, lhs.obj, rhs.obj))
+            return ComptimeVal(_comptime_py_op(op, lhs.obj, rhs.obj))
         lt, rt = self._bin_types(lhs, rhs)
-        type = self._binary_type(op, lt, rt, 'compare') if lt is not None and rt is not None else None
+        type = _binary_type(op, lt, rt, 'compare') if lt is not None and rt is not None else None
         if type is None:
-            raise self._unsupported_type_error(op, lt)
+            raise _unsupported_type_error(op, lt)
         lv = self._coerce(lhs, type)
         rv = self._coerce(rhs, type)
         kind = 'int' if isinstance(type, IntType) else 'float'
@@ -1018,7 +1109,7 @@ class HirRunner:
             # the slot already has memory (its address escaped or it was
             # stored before): write the call result into it
             assert slot.type is not None
-            v = self._to_slot(ev, slot.type)
+            v = _to_slot(ev, slot.type)
             self._emit(mir.Store(slot.ptr, v))
             return
         if isinstance(slot, RuntimeVal):
@@ -1027,7 +1118,7 @@ class HirRunner:
                 raise CompileError(
                     f"cannot write a call result through a {type_str(ptype)} value"
                 )
-            v = self._to_slot(ev, ptype.elem)
+            v = _to_slot(ev, ptype.elem)
             self._emit(mir.Store(slot.value, v))
             return
         raise CompileError('cannot write a call result into a compile-time location')
@@ -1145,7 +1236,7 @@ class HirRunner:
             )
         for i, (field, arg) in enumerate(zip(fields, inst.args)):
             ev = self._operand(arg)
-            value = self._materialize_arg(
+            value = _materialize_arg(
                 ev, field.type, f"the '{field.name}' argument of {desc.name}"
             )
             field_ptr = self._emit(mir.Gep(ptr, i))
@@ -1208,12 +1299,12 @@ class HirRunner:
                     f'method {fn_ir.name} takes {len(fn_ir.params) - 1} '
                     f'arguments, got {len(evals)}'
                 )
-            values = self._convert_evals(fn_ir, evals2, formal)
+            values = _convert_evals(fn_ir, evals2, formal)
         else:
             formal = self._solve_types(fn_ir, evals2, 'jit')
-            values = self._convert_evals(fn_ir, evals2, formal)
+            values = _convert_evals(fn_ir, evals2, formal)
         callee, ret_type = self._resolver.resolve_call(entry, formal)
-        args = self._native_call_args(callee, values)
+        args = _native_call_args(callee, values)
         value = self._emit(mir.Call(callee, args, ret_type))
         if ret_type == VoidType():
             return ComptimeVal(None)
@@ -1241,7 +1332,7 @@ class HirRunner:
         self_ev, _ = self._self_value(ptr_self, struct, addr)
         evals2 = [self_ev, *evals]
         formal = self._solve_types(fn_ir, evals2, 'jit')
-        values = self._convert_evals(fn_ir, evals2, formal)
+        values = _convert_evals(fn_ir, evals2, formal)
         return self._run_inline(fn_ir, values)
 
     def _solve_types(
@@ -1275,53 +1366,6 @@ class HirRunner:
         except TypeMismatchError as e:
             raise CompileError(str(e)) from e
 
-    def _convert_evals(
-        self,
-        fn_ir: astgen.FunctionIR,
-        evals: list[InterpVal],
-        formal: tuple[SpyType, ...],
-    ) -> tuple[mir.Value, ...]:
-        """Materialize the (possibly defaulted) arguments of one call as
-        values of the given formal types."""
-        formal_types = tuple(to_mir_type(t) for t in formal)
-        values: list[mir.Value] = []
-        for i, param in enumerate(fn_ir.params):
-            if i < len(evals):
-                ev = evals[i]
-                if isinstance(ev, ComptimeVal):
-                    values.append(self._const_of_py(ev.obj, formal_types[i]))
-                elif isinstance(ev, RuntimeVal):
-                    value = ev.value
-                    if typeof(value) != formal_types[i]:
-                        raise CompileError(
-                            f"cannot pass a {type_str(typeof(value))} value as the "
-                            f"'{param.name}' argument of function {fn_ir.name} "
-                            f"(expected {type_str(formal_types[i])})"
-                        )
-                    values.append(value)
-                else:
-                    raise CompileError('cannot pass this value as an argument')
-            else:
-                assert param.has_default
-                values.append(self._const_of_py(param.default_value, formal_types[i]))
-        return tuple(values)
-
-    def _materialize_arg(self, ev: InterpVal, target: Type, what: str) -> mir.Value:
-        """Materialize one argument value of exactly the type ``target``
-        (used by constructors, whose parameters are the struct fields)."""
-        match ev:
-            case ComptimeVal(obj):
-                return self._const_of_py(obj, target)
-            case RuntimeVal(value):
-                if typeof(value) != target:
-                    raise CompileError(
-                        f"cannot pass a {type_str(typeof(value))} value as {what} "
-                        f"(expected {type_str(target)})"
-                    )
-                return value
-            case _:
-                raise CompileError(f'cannot pass this value as {what}')
-
     def _arg_values_of(
         self, fn_ir: astgen.FunctionIR, args: tuple[hir.Value, ...], mode: str
     ) -> tuple[tuple[mir.Value, ...], tuple[SpyType, ...]]:
@@ -1333,35 +1377,8 @@ class HirRunner:
         """
         evals = [self._operand(a) for a in args]
         formal = self._solve_types(fn_ir, evals, mode)
-        values = self._convert_evals(fn_ir, evals, formal)
+        values = _convert_evals(fn_ir, evals, formal)
         return values, formal
-
-    def _native_call_args(
-        self, callee: mir.Value, values: tuple[mir.Value, ...]
-    ) -> tuple[mir.Value, ...]:
-        """The native argument values of one call: a by-value struct
-        formal receives the *address* of the caller's struct (the callee
-        copies it into its own storage at entry - native boundaries pass
-        structs as pointers); every other formal receives its value.
-        """
-        fn_type = typeof(callee)
-        if not isinstance(fn_type, PointerType) or not isinstance(
-            fn_type.elem, mir.FunctionType
-        ):
-            raise CompileError('internal error: call target has no signature')
-        args: list[mir.Value] = []
-        for expected, value in zip(fn_type.elem.args, values):
-            if isinstance(expected, StructType):
-                # a struct value is always the load of its storage
-                if isinstance(value, mir.Load):
-                    args.append(value.ptr)
-                else:
-                    raise CompileError(
-                        'internal error: cannot take the address of a struct argument'
-                    )
-            else:
-                args.append(value)
-        return tuple(args)
 
     def _call_spy_function(self, entry: FunctionEntry, inst: hir.CallInplace) -> InterpVal:
         if entry.context is not self._resolver:
@@ -1371,7 +1388,7 @@ class HirRunner:
         fn_ir = entry.hir
         values, formal = self._arg_values_of(fn_ir, inst.args, entry.kind)
         callee, ret_type = self._resolver.resolve_call(entry, formal)
-        args = self._native_call_args(callee, values)
+        args = _native_call_args(callee, values)
         value = self._emit(mir.Call(callee, args, ret_type))
         if ret_type == VoidType():
             # a void call produces no value: it only has effects
@@ -1420,5 +1437,5 @@ class HirRunner:
                 f"got {len(evals)}"
             )
         formal = self._solve_types(fn_ir, evals, 'jit')
-        values = self._convert_evals(fn_ir, evals, formal)
+        values = _convert_evals(fn_ir, evals, formal)
         return self._run_inline(fn_ir, values)

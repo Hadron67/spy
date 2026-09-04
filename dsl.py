@@ -375,6 +375,75 @@ def _native_spec(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> NativeFn 
         return entry.native_fn
     return entry.specs.get(arg_types)
 
+
+def _declared_ret_type(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> Type | None:
+    """The concrete spy return type of one specialization declared by
+    its annotations, or ``None`` when none is declared.
+
+    An ``aot`` function fixes its signature at registration.  A
+    ``jit`` function with a return annotation uses it as the return
+    type of the specialization: the annotation is either a concrete
+    spy type or a type parameter bound by the parameters (which
+    binds it to the argument types of the specialization).
+    """
+    if isinstance(entry, FunctionValue):
+        return entry.ret
+    fn_ir = entry.hir
+    ret_ann = fn_ir.ret_annotation
+    if ret_ann is None:
+        return None
+    for type_param in fn_ir.type_params:
+        if ret_ann is type_param:
+            # the return type parameter is bound by the (concrete)
+            # arguments of the parameters annotated with it
+            for i, param in enumerate(fn_ir.params):
+                if param.annotation is ret_ann:
+                    return arg_types[i]
+            return None
+    if not isinstance(ret_ann, Type):
+        return None
+    return ret_ann
+
+
+def _recursion_ret_type_error(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> str:
+    """Explain why the return type of a recursive specialization
+    cannot be determined from its annotations."""
+    fn_ir = entry.hir
+    ret_ann = fn_ir.ret_annotation
+    name = entry.fn.__name__
+    if ret_ann is None:
+        return (
+            f"recursive function {name} requires a return type annotation: "
+            'the return type of a recursive call must be known while '
+            'the body is being compiled'
+        )
+    for type_param in fn_ir.type_params:
+        if ret_ann is type_param:
+            return (
+                f"cannot determine the return type of the recursive function {name}: "
+                f"type parameter {type_param.__name__} appears only in the return "
+                'annotation, not on any parameter'
+            )
+    return (
+        f"cannot determine the return type of the recursive function {name}: "
+        f'the return annotation {ret_ann!r} is not a spy type'
+    )
+
+
+def _build_instance_class(cls: type, desc: SpyStructType) -> type:
+    """The Python class of the struct instances: a ctypes.Structure
+    subclass whose memory follows the LLVM layout of the struct (the
+    same layout the native code compiles against)."""
+    fields = [(f.name, ctypes_of(f.type)) for f in desc.fields]
+    py_cls = type(
+        cls.__name__,
+        (StructInstance,),
+        {'_fields_': fields, '__module__': cls.__module__, '__doc__': cls.__doc__},
+    )
+    py_cls.__spy_struct_type__ = desc  # type: ignore[attr-defined]
+    return py_cls
+
+
 class JitContext(FunctionResolver):
     """A cache of compiled spy functions; functions decorated by the
     same context may call each other (as native calls)."""
@@ -456,7 +525,7 @@ class JitContext(FunctionResolver):
                 )
             desc.add_field(name, annotation)
         self._check_struct_cycles(desc, [desc])
-        desc._py_cls = self._build_instance_class(cls, desc)
+        desc._py_cls = _build_instance_class(cls, desc)
         desc.__module__ = cls.__module__
         # collect the spy methods out of the class; a method that is not
         # decorated is a plain function and is inlined when called
@@ -516,19 +585,6 @@ class JitContext(FunctionResolver):
                     names = ' -> '.join(t.name for t in stack + [field.type])
                     raise CompileError(f'recursive struct definition: {names}')
                 self._check_struct_cycles(field.type, stack + [field.type])
-
-    def _build_instance_class(self, cls: type, desc: SpyStructType) -> type:
-        """The Python class of the struct instances: a ctypes.Structure
-        subclass whose memory follows the LLVM layout of the struct (the
-        same layout the native code compiles against)."""
-        fields = [(f.name, ctypes_of(f.type)) for f in desc.fields]
-        py_cls = type(
-            cls.__name__,
-            (StructInstance,),
-            {'_fields_': fields, '__module__': cls.__module__, '__doc__': cls.__doc__},
-        )
-        py_cls.__spy_struct_type__ = desc  # type: ignore[attr-defined]
-        return py_cls
 
     def _build_constructor(self, desc: SpyStructType) -> None:
         """The Python-side constructor ``Foo(a, b)`` of a struct: create
@@ -795,7 +851,7 @@ class JitContext(FunctionResolver):
         # specialization (a recursive function needs it: its calls are
         # typed while its body is still being compiled); without one the
         # return type is inferred from the return sites
-        ret_hint = self._declared_ret_type(entry, arg_types)
+        ret_hint = _declared_ret_type(entry, arg_types)
         args = tuple(
             MirFormalArg(fn_ir.params[i].name, to_mir_type(arg_types[i]))
             for i in range(len(arg_types))
@@ -868,7 +924,7 @@ class JitContext(FunctionResolver):
         if ret is None:
             # the callee is still being typed (a recursive call) and has
             # no declared return type: the call cannot be typed
-            raise CompileError(self._recursion_ret_type_error(entry, arg_types))
+            raise CompileError(_recursion_ret_type_error(entry, arg_types))
         return fn, ret
 
     @override
@@ -919,60 +975,6 @@ class JitContext(FunctionResolver):
         raise CompileError(
             f'method {name} of struct {struct.name} is not a spy method'
         )
-
-    def _declared_ret_type(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> Type | None:
-        """The concrete spy return type of one specialization declared by
-        its annotations, or ``None`` when none is declared.
-
-        An ``aot`` function fixes its signature at registration.  A
-        ``jit`` function with a return annotation uses it as the return
-        type of the specialization: the annotation is either a concrete
-        spy type or a type parameter bound by the parameters (which
-        binds it to the argument types of the specialization).
-        """
-        if isinstance(entry, FunctionValue):
-            return entry.ret
-        fn_ir = entry.hir
-        ret_ann = fn_ir.ret_annotation
-        if ret_ann is None:
-            return None
-        for type_param in fn_ir.type_params:
-            if ret_ann is type_param:
-                # the return type parameter is bound by the (concrete)
-                # arguments of the parameters annotated with it
-                for i, param in enumerate(fn_ir.params):
-                    if param.annotation is ret_ann:
-                        return arg_types[i]
-                return None
-        if not isinstance(ret_ann, Type):
-            return None
-        return ret_ann
-
-    def _recursion_ret_type_error(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> str:
-        """Explain why the return type of a recursive specialization
-        cannot be determined from its annotations."""
-        fn_ir = entry.hir
-        ret_ann = fn_ir.ret_annotation
-        name = entry.fn.__name__
-        if ret_ann is None:
-            return (
-                f"recursive function {name} requires a return type annotation: "
-                'the return type of a recursive call must be known while '
-                'the body is being compiled'
-            )
-        for type_param in fn_ir.type_params:
-            if ret_ann is type_param:
-                return (
-                    f"cannot determine the return type of the recursive function {name}: "
-                    f"type parameter {type_param.__name__} appears only in the return "
-                    'annotation, not on any parameter'
-                )
-        return (
-            f"cannot determine the return type of the recursive function {name}: "
-            f'the return annotation {ret_ann!r} is not a spy type'
-        )
-
-    # -- internals -----------------------------------------------------------
 
     def _register(
         self, fn: FunctionType, kind: str, ptr_self: bool = False
