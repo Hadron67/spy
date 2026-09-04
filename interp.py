@@ -51,7 +51,7 @@ from typing import Any
 from . import astgen, hir, mir
 from . import builtins as spy_builtins
 from .errors import CompileError, TypeMismatchError
-from .fn import FunctionEntry
+from .fn import FunctionEntry, FunctionValue
 from .info import FunctionResolver
 from .mir import (
     BoolType,
@@ -61,7 +61,9 @@ from .mir import (
     IntType,
     IntValue,
     PointerType,
+    StructType,
     Type,
+    VoidType,
     type_str,
 )
 from .type import (
@@ -83,7 +85,13 @@ from .type import (
     PointerType as SpyPointerType,
 )
 from .type import (
+    StructType as SpyStructType,
+)
+from .type import (
     Type as SpyType,
+)
+from .type import (
+    VoidType as SpyVoidType,
 )
 from .type import (
     value_type,
@@ -131,18 +139,25 @@ class PendingSlot(InterpVal):
     """The value of an executed ``hir.Alloca``: an addressable slot whose
     concrete type is fixed by its first store (the interpreter emits the
     typed MIR alloca at that moment).  A slot that receives the result of
-    a ``hir.CallInplace`` (RLS) first only *records* the value: scalar
-    and compile-time results are never given real memory - the matching
-    ``Load`` hands the recorded value out directly - and memory is
-    allocated only when the slot really must hold its value at a fixed
-    address (a later plain ``Store``, or an aggregate result, neither of
-    which an RLS slot hits yet)."""
+    a call (RLS) first only *records* the value: scalar and compile-time
+    results are never given real memory - the matching ``Load`` hands the
+    recorded value out directly - and memory is allocated only when the
+    slot really must hold its value at a fixed address (a later plain
+    ``Store``, or a struct result, which the callee writes into the slot
+    in place)."""
 
     type: Type | None = None
     ptr: mir.Value | None = None
     # the value an RLS call result recorded in the slot; ``Load`` returns
     # it while no memory has been allocated yet
     value: InterpVal | None = None
+
+
+@dataclass
+class InPlaceResult(InterpVal):
+    """The result of a call that wrote its result into the result slot
+    itself (a struct constructor): the interpreter must not store it
+    again."""
 
 
 @dataclass
@@ -169,7 +184,9 @@ def typeof(value: mir.Value) -> Type:
 def to_mir_type(type: SpyType) -> Type:
     """The MIR mirror of a spy type: the static type the runtime register
     of a value of ``type`` has.  The mapping is one-to-one over the types
-    that can cross into runtime code."""
+    that can cross into runtime code.  A spy struct type mirrors to one
+    :class:`mir.StructType` object (created lazily and cached on the
+    descriptor), so that all values of one struct share one identity."""
     match type:
         case SpyBoolType():
             return BoolType()
@@ -177,6 +194,10 @@ def to_mir_type(type: SpyType) -> Type:
             return IntType(type.bits, type.signed)
         case SpyFloatType():
             return FloatType(type.bits)
+        case SpyVoidType():
+            return VoidType()
+        case SpyStructType():
+            return struct_mir_type(type)
         case SpyPointerType(elem, _):
             # const-ness is not tracked in the MIR
             return PointerType(to_mir_type(elem))
@@ -184,6 +205,21 @@ def to_mir_type(type: SpyType) -> Type:
             return mir.FunctionType(tuple(to_mir_type(a.type) for a in args), to_mir_type(ret))
         case _:
             raise CompileError(f"spy type {type!r} has no MIR representation")
+
+
+def struct_mir_type(type: SpyStructType) -> StructType:
+    """The (cached) MIR mirror of one spy struct type: fields in
+    declaration order, mirroring the LLVM layout of the struct."""
+    ret = type._mir
+    if ret is not None:
+        return ret
+    fields: list[mir.FormalArg] = []
+    for field in type.fields:
+        fields.append(mir.FormalArg(field.name, to_mir_type(field.type)))
+    ret = StructType(type, tuple(fields))
+    ret.ctype = type._py_cls
+    type._mir = ret
+    return ret
 
 
 def to_spy_type(type: Type) -> SpyType:
@@ -196,8 +232,12 @@ def to_spy_type(type: Type) -> SpyType:
             return SpyIntType(type.bits, type.signed)
         case FloatType():
             return SpyFloatType(type.bits)
+        case VoidType():
+            return SpyVoidType()
         case PointerType(elem):
             return SpyPointerType(to_spy_type(elem), is_const=False)
+        case StructType():
+            return type.spy_type
         case mir.FunctionType(args, ret):
             return SpyFunctionType(
                 tuple(SpyFormalArg('', to_spy_type(a)) for a in args), to_spy_type(ret)
@@ -225,7 +265,10 @@ class HirRunner:
       callee specialization (compiled into the module of the caller
       when it is still fresh, or a symbol of an earlier module),
     * ``resolve_global(obj)``: the entry of a global object that is a
-      function registered in the host (or ``None``).
+      function registered in the host (or ``None``),
+    * ``resolve_method(struct, name)``: the method ``name`` of a struct
+      type (its registered entry, or the plain function to be
+      inlined), or ``None`` when the struct has no such method.
     """
 
     def __init__(self, resolver: FunctionResolver) -> None:
@@ -236,6 +279,9 @@ class HirRunner:
         self._inline_depth = 0
         self._ret_type: Type | None = None
         self._ret_target: Type | None = None
+        # True when a path of the function proper ended in a void return
+        # (a bare ``return``, or a fall-off of a void function)
+        self._saw_void_return = False
         # True while typing the body of the function proper (a ``Ret``
         # emits a typed return); False inside an inlined plain function,
         # whose return just yields a value to the caller
@@ -258,23 +304,56 @@ class HirRunner:
         the return sites when none is declared.
         """
         param_values = tuple(
-            mir.Param(i, arg.type, arg.name) for i, arg in enumerate(fn.args)
+            self._param_value(i, arg) for i, arg in enumerate(fn.args)
         )
         self._push_frame(param_values)
         self._ret_type = None
         self._ret_target = fn.ret_type
+        self._saw_void_return = False
         self._ret_emit = True
         self._regions = [fn.insts]
 
+        # the by-value struct parameters: their ABI value is the address
+        # of the caller's struct, which the prologue copy turns into this
+        # function's own inline copy (see ``_exec_store``)
+        self._byval_struct_args: dict[int, StructType] = {}
+        for i, arg in enumerate(fn.args):
+            if isinstance(arg.type, StructType):
+                self._byval_struct_args[i] = arg.type
+
         flow, _ = self._run_list(fn_ir.body)
+        declared = fn.ret_type
         if flow is not FLOW_RET:
-            raise CompileError(f"function {fn_ir.name} must end with a 'return' statement")
-        ret_type = self._ret_type
-        assert ret_type is not None
-        if fn.ret_type is not None:
-            # a declared return type is enforced at the return sites
-            # (see ``_finish_return``), so the two must agree
-            assert fn.ret_type == ret_type
+            # a path falls off the end of the body: allowed only for a
+            # void function (declared, or inferred when the body never
+            # returned a value) - the fall-off path ends in an implicit
+            # ``ret void``; a value-returning function must end every
+            # path with a ``return``
+            if self._ret_type is not None:
+                raise CompileError(
+                    f"function {fn_ir.name} returns a value on some paths but "
+                    'falls off its end (without a return) on others'
+                )
+            if declared is not None and declared != VoidType():
+                raise CompileError(
+                    f"function {fn_ir.name} must end with a 'return' statement"
+                )
+            self._finish_void()
+            ret_type = VoidType()
+        elif self._saw_void_return:
+            if self._ret_type is not None:
+                raise CompileError(
+                    f"function {fn_ir.name} returns a value on some paths but "
+                    'returns without a value on others'
+                )
+            ret_type = VoidType()
+        else:
+            ret_type = self._ret_type
+            assert ret_type is not None
+            if declared is not None:
+                # a declared return type is enforced at the return sites
+                # (see ``_finish_return``), so the two must agree
+                assert declared == ret_type
         fn.ret_type = ret_type
 
     # -- running instruction lists -------------------------------------------
@@ -292,6 +371,12 @@ class HirRunner:
     def _exec_inst(self, inst: hir.Inst) -> tuple[object, InterpVal | None]:
         match inst:
             case hir.Ret():
+                if inst.value is None:
+                    # a bare ``return``: a void return of the function
+                    if self._ret_emit:
+                        self._finish_void()
+                        return FLOW_RET, None
+                    return FLOW_RET, ComptimeVal(None)
                 ev = self._operand(inst.value)
                 if self._ret_emit:
                     self._finish_return(ev)
@@ -327,6 +412,12 @@ class HirRunner:
                 return FLOW_FALL, None
             case hir.CallInplace():
                 self._exec_call_inplace(inst)
+                return FLOW_FALL, None
+            case hir.CallMethod():
+                self._exec_call_method(inst)
+                return FLOW_FALL, None
+            case hir.FieldAddr():
+                self._regs[inst] = self._exec_field_addr(inst)
                 return FLOW_FALL, None
             case _:
                 raise CompileError(f"unsupported instruction {type(inst).__name__}")
@@ -366,6 +457,16 @@ class HirRunner:
     def _push_frame(self, arg_values: tuple[mir.Value, ...]) -> None:
         self._frames.append(Frame(arg_values))
 
+    def _param_value(self, index: int, arg: mir.FormalArg) -> mir.Value:
+        """The runtime register of one argument of the function proper: a
+        by-value struct argument arrives as a pointer to the caller's
+        struct (the prologue copy of ``_exec_store`` turns it into this
+        function's own inline copy); every other argument arrives as its
+        value."""
+        if isinstance(arg.type, StructType):
+            return mir.Param(index, PointerType(arg.type), arg.name)
+        return mir.Param(index, arg.type, arg.name)
+
     def _exec_load(self, inst: hir.Load) -> InterpVal:
         ptr = self._operand(inst.ptr)
         if isinstance(ptr, PendingSlot):
@@ -389,6 +490,23 @@ class HirRunner:
     def _exec_store(self, inst: hir.Store) -> None:
         ptr = self._operand(inst.ptr)
         value = self._operand(inst.value)
+        if (
+            self._ret_emit
+            and isinstance(inst.value, hir.Arg)
+            and inst.value.index in self._byval_struct_args
+        ):
+            # the prologue store of a by-value struct parameter: the
+            # argument is the address of the caller's struct - copy it
+            # into this function's own slot, so that the parameter
+            # behaves like a C by-value parameter (mutations stay local)
+            struct = self._byval_struct_args[inst.value.index]
+            if not isinstance(value, RuntimeVal) or not isinstance(
+                typeof(value.value), PointerType
+            ):
+                raise CompileError(
+                    'internal error: a by-value struct argument is not a pointer'
+                )
+            value = RuntimeVal(self._emit(mir.Load(value.value, struct)))
         if isinstance(ptr, PendingSlot):
             if ptr.ptr is None and ptr.value is not None:
                 # the slot holds an RLS call result that was only
@@ -422,6 +540,61 @@ class HirRunner:
             self._emit(mir.Store(ptr.value, v))
             return
         raise CompileError('cannot store through a compile-time pointer')
+
+    # -- struct values ---------------------------------------------------------
+
+    def _struct_addr_of(self, ev: InterpVal) -> tuple[mir.Value, StructType]:
+        """The address of the struct value ``ev`` denotes, and the static
+        struct type at that address.  A struct value lives in memory: a
+        variable whose slot holds the struct gives its slot, a slot that
+        holds a *pointer* to a struct (a ``ptr_self`` parameter) is
+        dereferenced first, and a runtime pointer value is used as it
+        is.  The address is a runtime pointer value whose element type is
+        the struct type."""
+        match ev:
+            case PendingSlot():
+                t = ev.type
+                if t is None:
+                    raise CompileError('cannot access the fields of a variable that has not been assigned yet')
+                if isinstance(t, StructType):
+                    assert ev.ptr is not None
+                    return ev.ptr, t
+                if isinstance(t, PointerType) and isinstance(t.elem, StructType):
+                    # the slot holds the address of the struct: dereference
+                    assert ev.ptr is not None
+                    ptr = self._emit(mir.Load(ev.ptr, t))
+                    return ptr, t.elem
+                raise CompileError(
+                    f"cannot access fields of a {type_str(t)} value: "
+                    'only struct values have fields'
+                )
+            case RuntimeVal(value):
+                t = typeof(value)
+                if isinstance(t, PointerType) and isinstance(t.elem, StructType):
+                    return value, t.elem
+                raise CompileError(
+                    f"cannot access fields of a {type_str(t)} value: "
+                    'only struct values have fields'
+                )
+            case _:
+                raise CompileError('cannot access the fields of this value')
+
+    def _field_index(self, type: StructType, name: str) -> int:
+        """The declaration index of the field ``name`` of a struct type."""
+        for i, field in enumerate(type.fields):
+            if field.name == name:
+                return i
+        raise CompileError(
+            f"type {type_str(type)} has no field named '{name}'"
+        )
+
+    def _exec_field_addr(self, inst: hir.FieldAddr) -> InterpVal:
+        """One step of an attribute chain on a struct value: the address
+        of the field ``inst.name`` of the struct ``inst.base`` denotes."""
+        ptr, type = self._struct_addr_of(self._operand(inst.base))
+        index = self._field_index(type, inst.name)
+        value = self._emit(mir.Gep(ptr, index))
+        return RuntimeVal(value)
 
     def _emit(self, inst: mir.Inst) -> mir.Value:
         self._regions[-1].append(inst)
@@ -471,7 +644,13 @@ class HirRunner:
         match the (annotation) target, compile-time values adopt it (or
         their Python type mapping), and all return sites of one function
         must agree on the return type."""
-        value = self._to_runtime(ev, self._ret_target)
+        target = self._ret_target
+        if target is VoidType():
+            raise CompileError(
+                'cannot return a value from a void function (its return '
+                'type is None)'
+            )
+        value = self._to_runtime(ev, target)
         ret_type = typeof(value)
         if self._ret_type is not None and self._ret_type != ret_type:
             raise CompileError(
@@ -480,6 +659,17 @@ class HirRunner:
             )
         self._ret_type = ret_type
         self._emit(mir.Ret(value))
+
+    def _finish_void(self) -> None:
+        """End one path of the function proper with a void return (a bare
+        ``return``, or the implicit end of a void function body)."""
+        target = self._ret_target
+        if target is not None and target != VoidType():
+            raise CompileError(
+                f"cannot return without a value where {type_str(target)} is expected"
+            )
+        self._saw_void_return = True
+        self._emit(mir.Ret(None))
 
     # -- helpers -------------------------------------------------------------
 
@@ -649,14 +839,38 @@ class HirRunner:
             return CompileError(f"cannot apply '{op}' to a compile-time object")
         return CompileError(f"cannot apply '{op}' to {type_str(type)} values")
 
+    def _bin_types(self, lhs: InterpVal, rhs: InterpVal) -> tuple[Type | None, Type | None]:
+        """The static types of the two operands of a binary operation.  A
+        compile-time integer constant adopts the type of a runtime
+        integer operand (``x + 1`` with ``x: u64`` is a u64 addition,
+        like an integer argument marshals to the annotated type at the
+        Python boundary); compile-time floats keep the default mapping
+        and mix with integers by promotion."""
+        lt = self._type_of(lhs)
+        rt = self._type_of(rhs)
+        if (
+            isinstance(rhs, ComptimeVal)
+            and not isinstance(rhs.obj, bool)
+            and isinstance(rhs.obj, int)
+            and isinstance(lt, IntType)
+        ):
+            rt = lt
+        elif (
+            isinstance(lhs, ComptimeVal)
+            and not isinstance(lhs.obj, bool)
+            and isinstance(lhs.obj, int)
+            and isinstance(rt, IntType)
+        ):
+            lt = rt
+        return lt, rt
+
     def _eval_binary(self, inst: hir.Binary) -> InterpVal:
         op = inst.op
         lhs = self._operand(inst.lhs)
         rhs = self._operand(inst.rhs)
         if isinstance(lhs, ComptimeVal) and isinstance(rhs, ComptimeVal):
             return ComptimeVal(self._comptime_py_op(op, lhs.obj, rhs.obj))
-        lt = self._type_of(lhs)
-        rt = self._type_of(rhs)
+        lt, rt = self._bin_types(lhs, rhs)
         type = self._binary_type(op, lt, rt, f"apply '{op}' to") if lt is not None and rt is not None else None
         if type is None:
             raise self._unsupported_type_error(op, lt)
@@ -691,8 +905,7 @@ class HirRunner:
         rhs = self._operand(inst.rhs)
         if isinstance(lhs, ComptimeVal) and isinstance(rhs, ComptimeVal):
             return ComptimeVal(self._comptime_py_op(op, lhs.obj, rhs.obj))
-        lt = self._type_of(lhs)
-        rt = self._type_of(rhs)
+        lt, rt = self._bin_types(lhs, rhs)
         type = self._binary_type(op, lt, rt, 'compare') if lt is not None and rt is not None else None
         if type is None:
             raise self._unsupported_type_error(op, lt)
@@ -755,31 +968,39 @@ class HirRunner:
         and its result is handed to the slot: scalar and compile-time
         results are only *recorded* in the slot (no memory, no extra
         MIR - the matching ``Load`` passes the recorded value on); a
-        slot that already has memory receives a real store.  (An
-        aggregate result - an array or a struct, not implemented yet -
-        would instead be returned through the result pointer, with the
-        callee returning void.)"""
+        slot that already has memory receives a real store; and a struct
+        constructor writes its result into the slot itself (in place),
+        so no result is handed back at all."""
         callee = self._operand(inst.callee)
         ev = self._dispatch_call(callee, inst)
-        ret = self._operand(inst.ret)
-        if isinstance(ret, PendingSlot):
-            if ret.ptr is None:
-                ret.value = ev
+        self._store_result(ev, inst.ret)
+
+    def _store_result(self, ev: InterpVal, ret: hir.Value) -> None:
+        """The RLS tail of a call: hand the returned value of a call to
+        its result location (see ``_exec_call_inplace``)."""
+        if isinstance(ev, InPlaceResult):
+            # the callee (a struct constructor) already wrote the result
+            # into the result location itself
+            return
+        slot = self._operand(ret)
+        if isinstance(slot, PendingSlot):
+            if slot.ptr is None:
+                slot.value = ev
                 return
             # the slot already has memory (its address escaped or it was
             # stored before): write the call result into it
-            assert ret.type is not None
-            v = self._to_slot(ev, ret.type)
-            self._emit(mir.Store(ret.ptr, v))
+            assert slot.type is not None
+            v = self._to_slot(ev, slot.type)
+            self._emit(mir.Store(slot.ptr, v))
             return
-        if isinstance(ret, RuntimeVal):
-            ptype = typeof(ret.value)
+        if isinstance(slot, RuntimeVal):
+            ptype = typeof(slot.value)
             if not isinstance(ptype, PointerType):
                 raise CompileError(
                     f"cannot write a call result through a {type_str(ptype)} value"
                 )
             v = self._to_slot(ev, ptype.elem)
-            self._emit(mir.Store(ret.value, v))
+            self._emit(mir.Store(slot.value, v))
             return
         raise CompileError('cannot write a call result into a compile-time location')
 
@@ -805,6 +1026,9 @@ class HirRunner:
             )
         if isinstance(obj, FunctionEntry):
             return self._call_spy_function(obj, inst)
+        if isinstance(obj, SpyStructType):
+            # a constructor ``Bar(...)``
+            return self._call_constructor(obj, inst)
         if isinstance(obj, pytypes.FunctionType):
             return self._call_plain_function(obj, inst)
         raise CompileError(
@@ -841,21 +1065,167 @@ class HirRunner:
         print(*objs)  # a compile-time log, exactly like spy.compile_log
         return ComptimeVal(None)
 
-    def _arg_values_of(
-        self, fn_ir: astgen.FunctionIR, args: tuple[hir.Value, ...], mode: str
-    ) -> tuple[tuple[mir.Value, ...], tuple[SpyType, ...]]:
-        """Resolve the arguments of one call against the callee signature.
+    # -- struct constructors and methods ----------------------------------------
 
-        Returns the marshaled argument values (defaults included) and the
-        concrete spy types of all formal parameters (the ``spy`` side
-        drives the call resolution).
-        """
-        if len(args) > len(fn_ir.params):
+    def _materialize_struct_slot(self, slot: PendingSlot, struct: StructType) -> mir.Value:
+        """Give an untyped result slot the memory of a struct value and
+        return its address; a slot that already holds a struct is reused."""
+        if slot.ptr is None:
+            if slot.value is not None:
+                # the slot only recorded a scalar call result that was
+                # never materialized: it is discarded by this assignment
+                slot.value = None
+            slot.ptr = self._emit(mir.Alloca(PointerType(struct)))
+            slot.type = struct
+        elif slot.type is None or slot.type != struct:
+            raise CompileError(
+                f'cannot write a {type_str(struct)} value into a slot that '
+                f'already holds a {type_str(slot.type)} value'  # type: ignore[arg-type]
+            )
+        return slot.ptr
+
+    def _call_constructor(self, desc: SpyStructType, inst: hir.CallInplace) -> InterpVal:
+        """A struct constructor ``Bar(a, b)``: the result slot receives a
+        new struct value.  With a user ``__init__`` the call is dispatched
+        to it with ``self`` pointing at the result slot; otherwise every
+        argument is written into the field of the same declaration index
+        (the default constructor).  Either way the value is written into
+        the result slot in place - no value is handed back."""
+        struct = struct_mir_type(desc)
+        ret = self._operand(inst.ret)
+        if not isinstance(ret, PendingSlot):
+            raise CompileError('a constructor must write into a variable slot')
+        ptr = self._materialize_struct_slot(ret, struct)
+        init = self._resolver.resolve_method(desc, '__init__')
+        if init is not None:
+            # a user-provided ``__init__``: call it with ``self`` bound to
+            # the address of the result (constructors always write
+            # through the result pointer)
+            target, _ = init
+            evals = [self._operand(a) for a in inst.args]
+            if isinstance(target, FunctionEntry):
+                self._call_entry_with_self(target, True, inst, struct, ptr, evals)
+            else:
+                self._inline_method_with_self(target, True, struct, ptr, evals)
+            return InPlaceResult()
+        fields = struct.fields
+        if len(inst.args) != len(fields):
+            raise CompileError(
+                f"constructor {desc.name} takes {len(fields)} arguments "
+                f"(one per field), got {len(inst.args)}"
+            )
+        for i, (field, arg) in enumerate(zip(fields, inst.args)):
+            ev = self._operand(arg)
+            value = self._materialize_arg(
+                ev, field.type, f"the '{field.name}' argument of {desc.name}"
+            )
+            field_ptr = self._emit(mir.Gep(ptr, i))
+            self._emit(mir.Store(field_ptr, value))
+        return InPlaceResult()
+
+    def _exec_call_method(self, inst: hir.CallMethod) -> None:
+        """A method call ``x.h(...)``: the method is resolved from the
+        static type of the struct ``x`` denotes and called with the
+        ``self`` argument injected (by value, or - for a ``ptr_self``
+        method - as the address of the struct, so that the method can
+        modify it in place)."""
+        addr, struct = self._struct_addr_of(self._operand(inst.base))
+        desc: SpyStructType = struct.spy_type
+        target = self._resolver.resolve_method(desc, inst.name)
+        if target is None:
+            raise CompileError(f"type {desc.name} has no method named '{inst.name}'")
+        method, ptr_self = target
+        evals = [self._operand(a) for a in inst.args]
+        if isinstance(method, FunctionEntry):
+            ev = self._call_entry_with_self(method, ptr_self, inst, struct, addr, evals)
+        else:
+            ev = self._inline_method_with_self(method, ptr_self, struct, addr, evals)
+        # the method's result lands in the result location like any call
+        self._store_result(ev, inst.ret)
+
+    def _self_value(
+        self, ptr_self: bool, struct: StructType, addr: mir.Value
+    ) -> tuple[InterpVal, SpyType]:
+        """The ``self`` argument of a method call: by value it is the
+        struct loaded from its address, by pointer it is the address
+        itself."""
+        if ptr_self:
+            return RuntimeVal(addr), SpyPointerType(struct.spy_type, is_const=False)
+        value = self._emit(mir.Load(addr, struct))
+        return RuntimeVal(value), struct.spy_type
+
+    def _call_entry_with_self(
+        self,
+        entry: FunctionEntry,
+        ptr_self: bool,
+        inst: hir.CallMethod | hir.CallInplace,
+        struct: StructType,
+        addr: mir.Value,
+        evals: list[InterpVal],
+    ) -> InterpVal:
+        """A native call of a registered spy method (``@aot`` or
+        ``@jit``), with its first parameter bound to ``self``."""
+        if entry.context is not self._resolver:
+            raise CompileError(
+                f"cannot call method {entry.fn.__name__} from another JitContext"
+            )
+        fn_ir = entry.hir
+        self_ev, _ = self._self_value(ptr_self, struct, addr)
+        evals2 = [self_ev, *evals]
+        if isinstance(entry, FunctionValue):
+            formal = tuple(a.type for a in entry.args)
+            if len(evals2) > len(fn_ir.params):
+                raise CompileError(
+                    f'method {fn_ir.name} takes {len(fn_ir.params) - 1} '
+                    f'arguments, got {len(evals)}'
+                )
+            values = self._convert_evals(fn_ir, evals2, formal)
+        else:
+            formal = self._solve_types(fn_ir, evals2, 'jit')
+            values = self._convert_evals(fn_ir, evals2, formal)
+        callee, ret_type = self._resolver.resolve_call(entry, formal)
+        args = self._native_call_args(callee, values)
+        value = self._emit(mir.Call(callee, args, ret_type))
+        if ret_type == VoidType():
+            return ComptimeVal(None)
+        return RuntimeVal(value)
+
+    def _inline_method_with_self(
+        self,
+        fn: Any,
+        ptr_self: bool,
+        struct: StructType,
+        addr: mir.Value,
+        evals: list[InterpVal],
+    ) -> InterpVal:
+        """A plain (undecorated) method: it is inlined into the current
+        stream like any plain Python function (its body may only use what
+        inlining supports)."""
+        fn_ir = self._resolver.hir_of_plain_fn(fn)
+        if any(f.fn is fn for f in self._inline_stack):
+            raise CompileError(
+                f'a plain Python method cannot call itself recursively '
+                f'(method {fn_ir.name}) - declare it with @aot/@jit instead'
+            )
+        if self._inline_depth >= _MAX_INLINE_DEPTH:
+            raise CompileError('too deeply nested inlined functions')
+        self_ev, _ = self._self_value(ptr_self, struct, addr)
+        evals2 = [self_ev, *evals]
+        formal = self._solve_types(fn_ir, evals2, 'jit')
+        values = self._convert_evals(fn_ir, evals2, formal)
+        return self._run_inline(fn_ir, values)
+
+    def _solve_types(
+        self, fn_ir: astgen.FunctionIR, evals: list[InterpVal], mode: str
+    ) -> tuple[SpyType, ...]:
+        """The concrete spy types of all formal parameters of one call,
+        solved from the provided arguments (defaults included), plus the
+        argument count check."""
+        if len(evals) > len(fn_ir.params):
             raise CompileError(
                 f"function {fn_ir.name} takes {len(fn_ir.params)} arguments, "
-                f"got {len(args)}"
+                f"got {len(evals)}"
             )
-        evals = [self._operand(a) for a in args]
         provided: list[SpyType | None] = [None] * len(fn_ir.params)
         for i, ev in enumerate(evals):
             match ev:
@@ -872,10 +1242,18 @@ class HirRunner:
                 )
             provided[i] = t
         try:
-            formal = astgen.solve_call_types(fn_ir, mode, tuple(provided))
+            return astgen.solve_call_types(fn_ir, mode, tuple(provided))
         except TypeMismatchError as e:
             raise CompileError(str(e)) from e
 
+    def _convert_evals(
+        self,
+        fn_ir: astgen.FunctionIR,
+        evals: list[InterpVal],
+        formal: tuple[SpyType, ...],
+    ) -> tuple[mir.Value, ...]:
+        """Materialize the (possibly defaulted) arguments of one call as
+        values of the given formal types."""
         formal_types = tuple(to_mir_type(t) for t in formal)
         values: list[mir.Value] = []
         for i, param in enumerate(fn_ir.params):
@@ -897,7 +1275,64 @@ class HirRunner:
             else:
                 assert param.has_default
                 values.append(self._const_of_py(param.default_value, formal_types[i]))
-        return tuple(values), formal
+        return tuple(values)
+
+    def _materialize_arg(self, ev: InterpVal, target: Type, what: str) -> mir.Value:
+        """Materialize one argument value of exactly the type ``target``
+        (used by constructors, whose parameters are the struct fields)."""
+        match ev:
+            case ComptimeVal(obj):
+                return self._const_of_py(obj, target)
+            case RuntimeVal(value):
+                if typeof(value) != target:
+                    raise CompileError(
+                        f"cannot pass a {type_str(typeof(value))} value as {what} "
+                        f"(expected {type_str(target)})"
+                    )
+                return value
+            case _:
+                raise CompileError(f'cannot pass this value as {what}')
+
+    def _arg_values_of(
+        self, fn_ir: astgen.FunctionIR, args: tuple[hir.Value, ...], mode: str
+    ) -> tuple[tuple[mir.Value, ...], tuple[SpyType, ...]]:
+        """Resolve the arguments of one call against the callee signature.
+
+        Returns the marshaled argument values (defaults included) and the
+        concrete spy types of all formal parameters (the ``spy`` side
+        drives the call resolution).
+        """
+        evals = [self._operand(a) for a in args]
+        formal = self._solve_types(fn_ir, evals, mode)
+        values = self._convert_evals(fn_ir, evals, formal)
+        return values, formal
+
+    def _native_call_args(
+        self, callee: mir.Value, values: tuple[mir.Value, ...]
+    ) -> tuple[mir.Value, ...]:
+        """The native argument values of one call: a by-value struct
+        formal receives the *address* of the caller's struct (the callee
+        copies it into its own storage at entry - native boundaries pass
+        structs as pointers); every other formal receives its value.
+        """
+        fn_type = typeof(callee)
+        if not isinstance(fn_type, PointerType) or not isinstance(
+            fn_type.elem, mir.FunctionType
+        ):
+            raise CompileError('internal error: call target has no signature')
+        args: list[mir.Value] = []
+        for expected, value in zip(fn_type.elem.args, values):
+            if isinstance(expected, StructType):
+                # a struct value is always the load of its storage
+                if isinstance(value, mir.Load):
+                    args.append(value.ptr)
+                else:
+                    raise CompileError(
+                        'internal error: cannot take the address of a struct argument'
+                    )
+            else:
+                args.append(value)
+        return tuple(args)
 
     def _call_spy_function(self, entry: FunctionEntry, inst: hir.CallInplace) -> InterpVal:
         if entry.context is not self._resolver:
@@ -907,22 +1342,19 @@ class HirRunner:
         fn_ir = entry.hir
         values, formal = self._arg_values_of(fn_ir, inst.args, entry.kind)
         callee, ret_type = self._resolver.resolve_call(entry, formal)
-        value = self._emit(mir.Call(callee, values, ret_type))
+        args = self._native_call_args(callee, values)
+        value = self._emit(mir.Call(callee, args, ret_type))
+        if ret_type == VoidType():
+            # a void call produces no value: it only has effects
+            return ComptimeVal(None)
         return RuntimeVal(value)
 
-    def _call_plain_function(self, fn: Any, inst: hir.CallInplace) -> InterpVal:
-        fn_ir = self._resolver.hir_of_plain_fn(fn)
-        if any(f.fn is fn for f in self._inline_stack):
-            raise CompileError(
-                f"a plain Python function cannot call itself recursively "
-                f"(function {fn_ir.name}); plain functions are inlined, and a "
-                'recursive inline would never finish compiling - declare it '
-                'as a spy function instead'
-            )
-        if self._inline_depth >= _MAX_INLINE_DEPTH:
-            raise CompileError('too deeply nested inlined functions')
-        values, _ = self._arg_values_of(fn_ir, inst.args, 'jit')
-
+    def _run_inline(
+        self, fn_ir: astgen.FunctionIR, values: tuple[mir.Value, ...]
+    ) -> InterpVal:
+        """Run the body of an inlined plain function with the given
+        (already materialized) argument values, returning its result: the
+        value of its ``return``, or ``None`` for a void body."""
         self._inline_stack.append(fn_ir)
         self._inline_depth += 1
         self._push_frame(values)
@@ -935,8 +1367,29 @@ class HirRunner:
             self._frames.pop()
             self._inline_depth -= 1
             self._inline_stack.pop()
-        if flow is not FLOW_RET or not isinstance(value, InterpVal):
-            raise CompileError(
-                f"inlined function {fn_ir.name} must end with a 'return' statement"
-            )
+        if flow is not FLOW_RET:
+            # the inlined body fell off its end: a void inline
+            return ComptimeVal(None)
+        assert isinstance(value, InterpVal)
         return value
+
+    def _call_plain_function(self, fn: Any, inst: hir.CallInplace) -> InterpVal:
+        fn_ir = self._resolver.hir_of_plain_fn(fn)
+        if any(f.fn is fn for f in self._inline_stack):
+            raise CompileError(
+                f"a plain Python function cannot call itself recursively "
+                f"(function {fn_ir.name}); plain functions are inlined, and a "
+                'recursive inline would never finish compiling - declare it '
+                'as a spy function instead'
+            )
+        if self._inline_depth >= _MAX_INLINE_DEPTH:
+            raise CompileError('too deeply nested inlined functions')
+        evals = [self._operand(a) for a in inst.args]
+        if len(evals) > len(fn_ir.params):
+            raise CompileError(
+                f"function {fn_ir.name} takes {len(fn_ir.params)} arguments, "
+                f"got {len(evals)}"
+            )
+        formal = self._solve_types(fn_ir, evals, 'jit')
+        values = self._convert_evals(fn_ir, evals, formal)
+        return self._run_inline(fn_ir, values)

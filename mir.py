@@ -28,6 +28,9 @@ external declaration).
 """
 
 from dataclasses import dataclass
+from typing import Any
+
+from .errors import CompileError
 
 # ---------------------------------------------------------------------------
 # static types
@@ -55,6 +58,52 @@ class FloatType(Type):
 
 
 @dataclass(frozen=True)
+class VoidType(Type):
+    """The return type of a void function (its body returns no value).
+    No runtime value ever has this type; a call of a void function
+    produces no result."""
+
+
+@dataclass(frozen=True)
+class FormalArg:
+    name: str
+    type: Type
+
+
+class StructType(Type):
+    """The static type of a struct value (and of the elements of struct
+    storage).  The type is an identity object mirroring one spy struct
+    type (``type.StructType``); two structs are equal only when they are
+    the same object, which is what keeps the types of one struct apart
+    from an accidentally identical one.
+
+    Fields are positional: ``fields[i]`` is the type of the i-th field,
+    in declaration order (the LLVM layout of the mirrored ``sllvm``
+    struct follows the same order).  ``spy_type`` is a back reference to
+    the spy-side descriptor, which carries the field names, the method
+    table and the Python-side ctypes class.
+    """
+
+    def __init__(
+        self,
+        spy_type: Any,
+        fields: tuple[FormalArg, ...],
+    ) -> None:
+        self.spy_type = spy_type
+        self.fields = fields
+        # the ctypes Structure subclass of the spy struct (set by the
+        # host when it builds the Python-side representation; used by
+        # ``lower`` to marshal by-value arguments)
+        self.ctype: Any = None
+
+    def __eq__(self, value: object, /) -> bool:
+        return self is value
+
+    def __hash__(self) -> int:
+        return object.__hash__(self)
+
+
+@dataclass(frozen=True)
 class PointerType(Type):
     elem: Type
 
@@ -66,12 +115,6 @@ class FunctionType(Type):
 
     args: tuple[Type, ...]
     return_type: Type
-
-
-@dataclass(frozen=True)
-class FormalArg:
-    name: str
-    type: Type
 
 
 def type_str(type: Type) -> str:
@@ -86,8 +129,12 @@ def type_str(type: Type) -> str:
             return ('i' if type.signed else 'u') + str(type.bits)
         case FloatType():
             return 'f' + str(type.bits)
+        case VoidType():
+            return 'void'
         case PointerType(elem):
             return '*' + type_str(elem)
+        case StructType():
+            return type.spy_type.name
         case FunctionType(args, ret):
             return f'fn({', '.join(type_str(a) for a in args)}) -> {type_str(ret)}'
         case _:
@@ -188,6 +235,28 @@ class Store(Inst):
 
 
 @dataclass(eq=False)
+class Gep(Inst):
+    """The address of a struct field: ``ptr`` must point at a struct
+    value and ``index`` names the field (by declaration index).  The
+    result is a pointer to the field; its type is computed here from the
+    static type of ``ptr`` (mirroring LLVM's ``getelementptr``)."""
+
+    ptr: Value
+    index: int
+
+    def __init__(self, ptr: Value, index: int) -> None:
+        self.ptr = ptr
+        self.index = index
+        ptype = ptr.type  # type: ignore[attr-defined]
+        if not isinstance(ptype, PointerType) or not isinstance(ptype.elem, StructType):
+            raise CompileError(
+                f'cannot take a field of a {type_str(ptype)} value '
+                '(field access requires a struct value)'
+            )
+        self.type: Type = PointerType(ptype.elem.fields[index].type)
+
+
+@dataclass(eq=False)
 class Arith(Inst):
     """Integer/float arithmetic.
 
@@ -244,9 +313,10 @@ class Call(Inst):
 @dataclass(eq=False)
 class Ret(Inst):
     """Return from the enclosing function; ends its region (no code of
-    the region is executed after a return)."""
+    the region is executed after a return).  ``value`` is None for a
+    void return (a ``ret void``)."""
 
-    value: Value
+    value: Value | None
 
 
 @dataclass(eq=False)

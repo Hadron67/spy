@@ -290,3 +290,21 @@ class IdentityObj:
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
+
+class IndexedMap[K, V]:
+    def __init__(self) -> None:
+        self._by_id: list[V] = []
+        self._by_key: dict[K, int] = {}
+
+    def add(self, key: K, value: V) -> int:
+        assert key not in self._by_key
+        id = len(self._by_id)
+        self._by_key[key] = id
+        self._by_id.append(value)
+        return id
+
+    def get_by_id(self, id: int) -> V:
+        return self._by_id[id]
+
+    def get_by_key(self, key: K) -> V:
+        return self._by_id[self._by_key[key]]

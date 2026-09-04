@@ -124,7 +124,7 @@ class FunctionValue(Value):
         fn: PyFunctionType,
         hir: FunctionIR,
         args: tuple[FormalArg, ...],
-        ret: Type,
+        ret: Type | None,
         mir_fn: mir.Function | None = None,
     ) -> None:
         self.fn = fn
@@ -137,7 +137,9 @@ class FunctionValue(Value):
         # the parsed HIR of the function (see ``JitContext.hir_of``)
         self.hir = hir
         self.args = args
-        self.ret = ret
+        # the declared return type, or None when it is inferred from the
+        # body (an ``aot`` method without a return annotation)
+        self.ret: Type | None = ret
         self.mir_fn = mir_fn
 
         self.native_fn: NativeFn | None = None
@@ -150,7 +152,9 @@ class FunctionValue(Value):
 
     @override
     def type(self) -> Type:
-        return PointerType(FunctionType(self.args, self.ret), True)
+        ret = self.ret
+        assert ret is not None, 'the function is still being typed'
+        return PointerType(FunctionType(self.args, ret), True)
 
 
 # A registered spy function of either kind: the per-function entry of

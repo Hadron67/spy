@@ -18,7 +18,9 @@ are equal), which is what makes the compile-time comparisons in
 
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import override
+from typing import Any, override
+
+from .errors import SpyError
 
 INT_DEFAULT_BITS = 32
 """A plain Python ``int`` argument is mapped to this signedness/width by
@@ -50,6 +52,19 @@ TYPE_TYPE = TypeType(0)
 @dataclass(frozen=True)
 class BoolType(Type):
     """The boolean type; values are ``i1`` at the LLVM level."""
+
+    @override
+    def type(self) -> Type:
+        return TYPE_TYPE
+
+
+@dataclass(frozen=True)
+class VoidType(Type):
+    """The type of ``None``: the return type of a function that returns no
+    value (declared as ``-> None``, or inferred for a body without value
+    returns).  It is a spy type only in the signature of such functions;
+    there are no runtime values of this type (a call of a void function
+    produces no value)."""
 
     @override
     def type(self) -> Type:
@@ -87,6 +102,104 @@ class FunctionType(Type):
     return_type: Type
 
 
+@dataclass(frozen=True)
+class StructField:
+    name: str
+    type: Type
+
+
+class StructType(Type):
+    """A spy struct type: the object ``@cache.struct()`` binds to the class
+    name.  It doubles as the Python-side constructor of struct *values*:
+    calling ``Foo(a, b)`` creates a native struct instance whose memory
+    follows the LLVM layout (see ``_py_cls``).
+
+    The identity of the object *is* the identity of the type (two structs
+    are equal only if they are the same object), which is what makes
+    ``spy.type(x) == Foo`` work.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._fields: list[StructField] = []
+        # the spy methods of the struct, by name.  ``@cache.struct``
+        # extracts them from the Python class when the struct is created
+        # (a decorated method contributes its registration handle, a
+        # plain function stays a plain function and is inlined on call);
+        # methods may also be added later, including methods that have no
+        # counterpart in the Python class
+        self.methods: dict[str, Any] = {}
+        # the ``__init__`` method (a registration handle) of a
+        # user-provided constructor, or None when the default constructor
+        # (which writes the arguments into the fields in declaration
+        # order) applies
+        self.custom_init: Any | None = None
+        # the Python-side callable that constructs struct instances
+        # (``Foo(a, b)``); installed by the host when the struct is
+        # created
+        self._py_init: Any = None
+        # the Python class of the struct instances (a ctypes.Structure
+        # subclass mirroring the LLVM layout); installed by the host
+        self._py_cls: Any = None
+        # the MIR mirror of the type, created lazily when a function
+        # body needs it (see ``interp.to_mir_type``)
+        self._mir: Any | None = None
+
+    def add_field(self, name: str, type: Type) -> None:
+        assert all(f.name != name for f in self._fields)
+        self._fields.append(StructField(name, type))
+
+    @property
+    def fields(self) -> tuple[StructField, ...]:
+        return tuple(self._fields)
+
+    def field_index(self, name: str) -> int | None:
+        """The declaration index of the field ``name``, or None when the
+        struct has no such field."""
+        for i, field in enumerate(self._fields):
+            if field.name == name:
+                return i
+        return None
+
+    def field_type(self, name: str) -> Type | None:
+        """The spy type of the field ``name``."""
+        index = self.field_index(name)
+        return self._fields[index].type if index is not None else None
+
+    def method_of(self, name: str) -> Any:
+        """The spy method ``name`` of the struct: its registration handle
+        (a decorated ``@aot``/``@jit`` method) or its plain function
+        (inlined on call).  Raises a ``KeyError`` when the struct has no
+        such method."""
+        return self.methods[name]
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Python-side construction of a struct value: ``Foo(a, b)``
+        allocates a native instance and runs the struct's constructor
+        (the ``__init__`` method, or the default field-wise constructor)
+        on it."""
+        if self._py_init is None:
+            raise SpyError(
+                f'struct {self.name} is not bound to a JitContext; '
+                'define it with @cache.struct() and construct it after the '
+                'module has loaded'
+            )
+        return self._py_init(*args, **kwargs)
+
+    def __repr__(self) -> str:
+        return f'<spy struct {self.name}>'
+
+    @override
+    def type(self) -> Type:
+        return TYPE_TYPE
+
+    def __eq__(self, value: object, /) -> bool:
+        return self is value
+
+    def __hash__(self) -> int:
+        return object.__hash__(self)
+
+
 # ---------------------------------------------------------------------------
 # function values
 # ---------------------------------------------------------------------------
@@ -120,6 +233,10 @@ def type_str(type: Type) -> str:
             return f'fn({', '.join(type_str(a.type) for a in args)}) -> {type_str(ret)}'
         case AnyFunction():
             return 'any fn'
+        case VoidType():
+            return 'void'
+        case StructType():
+            return type.name
         case _:
             return str(type)
 
@@ -148,6 +265,12 @@ def value_type(value: object) -> Type | None:
             # own type they are represented by a const pointer to u8
             return PointerType(IntType(8, False), is_const=True)
         case _:
+            # a struct instance knows its spy struct type: its Python
+            # class (built by the host) carries a back reference
+            cls = type(value)
+            descriptor = getattr(cls, '__spy_struct_type__', None)
+            if descriptor is not None:
+                return descriptor
             return None
 
 
@@ -163,4 +286,8 @@ def value_repr(value: object) -> str:
         case bool():
             return 'bool'
         case _:
+            cls = type(value)
+            descriptor = getattr(cls, '__spy_struct_type__', None)
+            if descriptor is not None:
+                return f'a {descriptor.name} struct'
             return repr(value)

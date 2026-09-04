@@ -107,6 +107,32 @@ class Store(Inst):
 
 
 @dataclass(eq=False)
+class FieldAddr(Inst):
+    """The address of the field ``name`` of the struct ``base`` points
+    at.  ``base`` denotes the *storage* of a struct value: the slot of a
+    variable (an ``Alloca``), or the address of a nested field (another
+    ``FieldAddr``); the interpreter resolves it - and the field's type -
+    from the static type it has typed ``base`` with (see ``interp``)."""
+
+    base: Value
+    name: str
+
+
+@dataclass(eq=False)
+class CallMethod(Inst):
+    """A call of the method ``name`` of the struct ``base`` points at
+    (result-location semantics like :class:`CallInplace`): the method is
+    resolved from the static type of the struct and the ``self``
+    argument is injected by the interpreter according to the method's
+    ``ptr_self`` mode."""
+
+    base: Value
+    name: str
+    args: tuple[Value, ...]
+    ret: Value
+
+
+@dataclass(eq=False)
 class CallInplace(Inst):
     """A call whose result is written into a *result location* (RLS),
     like Zig: ``ret`` is the pointer the callee's result goes to and the
@@ -159,7 +185,10 @@ class Unary(Inst):
 
 @dataclass(eq=False)
 class Ret(Inst):
-    value: Value
+    """Return from the function.  ``value`` is None for a bare ``return``
+    of a void function."""
+
+    value: Value | None
 
 
 @dataclass(eq=False)

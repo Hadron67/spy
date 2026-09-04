@@ -51,12 +51,12 @@ import ast
 import inspect
 import textwrap
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from . import hir
 from .errors import CompileError, TypeMismatchError
 from .fn import FunctionIR, ParamDef
-from .type import Type, type_str, value_type
+from .type import Type, VoidType, type_str, value_type
 
 _BIN_OPS = {
     ast.Add: '+',
@@ -136,9 +136,8 @@ class _Builder:
         fn_name = self._fn_ir.name
         match node:
             case ast.Return():
-                if node.value is None:
-                    raise CompileError(f"bare 'return' is not supported yet in spy function {fn_name}")
-                self.add(hir.Ret(self._gen_value(node.value)))
+                value = None if node.value is None else self._gen_value(node.value)
+                self.add(hir.Ret(value))
             case ast.Pass():
                 pass
             case ast.Expr():
@@ -174,23 +173,47 @@ class _Builder:
     # -- variables ------------------------------------------------------------
 
     def _gen_assign(self, target: ast.expr, value: ast.expr) -> None:
-        """One ``name = expr`` statement.  The first ``=`` on ``name``
-        in the current block declares a block-local variable (a fresh
-        slot, shadowing any outer binding); later assignments in the
-        block only store into its slot."""
-        if isinstance(target, ast.Name) and self._scope.bindings.get(target.id) is None:
-            # the slot is bound before the initializer is generated, so
-            # a self-referencing declaration (``y = y + 1``) reads the
-            # not-yet-stored slot - a compile error when it runs, like
-            # an unbound local - instead of silently reading an outer
-            # ``y``
-            self._scope.bindings[target.id] = self.add(hir.Alloca())
-        self.add(hir.Store(self._gen_ref(target), self._gen_value(value)))
+        """One ``target = expr`` statement.  The first ``=`` on a name
+        declares a block-local variable (a fresh slot, shadowing any
+        outer binding); later assignments in the block only store into
+        its slot.  A call on the right hand side writes its result
+        straight into the target slot (result-location semantics): a
+        constructor ``x = Bar(...)`` fills the fields of the slot in
+        place, and a scalar call result is only recorded in it."""
+        if isinstance(target, ast.Name):
+            slot = self._scope.bindings.get(target.id)
+            if slot is None:
+                # the slot is bound before the initializer is generated, so
+                # a self-referencing declaration (``y = y + 1``) reads the
+                # not-yet-stored slot - a compile error when it runs, like
+                # an unbound local - instead of silently reading an outer
+                # ``y``
+                slot = self.add(hir.Alloca())
+                self._scope.bindings[target.id] = slot
+            if isinstance(value, ast.Call):
+                self._gen_call(value, slot)
+                return
+            self.add(hir.Store(slot, self._gen_value(value)))
+        elif isinstance(target, ast.Attribute):
+            # assignment to a field of a runtime struct value (``x.h =
+            # e``): store through the address of the field
+            if self._attr_runtime(target):
+                self.add(hir.Store(self._addr_of(target), self._gen_value(value)))
+                return
+            raise CompileError(
+                f"cannot assign to the attribute of a compile-time value "
+                f"(function {self._fn_ir.name})"
+            )
+        else:
+            raise CompileError(
+                f"unsupported assignment target in spy function {self._fn_ir.name}"
+            )
 
     def _gen_augassign(self, node: ast.AugAssign) -> None:
-        """One ``name += expr`` statement: read the slot of ``name``,
-        add the value, store the result back.  ``+=`` never declares: it
-        requires the name to be declared."""
+        """One ``name += expr`` statement: read the value, add ``expr``
+        and store the result back.  The target is a variable slot or the
+        address of a field of a runtime struct value (``self.h += e``);
+        ``+=`` never declares: it requires the name to be declared."""
         fn_name = self._fn_ir.name
         if not isinstance(node.op, ast.Add):
             raise CompileError(f"only '+=' is supported yet in spy function {fn_name}")
@@ -276,8 +299,10 @@ class _Builder:
 
     def _gen_ref(self, node: ast.expr) -> hir.Value:
         """A reference to the value of ``node`` (see ``_gen_expr``):
-        addressable names give their slot, everything else gives a
-        pointer to a freshly allocated slot holding its value."""
+        addressable names give their slot, the fields of a runtime
+        struct value give their address (a :class:`hir.FieldAddr`
+        chain), everything else gives a pointer to a freshly allocated
+        slot holding its value."""
         match node:
             case ast.Name():
                 slot = self._scope.lookup(node.id)
@@ -289,6 +314,9 @@ class _Builder:
                 # already a reference
                 return self._resolve_global(node.id)
             case ast.Attribute():
+                if self._attr_runtime(node):
+                    # the field of a runtime struct value: its address
+                    return self._addr_of(node)
                 # attribute chains on compile-time objects fold to a
                 # ``hir.Const`` leaf, which is its own reference
                 return self._gen_value(node)
@@ -296,6 +324,51 @@ class _Builder:
                 loc = self.add(hir.Alloca())
                 self._gen_result_loc(node, loc)
                 return loc
+
+    # -- struct values ---------------------------------------------------------
+
+    @staticmethod
+    def _attr_root(node: ast.Attribute) -> ast.Name | None:
+        """The Name an attribute chain is rooted at: ``x.f.g`` returns
+        ``x``, ``spy.type`` returns ``spy``."""
+        while isinstance(node, ast.Attribute):
+            node = node.value  # type: ignore[assignment]
+        if isinstance(node, ast.Name):
+            return node
+        return None
+
+    def _attr_runtime(self, node: ast.expr) -> bool:
+        """Whether ``node`` is an attribute chain rooted at a *variable*
+        (a parameter or a local): only then is the attribute a field of a
+        runtime struct value (chains rooted at globals - ``spy.u64``,
+        ``spy.type``, ... - fold at compile time instead)."""
+        root = self._attr_root(node) if isinstance(node, ast.Attribute) else None
+        return root is not None and self._scope.lookup(root.id) is not None
+
+    def _addr_of(self, node: ast.expr) -> hir.Value:
+        """The address of the struct storage ``node`` denotes: the slot
+        of a variable, or the address of a nested field of one.  The
+        address of a chain ``x.f.g`` is the address of the innermost
+        field; the interpreter resolves each step from the static type it
+        has typed the storage with (a ``FieldAddr`` instruction carries
+        the field name only)."""
+        fn_name = self._fn_ir.name
+        match node:
+            case ast.Name():
+                slot = self._scope.lookup(node.id)
+                if slot is not None:
+                    return slot
+                raise CompileError(
+                    f"cannot access fields of the global value '{node.id}' in spy "
+                    f'function {fn_name}: only struct variables are addressable'
+                )
+            case ast.Attribute():
+                return self.add(hir.FieldAddr(self._addr_of(node.value), node.attr))
+            case _:
+                raise CompileError(
+                    f"attribute access on the result of an expression is not supported "
+                    f"yet in spy function {fn_name} (only on variables)"
+                )
 
     def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value) -> None:
         """Evaluate ``node`` writing its result into ``result_loc``
@@ -308,17 +381,32 @@ class _Builder:
                         f"calls with keyword arguments inside spy functions are not supported yet "
                         f"(function {fn_name})"
                     )
-                # the callee must be addressable (a reference), the
-                # arguments are by-value values
-                callee = self._gen_ref(node.func)
-                args = tuple(self._gen_value(a) for a in node.args)
-                self.add(hir.CallInplace(callee, args, result_loc))
+                self._gen_call(node, result_loc)
             case _:
                 # every other expression computes a value first; only the
                 # call (and, later, the ``if`` expression) can write
                 # through a result location without materializing a value
                 value = self._gen_value(node)
                 self.add(hir.Store(result_loc, value))
+
+    def _gen_call(self, node: ast.Call, result_loc: hir.Value) -> None:
+        """One call whose result is written into ``result_loc``: a method
+        call ``x.h(...)`` on a runtime struct value, or an ordinary call
+        (a spy function, a constructor ``Foo(...)``, an inlined plain
+        function or a spy builtin)."""
+        if isinstance(node.func, ast.Attribute) and self._attr_runtime(node.func):
+            # a method of the struct ``base``: the method and its self
+            # parameter are resolved by the interpreter from the static
+            # type of the base; only the base's address is carried here
+            base = self._addr_of(node.func.value)
+            args = tuple(self._gen_value(a) for a in node.args)
+            self.add(hir.CallMethod(base, node.func.attr, args, result_loc))
+            return
+        # the callee must be addressable (a reference), the arguments are
+        # by-value values
+        callee = self._gen_ref(node.func)
+        args = tuple(self._gen_value(a) for a in node.args)
+        self.add(hir.CallInplace(callee, args, result_loc))
 
     def _gen_value(self, node: ast.expr) -> hir.Value:
         """Evaluate ``node`` producing its value in a register (the plain
@@ -336,6 +424,12 @@ class _Builder:
                     return self.add(hir.Load(slot))
                 return self._resolve_global(node.id)
             case ast.Attribute():
+                if self._attr_runtime(node):
+                    # a field of a runtime struct value: read it through
+                    # the address of the (innermost) field - the chain is
+                    # addressable, so no intermediate struct value is
+                    # materialized
+                    return self.add(hir.Load(self._addr_of(node)))
                 base = self._gen_value(node.value)
                 if isinstance(base, hir.Const) and not isinstance(
                     base.value, (int, float, str, bool, type(None))
@@ -431,6 +525,12 @@ def parse_function(fn: Callable) -> FunctionIR:
     # re-evaluating the source: Python already evaluated the annotations
     # (PEP 695 annotations may evaluate lazily on access) and the default
     # values when it created the function.
+    # ``fn.__annotations__`` holds the evaluated annotations; the return
+    # annotation is normalized here: ``None`` (no ``->`` written) stays
+    # ``None``, and an explicit ``-> None`` becomes the spy ``VoidType``
+    # (so that the two can be told apart - the first one lets the return
+    # type be inferred from the body, the second declares a void
+    # function).
     try:
         annotations = fn.__annotations__
         defaults = fn.__defaults__ if fn.__defaults__ is not None else ()
@@ -438,6 +538,12 @@ def parse_function(fn: Callable) -> FunctionIR:
         raise CompileError(
             f"cannot read the annotations of function {node.name}: {e}"
         ) from e
+    if 'return' not in annotations:
+        ret_annotation: Any = None
+    elif annotations['return'] is None:
+        ret_annotation = VoidType()
+    else:
+        ret_annotation = annotations['return']
 
     # ``fn.__type_params__`` exposes the declared PEP 695 type parameters
     # (Python 3.13+); the AST ``[T]`` syntax may parse on 3.12, but the
@@ -465,7 +571,7 @@ def parse_function(fn: Callable) -> FunctionIR:
         default_value = defaults[i - offset] if has_default else None
         params.append(ParamDef(arg.arg, annotations.get(arg.arg), has_default, default_value))
 
-    ir = FunctionIR(fn, node.name, tuple(type_params), tuple(params), annotations.get('return'), ())
+    ir = FunctionIR(fn, node.name, tuple(type_params), tuple(params), ret_annotation, ())
 
     # prologue: every parameter is addressable, so allocate one slot per
     # parameter and store its by-value argument into it.  The function

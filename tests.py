@@ -32,6 +32,7 @@ from . import (
     f64,
     hir,
     i32,
+    u32,
     u64,
 )
 from . import as_ as spy_as
@@ -841,4 +842,381 @@ class RlsHirTest(TestCase):
         self.assertIs(cmp.lhs, load)
 
 
-all_tests = [SpyExampleTest, RlsHirTest]
+# ---------------------------------------------------------------------------
+# structs
+# ---------------------------------------------------------------------------
+
+
+def make_struct_samples(cache: JitContext) -> dict[str, object]:
+    """Define the spy structs and functions of the struct tests (the
+    example of the spy README) into ``cache``."""
+
+    @cache.struct()
+    class Foo:
+        a: u64
+        b: u32
+
+    @cache.struct()
+    class Bar:
+        foo: Foo
+        h: i32
+
+        @cache.aot(ptr_self=True)  # ``self`` is passed by pointer
+        def hkm(self):
+            self.foo.a += 34
+            self.h += 2
+
+    @cache.aot()
+    def example(bar: Bar) -> None:
+        # ``bar`` is a by-value copy; a struct is created inside the
+        # jitted function and a method is called on it
+        bar.hkm()
+        bar1 = Bar(Foo(1, 3), 5)
+        bar1.hkm()
+
+    @cache.struct()
+    class Counter:
+        x: i32
+
+        @cache.aot(ptr_self=True)
+        def add1(self):
+            self.x += 1
+
+        @cache.aot(ptr_self=True)
+        def addn(self, n: i32) -> None:
+            self.x += n
+
+        @cache.aot(ptr_self=True)
+        def add2(self):
+            # a method that calls another method of the same struct
+            self.add1()
+            self.add1()
+
+        @cache.aot()  # by-value ``self``
+        def get(self) -> i32:
+            return self.x
+
+        @cache.aot(ptr_self=True)
+        def bump_if_negative(self) -> None:
+            # a void method with a runtime if and an early return
+            if self.x < 0:
+                return
+            self.x += 1
+
+        def double(self) -> i32:
+            # a plain (undecorated) method: inlined when called
+            return self.x * 2
+
+        @cache.jit(ptr_self=True)
+        def jit_inc(self, k):
+            # a jit method: its other parameter is typed by the call
+            self.x += k
+
+    @cache.aot()
+    def use_counter(c: Counter) -> i32:
+        c.add1()
+        c.addn(5)
+        c.add2()
+        return c.get() + c.double()
+
+    @cache.struct()
+    class Cfg:
+        n: i32
+
+        @cache.aot(ptr_self=True)
+        def set_double(self, v: i32):
+            # construct a struct inside a jit method and copy a field out
+            t = Cfg(v * 2)
+            self.n = t.n
+
+    @cache.struct()
+    class WithInit:
+        a: i32
+        b: i32
+
+        def __init__(self, a, k=2):
+            # a custom (plain) constructor: ``self`` is the result pointer
+            self.a = a
+            self.b = a + k
+
+    @cache.jit()
+    def is_bar(b):
+        # a compile-time dispatch on the struct type of the argument
+        if spy_type(b) == Bar:
+            return 1
+        return 0
+
+    @cache.jit()
+    def jit_sum(foo):
+        # a jit function over an unannotated struct parameter: constants
+        # adopt the type of the u64 field they are combined with
+        return foo.a + 2
+
+    return {
+        'Foo': Foo,
+        'Bar': Bar,
+        'example': example,
+        'Counter': Counter,
+        'use_counter': use_counter,
+        'Cfg': Cfg,
+        'WithInit': WithInit,
+        'is_bar': is_bar,
+        'jit_sum': jit_sum,
+    }
+
+
+def _make_struct_bad_field(cache: JitContext) -> tuple[Any, Any]:
+    @cache.struct()
+    class Wrong:
+        x: i32
+
+    @cache.aot()
+    def use(w: Wrong) -> i32:
+        return w.y
+
+    return use, Wrong
+
+
+class StructTest(TestCase):
+    # the sample structs/functions of this test's context (built by
+    # setUp from make_struct_samples)
+    Foo: Any
+    Bar: Any
+    example: Any
+    Counter: Any
+    use_counter: Any
+    Cfg: Any
+    WithInit: Any
+    is_bar: Any
+    jit_sum: Any
+
+    def setUp(self) -> None:
+        self.cache = JitContext()
+        for name, value in make_struct_samples(self.cache).items():
+            setattr(self, name, value)
+
+    # -- the README example --------------------------------------------------
+
+    def test_readme_example(self) -> None:
+        bar = self.Bar(self.Foo(1, 2), 3)
+        self.assertEqual((bar.foo.a, bar.foo.b, bar.h), (1, 2, 3))
+        # example receives ``bar`` by value: its mutations are local
+        self.example(bar)
+        self.assertEqual(bar.h, 3)
+        self.assertEqual(bar.foo.a, 1)
+        # a Python-side method call: ``ptr_self`` passes the address of
+        # the instance's native memory, so the method modifies it in place
+        bar.hkm()
+        self.assertEqual(bar.h, 5)
+        self.assertEqual(bar.foo.a, 35)
+
+    def test_python_construction_checks(self) -> None:
+        with self.assertRaises(TypeMismatchError):
+            self.Bar(1.5, 2)
+        with self.assertRaises(TypeMismatchError):
+            self.Bar(self.Foo(1, 2), 2**31)
+        with self.assertRaises(TypeError):
+            self.Bar(self.Foo(1, 2))
+        with self.assertRaises(TypeError):
+            self.Bar(self.Foo(1, 2), 3, extra=1)
+        # keyword arguments construct by field name
+        bar = self.Bar(foo=self.Foo(1, 2), h=3)
+        self.assertEqual(bar.h, 3)
+        # out-of-range u64 values are rejected on construction
+        with self.assertRaises(TypeMismatchError):
+            self.Foo(2**64, 1)
+
+    def test_by_value_params_are_copies(self) -> None:
+        @self.cache.aot()
+        def mutate(f: self.Foo) -> u64:  # type: ignore[name-defined]
+            f.a = 100
+            f.b += 1
+            return f.a
+
+        foo = self.Foo(1, 2)
+        self.assertEqual(mutate(foo), 100)
+        # the Python value is untouched: the callee worked on a copy
+        self.assertEqual((foo.a, foo.b), (1, 2))
+
+    def test_by_value_copy_has_c_semantics(self) -> None:
+        # ``b2 = bar`` copies; mutating the copy does not change ``bar``
+        @self.cache.aot()
+        def f(p: self.Bar) -> i32:  # type: ignore[name-defined]
+            b2 = p
+            b2.h += 100
+            return p.h
+
+        bar = self.Bar(self.Foo(1, 2), 3)
+        self.assertEqual(f(bar), 3)
+
+    def test_cross_module_by_value_struct_call(self) -> None:
+        # ``read_bar`` is compiled first; ``call_read`` references it as
+        # an extern symbol of an earlier module (its struct parameter is
+        # passed by pointer across the module boundary)
+        @self.cache.aot()
+        def read_bar(b: self.Bar) -> i32:  # type: ignore[name-defined]
+            return b.h
+
+        bar = self.Bar(self.Foo(1, 2), 7)
+        self.assertEqual(read_bar(bar), 7)
+
+        @self.cache.aot()
+        def call_read(c: self.Bar) -> i32:  # type: ignore[name-defined]
+            return read_bar(c) + 1
+
+        self.assertEqual(call_read(bar), 8)
+        # the Python value is untouched by either call
+        self.assertEqual(bar.h, 7)
+
+    def test_field_access_and_assignment(self) -> None:
+        @self.cache.aot()
+        def pick(p: self.Bar) -> i32:  # type: ignore[name-defined]
+            p.h = p.h + 7
+            q = p.foo
+            q.b = q.b + 1
+            return p.h
+
+        bar = self.Bar(self.Foo(1, 2), 3)
+        self.assertEqual(pick(bar), 10)
+        self.assertEqual(bar.h, 3)
+
+    def test_nested_struct_in_field_assignment(self) -> None:
+        # a constant and a loaded value stored into nested fields
+        @self.cache.aot()
+        def setter(b: self.Bar) -> u64:  # type: ignore[name-defined]
+            b.foo.a = 5
+            b.foo.a = b.foo.a + 1
+            return b.foo.a
+
+        bar = self.Bar(self.Foo(9, 2), 3)
+        self.assertEqual(setter(bar), 6)
+        self.assertEqual(bar.foo.a, 9)  # by value: unchanged
+
+    # -- methods -------------------------------------------------------------
+
+    def test_methods_from_spy_code(self) -> None:
+        # use_counter calls methods of its by-value copy; the Python
+        # instance is unchanged
+        c = self.Counter(10)
+        self.assertEqual(self.use_counter(c), 54)
+        self.assertEqual(c.x, 10)
+        # calling the method chain from Python mutates in place
+        c.add2()
+        self.assertEqual(c.x, 12)
+
+    def test_methods_mutate_in_place_from_python(self) -> None:
+        c = self.Counter(5)
+        c.addn(2)
+        self.assertEqual(c.x, 7)
+        c.jit_inc(100)
+        self.assertEqual(c.x, 107)
+
+    def test_by_value_self_getter(self) -> None:
+        c = self.Counter(41)
+        self.assertEqual(c.get(), 41)
+
+    def test_void_method_with_runtime_if(self) -> None:
+        c = self.Counter(5)
+        c.bump_if_negative()
+        self.assertEqual(c.x, 6)
+        neg = self.Counter(-5)
+        neg.bump_if_negative()
+        self.assertEqual(neg.x, -5)
+
+    def test_inlined_plain_method(self) -> None:
+        # ``use_counter`` calls the plain (undecorated) ``double`` method,
+        # which is inlined into the caller
+        c = self.Counter(20)
+        self.assertEqual(self.use_counter(c), 84)
+
+    def test_struct_constructed_inside_jit_method(self) -> None:
+        cfg = self.Cfg(0)
+        cfg.set_double(21)
+        self.assertEqual(cfg.n, 42)
+
+    def test_missing_method_error(self) -> None:
+        # calling a method the struct does not have is a compile error
+        @self.cache.aot()
+        def bad(c: self.Counter) -> i32:  # type: ignore[union-attr]
+            c.nope()
+            return c.x
+
+        with self.assertRaises(CompileError) as ctx:
+            bad(self.Counter(0))
+        self.assertIn("has no method named 'nope'", str(ctx.exception))
+
+    # -- constructors ---------------------------------------------------------
+
+    def test_custom_init(self) -> None:
+        w = self.WithInit(3)
+        self.assertEqual((w.a, w.b), (3, 5))
+        w2 = self.WithInit(10, 100)
+        self.assertEqual(w2.b, 110)
+        # keyword and default arguments
+        w3 = self.WithInit(a=1)
+        self.assertEqual(w3.b, 3)
+
+    # -- misc -----------------------------------------------------------------
+
+    def test_comptime_dispatch_on_struct_type(self) -> None:
+        bar = self.Bar(self.Foo(1, 2), 3)
+        self.assertEqual(self.is_bar(bar), 1)
+        self.assertEqual(self.is_bar(5), 0)
+
+    def test_jit_function_over_struct(self) -> None:
+        foo = self.Foo(1, 2)
+        self.assertEqual(self.jit_sum(foo), 3)
+        # a jit function over a struct with same-width fields
+        @self.cache.struct()
+        class Pair:
+            a: i32
+            b: i32
+
+        @self.cache.jit()
+        def add(pair):
+            return pair.a + pair.b
+
+        self.assertEqual(add(Pair(7, 9)), 16)
+
+    def test_extra_method_added_after_struct(self) -> None:
+        # a method may be attached to a struct after its creation, even
+        # when it has no counterpart in the Python class
+        @self.cache.aot()
+        def extra_get(self) -> i32:
+            return self.x * 10
+
+        self.Counter.methods['extra_get'] = extra_get  # type: ignore[assignment]
+
+        @self.cache.aot()
+        def run(c: self.Counter) -> i32:  # type: ignore[name-defined]
+            return c.extra_get()
+
+        self.assertEqual(run(self.Counter(4)), 40)
+
+    def test_void_jit_function(self) -> None:
+        # a jit function declared ``-> None``: its body may fall off the
+        # end and may use a bare ``return`` inside a runtime if
+        @self.cache.jit()
+        def noop() -> None:
+            pass
+
+        self.assertIsNone(noop())
+
+        @self.cache.jit()
+        def guard(x) -> None:
+            y = x * 2
+            if y > 0:
+                return  # an early void return
+            y = x  # the x <= 0 path falls through to the end
+
+        self.assertIsNone(guard(1))
+        self.assertIsNone(guard(-1))
+
+    def test_unknown_field_error(self) -> None:
+        fn, Wrong = _make_struct_bad_field(self.cache)
+        with self.assertRaises(CompileError) as ctx:
+            fn(Wrong(0))
+        self.assertIn("no field named 'y'", str(ctx.exception))
+
+
+all_tests = [SpyExampleTest, RlsHirTest, StructTest]

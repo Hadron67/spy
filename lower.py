@@ -31,7 +31,9 @@ from .mir import (
     IntType,
     IntValue,
     PointerType,
+    StructType,
     Type,
+    VoidType,
     type_str,
 )
 
@@ -59,21 +61,53 @@ _CTYPE_INT = {
 }
 
 
-def to_llvm_type(type: Type) -> sllvm.Type:
-    match type:
-        case BoolType():
-            return sllvm.IntType(1)
-        case IntType():
-            return sllvm.IntType(type.bits)
-        case FloatType():
-            return sllvm.FloatType(type.bits)
-        case PointerType(elem):
-            return sllvm.PointerType(to_llvm_type(elem))
-        case _:
-            raise CompileError(f"type {type_str(type)} cannot be lowered to LLVM yet")
+class _ModuleTypes:
+    """The LLVM types of one module: the struct types are created once
+    per module (their identity is what LLVM type compatibility checks
+    use), mirroring the MIR struct types of the functions being
+    lowered."""
+
+    def __init__(self) -> None:
+        self._structs: dict[StructType, sllvm.StructType] = {}
+
+    def to_llvm(self, type: Type) -> sllvm.Type:
+        match type:
+            case BoolType():
+                return sllvm.IntType(1)
+            case IntType():
+                return sllvm.IntType(type.bits)
+            case FloatType():
+                return sllvm.FloatType(type.bits)
+            case VoidType():
+                return sllvm.VoidType()
+            case PointerType(elem):
+                return sllvm.PointerType(self.to_llvm(elem))
+            case StructType():
+                ret = self._structs.get(type)
+                if ret is None:
+                    ret = sllvm.StructType(
+                        *(self.to_llvm(f.type) for f in type.fields)
+                    )
+                    self._structs[type] = ret
+                return ret
+            case _:
+                raise CompileError(f"type {type_str(type)} cannot be lowered to LLVM yet")
+
+    def struct_types(self) -> list[sllvm.Type]:
+        return list(self._structs.values())
+
+    def arg_llvm(self, type: Type) -> sllvm.Type:
+        """The LLVM type of one *parameter*: a by-value struct parameter
+        arrives as a pointer to the caller's struct (structs cross native
+        boundaries as pointers - ``ctypes`` and the LLVM ABI disagree on
+        aggregate by-value passing on some platforms)."""
+        if isinstance(type, StructType):
+            return sllvm.PointerType(self.to_llvm(type))
+        return self.to_llvm(type)
 
 
-def to_ctype(type: Type) -> type[ctypes._CDataType]:
+def to_ctype(type: Type) -> type[ctypes._CDataType] | None:
+    """The ctypes type of a *result*."""
     match type:
         case BoolType():
             return ctypes.c_bool
@@ -86,8 +120,21 @@ def to_ctype(type: Type) -> type[ctypes._CDataType]:
             return ctypes.c_float if type.bits == 32 else ctypes.c_double
         case PointerType():
             return ctypes.c_void_p
+        case VoidType():
+            # a void result: ctypes restype ``None``
+            return None
+        case StructType():
+            return type.ctype
         case _:
             raise CompileError(f"type {type_str(type)} has no ctypes mapping")
+
+
+def arg_ctype(type: Type) -> type[ctypes._CDataType]:
+    """The ctypes type of one *argument*: structs are passed as pointers
+    at native boundaries (see ``_ModuleTypes.arg_llvm``)."""
+    if isinstance(type, StructType):
+        return ctypes.c_void_p
+    return to_ctype(type)  # type: ignore[return-value]
 
 
 class _Lowerer:
@@ -99,10 +146,16 @@ class _Lowerer:
     ``define``; a call to a :class:`mir.Symbol` of an earlier module
     references a (cached) extern declaration."""
 
-    def __init__(self, llvm_fns: dict[str, sllvm.Function]) -> None:
+    def __init__(
+        self, llvm_fns: dict[str, sllvm.Function], types: _ModuleTypes
+    ) -> None:
         self._llvm_fns = llvm_fns
+        self._types = types
         self._lowered: dict[object, sllvm.Value] = {}
         self._declarations: dict[str, sllvm.DeclareFunction] = {}
+
+    def _to_llvm(self, type: Type) -> sllvm.Type:
+        return self._types.to_llvm(type)
 
     def lower(self, fn: mir.Function) -> None:
         """Lower the region tree of ``fn`` into its pre-created
@@ -129,8 +182,12 @@ class _Lowerer:
             return
         inst = insts[0]
         if isinstance(inst, mir.Ret):
-            value = self._value(inst.value, arg_values)
-            block.ret(value)
+            if inst.value is None:
+                # a void return (``ret void``)
+                block.ret(None)
+            else:
+                value = self._value(inst.value, arg_values)
+                block.ret(value)
             return
         if isinstance(inst, mir.If):
             cond = self._value(inst.cond, arg_values)
@@ -190,8 +247,8 @@ class _Lowerer:
         decl = self._declarations.get(symbol.name)
         if decl is None:
             fn_type = sllvm.fn_type(
-                to_llvm_type(symbol.fn_type.return_type),
-                *(to_llvm_type(t) for t in symbol.fn_type.args),
+                self._to_llvm(symbol.fn_type.return_type),
+                *(self._types.arg_llvm(t) for t in symbol.fn_type.args),
             )
             decl = sllvm.DeclareFunction(symbol.name, fn_type)
             self._declarations[symbol.name] = decl
@@ -206,7 +263,7 @@ class _Lowerer:
         result: sllvm.Value | None = None
         match inst:
             case mir.Alloca(t):
-                result = block.alloca(to_llvm_type(t.elem))
+                result = block.alloca(self._to_llvm(t.elem))
             case mir.Store():
                 ptr = self._value(inst.ptr, arg_values)
                 value = self._value(inst.value, arg_values)
@@ -214,6 +271,9 @@ class _Lowerer:
             case mir.Load():
                 ptr = self._value(inst.ptr, arg_values)
                 result = block.load(ptr)
+            case mir.Gep():
+                ptr = self._value(inst.ptr, arg_values)
+                result = block.get_element_ptr(ptr, 0, inst.index)
             case mir.Arith():
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)
@@ -234,7 +294,7 @@ class _Lowerer:
                         raise CompileError(f"unsupported MIR operation '{inst.op}'")
             case mir.Convert():
                 value = self._value(inst.value, arg_values)
-                to = to_llvm_type(inst.type)
+                to = self._to_llvm(inst.type)
                 match inst.kind:
                     case 'sitofp':
                         result = block.int_to_float(value, to)  # type: ignore[arg-type]
@@ -284,6 +344,7 @@ def compile_module(
     resolvable from it.
     """
     assert len({fn.name for fn in fns}) == len(fns), 'duplicate function names in one module'
+    types = _ModuleTypes()
 
     # create one sllvm.Function per MIR function up front: bodies may
     # call any function of the module, and the call sites need the
@@ -291,17 +352,25 @@ def compile_module(
     llvm_fns: dict[str, sllvm.Function] = {}
     for fn in fns:
         assert fn.ret_type is not None, f'function {fn.name} is not fully typed'
+        if isinstance(fn.ret_type, StructType):
+            raise CompileError(
+                f"functions that return a {type_str(fn.ret_type)} value are not "
+                f'supported yet (function {fn.name}): return its fields instead'
+            )
         llvm_fn = sllvm.Function(fn.name)
-        llvm_fn.add_args(*(to_llvm_type(a.type) for a in fn.args))
-        llvm_fn.set_return_type(to_llvm_type(fn.ret_type))
+        llvm_fn.add_args(*(types.arg_llvm(a.type) for a in fn.args))
+        llvm_fn.set_return_type(types.to_llvm(fn.ret_type))
         llvm_fns[fn.name] = llvm_fn
 
-    lowerer = _Lowerer(llvm_fns)
+    lowerer = _Lowerer(llvm_fns, types)
     for fn in fns:
         lowerer.lower(fn)
 
     mod = sllvm.Module()
     mod.add_recursively(values=[llvm_fns[fn.name] for fn in fns])
+    # register every struct type the module refers to (its writer needs
+    # the ``%struct = type {...}`` definitions)
+    mod.add_recursively(types=types.struct_types())
     lines = mod.write()
 
     target = llvm.Target.from_default_triple()
@@ -329,8 +398,9 @@ def compile_module(
     for fn in fns:
         assert fn.ret_type is not None, f'function {fn.name} is not fully typed'
         addr = engine.get_function_address(fn.name)
-        arg_ctypes = tuple(to_ctype(t) for t in (a.type for a in fn.args))
-        proto = ctypes.CFUNCTYPE(to_ctype(fn.ret_type), *arg_ctypes)
+        arg_ctypes = tuple(arg_ctype(t) for t in (a.type for a in fn.args))
+        restype = to_ctype(fn.ret_type)
+        proto = ctypes.CFUNCTYPE(restype, *arg_ctypes)  # type: ignore[arg-type]
         entry = ctypes.cast(addr, proto)
         ret = NativeFn(fn.name, tuple(a.type for a in fn.args), fn.ret_type, lines)
         ret._engine = engine

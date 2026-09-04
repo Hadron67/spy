@@ -22,6 +22,7 @@ resolved to its function entry when the reference runs (see
 ``interp``); calling it is compiled to a native ``call``.
 """
 
+import ctypes
 from types import FunctionType
 from typing import Any
 
@@ -43,12 +44,115 @@ from .type import (
     FormalArg,
     IntType,
     PointerType,
+    StructType as SpyStructType,
     Type,
     Value,
     int_range,
     type_str,
     value_type,
 )
+
+# ---------------------------------------------------------------------------
+# Python values of struct types: a struct instance is a ctypes.Structure
+# subclass instance whose memory follows the LLVM layout of the struct (so
+# native functions may read and - through a pointer parameter - modify it
+# in place).
+# ---------------------------------------------------------------------------
+
+
+class StructInstance(ctypes.Structure):
+    """The common base of the Python classes of struct instances (see
+    ``StructType._py_cls``).  Every instance knows its spy struct type
+    through the ``__spy_struct_type__`` attribute of its class."""
+
+
+_CTYPE_INT = {
+    (8, True): ctypes.c_int8,
+    (8, False): ctypes.c_uint8,
+    (16, True): ctypes.c_int16,
+    (16, False): ctypes.c_uint16,
+    (32, True): ctypes.c_int32,
+    (32, False): ctypes.c_uint32,
+    (64, True): ctypes.c_int64,
+    (64, False): ctypes.c_uint64,
+}
+
+
+def ctypes_of(type: Type) -> type:
+    """The ctypes field type mirroring the LLVM layout of a spy type."""
+    match type:
+        case BoolType():
+            return ctypes.c_bool
+        case IntType():
+            ct = _CTYPE_INT.get((type.bits, type.signed))
+            if ct is None:
+                raise CompileError(f"integer type {type_str(type)} has no ctypes mapping")
+            return ct
+        case FloatType():
+            return ctypes.c_float if type.bits == 32 else ctypes.c_double
+        case SpyStructType():
+            return type._py_cls
+        case _:
+            raise CompileError(
+                f"type {type_str(type)} cannot be stored in a struct field"
+            )
+
+
+def _coerce_py(value: object, target: Type, what: str) -> object:
+    """Convert one Python value to the representation the ctypes boundary
+    of ``target`` expects (range checks included), for the argument of a
+    struct constructor or a struct field."""
+    match target:
+        case BoolType():
+            if not isinstance(value, bool):
+                raise TypeMismatchError(
+                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"passed as {what} (expected bool)"
+                )
+            return bool(value)
+        case IntType():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeMismatchError(
+                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"passed as {what} (expected {type_str(target)})"
+                )
+            lo, hi = int_range(target)
+            if not lo <= value <= hi:
+                raise TypeMismatchError(
+                    f"integer {value} is out of range for type {type_str(target)} "
+                    f"in {what}"
+                )
+            return int(value)
+        case FloatType():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeMismatchError(
+                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"passed as {what} (expected {type_str(target)})"
+                )
+            try:
+                return float(value)
+            except OverflowError:
+                raise TypeMismatchError(
+                    f"cannot convert {value} to {type_str(target)} in {what}"
+                ) from None
+        case PointerType():
+            if not isinstance(value, str):
+                raise TypeMismatchError(
+                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"passed as {what} (expected a string)"
+                )
+            return value.encode('utf-8')
+        case SpyStructType():
+            if not isinstance(value, target._py_cls):
+                raise TypeMismatchError(
+                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"passed as {what} (expected a {target.name} struct)"
+                )
+            return value
+        case _:
+            raise TypeMismatchError(
+                f"type {type_str(target)} is not supported as {what}"
+            )
 
 
 def _sanitize(name: str) -> str:
@@ -94,46 +198,35 @@ def _marshal(fn_name: str, param_name: str, value: object, target: Type) -> obje
             )
         value = value.value
 
-    def fail() -> TypeMismatchError:
-        kind = 'a bool' if isinstance(value, bool) else f'a {type(value).__name__}'
-        return TypeMismatchError(
-            f"type mismatch: {kind} value cannot be passed as the '{param_name}' "
-            f"argument of {fn_name} (expected {type_str(target)})"
-        )
+    what = f"the '{param_name}' argument of {fn_name}"
+    if isinstance(target, PointerType) and isinstance(target.elem, SpyStructType):
+        # a struct *pointer* parameter (the ``self`` of a ``ptr_self``
+        # method): the Python instance is passed by reference - the
+        # callee sees (and may modify) its native memory
+        value = _coerce_py(value, target.elem, what)
+        return ctypes.addressof(value)  # type: ignore[arg-type]
+    if isinstance(target, SpyStructType):
+        # a by-value struct parameter: the callee copies it into its own
+        # storage at entry, so the instance is passed by reference and
+        # never modified
+        value = _coerce_py(value, target, what)
+        return ctypes.addressof(value)  # type: ignore[arg-type]
+    return _coerce_py(value, target, what)
 
-    match target:
-        case BoolType():
-            if not isinstance(value, bool):
-                raise fail()
-            return bool(value)
-        case IntType():
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise fail()
-            lo, hi = int_range(target)
-            if not lo <= value <= hi:
-                raise TypeMismatchError(
-                    f"integer {value} is out of range for type {type_str(target)} "
-                    f"in argument '{param_name}' of {fn_name}"
-                )
-            return int(value)
-        case FloatType():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise fail()
-            try:
-                return float(value)
-            except OverflowError:
-                raise TypeMismatchError(
-                    f"cannot convert {value} to {type_str(target)} in argument "
-                    f"'{param_name}' of {fn_name}"
-                ) from None
-        case PointerType():
-            if not isinstance(value, str):
-                raise fail()
-            return value.encode('utf-8')
-        case _:
-            raise TypeMismatchError(
-                f"type {type_str(target)} is not supported for arguments of {fn_name} yet"
-            )
+
+def _bound_method(handle: Any) -> Any:
+    """The Python method of a struct instance: ``bar.hkm()`` binds the
+    instance as the first argument of the method's registration
+    handle."""
+
+    def method(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return handle(self, *args, **kwargs)
+
+    method.__name__ = handle.__name__
+    method.__qualname__ = (
+        f'{handle._method.name}.{handle.__name__}' if handle._method else handle.__name__
+    )
+    return method
 
 
 class _RegisteredFunction:
@@ -143,21 +236,60 @@ class _RegisteredFunction:
     spy body references when it uses the function.  Registration itself
     never parses the function: the function entry - whose construction
     parses the body - is created at the first use and cached in
-    ``_entry`` (see ``entry``)."""
+    ``_entry`` (see ``entry``).
 
-    __slots__ = ('_context', '_entry', '_fn', '_kind', '_name_base')
+    A function decorated *inside a struct class* is a *method*: the
+    struct (``JitContext.struct``) marks its handle with the owning
+    struct type (``_method``).  Its first parameter is then ``self``,
+    typed by the struct instead of by an annotation, and Python-side
+    calls go through the instance (``bar.hkm()``); ``ptr_self`` decides
+    whether ``self`` is passed by value or by pointer.
+    """
 
-    def __init__(self, context: 'JitContext', fn: FunctionType, kind: str, name_base: str) -> None:
+    __slots__ = ('_context', '_entry', '_fn', '_kind', '_method', '_name_base', '_ptr_self')
+
+    def __init__(
+        self,
+        context: 'JitContext',
+        fn: FunctionType,
+        kind: str,
+        name_base: str,
+        ptr_self: bool = False,
+    ) -> None:
         self._context = context
         self._fn = fn
         self._kind = kind
         # the context-unique base name of the native symbols (see
         # ``JitContext._allocate_name``)
         self._name_base = name_base
+        # whether the first parameter of a method is passed by pointer
+        # (``@aot(ptr_self=True)``; meaningful only for methods)
+        self._ptr_self = ptr_self
+        # the owning struct type, when the function is the method of a
+        # struct (see ``JitContext.struct``)
+        self._method: SpyStructType | None = None
         # the function entry, created at the first use
         self._entry: FunctionEntry | None = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._method is not None:
+            # a method called from Python: the first argument is the
+            # struct instance (``bar.hkm()`` calls ``handle(bar)``)
+            if len(args) == 0:
+                raise TypeError(
+                    f'{self._fn.__name__}() is a spy method of {self._method.name}: '
+                    'call it on a struct instance, e.g. instance.hkm()'
+                )
+            instance = args[0]
+            if not isinstance(instance, self._method._py_cls):
+                raise TypeError(
+                    f'{self._fn.__name__}() is a spy method of '
+                    f'{self._method.name}: its first argument must be a '
+                    f'{self._method.name} instance'
+                )
+            return self._context._dispatch_method(
+                self, instance, args[1:], kwargs
+            )
         return self._context._dispatch(self.entry(), args, kwargs)
 
     def entry(self) -> FunctionEntry:
@@ -175,18 +307,52 @@ class _RegisteredFunction:
             return entry
         fn_ir = astgen.parse_function(self._fn)
         if self._kind == 'aot':
-            # resolve the fixed signature from the annotations
-            params = fn_ir.params
-            formal = astgen.solve_call_types(fn_ir, 'aot', (None,) * len(params))
-            ret = astgen.return_annotation_type(fn_ir)
-            args = tuple(FormalArg(params[i].name, formal[i]) for i in range(len(params)))
+            if self._method is None:
+                # resolve the fixed signature from the annotations
+                params = fn_ir.params
+                formal = astgen.solve_call_types(fn_ir, 'aot', (None,) * len(params))
+                ret = astgen.return_annotation_type(fn_ir)
+                args = tuple(FormalArg(params[i].name, formal[i]) for i in range(len(params)))
+            else:
+                args, ret = self._method_args(fn_ir)
             entry = FunctionValue(self._fn, fn_ir, args, ret)
-        else:
+        elif self._kind == 'jit':
             entry = LazyJitFunction(self._fn, fn_ir)
+        else:
+            raise ValueError(f'unknown function kind {self._kind!r}')
         entry.context = self._context
         entry.name_base = self._name_base
         self._entry = entry
         return entry
+
+    def _method_args(
+        self, fn_ir: astgen.FunctionIR
+    ) -> tuple[tuple[FormalArg, ...], Type | None]:
+        """The signature of an ``aot`` method: its first parameter is
+        ``self``, typed by the owning struct (by value, or by pointer
+        with ``ptr_self``); the other parameters are annotated like any
+        aot parameter; the return type is the declared one, or None when
+        it is inferred from the body (a method may return nothing)."""
+        assert self._method is not None
+        params = fn_ir.params
+        if len(params) == 0:
+            raise CompileError(
+                f'method {self._fn.__name__} of {self._method.name} must take '
+                "a 'self' parameter"
+            )
+        self_type: Type = self._method
+        if self._ptr_self:
+            self_type = PointerType(self._method)
+        args = [FormalArg(params[0].name, self_type)]
+        for param in params[1:]:
+            args.append(FormalArg(param.name, astgen.annotation_type(fn_ir, param)))
+        if fn_ir.ret_annotation is not None:
+            ret = astgen.return_annotation_type(fn_ir)
+        else:
+            # no return annotation: the return type is inferred from the
+            # body (a body that never returns a value is a void method)
+            ret = None
+        return tuple(args), ret
 
     @property
     def __name__(self) -> str:
@@ -222,26 +388,260 @@ class JitContext(FunctionResolver):
 
     # -- decorators ----------------------------------------------------------
 
-    def jit(self, fn: FunctionType | None = None):
+    def jit(self, fn: FunctionType | None = None, *, ptr_self: bool = False):
         """``@cache.jit()``: compile lazily at the first call, using the
         marshaled types of the arguments (annotations have no effect on
         the chosen argument types; type parameters like ``T`` unify the
         parameters, and a declared return annotation fixes the return
-        type of the specialization)."""
+        type of the specialization).  ``ptr_self`` is only meaningful for
+        a method defined inside a struct class (see ``struct``)."""
         if fn is not None:
-            return self._register(fn, 'jit')
-        return lambda f: self._register(f, 'jit')
+            return self._register(fn, 'jit', ptr_self)
+        return lambda f: self._register(f, 'jit', ptr_self)
 
-    def aot(self, fn: FunctionType | None = None):
+    def aot(self, fn: FunctionType | None = None, *, ptr_self: bool = False):
         """``@cache.aot()``: compile lazily at the first use from the
         (concrete) type annotations, which are required for every
-        parameter and for the return type.  Unlike a ``jit`` function
-        an ``aot`` function has exactly one specialization, fixed by its
-        annotations (a plain Python argument is still marshaled to the
-        annotated type)."""
+        parameter (except the ``self`` of a method) and for the return
+        type (except that a method without a return annotation infers it
+        from its body).  Unlike a ``jit`` function an ``aot`` function
+        has exactly one specialization, fixed by its annotations (a
+        plain Python argument is still marshaled to the annotated type).
+        ``ptr_self=True`` makes the ``self`` of a method a pointer
+        parameter (``def hkm(self: spy.ptr(Bar))``), so that the method
+        may modify the struct it is called on in place."""
         if fn is not None:
-            return self._register(fn, 'aot')
-        return lambda f: self._register(f, 'aot')
+            return self._register(fn, 'aot', ptr_self)
+        return lambda f: self._register(f, 'aot', ptr_self)
+
+    def struct(self, cls: type | None = None):
+        """``@cache.struct()``: turn a class whose annotations declare
+        spy-typed fields into a spy struct type (bound to the class
+        name).  Methods decorated with ``@cache.aot()``/``@cache.jit()``
+        inside the class are the spy methods of the struct; a plain
+        (undecorated) method is inlined on call; a ``def __init__``
+        becomes the user constructor (default: arguments are written
+        into the fields in declaration order)."""
+        if cls is not None:
+            return self._struct(cls)
+        return lambda c: self._struct(c)
+
+    # -- struct types ----------------------------------------------------------
+
+    def _struct(self, cls: type) -> SpyStructType:
+        """Build the spy struct type of ``cls``: the fields from the
+        annotations (in declaration order), the spy methods from the
+        class members, and the Python class of the instances (a ctypes
+        layout mirroring the LLVM struct)."""
+        annotations = getattr(cls, '__annotations__', {})
+        desc = SpyStructType(cls.__name__)
+        for name, annotation in annotations.items():
+            if not isinstance(annotation, Type):
+                raise CompileError(
+                    f"field '{name}' of struct {cls.__name__} has no spy type: "
+                    f'{annotation!r}'
+                )
+            desc.add_field(name, annotation)
+        self._check_struct_cycles(desc, [desc])
+        desc._py_cls = self._build_instance_class(cls, desc)
+        desc.__module__ = cls.__module__
+        # collect the spy methods out of the class; a method that is not
+        # decorated is a plain function and is inlined when called
+        for name, value in list(cls.__dict__.items()):
+            if name.startswith('__') and name != '__init__':
+                # ``__init__`` is the (optional) user constructor; other
+                # special members of the source class are ignored
+                continue
+            if name in ('__module__', '__qualname__', '__doc__', '__annotations__'):
+                continue
+            if isinstance(value, _RegisteredFunction):
+                if value._context is not self:
+                    raise CompileError(
+                        f"method {value.__name__} of struct {cls.__name__} is "
+                        'registered in another JitContext'
+                    )
+                if value._entry is not None:
+                    raise CompileError(
+                        f'method {value.__name__} of struct {cls.__name__} was '
+                        'used before its struct was defined'
+                    )
+                if name == '__init__':
+                    # a constructor always receives the result pointer
+                    value._ptr_self = True
+                else:
+                    # Python-side method calls go through the instance
+                    # (``bar.hkm()``), whose class carries a bound wrapper
+                    setattr(desc._py_cls, name, _bound_method(value))
+                value._method = desc
+                desc.methods[name] = value
+            elif isinstance(value, FunctionType):
+                if name == '__init__':
+                    # a plain ``__init__`` is registered as a jit-style
+                    # method (its arguments have no annotations to solve
+                    # from), with ``self`` bound to the result pointer
+                    value = self._register(value, 'jit', True)
+                    value._method = desc
+                    desc.methods[name] = value
+                else:
+                    desc.methods[name] = value
+                    setattr(desc._py_cls, name, value)
+            else:
+                raise CompileError(
+                    f"unsupported member '{name}' of struct class {cls.__name__}: "
+                    'struct classes may only contain annotated fields and spy '
+                    'methods'
+                )
+        self._build_constructor(desc)
+        return desc
+
+    def _check_struct_cycles(self, desc: SpyStructType, stack: list[SpyStructType]) -> None:
+        """Reject recursive struct definitions (a struct cannot contain a
+        struct value of its own type)."""
+        for field in desc.fields:
+            if isinstance(field.type, SpyStructType):
+                if field.type in stack:
+                    names = ' -> '.join(t.name for t in stack + [field.type])
+                    raise CompileError(f'recursive struct definition: {names}')
+                self._check_struct_cycles(field.type, stack + [field.type])
+
+    def _build_instance_class(self, cls: type, desc: SpyStructType) -> type:
+        """The Python class of the struct instances: a ctypes.Structure
+        subclass whose memory follows the LLVM layout of the struct (the
+        same layout the native code compiles against)."""
+        fields = [(f.name, ctypes_of(f.type)) for f in desc.fields]
+        py_cls = type(
+            cls.__name__,
+            (StructInstance,),
+            {'_fields_': fields, '__module__': cls.__module__, '__doc__': cls.__doc__},
+        )
+        py_cls.__spy_struct_type__ = desc  # type: ignore[attr-defined]
+        return py_cls
+
+    def _build_constructor(self, desc: SpyStructType) -> None:
+        """The Python-side constructor ``Foo(a, b)`` of a struct: create
+        the native instance and run the constructor (the ``__init__``
+        method, or the default field-wise constructor) on it."""
+
+        def construct(*args: Any, **kwargs: Any) -> Any:
+            py_cls = desc._py_cls
+            instance = py_cls()
+            if desc.methods.get('__init__') is not None:
+                # a user constructor: run it with ``self`` bound to the
+                # native memory of the new instance
+                handle = desc.methods['__init__']
+                self._dispatch_method(handle, instance, args, kwargs)
+                return instance
+            # the default constructor: arguments are the fields
+            self._write_fields(desc, instance, args, kwargs)
+            return instance
+
+        desc._py_init = construct
+
+    def _write_fields(
+        self,
+        desc: SpyStructType,
+        instance: StructInstance,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Write Python arguments into the fields of a fresh struct
+        instance (in declaration order; keyword arguments by field
+        name)."""
+        fields = desc.fields
+        bound: list[Any] = []
+        names = [f.name for f in fields]
+        if len(args) > len(fields):
+            raise TypeError(
+                f'{desc.name}() takes at most {len(fields)} arguments '
+                f'({len(args)} given)'
+            )
+        for i, value in enumerate(args):
+            bound.append((fields[i], value))
+        for key, value in kwargs.items():
+            if key not in names:
+                raise TypeError(f"{desc.name}() got an unexpected keyword argument '{key}'")
+            if key in [b[0].name for b in bound]:
+                raise TypeError(f"{desc.name}() got multiple values for argument '{key}'")
+            bound.append((fields[names.index(key)], value))
+        if len(bound) != len(fields):
+            missing = [n for n in names if n not in [b[0].name for b in bound]]
+            raise TypeError(f"{desc.name}() missing required argument '{missing[0]}'")
+        for field, value in bound:
+            converted = _coerce_py(value, field.type, f"field '{field.name}' of {desc.name}")
+            if isinstance(field.type, SpyStructType):
+                # copy the memory of the nested struct into the field
+                self._copy_memory(instance, field.name, converted)
+            else:
+                setattr(instance, field.name, converted)
+
+    @staticmethod
+    def _copy_memory(instance: StructInstance, field: str, value: Any) -> None:
+        """Copy the native memory of a nested struct instance into a
+        struct field of another instance."""
+        view = getattr(instance, field)
+        ctypes.memmove(ctypes.addressof(view), ctypes.addressof(value), ctypes.sizeof(view))
+
+    def _dispatch_method(
+        self,
+        handle: _RegisteredFunction,
+        instance: StructInstance,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """A Python-side call of a spy method on a struct instance
+        (``bar.hkm()``): bind the arguments to the parameters after
+        ``self``, marshal the instance according to ``ptr_self`` and
+        call the compiled method."""
+        entry = handle.entry()
+        fn_ir = entry.hir
+        name = entry.fn.__name__
+        assert handle._method is not None
+        desc = handle._method
+        params = fn_ir.params
+        if len(params) == 0:
+            raise TypeError(f'{name}() is missing its self parameter')
+        self_type: Type = PointerType(desc) if handle._ptr_self else desc
+
+        rest = params[1:]
+        names = [p.name for p in rest]
+        if len(args) > len(rest):
+            raise TypeError(
+                f'{name}() takes {len(rest)} positional arguments but {len(args)} were given'
+            )
+        present: dict[str, Any] = {}
+        for i, value in enumerate(args):
+            present[names[i]] = value
+        for key, value in kwargs.items():
+            if key not in names:
+                raise TypeError(f"{name}() got an unexpected keyword argument '{key}'")
+            if key in present:
+                raise TypeError(f"{name}() got multiple values for argument '{key}'")
+            present[key] = value
+
+        if isinstance(entry, FunctionValue):
+            formal = tuple(a.type for a in entry.args)
+        else:
+            # a jit method: solve the formal types from the marshaled
+            # arguments; ``self`` is pinned to its pointer/value type
+            provided: list[Type | None] = [self_type]
+            for param in rest:
+                if param.name in present:
+                    provided.append(_candidate_type(name, param.name, present[param.name]))
+                else:
+                    provided.append(None)
+            formal = astgen.solve_call_types(fn_ir, 'jit', tuple(provided))
+
+        marshaled = [_marshal(name, 'self', instance, self_type)]
+        for i, param in enumerate(rest):
+            if param.name in present:
+                value = present[param.name]
+            else:
+                if not param.has_default:
+                    raise TypeError(f"{name}() missing required argument '{param.name}'")
+                value = param.default_value
+            marshaled.append(_marshal(name, param.name, value, formal[i + 1]))
+        spec = self.ensure_spec(entry, formal)
+        return spec.call(*marshaled)
 
     # -- Python-side calls ---------------------------------------------------
 
@@ -492,6 +892,34 @@ class JitContext(FunctionResolver):
             return self._entries[value].entry()
         return None
 
+    @override
+    def resolve_method(self, struct: SpyStructType, name: str) -> tuple[Any, bool] | None:
+        """The spy method ``name`` of ``struct`` as seen from inside a
+        compiled function body (see :class:`FunctionResolver`): the
+        entry of the registered ``@aot``/``@jit`` method, or the plain
+        Python function of an undecorated method (which the interpreter
+        inlines), together with its ``ptr_self`` flag.  ``None`` when
+        the struct has no such method."""
+        method = struct.methods.get(name)
+        if method is None:
+            return None
+        if isinstance(method, _RegisteredFunction):
+            if method._method is None:
+                method._method = struct
+                if name == '__init__':
+                    method._ptr_self = True
+            if method._context is not self:
+                raise CompileError(
+                    f"cannot call method {method.__name__} of struct "
+                    f'{struct.name} from another JitContext'
+                )
+            return method.entry(), method._ptr_self
+        if isinstance(method, FunctionType):
+            return method, False
+        raise CompileError(
+            f'method {name} of struct {struct.name} is not a spy method'
+        )
+
     def _declared_ret_type(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> Type | None:
         """The concrete spy return type of one specialization declared by
         its annotations, or ``None`` when none is declared.
@@ -546,7 +974,9 @@ class JitContext(FunctionResolver):
 
     # -- internals -----------------------------------------------------------
 
-    def _register(self, fn: FunctionType, kind: str) -> _RegisteredFunction:
+    def _register(
+        self, fn: FunctionType, kind: str, ptr_self: bool = False
+    ) -> _RegisteredFunction:
         if not isinstance(fn, FunctionType):
             raise TypeError('spy decorators can only be applied to plain Python functions')
         if fn in self._entries:
@@ -556,7 +986,7 @@ class JitContext(FunctionResolver):
         # context-unique base name of the native symbols; the function
         # entry - whose construction parses the body - is created at the
         # first use (see ``_RegisteredFunction.entry``)
-        registered = _RegisteredFunction(self, fn, kind, self._allocate_name(fn))
+        registered = _RegisteredFunction(self, fn, kind, self._allocate_name(fn), ptr_self)
         self._entries[fn] = registered
         return registered
 
