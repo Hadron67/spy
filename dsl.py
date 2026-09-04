@@ -1,10 +1,10 @@
 """The user-facing DSL: ``JitContext`` with the ``jit`` and ``aot``
 decorators.
 
-A decorated function becomes a *function value* (``LazyJitFunction``
-for ``jit``, ``FunctionValue`` for ``aot``), mounted as ``_spy_entry``
-on the function object; Python-side calls go through a thin callable
-view bound to its context.  At call time the view
+A decorated function is *registered* in its context - its entry is
+recorded and a thin callable view (``_FunctionView``) is bound to the
+decorated name - and parsed (astgen) only when it is first used.  A
+Python-side call goes through the view, which at call time
 
 1. binds the Python arguments to the formal parameters (keyword
    arguments and default values are filled in here),
@@ -16,13 +16,15 @@ view bound to its context.  At call time the view
    compile pipeline is ``astgen -> hir -> interp (typed mir) -> lower``)
    and calls the native function.
 
-Calling a *decorated* function from inside another spy function goes
-through the same resolution but is compiled to a native ``call``; see
-``interp``.
+A decorated function used from inside another spy function body is
+resolved to its function entry when the reference runs (see
+``interp``); calling it is compiled to a native ``call``.
 """
 
 from types import FunctionType
 from typing import Any
+
+from typing_extensions import override
 
 from . import astgen, mir
 from .builtins import AsValue
@@ -41,6 +43,7 @@ from .type import (
     IntType,
     PointerType,
     Type,
+    Value,
     int_range,
     type_str,
     value_type,
@@ -133,28 +136,35 @@ def _marshal(fn_name: str, param_name: str, value: object, target: Type) -> obje
 
 
 class _FunctionView:
-    """A callable view of a function value.  Function values themselves
-    are pure values (the call logic lives in the interpreter and the
-    host), so Python-side calls go through this thin view bound to its
-    context.  The view exposes its value as ``_spy_entry`` (also
-    mounted on the raw function, so name resolution can find it)."""
+    """A callable view of a registered function.  The decorated name in
+    a module (or an enclosing factory) scope binds to this view, so it
+    is also the object a spy body references when it uses the function.
+    Registration itself never parses the function: the concrete entry
+    is looked up - and for an ``aot`` function created - on first use
+    through the context (see ``JitContext._entry_of``)."""
 
-    __slots__ = ('_context', '_spy_entry')
+    __slots__ = ('_context', '_fn', '_kind')
 
-    def __init__(self, context: 'JitContext', entry: FunctionEntry) -> None:
+    def __init__(self, context: 'JitContext', fn: FunctionType, kind: str) -> None:
         self._context = context
-        self._spy_entry = entry
+        self._fn = fn
+        self._kind = kind
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return self._context._dispatch(self._spy_entry, args, kwargs)
+        return self._context._dispatch(self._entry, args, kwargs)
+
+    @property
+    def _entry(self) -> FunctionEntry:
+        """The entry of the registered function (created on first use
+        for an aot function)."""
+        return self._context._entry_of(self._fn)
 
     @property
     def __name__(self) -> str:
-        return self._spy_entry.fn.__name__
+        return self._fn.__name__
 
     def __repr__(self) -> str:
-        entry = self._spy_entry
-        return f'<spy {entry.kind} function {entry.fn.__name__}>'
+        return f'<spy {self._kind} function {self._fn.__name__}>'
 
 
 class JitContext(FunctionResolver):
@@ -163,14 +173,23 @@ class JitContext(FunctionResolver):
 
     def __init__(self) -> None:
         self._entries: dict[FunctionType, FunctionEntry] = {}
+        # registered ``aot`` functions that have not been used yet:
+        # fn -> the preallocated base name of their native symbols.  An
+        # aot entry fixes its signature from the annotations, which
+        # needs a parse, so registration only records the function; the
+        # entry is created when the function is first used (see
+        # ``_entry_of``)
+        self._pending_aot: dict[FunctionType, str] = {}
         # parsed HIR of plain Python functions that are only ever
-        # inlined; a registered function caches its HIR on the function
+        # inlined (inlined functions are not registered);
+        # a registered function caches its HIR on the function
         # value instead
-        self._hir_cache: dict[FunctionType, astgen.FunctionIR] = {}
-        # allocated base names (``spy.<name>.<types>``) -> their owner;
-        # keeps the native symbols of different functions apart even when
-        # they happen to share a ``__name__``
-        self._name_owners: dict[str, FunctionEntry] = {}
+        self._inline_fn_hir_cache: dict[FunctionType, astgen.FunctionIR] = {}
+        # allocated base names (``spy.<name>.<types>``) -> their owner
+        # (the raw function object); keeps the native symbols of
+        # different functions apart even when they happen to share a
+        # ``__name__``
+        self._name_owners: dict[str, FunctionType] = {}
         # the MIR functions defined by the module under construction
         # (see ``ensure_spec``), keyed like the per-function
         # ``mir_cache``; None outside a build
@@ -189,9 +208,12 @@ class JitContext(FunctionResolver):
         return lambda f: self._register(f, 'jit')
 
     def aot(self, fn: FunctionType | None = None):
-        """``@cache.aot()``: compile immediately from the (concrete)
-        type annotations, which are required for every parameter and for
-        the return type."""
+        """``@cache.aot()``: compile lazily at the first use from the
+        (concrete) type annotations, which are required for every
+        parameter and for the return type.  Unlike a ``jit`` function
+        an ``aot`` function has exactly one specialization, fixed by its
+        annotations (a plain Python argument is still marshaled to the
+        annotated type)."""
         if fn is not None:
             return self._register(fn, 'aot')
         return lambda f: self._register(f, 'aot')
@@ -255,10 +277,10 @@ class JitContext(FunctionResolver):
                 ir = astgen.parse_function(fn)
                 entry.hir = ir
             return ir
-        ir = self._hir_cache.get(fn)
+        ir = self._inline_fn_hir_cache.get(fn)
         if ir is None:
             ir = astgen.parse_function(fn)
-            self._hir_cache[fn] = ir
+            self._inline_fn_hir_cache[fn] = ir
         return ir
 
     def _native_spec(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> NativeFn | None:
@@ -266,9 +288,9 @@ class JitContext(FunctionResolver):
         when it is not (yet) compiled.
 
         An aot function has exactly one specialization, fixed by its
-        annotations and lowered when it is registered: its native
-        function is stored on the value (the value also keeps the MIR,
-        in ``mir_fn``)."""
+        annotations and lowered at its first use: its native function is
+        stored on the value (the value also keeps the MIR, in
+        ``mir_fn``)."""
         if isinstance(entry, FunctionValue):
             return entry.native_fn
         return entry.specs.get(arg_types)
@@ -287,8 +309,9 @@ class JitContext(FunctionResolver):
             return native
         message: str | None = None
         if not isinstance(entry, FunctionValue):
-            # a failed aot registration leaves no wrapper to call the
-            # function again, so only jit failures need to be cached
+            # a jit function may be retried through its wrapper, so its
+            # failures are cached; an aot function simply recompiles on
+            # its next call
             message = entry.failed.get(arg_types)
         if message is not None:
             raise CompileError(message)
@@ -407,6 +430,7 @@ class JitContext(FunctionResolver):
             result[key] = native
         return result
 
+    @override
     def resolve_call(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> tuple[mir.Value, mir.Type]:
         """The callable value of one callee specialization as seen from
         inside a compiled function: a :class:`mir.Function` of the
@@ -425,6 +449,31 @@ class JitContext(FunctionResolver):
             # no declared return type: the call cannot be typed
             raise CompileError(self._recursion_ret_type_error(entry, arg_types))
         return fn, ret
+
+    @override
+    def resolve_global(self, value: Any) -> Value | None:
+        """The spy value a global object referenced inside a function
+        body resolves to (see :class:`FunctionResolver`): a function
+        registered in this context - reached as the raw function object
+        or through the callable view its decorated name binds to -
+        becomes its function entry, and anything else returns ``None``
+        (the object stays a plain compile-time Python value)."""
+        if isinstance(value, _FunctionView):
+            # a view always belongs to the context that registered its
+            # function
+            if value._context is not self:
+                return value._context.resolve_global(value._fn)
+            value = value._fn
+        if not isinstance(value, FunctionType):
+            return None
+        entry = self._entries.get(value)
+        if entry is not None:
+            return entry
+        if value in self._pending_aot:
+            # an aot function referenced before its first use: create
+            # its entry (fixing the signature from the annotations)
+            return self._entry_of(value)
+        return None
 
     def _declared_ret_type(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> Type | None:
         """The concrete spy return type of one specialization declared by
@@ -480,42 +529,58 @@ class JitContext(FunctionResolver):
 
     # -- internals -----------------------------------------------------------
 
+    def _entry_of(self, fn: FunctionType) -> FunctionEntry:
+        """The entry of the registered function ``fn``, creating it on
+        first use.
+
+        A jit entry needs no parse and exists from registration on.  An
+        aot entry fixes its signature from the annotations, which needs
+        a parse, so it is only created here - or in
+        :meth:`resolve_global` when a spy body references the function -
+        the first time the function is used.
+        """
+        entry = self._entries.get(fn)
+        if entry is not None:
+            return entry
+        name = self._pending_aot.get(fn)
+        if name is None:
+            raise CompileError(f'internal error: {fn.__name__} is not a registered function')
+        # resolve the fixed signature from the annotations
+        fn_ir = astgen.parse_function(fn)
+        params = fn_ir.params
+        formal = astgen.solve_call_types(fn_ir, 'aot', (None,) * len(params))
+        ret = astgen.return_annotation_type(fn_ir)
+        args = tuple(FormalArg(params[i].name, formal[i]) for i in range(len(params)))
+        entry = FunctionValue(fn, args, ret)
+        entry.context = self
+        entry.name_base = name
+        # reuse the parse that was done for the signature above
+        entry.hir = fn_ir
+        self._entries[fn] = entry
+        del self._pending_aot[fn]
+        return entry
+
     def _register(self, fn: FunctionType, kind: str) -> _FunctionView:
         if not isinstance(fn, FunctionType):
             raise TypeError('spy decorators can only be applied to plain Python functions')
-        if fn in self._entries:
+        if fn in self._entries or fn in self._pending_aot:
             raise ValueError(f'function {fn.__name__} is already registered in this JitContext')
-        entry: FunctionEntry
-        formal: tuple[Type, ...] | None = None
-        fn_ir: astgen.FunctionIR | None = None
+        # registration never parses (astgen happens only when the
+        # function is used): a jit entry needs no parse and is created
+        # right away; an aot entry fixes its signature from the
+        # annotations, which needs a parse, so only its native-name base
+        # is recorded here (see ``_entry_of``)
+        name = self._allocate_name(fn)
         if kind == 'aot':
-            # resolve the fixed signature from the annotations first; the
-            # body is compiled right below (registration time)
-            fn_ir = self.hir_of(fn)
-            params = fn_ir.params
-            formal = astgen.solve_call_types(fn_ir, 'aot', (None,) * len(params))
-            ret = astgen.return_annotation_type(fn_ir)
-            args = tuple(FormalArg(params[i].name, formal[i]) for i in range(len(params)))
-            entry = FunctionValue(fn, args, ret)
+            self._pending_aot[fn] = name
         else:
             entry = LazyJitFunction(fn)
-        entry.context = self
-        entry.name_base = self._allocate_name(fn, entry)
-        self._entries[fn] = entry
-        if kind == 'aot':
-            assert fn_ir is not None
-            # reuse the parse that was done for the signature above
-            entry.hir = fn_ir
-        # mount the value on the function object, so that name resolution
-        # inside spy bodies finds it (see ``astgen``)
-        fn._spy_entry = entry  # type: ignore[attr-defined]
-        view = _FunctionView(self, entry)
-        if kind == 'aot':
-            assert formal is not None
-            self.ensure_spec(entry, formal)
-        return view
+            entry.context = self
+            entry.name_base = name
+            self._entries[fn] = entry
+        return _FunctionView(self, fn, kind)
 
-    def _allocate_name(self, fn: FunctionType, entry: FunctionEntry) -> str:
+    def _allocate_name(self, fn: FunctionType) -> str:
         """The context-unique base name of the native symbols of ``fn``.
 
         Two different functions registered in the same context may share
@@ -542,7 +607,7 @@ class JitContext(FunctionResolver):
                     break
                 n += 1
         assert name is not None
-        self._name_owners[name] = entry
+        self._name_owners[name] = fn
         return name
 
     def _extern_symbols(self) -> dict[str, NativeFn]:

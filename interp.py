@@ -45,7 +45,6 @@ type information of its own.
 
 import operator
 import types as pytypes
-from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +52,7 @@ from . import astgen, hir, mir
 from . import builtins as spy_builtins
 from .errors import CompileError, TypeMismatchError
 from .fn import FunctionEntry
+from .info import FunctionResolver
 from .mir import (
     BoolType,
     BoolValue,
@@ -210,29 +210,6 @@ def to_spy_type(type: Type) -> SpyType:
 # the compile-time host interface
 # ---------------------------------------------------------------------------
 
-class FunctionResolver:
-    """The compile-time host of one :class:`HirRunner`.
-
-    ``dsl.JitContext`` implements this interface; the interpreter cannot
-    import the host directly (the host imports the interpreter), so the
-    host inherits this class instead.  The interface exposes only what
-    running a function body needs: the parsed HIR of callees and the
-    resolution of native call targets (which may compile a callee on
-    the fly).
-    """
-    @abstractmethod
-    def hir_of(self, fn: pytypes.FunctionType) -> astgen.FunctionIR:
-        """Parse (and cache) the HIR of a Python function."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def resolve_call(self, entry: FunctionEntry, arg_types: tuple[SpyType, ...]) -> tuple[mir.Value, Type]:
-        """Resolve the callable value of one callee specialization from
-        inside a compiled function: functions that are not compiled yet
-        are compiled (MIR-wise) and defined in the module of the caller;
-        functions of earlier modules are returned as symbols."""
-        raise NotImplementedError
-
 
 class HirRunner:
     """Runs one function body (and everything it inlines) at compile
@@ -246,7 +223,9 @@ class HirRunner:
     * ``hir_of(fn)``: the parsed (and cached) HIR of a Python function,
     * ``resolve_call(entry, arg_types)``: the callable value of one
       callee specialization (compiled into the module of the caller
-      when it is still fresh, or a symbol of an earlier module).
+      when it is still fresh, or a symbol of an earlier module),
+    * ``resolve_global(obj)``: the entry of a global object that is a
+      function registered in the host (or ``None``).
     """
 
     def __init__(self, resolver: FunctionResolver) -> None:
@@ -355,7 +334,18 @@ class HirRunner:
     def _operand(self, value: hir.Value) -> InterpVal:
         match value:
             case hir.Const():
-                return ComptimeVal(value.value)
+                obj = value.value
+                # a global referenced by a spy body may be a function
+                # registered in the host context - reached as the raw
+                # function object or through the callable view its
+                # decorated name binds to; it is resolved to its entry
+                # here, when the reference runs (see
+                # ``FunctionResolver.resolve_global``)
+                if not isinstance(obj, (int, float, str, bool, type(None))):
+                    resolved = self._resolver.resolve_global(obj)
+                    if resolved is not None:
+                        return ComptimeVal(resolved)
+                return ComptimeVal(obj)
             case hir.Arg(index):
                 if len(self._frames) == 0:
                     raise CompileError('internal error: Arg outside of any function frame')
@@ -797,23 +787,14 @@ class HirRunner:
         """Resolve one call by its callee value and run it, returning its
         value.  Spy functions compile to a native ``call`` producing a
         typed register, plain Python functions are inlined, and the spy
-        builtins are evaluated at compile time."""
+        builtins are evaluated at compile time.  The callee constant of a
+        registered spy function already resolved to its entry when the
+        callee operand was evaluated (see ``_operand``)."""
         if not isinstance(callee, ComptimeVal):
             raise CompileError(
                 "calls through runtime function values are not supported yet"
             )
         obj = callee.obj
-        # ``astgen`` embeds the object a callee name refers to at parse
-        # time; a function body may be parsed before its callees - or
-        # even itself (an aot function parses its own body while it is
-        # being registered) - are registered, so whether a function
-        # object is a spy function is decided here, when the call runs:
-        # a registered spy function (or its callable view) mounts its
-        # function value as ``_spy_entry``.
-        if not isinstance(obj, FunctionEntry):
-            entry = getattr(obj, '_spy_entry', None)
-            if isinstance(entry, FunctionEntry):
-                obj = entry
         if obj is spy_builtins.spy_type:
             return self._call_builtin_type(inst)
         if obj is spy_builtins.spy_compile_log:

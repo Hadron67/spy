@@ -312,19 +312,6 @@ def _make_cap(cache, threshold):
     return cap
 
 
-def _make_unbound(cache):
-    """Factory whose aot function captures ``late``, which is only
-    assigned *after* the function has been compiled: its closure cell is
-    empty when the body is parsed."""
-
-    @cache.aot()
-    def unbound(x: i32) -> i32:
-        return x + late
-
-    late = 1
-    return unbound
-
-
 class SpyExampleTest(TestCase):
     # the registered sample wrappers of this test's context (built by
     # setUp from make_samples)
@@ -357,7 +344,7 @@ class SpyExampleTest(TestCase):
             setattr(self, name, value)
 
     def _spec_lines(self, wrapper, arg_types) -> list[str]:
-        entry = wrapper._spy_entry
+        entry = wrapper._entry
         spec = entry.specs[arg_types]
         return spec.lines
 
@@ -405,10 +392,13 @@ class SpyExampleTest(TestCase):
         with self.assertRaises(TypeMismatchError):
             self.add_aot(spy_as(1, i32), spy_as(2, u64))
 
-    def test_aot_return_type_mismatch_at_decoration(self) -> None:
+    def test_aot_return_type_mismatch_at_first_use(self) -> None:
+        # the bad body type-checks when the function is first used: aot
+        # functions are compiled lazily, like jit ones
         cache = JitContext()
+        add = cache.aot()(bad_aot)
         with self.assertRaises(CompileError):
-            cache.aot()(bad_aot)
+            add(1, 2)
 
     def test_defaults(self) -> None:
         self.assertEqual(self.add_default(1, 2), 3)
@@ -475,7 +465,7 @@ class SpyExampleTest(TestCase):
         self.assertEqual(first(3, 4), 7)
         self.assertEqual(second(5, 6), 11)
         names = []
-        for entry in (first._spy_entry, second._spy_entry):
+        for entry in (first._entry, second._entry):
             assert isinstance(entry, LazyJitFunction)
             for spec in entry.specs.values():
                 names.append(spec.name)
@@ -539,7 +529,7 @@ class SpyExampleTest(TestCase):
         # specialization recurses to itself
         self.assertEqual(self.pow2(5), 32)
         self.assertEqual(self.pow2(3.0), 8.0)
-        names = sorted(spec.name for spec in self.pow2._spy_entry.specs.values())
+        names = sorted(spec.name for spec in self.pow2._entry.specs.values())
         self.assertEqual(names, ['spy.pow2.f64', 'spy.pow2.i32'], names)
 
     def test_recursion_with_type_parameter_return(self) -> None:
@@ -608,9 +598,22 @@ class SpyExampleTest(TestCase):
         self.assertEqual(twice(3, 4), 14)
 
     def test_closure_aot(self) -> None:
-        # an aot function is compiled at registration, inside the
-        # factory, with the captured argument already bound
+        # an aot function captures the factory argument; it is compiled
+        # lazily at its first call, inside the factory's scope
         off = _make_offset_aot(self.cache, 100)
+        self.assertEqual(off(5), 105)
+        self.assertEqual(off(-100), 0)
+
+    def test_closure_aot_captures_later_assignment(self) -> None:
+        # the aot body is only parsed at its first use, so a capture
+        # that is assigned after the decoration is bound by then
+        cache = JitContext()
+
+        @cache.aot()
+        def off(x: i32) -> i32:
+            return x + late
+
+        late = 100
         self.assertEqual(off(5), 105)
         self.assertEqual(off(-100), 0)
 
@@ -619,14 +622,6 @@ class SpyExampleTest(TestCase):
         self.assertEqual(cap(5), 5)
         # 50 (the captured factory argument), not the module global 1000
         self.assertEqual(cap(5000), 50)
-
-    def test_closure_unbound_at_parse_time(self) -> None:
-        # the aot body is compiled while the captured variable is not
-        # assigned yet: its closure cell is empty
-        cache = JitContext()
-        with self.assertRaises(CompileError) as ctx:
-            _make_unbound(cache)
-        self.assertIn('not bound yet', str(ctx.exception))
 
 
 def _make_rls_pair():

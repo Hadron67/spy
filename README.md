@@ -21,11 +21,11 @@ import symlat.spy as spy
 
 cache = spy.JitContext()
 
-@cache.jit()              # 惰性：首次调用时按实参类型编译
+@cache.jit()              # 惰性：首次调用时按实参类型编译（可多个特化）
 def add[T](a: T, b: T) -> T:
     return a + b
 
-@cache.aot()              # 立即：注册时按（必须具体、齐全的）注解编译
+@cache.aot()              # 惰性：首次使用时按（必须具体、齐全的）注解编译；一个函数只有一个编译实例
 def add_u64(a: spy.u64, b: spy.u64) -> spy.u64:
     return a + b
 

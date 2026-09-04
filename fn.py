@@ -102,7 +102,7 @@ class LazyJitFunction(Value):
 
 class FunctionValue(Value):
     """The function value of a ``@aot`` function: compiled from its type
-    annotations when it is registered, so the value carries the concrete
+    annotations at its first use, so the value carries the concrete
     signature (``args`` and ``ret``) and the compiled
     :class:`mir.Function` (calling it emits a ``mir.Call`` of that
     function).
