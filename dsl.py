@@ -44,12 +44,14 @@ from .type import (
     FormalArg,
     IntType,
     PointerType,
-    StructType as SpyStructType,
     Type,
     Value,
     int_range,
     type_str,
     value_type,
+)
+from .type import (
+    StructType as SpyStructType,
 )
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,7 @@ type information of its own.
 import operator
 import types as pytypes
 from dataclasses import dataclass
+from enum import IntEnum, auto
 from typing import Any
 
 from . import astgen, hir, mir
@@ -168,8 +169,13 @@ class Frame:
     arg_values: tuple[mir.Value, ...]
 
 
-FLOW_FALL = object()
-FLOW_RET = object()
+class Flow(IntEnum):
+    """How executing a straight-line list of instructions ended: the
+    list ``FALL`` off its end, or was cut short by a ``return``
+    (``RET``) - the only case that carries a returned value."""
+
+    FALL = auto()
+    RET = auto()
 
 
 def typeof(value: mir.Value) -> Type:
@@ -323,7 +329,7 @@ class HirRunner:
 
         flow, _ = self._run_list(fn_ir.body)
         declared = fn.ret_type
-        if flow is not FLOW_RET:
+        if flow is not Flow.RET:
             # a path falls off the end of the body: allowed only for a
             # void function (declared, or inferred when the body never
             # returned a value) - the fall-off path ends in an implicit
@@ -358,31 +364,31 @@ class HirRunner:
 
     # -- running instruction lists -------------------------------------------
 
-    def _run_list(self, insts: tuple[hir.Inst, ...]) -> tuple[object, InterpVal | None]:
+    def _run_list(self, insts: tuple[hir.Inst, ...]) -> tuple[Flow, InterpVal | None]:
         """Execute instructions in order; a ``Ret`` (executed directly in
         this list, i.e. not nested inside an inlined function) stops the
         list and reports the returned value."""
         for inst in insts:
             flow, value = self._exec_inst(inst)
-            if flow is FLOW_RET:
+            if flow is Flow.RET:
                 return flow, value
-        return FLOW_FALL, None
+        return Flow.FALL, None
 
-    def _exec_inst(self, inst: hir.Inst) -> tuple[object, InterpVal | None]:
+    def _exec_inst(self, inst: hir.Inst) -> tuple[Flow, InterpVal | None]:
         match inst:
             case hir.Ret():
                 if inst.value is None:
                     # a bare ``return``: a void return of the function
                     if self._ret_emit:
                         self._finish_void()
-                        return FLOW_RET, None
-                    return FLOW_RET, ComptimeVal(None)
+                        return Flow.RET, None
+                    return Flow.RET, ComptimeVal(None)
                 ev = self._operand(inst.value)
                 if self._ret_emit:
                     self._finish_return(ev)
-                    return FLOW_RET, None
+                    return Flow.RET, None
                 # an inlined callee: the return just yields the value
-                return FLOW_RET, ev
+                return Flow.RET, ev
             case hir.If():
                 cond = self._operand(inst.cond)
                 if isinstance(cond, ComptimeVal):
@@ -391,34 +397,34 @@ class HirRunner:
                 return self._exec_runtime_if(inst, cond)
             case hir.Load():
                 self._regs[inst] = self._exec_load(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.Alloca():
                 self._regs[inst] = PendingSlot()
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.Store():
                 self._exec_store(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.Binary():
                 self._regs[inst] = self._eval_binary(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.Compare():
                 self._regs[inst] = self._eval_cmp(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.BoolOp():
                 self._regs[inst] = self._eval_boolop(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.Unary():
                 self._regs[inst] = self._eval_unary(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.CallInplace():
                 self._exec_call_inplace(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.CallMethod():
                 self._exec_call_method(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case hir.FieldAddr():
                 self._regs[inst] = self._exec_field_addr(inst)
-                return FLOW_FALL, None
+                return Flow.FALL, None
             case _:
                 raise CompileError(f"unsupported instruction {type(inst).__name__}")
 
@@ -613,9 +619,9 @@ class HirRunner:
             flow, _ = self._run_list(stmts)
         finally:
             self._regions.pop()
-        return region, flow is FLOW_RET
+        return region, flow is Flow.RET
 
-    def _exec_runtime_if(self, inst: hir.If, cond: InterpVal) -> tuple[object, InterpVal | None]:
+    def _exec_runtime_if(self, inst: hir.If, cond: InterpVal) -> tuple[Flow, InterpVal | None]:
         """A runtime ``if``: both branch bodies are typed and emitted as
         regions of a :class:`mir.If`.  A branch that returns ends its
         path; a branch that falls off continues with the code after the
@@ -636,8 +642,8 @@ class HirRunner:
         self._emit(mir.If(cond.value, tuple(then_body), tuple(else_body)))
         if then_returns and else_returns:
             # every path returns: whatever follows in this region is dead
-            return FLOW_RET, None
-        return FLOW_FALL, None
+            return Flow.RET, None
+        return Flow.FALL, None
 
     def _finish_return(self, ev: InterpVal) -> None:
         """Materialize the value of one return site: runtime values must
@@ -1367,7 +1373,7 @@ class HirRunner:
             self._frames.pop()
             self._inline_depth -= 1
             self._inline_stack.pop()
-        if flow is not FLOW_RET:
+        if flow is not Flow.RET:
             # the inlined body fell off its end: a void inline
             return ComptimeVal(None)
         assert isinstance(value, InterpVal)
