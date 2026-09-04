@@ -656,7 +656,7 @@ class SpyExampleTest(TestCase):
         # initializer sees an uninitialized slot (like an unbound local)
         @self.cache.jit()
         def bad(x):
-            y = y + 1
+            y = y + 1 # pyright: ignore[reportUnboundVariable] # noqa: F821
             return y
         with self.assertRaises(CompileError) as ctx:
             bad(1)
@@ -676,7 +676,7 @@ class SpyExampleTest(TestCase):
     def test_augassign_requires_a_prior_declaration(self) -> None:
         @self.cache.jit()
         def bad(x):
-            y += 1
+            y += 1 # pyright: ignore[reportUnboundVariable] # noqa: F821
             return y
         with self.assertRaises(CompileError) as ctx:
             bad(1)
