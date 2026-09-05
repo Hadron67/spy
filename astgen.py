@@ -206,25 +206,7 @@ class _Builder:
                 # ``y``
                 slot = self.add(hir.Alloca())
                 self._scope.bindings[target.id] = slot
-            if isinstance(value, ast.Call):
-                self._gen_call(value, slot)
-                return
-            self.add(hir.Store(slot, self._gen_value(value)))
-        elif isinstance(target, ast.Attribute):
-            # assignment to a field of a runtime struct value (``x.h =
-            # e``): store through the address of the field (globals are
-            # immutable: their fields cannot be assigned)
-            if self._attr_runtime(target):
-                self.add(hir.Store(self._gen_ref(target), self._gen_value(value)))
-                return
-            raise CompileError(
-                f"cannot assign to the attribute of a compile-time value "
-                f"(function {self._fn_ir.name})"
-            )
-        else:
-            raise CompileError(
-                f"unsupported assignment target in spy function {self._fn_ir.name}"
-            )
+        self.add(hir.Store(self._gen_ref(target), self._gen_value(value)))
 
     def _gen_augassign(self, node: ast.AugAssign) -> None:
         """One ``name += expr`` statement: read the value, add ``expr``
@@ -336,39 +318,18 @@ class _Builder:
             case ast.Name():
                 return self._gen_name(node.id, True)
             case ast.Attribute():
-                if self._attr_runtime(node):
-                    # the fields of a runtime struct value: the address
-                    # of the innermost field is the FieldAddr chain
-                    # rooted at the storage of the base value
-                    return self.add(hir.FieldAddr(self._gen_ref(node.value), node.attr))
-                # attribute chains on compile-time objects fold to a
-                # ``hir.Const`` leaf, which is its own reference (the
-                # folded value is immutable)
-                return self._gen_value(node)
+                base = self._gen_ref(node.value)
+                if isinstance(base, hir.ConstRef):
+                    if hasattr(base.value, node.attr):
+                        return hir.ConstRef(getattr(base.value, node.attr))
+                    raise AttributeError(f"Attribute '{node.attr}' not found on {base.value}")
+                return self.add(hir.FieldAddr(self._gen_ref(node.value), node.attr))
             case _:
                 loc = self.add(hir.Alloca())
                 self._gen_result_loc(node, loc)
                 return loc
 
     # -- struct values ---------------------------------------------------------
-
-    @staticmethod
-    def _attr_root(node: ast.Attribute) -> ast.Name | None:
-        """The Name an attribute chain is rooted at: ``x.f.g`` returns
-        ``x``, ``spy.type`` returns ``spy``."""
-        while isinstance(node, ast.Attribute):
-            node = node.value  # type: ignore[assignment]
-        if isinstance(node, ast.Name):
-            return node
-        return None
-
-    def _attr_runtime(self, node: ast.expr) -> bool:
-        """Whether ``node`` is an attribute chain rooted at a *variable*
-        (a parameter or a local): only then is the attribute a field of a
-        runtime struct value (chains rooted at globals - ``spy.u64``,
-        ``spy.type``, ... - fold at compile time instead)."""
-        root = self._attr_root(node) if isinstance(node, ast.Attribute) else None
-        return root is not None and self._scope.lookup(root.id) is not None
 
     def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value) -> None:
         """Evaluate ``node`` writing its result into ``result_loc``
@@ -394,7 +355,7 @@ class _Builder:
         call ``x.h(...)`` on a runtime struct value, or an ordinary call
         (a spy function, a constructor ``Foo(...)``, an inlined plain
         function or a spy builtin)."""
-        if isinstance(node.func, ast.Attribute) and self._attr_runtime(node.func):
+        if isinstance(node.func, ast.Attribute):
             # a method of the struct ``base``: the method and its self
             # parameter are resolved by the interpreter from the static
             # type of the base; only the base's address is carried here
@@ -427,6 +388,11 @@ class _Builder:
         # name; a reference to it is a ``ConstRef`` of that object
         return hir.ConstRef(obj) if is_ref else hir.Const(obj)
 
+    def _make_load(self, value: hir.Value):
+        if isinstance(value, hir.ConstRef):
+            return hir.Const(value.value)
+        return self.add(hir.Load(value))
+
     def _gen_value(self, node: ast.expr) -> hir.Value:
         """Evaluate ``node`` producing its value in a register (the plain
         by-value context)."""
@@ -438,29 +404,6 @@ class _Builder:
                 raise CompileError(f"unsupported constant {node.value!r} in spy function {fn_name}")
             case ast.Name():
                 return self._gen_name(node.id, False)
-            case ast.Attribute():
-                if self._attr_runtime(node):
-                    # a field of a runtime struct value: read it through
-                    # the address of the (innermost) field - the chain is
-                    # addressable, so no intermediate struct value is
-                    # materialized
-                    return self.add(hir.Load(self._gen_ref(node)))
-                base = self._gen_value(node.value)
-                if isinstance(base, hir.Const) and not isinstance(
-                    base.value, (int, float, str, bool, type(None))
-                ):
-                    # attribute of a compile-time object (e.g. spy.type)
-                    try:
-                        obj = getattr(base.value, node.attr)
-                    except AttributeError as e:
-                        raise CompileError(
-                            f"compile-time value {base.value!r} has no attribute {node.attr} "
-                            f"in spy function {fn_name}"
-                        ) from e
-                    return hir.Const(obj)
-                raise CompileError(
-                    f"attribute access on values is not supported yet in spy function {fn_name}"
-                )
             case ast.BinOp():
                 op = _BIN_OPS.get(type(node.op))
                 if op is None:
@@ -504,7 +447,9 @@ class _Builder:
             case ast.Call():
                 loc = self.add(hir.Alloca())
                 self._gen_result_loc(node, loc)
-                return self.add(hir.Load(loc))
+                return self._make_load(loc)
+            case ast.Attribute():
+                return self._make_load(self._gen_ref(node))
             case _:
                 raise CompileError(
                     f"unsupported expression {type(node).__name__} in spy function {fn_name}"
