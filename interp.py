@@ -162,11 +162,14 @@ class RetLocVal(InterpVal):
 
 @dataclass
 class Frame:
-    """The by-value arguments of the function whose body is currently
-    being executed (resolved by ``hir.Arg`` leaves): each argument value
-    together with its spy type."""
+    """One function body being executed at compile time: its by-value
+    arguments (resolved by ``hir.Arg`` leaves: each argument value with
+    its spy type) together with its result location - the
+    ``hir.ResultLoc`` leaf its return statements write into and the
+    ``RetLocVal`` holding the location's content (see ``RetLocVal``)."""
 
     arg_values: tuple[tuple[mir.Value, sval.Type], ...]
+    ret_loc: tuple[hir.ResultLoc, RetLocVal]
 
 
 class Flow(IntEnum):
@@ -436,10 +439,6 @@ class HirRunner:
         # the emission regions (see ``_emit``): a stack of lists whose
         # top is the region currently being typed
         self._regions: list[list[mir.Inst]] = []
-        # the result locations of the function bodies being executed (see
-        # ``RetLocVal``), keyed by their ``hir.ResultLoc`` leaf: the top
-        # is the body whose instructions are currently being typed
-        self._ret_locs: list[tuple[hir.ResultLoc, RetLocVal]] = []
         # the spy return type of the function proper declared by its
         # annotation (or None when it is inferred from the body); the
         # target every return site is checked against
@@ -493,12 +492,16 @@ decision).  The return convention of the function is decided here
         return type is kept in ``fn.result_type``.
         """
         self._fn = fn
-        # push the result location of the function's return statements
-        self._ret_locs.append((fn_ir.ret_loc, RetLocVal()))
         self._ret_target = ret_hint
         self._result_mode = None
         self._result_ptr = None
         self._ret_written = False
+        # the frame of the function proper is pushed before its
+        # (possibly result-pointer) signature is lowered: its result
+        # location must be in place when the result pointer is bound
+        # (see ``_bind_result_ptr``); its argument values are filled in
+        # once the signature is fixed
+        frame = self._push_frame((), fn_ir.ret_loc)
         declared = ret_hint
         if declared is not None and sval.returns_via_result_ptr(declared):
             # the declared return type is delivered through a result
@@ -519,7 +522,7 @@ decision).  The return convention of the function is decided here
             param_values += (
                 (result_ptr, sval.PointerType(result_type, is_const=False)),
             )
-        self._push_frame(param_values)
+        frame.arg_values = param_values
         self._ret_type = None
         self._saw_void_return = False
         self._ret_emit = True
@@ -557,7 +560,7 @@ decision).  The return convention of the function is decided here
                 # a declared return type is enforced at the return sites
                 # (see ``_write_result``), so the two must agree
                 assert declared == ret_type
-        self._ret_locs.pop()
+        self._frames.pop()
         if self._result_mode == 'ptr':
             # a result-pointer function: its MIR signature was lowered to
             # a trailing result pointer formal and a void return when the
@@ -592,8 +595,8 @@ decision).  The return convention of the function is decided here
     # -- return statements ------------------------------------------------
 
     def _result_loc_of(self) -> RetLocVal:
-        assert len(self._ret_locs) > 0, 'internal error: no function result location'
-        return self._ret_locs[-1][1]
+        assert len(self._frames) > 0, 'internal error: no function result location'
+        return self._frames[-1].ret_loc[1]
 
     def _write_result(self, ev: InterpVal) -> None:
         """The value of one return expression of the function proper is
@@ -811,7 +814,8 @@ decision).  The return convention of the function is decided here
                 # the result location of the innermost body being typed
                 # whose leaf this is (its own, or - during an inlined
                 # call - the callee's)
-                for leaf, retloc in reversed(self._ret_locs):
+                for frame in reversed(self._frames):
+                    leaf, retloc = frame.ret_loc
                     if leaf is value:
                         return retloc
                 raise CompileError('internal error: result location outside of any function')
@@ -825,8 +829,18 @@ decision).  The return convention of the function is decided here
 
     # -- memory instructions -------------------------------------------------
 
-    def _push_frame(self, arg_values: tuple[tuple[mir.Value, sval.Type], ...]) -> None:
-        self._frames.append(Frame(arg_values))
+    def _push_frame(
+        self,
+        arg_values: tuple[tuple[mir.Value, sval.Type], ...],
+        ret_loc: hir.ResultLoc,
+    ) -> Frame:
+        """Push the frame of one function body (its by-value arguments
+        and its result location, the ``hir.ResultLoc`` leaf its return
+        statements write into, with a fresh ``RetLocVal``); returns the
+        frame."""
+        frame = Frame(arg_values, (ret_loc, RetLocVal()))
+        self._frames.append(frame)
+        return frame
 
     def _load(self, ptr: InterpVal) -> InterpVal:
         if isinstance(ptr, PendingSlot):
@@ -1616,15 +1630,13 @@ decision).  The return convention of the function is decided here
         value of its ``return``, or ``None`` for a void body."""
         self._inline_stack.append(fn_ir)
         self._inline_depth += 1
-        self._ret_locs.append((fn_ir.ret_loc, RetLocVal()))
-        self._push_frame(tuple(zip(values, formal)))
+        self._push_frame(tuple(zip(values, formal)), fn_ir.ret_loc)
         saved_ret_emit = self._ret_emit
         self._ret_emit = False
         try:
             flow, value = self._run_list(fn_ir.body)
         finally:
             self._ret_emit = saved_ret_emit
-            self._ret_locs.pop()
             self._frames.pop()
             self._inline_depth -= 1
             self._inline_stack.pop()
