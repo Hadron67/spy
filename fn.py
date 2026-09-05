@@ -39,7 +39,8 @@ class NativeFn:
     """A compiled native function of one specialization.
 
     ``arg_types``/``ret_type`` are the *lowered* signature (see
-    ``mir.returns_via_result_ptr``): a function that returns through a
+    ``type.returns_via_result_ptr``, which the interpreter consults when
+    it lowers a signature into MIR): a function that returns through a
     result pointer carries its trailing result pointer formal in
     ``arg_types``, a void ``ret_type`` and its logical return type in
     ``result_type``.  The Python-facing ``_entry`` is pointer-ABI form

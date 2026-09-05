@@ -31,7 +31,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import CompileError
-from .type import returns_via_result_ptr as spy_returns_via_result_ptr
 
 # ---------------------------------------------------------------------------
 # static types
@@ -40,20 +39,6 @@ from .type import returns_via_result_ptr as spy_returns_via_result_ptr
 
 class Type:
     pass
-
-
-def via_result_ptr(type: Type) -> bool:
-    """The MIR mirror of ``type.returns_via_result_ptr``: whether a
-    function returning ``type`` delivers its result through a result
-    pointer instead of returning it as a value.  This is where the return
-    convention is decided *once* for the MIR side; the lowering of a
-    function signature into its MIR form (an extra result pointer formal
-    and a void return, or a plain typed return) follows it."""
-    match type:
-        case StructType():
-            return spy_returns_via_result_ptr(type.spy_type)
-        case _:
-            return False
 
 
 @dataclass(frozen=True)
@@ -363,7 +348,7 @@ class Function(Value):
 
     The signature the object carries is the *lowered* (MIR) form: a
     function whose return type is returned through a result pointer (see
-    :func:`returns_via_result_ptr`) has its trailing result pointer
+    ``type.returns_via_result_ptr``) has its trailing result pointer
     formal appended to ``args`` and a ``void`` ``ret_type`` - the
     original return type is then kept in ``result_type`` - while a
     direct-return function returns its value type.  ``interp`` performs
@@ -375,9 +360,9 @@ class Function(Value):
     ret_type: Type | None
     insts: list[Inst]
     # the return type of a function that delivers its result through a
-    # result pointer (``returns_via_result_ptr``): ``ret_type`` is then
-    # ``void`` and ``args`` carries the trailing result pointer formal;
-    # None for a direct-return function
+    # result pointer (``type.returns_via_result_ptr``): ``ret_type`` is
+    # then ``void`` and ``args`` carries the trailing result pointer
+    # formal; None for a direct-return function
     result_type: Type | None = None
 
     @property

@@ -25,11 +25,16 @@ class FunctionResolver:
         raise NotImplementedError
 
     @abstractmethod
-    def resolve_call(self, entry: FunctionEntry, arg_types: tuple[SpyType, ...]) -> tuple[mir.Value, mir.Type]:
+    def resolve_call(
+        self, entry: FunctionEntry, arg_types: tuple[SpyType, ...]
+    ) -> tuple[mir.Value, SpyType]:
         """Resolve the callable value of one callee specialization from
         inside a compiled function: functions that are not compiled yet
         are compiled (MIR-wise) and defined in the module of the caller;
-        functions of earlier modules are returned as symbols."""
+        functions of earlier modules are returned as symbols.  The
+        second element is the *logical spy return type* of the callee
+        (the type its callers see, in ``type.py``) - the interpreter's
+        only type information about the call."""
         raise NotImplementedError
 
     @abstractmethod

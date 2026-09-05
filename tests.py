@@ -162,7 +162,7 @@ def make_samples(cache: JitContext) -> dict[str, object]:
     def pow2[T: Numeric](n: T) -> T:
         # a generic recursion that is specialized to several types
         if n <= 0:
-            return 1
+            return 1 # pyright: ignore[reportReturnType] FIXME: fix this typing issue
         return 2 * pow2(n - 1)
 
     @cache.jit()
