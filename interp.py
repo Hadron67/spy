@@ -46,7 +46,7 @@ type information of its own.
 
 import operator
 import types as pytypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import Any, cast
 
@@ -161,15 +161,59 @@ class RetLocVal(InterpVal):
 
 
 @dataclass
+class _RuntimeIfState:
+    """The typing state of one runtime ``if`` whose two branch regions
+    are being typed (both branches are always typed, as both survive at
+    runtime): the ``if`` itself, its already-evaluated condition, the
+    emission regions being typed for the two branches, and whether each
+    branch's run ended in a ``return`` (None while the branch region is
+    still being typed).  The two region :class:`BlockFrame`s of the
+    branches share one state, which they advance when their runs end
+    (see ``HirRunner._end_block``)."""
+
+    inst: hir.If
+    cond: RuntimeVal
+    then_region: list[mir.Inst] | None = None
+    else_region: list[mir.Inst] | None = None
+    then_returns: bool | None = None
+    else_returns: bool | None = None
+
+
+@dataclass
+class BlockFrame:
+    """The execution state of one block being run: a straight-line list
+    of instructions - the body of a function, the chosen branch of a
+    compile-time ``if``, or the body of one branch of a runtime ``if`` -
+    with the index of its next instruction.  A runtime-``if`` branch
+    block additionally carries the state of the ``if`` it belongs to
+    (``runtime_if``); the block of a compile-time branch carries none,
+    since its end just lets the enclosing block continue."""
+
+    insts: tuple[hir.Inst, ...]
+    pc: int = 0
+    runtime_if: _RuntimeIfState | None = None
+
+
+@dataclass
 class Frame:
     """One function body being executed at compile time: its by-value
     arguments (resolved by ``hir.Arg`` leaves: each argument value with
     its spy type) together with its result location - the
     ``hir.ResultLoc`` leaf its return statements write into and the
-    ``RetLocVal`` holding the location's content (see ``RetLocVal``)."""
+    ``RetLocVal`` holding the location's content (see ``RetLocVal``) -
+    and the execution state of its body: the stack of blocks it is
+    currently running (see ``BlockFrame``) and, for an inlined callee,
+    the pending call of the caller that the callee's value resumes when
+    its run ends (``resume``; None for the function proper, whose run
+    end just ends the machine)."""
 
     arg_values: tuple[tuple[mir.Value, sval.Type], ...]
     ret_loc: tuple[hir.ResultLoc, RetLocVal]
+    block_stack: list[BlockFrame] = field(default_factory=list)
+    # the call instruction of the caller and whether it is the
+    # ``__init__`` of a constructor (whose in-place write makes the call
+    # result an ``InPlaceResult`` rather than the value the body yielded)
+    resume: tuple[hir.CallInplace | hir.CallMethodInplace, bool] | None = None
 
 
 class Flow(IntEnum):
@@ -480,6 +524,10 @@ class HirRunner:
         # True when the return statement of the path currently being
         # typed has written its value into the result location
         self._ret_written = False
+        # the outcome of the run of the function proper (see
+        # ``_frame_ended``), read by ``run_function`` after the machine
+        # stopped; None while the machine is still running
+        self._flow: Flow | None = None
 
     # -- entry point ---------------------------------------------------------
 
@@ -552,8 +600,11 @@ decision).  The return convention of the function is decided here
         self._ret_type = None
         self._saw_void_return = False
         self._regions = [fn.insts]
-
-        flow, _ = self._run_list(fn_ir.body)
+        self._flow = None
+        frame.block_stack.append(BlockFrame(fn_ir.body))
+        self._run_machine()
+        flow = self._flow
+        assert flow is not None
         if flow is not Flow.RET:
             # a path falls off the end of the body: allowed only for a
             # void function (declared, or inferred when the body never
@@ -733,19 +784,51 @@ decision).  The return convention of the function is decided here
         assert isinstance(value, RuntimeVal)
         self._emit(mir.Ret(value.value))
 
-    # -- running instruction lists -------------------------------------------
+    # -- running blocks -----------------------------------------------------
 
-    def _run_list(self, insts: tuple[hir.Inst, ...]) -> tuple[Flow, InterpVal | None]:
-        """Execute instructions in order; a ``Ret`` (executed directly in
-        this list, i.e. not nested inside an inlined function) stops the
-        list and reports the returned value."""
-        for inst in insts:
-            flow, value = self._exec_inst(inst)
-            if flow is Flow.RET:
-                return flow, value
-        return Flow.FALL, None
+    def _run_machine(self) -> None:
+        """The flat execution loop: executes one instruction at a time
+        from the top block of the executing frame (see ``_step``) until
+        the run of the function proper ended - its outcome recorded in
+        ``self._flow`` by ``_frame_ended``.  There is no recursion: the
+        control state of every suspended context lives in the block
+        stacks of the frames (an ``if`` branch, a runtime-``if`` region,
+        an inlined callee are all pushed as blocks and popped when they
+        end)."""
+        while self._flow is None:
+            self._step()
 
-    def _exec_inst(self, inst: hir.Inst) -> tuple[Flow, InterpVal | None]:
+    def _step(self) -> None:
+        """Execute one step of the machine: the next instruction of the
+        top block of the executing frame - or the end of that block,
+        when it has no next instruction (it fell off its end)."""
+        frame = self._frames[-1]
+        block = frame.block_stack[-1]
+        if block.pc >= len(block.insts):
+            self._end_block(False, None)
+            return
+        inst = block.insts[block.pc]
+        block.pc += 1
+        self._exec_inst(inst)
+
+    def _push_block(
+        self, insts: tuple[hir.Inst, ...], runtime_if: _RuntimeIfState | None = None
+    ) -> None:
+        """Push one block onto the block stack of the executing frame:
+        the chosen branch of a compile-time ``if`` (``runtime_if``
+        None), the body of one branch of a runtime ``if``, or the body
+        of an inlined callee."""
+        frame = self._frames[-1]
+        frame.block_stack.append(BlockFrame(insts, runtime_if=runtime_if))
+
+    def _exec_inst(self, inst: hir.Inst) -> None:
+        """Execute one instruction of the current block.  A control
+        instruction changes the execution state: an ``if`` pushes the
+        block of a branch (or starts typing the branch regions of a
+        runtime ``if``), a ``return`` cuts the current path (see
+        ``_end_block``); every other instruction only updates the
+        register table.  Straight-line instructions of the same block
+        are then executed one after another by ``_step``."""
         match inst:
             case hir.Ret():
                 if not self._in_function_proper():
@@ -763,50 +846,152 @@ decision).  The return convention of the function is decided here
                         )
                         retloc.ptr = None
                         retloc.type = None
-                        return Flow.RET, value
-                    value = retloc.value
-                    retloc.value = None
-                    return Flow.RET, value if value is not None else ComptimeVal(None)
-                self._finish_path()
-                return Flow.RET, None
+                    else:
+                        value = retloc.value
+                        retloc.value = None
+                    self._end_block(True, value if value is not None else ComptimeVal(None))
+                else:
+                    # a path of the function proper ends: emit its return
+                    # and cut the path
+                    self._finish_path()
+                    self._end_block(True, None)
             case hir.If():
                 cond = self._operand(inst.cond)
                 if isinstance(cond, ComptimeVal):
+                    # only the chosen branch is run: the other one is
+                    # dead (its code is never typed or emitted)
                     chosen = inst.then_body if cond.obj else inst.else_body
-                    return self._run_list(chosen)
-                return self._exec_runtime_if(inst, cond)
+                    self._push_block(chosen)
+                else:
+                    self._exec_runtime_if(inst, cond)
             case hir.Load():
                 self._regs[inst] = self._load(self._operand(inst.ptr))
-                return Flow.FALL, None
             case hir.Alloca():
                 self._regs[inst] = PendingSlot()
-                return Flow.FALL, None
             case hir.Store():
                 self._store(self._operand(inst.ptr), self._operand(inst.value))
-                return Flow.FALL, None
             case hir.Binary():
                 self._regs[inst] = self._eval_binary(inst)
-                return Flow.FALL, None
             case hir.Compare():
                 self._regs[inst] = self._eval_cmp(inst)
-                return Flow.FALL, None
             case hir.BoolOp():
                 self._regs[inst] = self._eval_boolop(inst)
-                return Flow.FALL, None
             case hir.Unary():
                 self._regs[inst] = self._eval_unary(inst)
-                return Flow.FALL, None
             case hir.CallInplace():
                 self._exec_call_inplace(inst)
-                return Flow.FALL, None
             case hir.CallMethodInplace():
                 self._exec_call_method(inst)
-                return Flow.FALL, None
             case hir.FieldAddr():
                 self._regs[inst] = self._exec_field_addr(inst)
-                return Flow.FALL, None
             case _:
                 raise CompileError(f"unsupported instruction {type(inst).__name__}")
+
+    def _end_block(self, returns: bool, value: InterpVal | None) -> None:
+        """The run of a block of the executing frame ended: its list
+        fell off its end (``returns`` False), or its path was cut short
+        by a ``return`` (``returns`` True, ``value`` the returned value
+        when one applies - the value an inlined body yields).  The
+        outcome propagates to the enclosing execution: the chosen branch
+        of a compile-time ``if`` that fell through lets the enclosing
+        block resume; the branch region of a runtime ``if`` feeds the
+        state of the ``if`` (typing its other branch, or completing the
+        ``if`` once both branches have been typed); the body block of a
+        function ends the run of its frame.  A ``return`` cuts through
+        every compile-time branch above the boundary: the code after
+        them belongs to the dead path."""
+        while True:
+            frame = self._frames[-1]
+            block = frame.block_stack.pop()
+            if not frame.block_stack:
+                # the popped block is the body block: the run of the
+                # frame's function ended
+                self._frame_ended(returns, value)
+                return
+            runtime_if = block.runtime_if
+            if runtime_if is None:
+                # the popped block is the chosen branch of a
+                # compile-time ``if``
+                if returns:
+                    # the branch returned: everything enclosing is dead
+                    # - keep unwinding the path
+                    continue
+                # the branch fell through: the enclosing block resumes
+                # (its pc already points past the ``if``)
+                return
+            # the popped block is one branch region of a runtime ``if``
+            # whose MIR instructions were typed into the region on top
+            # of ``self._regions``
+            self._regions.pop()
+            if runtime_if.then_returns is None:
+                # the then-branch was just typed: type the else-branch
+                # next (both branches are always typed and emitted)
+                runtime_if.then_returns = returns
+                self._run_rt_region(runtime_if, runtime_if.inst.else_body)
+                return
+            # the else-branch region just ended: the ``if`` is complete -
+            # its MIR ``If`` is emitted into the enclosing region (the
+            # branch regions were already popped off ``self._regions``)
+            runtime_if.else_returns = returns
+            then_returns = runtime_if.then_returns
+            assert then_returns is not None
+            if not then_returns and not returns:
+                raise CompileError(
+                    "runtime 'if' branches that both fall through are not supported yet"
+                )
+            then_region = runtime_if.then_region
+            else_region = runtime_if.else_region
+            assert then_region is not None
+            assert else_region is not None
+            self._emit(
+                mir.If(
+                    runtime_if.cond.value,
+                    tuple(then_region),
+                    tuple(else_region),
+                )
+            )
+            if then_returns and returns:
+                # every path of the ``if`` returns: everything after it
+                # is dead, so the enclosing path is cut as well
+                returns = True
+                value = None
+                continue
+            # one branch falls through: the enclosing block resumes
+            return
+
+    def _frame_ended(self, returns: bool, value: InterpVal | None) -> None:
+        """The body block of the executing frame was popped: the run of
+        its function ended - falling off its end (``returns`` False, a
+        void body) or cut by a ``return``.  The run of the function
+        proper ends the machine (its outcome is recorded in
+        ``self._flow``); an inlined callee is popped and its value
+        resumes the pending call of the caller (see ``_resume_call``)."""
+        if len(self._frames) == 1:
+            self._flow = Flow.RET if returns else Flow.FALL
+            return
+        frame = self._frames.pop()
+        self._inline_depth -= 1
+        self._inline_stack.pop()
+        if returns:
+            assert value is not None
+            self._resume_call(frame, value)
+        else:
+            # the inlined body fell off its end: a void inline
+            self._resume_call(frame, ComptimeVal(None))
+
+    def _resume_call(self, frame: Frame, value: InterpVal) -> None:
+        """The run of an inlined callee ended: resume the call of the
+        caller that suspended on it - the call's result is handed to its
+        result location (``_store_result``), and the block run of the
+        caller continues with the instructions after the call."""
+        resume = frame.resume
+        assert resume is not None
+        inst, is_ctor = resume
+        # a constructor's ``__init__`` wrote the struct into the result
+        # location itself: the call result is the in-place marker, not
+        # the (void) value the body yielded
+        ev = InPlaceResult() if is_ctor else value
+        self._store_result(ev, inst.ret)
 
     def _operand(self, value: hir.Value) -> InterpVal:
         match value:
@@ -1020,42 +1205,40 @@ decision).  The return convention of the function is decided here
 
     # -- regions and runtime branches -----------------------------------------
 
-    def _run_region(self, stmts: tuple[hir.Inst, ...]) -> tuple[list[mir.Inst], bool]:
-        """Type and emit one region (a branch body of a runtime ``if``):
-        a straight-line list that may itself contain runtime ``if``s.
-        Returns the emitted instructions and whether the region returns
-        on every path (i.e. never falls off its end)."""
+    def _run_rt_region(
+        self, state: _RuntimeIfState, body: tuple[hir.Inst, ...]
+    ) -> None:
+        """Begin typing one branch region of the runtime ``if``
+        ``state``: its then-branch when the state is still fresh, its
+        else-branch once the then-branch has been typed (both branches
+        are always typed and emitted).  The branch body is pushed on the
+        block stack of the executing frame as a region block typing into
+        a fresh emission region, which is complete when the block's run
+        ends (see ``_end_block``)."""
         region: list[mir.Inst] = []
+        if state.then_region is None:
+            state.then_region = region
+        else:
+            state.else_region = region
         self._regions.append(region)
-        try:
-            flow, _ = self._run_list(stmts)
-        finally:
-            self._regions.pop()
-        return region, flow is Flow.RET
+        self._push_block(body, state)
 
-    def _exec_runtime_if(self, inst: hir.If, cond: InterpVal) -> tuple[Flow, InterpVal | None]:
+    def _exec_runtime_if(self, inst: hir.If, cond: InterpVal) -> None:
         """A runtime ``if``: both branch bodies are typed and emitted as
         regions of a :class:`mir.If`.  A branch that returns ends its
         path; a branch that falls off continues with the code after the
         ``if``.  Both branches falling through (a join) is not supported
-        yet, and neither are runtime branches inside inlined functions."""
+        yet, and neither are runtime branches inside inlined functions.
+        The typing of the two regions runs under the machine (see
+        ``_RuntimeIfState`` and ``_end_block``)."""
         if not self._in_function_proper():
             raise CompileError(
                 "runtime 'if' inside inlined functions is not supported yet"
             )
         if not isinstance(cond, RuntimeVal) or cond.type != sval.BoolType():
             raise CompileError('runtime if conditions must be boolean values')
-        then_body, then_returns = self._run_region(inst.then_body)
-        else_body, else_returns = self._run_region(inst.else_body)
-        if not then_returns and not else_returns:
-            raise CompileError(
-                "runtime 'if' branches that both fall through are not supported yet"
-            )
-        self._emit(mir.If(cond.value, tuple(then_body), tuple(else_body)))
-        if then_returns and else_returns:
-            # every path returns: whatever follows in this region is dead
-            return Flow.RET, None
-        return Flow.FALL, None
+        state = _RuntimeIfState(inst, cond)
+        self._run_rt_region(state, inst.then_body)
 
     def _finish_void(self) -> None:
         """End one path of the function proper with a void return (a bare
@@ -1220,9 +1403,17 @@ decision).  The return convention of the function is decided here
         value is materialized into the slot (its address may escape);
         and a constructor - or a call whose result goes through a result
         pointer - writes into the slot itself (in place), so no result
-        is handed back at all."""
+        is handed back at all.
+
+        A call of a plain Python function is *inlined*: the callee body
+        is pushed as a frame and runs under the machine, and this method
+        returns without completing - the call's result is handed to the
+        slot when the callee's run ends (see ``_resume_call``)."""
         callee = self._operand(inst.callee)
         ev = self._dispatch_call(callee, inst)
+        if ev is None:
+            # an inlined callee body is now running under the machine
+            return
         self._store_result(ev, inst.ret)
 
     def _store_result(self, ev: InterpVal, ret: hir.Value) -> None:
@@ -1278,13 +1469,19 @@ decision).  The return convention of the function is decided here
             return
         raise CompileError('cannot write a call result into a compile-time location')
 
-    def _dispatch_call(self, callee: InterpVal, inst: hir.CallInplace) -> InterpVal:
-        """Resolve one call by its callee value and run it, returning its
-        value.  Spy functions compile to a native ``call`` producing a
-        typed register, plain Python functions are inlined, and the spy
+    def _dispatch_call(self, callee: InterpVal, inst: hir.CallInplace) -> InterpVal | None:
+        """Resolve one call by its callee value and run it.  Spy
+        functions compile to a native ``call`` producing a typed
+        register, plain Python functions are inlined, and the spy
         builtins are evaluated at compile time.  The callee constant of a
         registered spy function already resolved to its entry when the
-        callee operand was evaluated (see ``_operand``)."""
+        callee operand was evaluated (see ``_operand``).
+
+        Returns the value of the call when it completed here (the caller
+        still hands it to the result location), or None when the call
+        runs an inlined callee: its frame was pushed and its body is now
+        running under the machine; the call's result is handed to the
+        result location when the run ends (see ``_resume_call``)."""
         assert not isinstance(callee, ComptimeVal), "values cannot be called at compile time"
         if not isinstance(callee, ComptimeRefVal):
             raise CompileError(
@@ -1305,7 +1502,9 @@ decision).  The return convention of the function is decided here
             # a constructor ``Bar(...)``
             return self._call_constructor(obj, inst)
         if isinstance(obj, pytypes.FunctionType):
-            return self._inline_plain(obj, [self._operand(a) for a in inst.args], 'function')
+            return self._start_inline(
+                obj, [self._operand(a) for a in inst.args], 'function', inst, False
+            )
         raise CompileError(
             f"cannot compile a call to {obj!r}; only spy functions, plain Python "
             "functions and the spy builtins can be called"
@@ -1401,13 +1600,18 @@ decision).  The return convention of the function is decided here
             return loc.value
         return self._materialize_location(loc, type)
 
-    def _call_constructor(self, desc: sval.StructType, inst: hir.CallInplace) -> InterpVal:
+    def _call_constructor(
+        self, desc: sval.StructType, inst: hir.CallInplace
+    ) -> InterpVal | None:
         """A struct constructor ``Bar(a, b)``: the result slot receives a
         new struct value.  With a user ``__init__`` the call is dispatched
         to it with ``self`` pointing at the result slot; otherwise every
         argument is written into the field of the same declaration index
         (the default constructor).  Either way the value is written into
-        the result location in place - no value is handed back."""
+        the result location in place - no value is handed back: returns
+        ``InPlaceResult``, or None when a user ``__init__`` that is a
+        plain Python function is being inlined (its run under the machine
+        resumes the call, see ``_start_inline``)."""
         struct = desc
         ret = self._operand(inst.ret)
         if not isinstance(ret, (PendingSlot, RetLocVal)):
@@ -1425,19 +1629,22 @@ decision).  The return convention of the function is decided here
             evals.extend(self._operand(a) for a in inst.args)
             if isinstance(target, FunctionEntry):
                 self._call_entry(target, inst, evals)
-            else:
-                self._inline_plain(target, evals, 'method')
-            return InPlaceResult()
+                return InPlaceResult()
+            # a plain ``__init__`` is inlined: it writes the fields of
+            # the result slot itself, so the call result that resumes
+            # the constructor is the in-place marker (its run ends, see
+            # ``_resume_call``)
+            return self._start_inline(target, evals, 'method', inst, True)
         fields = desc.fields
         if len(inst.args) != len(fields):
             raise CompileError(
                 f"constructor {desc.name} takes {len(fields)} arguments "
                 f"(one per field), got {len(inst.args)}"
             )
-        for i, field in enumerate(fields):
+        for i, f in enumerate(fields):
             ev = self._operand(inst.args[i])
             value = _materialize_arg(
-                ev, field.type, f"the '{field.name}' argument of {desc.name}"
+                ev, f.type, f"the '{f.name}' argument of {desc.name}"
             )
             field_ptr = self._emit(mir.Gep(ptr, i))
             self._emit(mir.Store(field_ptr, value))
@@ -1449,7 +1656,10 @@ decision).  The return convention of the function is decided here
         pointer to it (a ``ptr_self`` method) - the call is run like any
         other call, with the base prepended as that first argument (its
         static type, compared with the callee's, decides whether the
-        struct value or its address is passed)."""
+        struct value or its address is passed).  A plain (undecorated)
+        method is inlined: its body is pushed and runs under the machine,
+        and the call's result is handed to the result location when the
+        run ends (see ``_resume_call``)."""
         addr, struct = self._struct_addr_of(self._operand(inst.base))
         target = self._resolver.resolve_method(struct, inst.name)
         if target is None:
@@ -1461,7 +1671,10 @@ decision).  The return convention of the function is decided here
         if isinstance(method, FunctionEntry):
             ev = self._call_entry(method, inst, evals)
         else:
-            ev = self._inline_plain(method, evals, 'method')
+            # a plain method is inlined: its run resumes this call
+            ev = self._start_inline(method, evals, 'method', inst, False)
+        if ev is None:
+            return
         # the method's result lands in the result location like any call
         self._store_result(ev, inst.ret)
 
@@ -1568,14 +1781,22 @@ decision).  The return convention of the function is decided here
             return ComptimeVal(None)
         return RuntimeVal(value, ret_type)
 
-    def _inline_plain(
-        self, fn: Any, evals: list[InterpVal], what: str
-    ) -> InterpVal:
-        """A plain Python function - a helper, or the plain (undecorated)
-        method of a struct (``what`` is 'function' or 'method', used in
-        the error messages) - is inlined into the current stream like any
-        plain Python function (its body may only use what inlining
-        supports)."""
+    def _start_inline(
+        self,
+        fn: Any,
+        evals: list[InterpVal],
+        what: str,
+        inst: hir.CallInplace | hir.CallMethodInplace,
+        is_ctor: bool,
+    ) -> None:
+        """Start running the body of a plain Python function - a helper,
+        or the plain (undecorated) method of a struct (``what`` is
+        'function' or 'method', used in the error messages) - inlined
+        into the current stream like any plain Python function (its body
+        may only use what inlining supports).  The callee's frame is
+        pushed, carrying the pending call of the caller: the machine runs
+        the callee's body until it ends, then resumes the call (see
+        ``_frame_ended`` and ``_resume_call``)."""
         fn_ir = self._resolver.hir_of_plain_fn(fn)
         if any(f.fn is fn for f in self._inline_stack):
             if what == 'method':
@@ -1593,7 +1814,11 @@ decision).  The return convention of the function is decided here
             raise CompileError('too deeply nested inlined functions')
         formal = self._solve_types(fn_ir, evals, 'jit')
         values = _convert_evals(fn_ir, evals, formal)
-        return self._run_inline(fn_ir, values, formal)
+        frame = self._push_frame(tuple(zip(values, formal)), fn_ir.ret_loc)
+        frame.resume = (inst, is_ctor)
+        self._inline_stack.append(fn_ir)
+        self._inline_depth += 1
+        self._push_block(fn_ir.body)
 
     def _solve_types(
         self, fn_ir: astgen.FunctionIR, evals: list[InterpVal], mode: str
@@ -1626,27 +1851,3 @@ decision).  The return convention of the function is decided here
             return param_types
         except TypeMismatchError as e:
             raise CompileError(str(e)) from e
-
-    def _run_inline(
-        self,
-        fn_ir: astgen.FunctionIR,
-        values: tuple[mir.Value, ...],
-        formal: tuple[sval.Type, ...],
-    ) -> InterpVal:
-        """Run the body of an inlined plain function with the given
-        (already materialized) argument values, returning its result: the
-        value of its ``return``, or ``None`` for a void body."""
-        self._inline_stack.append(fn_ir)
-        self._inline_depth += 1
-        self._push_frame(tuple(zip(values, formal)), fn_ir.ret_loc)
-        try:
-            flow, value = self._run_list(fn_ir.body)
-        finally:
-            self._frames.pop()
-            self._inline_depth -= 1
-            self._inline_stack.pop()
-        if flow is not Flow.RET:
-            # the inlined body fell off its end: a void inline
-            return ComptimeVal(None)
-        assert isinstance(value, InterpVal)
-        return value
