@@ -29,7 +29,7 @@ from . import (
 )
 from . import as_ as spy_as
 from . import bool as spy_bool
-from . import type as spy_type
+from . import typeof as spy_typeof
 from .fn import LazyJitFunction
 
 # ---------------------------------------------------------------------------
@@ -69,14 +69,14 @@ def make_samples(cache: JitContext) -> dict[str, object]:
 
     @cache.jit()
     def foo(a, b):
-        if spy_type(a) == u64 and spy_type(b) == u64:
+        if spy_typeof(a) == u64 and spy_typeof(b) == u64:
             return add_aot(a, b)
         else:
             return add_inline(a, b)
 
     @cache.jit()
     def is_i32(a):
-        return spy_type(a) == i32
+        return spy_typeof(a) == i32
 
     @cache.jit()
     def call_add[T](a: T, b: T) -> T:
@@ -263,11 +263,11 @@ def _make_scale(k):
 
 
 def _make_is_type(ty):
-    """Factory: the returned function compares ``spy_type(x)`` with the
+    """Factory: the returned function compares ``spy_typeof(x)`` with the
     captured type descriptor ``ty`` (a compile-time comparison)."""
 
     def is_ty(x):
-        return spy_type(x) == ty
+        return spy_typeof(x) == ty
 
     return is_ty
 
@@ -619,7 +619,7 @@ class SpyExampleTest(TestCase):
         @self.cache.jit()
         def pick(x):
             s = 1
-            if spy_type(x) == i32:
+            if spy_typeof(x) == i32:
                 s = x
                 s += 100
                 return s
@@ -717,7 +717,7 @@ class SpyExampleTest(TestCase):
         self.assertEqual(other(2), 20)
         self.assertEqual(scale(4), 12)
 
-    def test_closure_captures_spy_type(self) -> None:
+    def test_closure_captures_spy_typeof(self) -> None:
         # a captured type descriptor usable in a compile-time comparison
         is_u64 = self.cache.jit()(_make_is_type(u64))
         self.assertFalse(is_u64(1))
@@ -776,11 +776,11 @@ def _make_rls_pair():
 
 def _make_type_caller():
     """Factory: the returned caller uses the compile-time builtin
-    ``spy.type`` (a module global of this test module) in a value
+    ``spy.typeof`` (a module global of this test module) in a value
     context."""
 
     def outer(x):
-        return spy_type(x) == i32
+        return spy_typeof(x) == i32
 
     return outer
 
@@ -825,7 +825,7 @@ class RlsHirTest(TestCase):
         self.assertIs(ir.ret_loc, call.ret)
 
     def test_comptime_call_through_result_slot(self) -> None:
-        # a compile-time builtin (spy.type) goes through the same
+        # a compile-time builtin (spy.typeof) goes through the same
         # temporary-slot + load shape: the interpreter records its
         # compile-time result in the slot and the matching Load passes it
         # on without giving the slot memory
@@ -833,7 +833,7 @@ class RlsHirTest(TestCase):
         ir, call = self._single_call(outer)
         callee = call.callee
         assert isinstance(callee, hir.ConstRef)
-        self.assertIs(callee.value, spy_type)
+        self.assertIs(callee.value, spy_typeof)
         self.assertEqual(len(call.args), 1)
         self.assertIsInstance(call.args[0], hir.Load)
         self.assertIsInstance(call.ret, hir.Alloca)
@@ -946,7 +946,7 @@ def make_struct_samples(cache: JitContext) -> dict[str, object]:
     @cache.jit()
     def is_bar(b):
         # a compile-time dispatch on the struct type of the argument
-        if spy_type(b) == Bar:
+        if spy_typeof(b) == Bar:
             return 1
         return 0
 

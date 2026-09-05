@@ -28,7 +28,7 @@ or read.
 
 Calls are dispatched at compile time:
 
-* calls to the ``spy`` builtins (``spy.type``, ``spy.compile_log``) are
+* calls to the ``spy`` builtins (``spy.typeof``, ``spy.compile_log``) are
   evaluated eagerly,
 * calls to other spy functions (jit or aot) become native ``call``
   instructions to the specialization selected by the argument types,
@@ -51,52 +51,10 @@ from typing import Any
 
 from . import astgen, hir, mir
 from . import builtins as spy_builtins
+from . import type as stype
 from .errors import CompileError, TypeMismatchError
 from .fn import FunctionEntry, FunctionValue
 from .info import FunctionResolver
-from .mir import (
-    BoolType,
-    BoolValue,
-    FloatType,
-    FloatValue,
-    IntType,
-    IntValue,
-    PointerType,
-    StructType,
-    Type,
-    VoidType,
-    type_str,
-)
-from .type import (
-    BoolType as SpyBoolType,
-)
-from .type import (
-    FloatType as SpyFloatType,
-)
-from .type import (
-    FormalArg as SpyFormalArg,
-)
-from .type import (
-    FunctionType as SpyFunctionType,
-)
-from .type import (
-    IntType as SpyIntType,
-)
-from .type import (
-    PointerType as SpyPointerType,
-)
-from .type import (
-    StructType as SpyStructType,
-)
-from .type import (
-    Type as SpyType,
-)
-from .type import (
-    VoidType as SpyVoidType,
-)
-from .type import (
-    value_type,
-)
 
 _MAX_INLINE_DEPTH = 64
 
@@ -152,7 +110,7 @@ class PendingSlot(InterpVal):
     ``Store``, or a struct result, which the callee writes into the slot
     in place)."""
 
-    type: Type | None = None
+    type: mir.Type | None = None
     ptr: mir.Value | None = None
     # the value an RLS call result recorded in the slot; ``Load`` returns
     # it while no memory has been allocated yet
@@ -189,7 +147,7 @@ class RetLocVal(InterpVal):
     # function whose result is written in place, or the result pointer
     # parameter of a result-pointer function); its static type is ``type``
     ptr: mir.Value | None = None
-    type: Type | None = None
+    type: mir.Type | None = None
 
 
 @dataclass
@@ -209,7 +167,7 @@ class Flow(IntEnum):
     RET = auto()
 
 
-def typeof(value: mir.Value) -> Type:
+def typeof(value: mir.Value) -> mir.Type:
     return value.type  # type: ignore[attr-defined]
 
 
@@ -218,33 +176,33 @@ def typeof(value: mir.Value) -> Type:
 # ---------------------------------------------------------------------------
 
 
-def to_mir_type(type: SpyType) -> Type:
+def to_mir_type(type: stype.Type) -> mir.Type:
     """The MIR mirror of a spy type: the static type the runtime register
     of a value of ``type`` has.  The mapping is one-to-one over the types
     that can cross into runtime code.  A spy struct type mirrors to one
     :class:`mir.StructType` object (created lazily and cached on the
     descriptor), so that all values of one struct share one identity."""
     match type:
-        case SpyBoolType():
-            return BoolType()
-        case SpyIntType():
-            return IntType(type.bits, type.signed)
-        case SpyFloatType():
-            return FloatType(type.bits)
-        case SpyVoidType():
-            return VoidType()
-        case SpyStructType():
+        case stype.BoolType():
+            return mir.BoolType()
+        case stype.IntType():
+            return mir.IntType(type.bits, type.signed)
+        case stype.FloatType():
+            return mir.FloatType(type.bits)
+        case stype.VoidType():
+            return mir.VoidType()
+        case stype.StructType():
             return struct_mir_type(type)
-        case SpyPointerType(elem, _):
+        case stype.PointerType(elem, _):
             # const-ness is not tracked in the MIR
-            return PointerType(to_mir_type(elem))
-        case SpyFunctionType(args, ret):
+            return mir.PointerType(to_mir_type(elem))
+        case stype.FunctionType(args, ret):
             return mir.FunctionType(tuple(to_mir_type(a.type) for a in args), to_mir_type(ret))
         case _:
             raise CompileError(f"spy type {type!r} has no MIR representation")
 
 
-def struct_mir_type(type: SpyStructType) -> StructType:
+def struct_mir_type(type: stype.StructType) -> mir.StructType:
     """The (cached) MIR mirror of one spy struct type: fields in
     declaration order, mirroring the LLVM layout of the struct."""
     ret = type._mir
@@ -253,34 +211,34 @@ def struct_mir_type(type: SpyStructType) -> StructType:
     fields: list[mir.FormalArg] = []
     for field in type.fields:
         fields.append(mir.FormalArg(field.name, to_mir_type(field.type)))
-    ret = StructType(type, tuple(fields))
+    ret = mir.StructType(type, tuple(fields))
     ret.ctype = type._py_cls
     type._mir = ret
     return ret
 
 
-def to_spy_type(type: Type) -> SpyType:
+def to_spy_type(type: mir.Type) -> stype.Type:
     """The spy type a MIR type mirrors (the inverse of
     :func:`to_mir_type` on its accepted types)."""
     match type:
-        case BoolType():
-            return SpyBoolType()
-        case IntType():
-            return SpyIntType(type.bits, type.signed)
-        case FloatType():
-            return SpyFloatType(type.bits)
-        case VoidType():
-            return SpyVoidType()
-        case PointerType(elem):
-            return SpyPointerType(to_spy_type(elem), is_const=False)
-        case StructType():
+        case mir.BoolType():
+            return stype.BoolType()
+        case mir.IntType():
+            return stype.IntType(type.bits, type.signed)
+        case mir.FloatType():
+            return stype.FloatType(type.bits)
+        case mir.VoidType():
+            return stype.VoidType()
+        case mir.PointerType(elem):
+            return stype.PointerType(to_spy_type(elem), is_const=False)
+        case mir.StructType():
             return type.spy_type
         case mir.FunctionType(args, ret):
-            return SpyFunctionType(
-                tuple(SpyFormalArg('', to_spy_type(a)) for a in args), to_spy_type(ret)
+            return stype.FunctionType(
+                tuple(stype.FormalArg('', to_spy_type(a)) for a in args), to_spy_type(ret)
             )
         case _:
-            raise CompileError(f"MIR type {type_str(type)} has no spy counterpart")
+            raise CompileError(f"MIR type {mir.type_str(type)} has no spy counterpart")
 
 
 # ---------------------------------------------------------------------------
@@ -291,24 +249,24 @@ def to_spy_type(type: Type) -> SpyType:
 # ---------------------------------------------------------------------------
 
 
-def _field_index(type: StructType, name: str) -> int:
+def _field_index(type: mir.StructType, name: str) -> int:
     """The declaration index of the field ``name`` of a struct type."""
     for i, field in enumerate(type.fields):
         if field.name == name:
             return i
     raise CompileError(
-        f"type {type_str(type)} has no field named '{name}'"
+        f"type {mir.type_str(type)} has no field named '{name}'"
     )
 
 
-def _const_of_py(obj: Any, type: Type) -> mir.Value:
+def _const_of_py(obj: Any, type: mir.Type) -> mir.Value:
     """Turn a Python literal into a typed MIR constant."""
     match type:
-        case BoolType():
+        case mir.BoolType():
             if not isinstance(obj, bool):
                 raise CompileError(f"cannot use {obj!r} as a bool constant")
-            return BoolValue(obj)
-        case IntType():
+            return mir.BoolValue(obj)
+        case mir.IntType():
             if isinstance(obj, bool) or not isinstance(obj, int):
                 raise CompileError(f"cannot use {obj!r} as an integer constant")
             if type.signed:
@@ -317,16 +275,16 @@ def _const_of_py(obj: Any, type: Type) -> mir.Value:
                 lo, hi = (0, 2 ** type.bits - 1)
             if not lo <= obj <= hi:
                 raise CompileError(
-                    f"integer constant {obj} is out of range for {type_str(type)}"
+                    f"integer constant {obj} is out of range for {mir.type_str(type)}"
                 )
-            return IntValue(obj, type.bits, type.signed)
-        case FloatType():
+            return mir.IntValue(obj, type.bits, type.signed)
+        case mir.FloatType():
             if isinstance(obj, bool) or not isinstance(obj, (int, float)):
                 raise CompileError(f"cannot use {obj!r} as a float constant")
-            return FloatValue(float(obj), type.bits)
+            return mir.FloatValue(float(obj), type.bits)
         case _:
             raise CompileError(
-                f"cannot create a constant of type {type_str(type)} from {obj!r}"
+                f"cannot create a constant of type {mir.type_str(type)} from {obj!r}"
             )
 
 
@@ -343,40 +301,40 @@ def _comptime_py_op(op: str, lhs: Any, rhs: Any) -> Any:
         ) from e
 
 
-def _binary_type(op: str, lt: Type, rt: Type, what: str) -> Type | None:
+def _binary_type(op: str, lt: mir.Type, rt: mir.Type, what: str) -> mir.Type | None:
     """The type a binary operation on ``lt``/``rt`` is performed on, or
     None if the operand combination is not a number pair."""
-    if isinstance(lt, IntType) and isinstance(rt, IntType):
+    if isinstance(lt, mir.IntType) and isinstance(rt, mir.IntType):
         if lt != rt:
             raise CompileError(
-                f"cannot {what} a {type_str(lt)} value with a {type_str(rt)} value "
+                f"cannot {what} a {mir.type_str(lt)} value with a {mir.type_str(rt)} value "
                 "(different integer types)"
             )
         return lt
-    if isinstance(lt, FloatType) and isinstance(rt, FloatType):
-        return FloatType(max(lt.bits, rt.bits))
-    if isinstance(lt, IntType) and isinstance(rt, FloatType):
+    if isinstance(lt, mir.FloatType) and isinstance(rt, mir.FloatType):
+        return mir.FloatType(max(lt.bits, rt.bits))
+    if isinstance(lt, mir.IntType) and isinstance(rt, mir.FloatType):
         return rt
-    if isinstance(lt, FloatType) and isinstance(rt, IntType):
+    if isinstance(lt, mir.FloatType) and isinstance(rt, mir.IntType):
         return lt
     return None
 
 
-def _unsupported_type_error(op: str, type: Type | None) -> CompileError:
-    if isinstance(type, PointerType) and isinstance(type.elem, IntType) and type.elem.bits == 8:
+def _unsupported_type_error(op: str, type: mir.Type | None) -> CompileError:
+    if isinstance(type, mir.PointerType) and isinstance(type.elem, mir.IntType) and type.elem.bits == 8:
         return CompileError(
             f"cannot apply '{op}' to string values "
             "(strings are compiled as arrays of u8)"
         )
-    if isinstance(type, PointerType):
+    if isinstance(type, mir.PointerType):
         return CompileError(f"cannot apply '{op}' to pointer values")
     if type is None:
         return CompileError(f"cannot apply '{op}' to a compile-time object")
-    return CompileError(f"cannot apply '{op}' to {type_str(type)} values")
+    return CompileError(f"cannot apply '{op}' to {mir.type_str(type)} values")
 
 
 
-def _to_runtime(ev: InterpVal, target: Type | None) -> mir.Value:
+def _to_runtime(ev: InterpVal, target: mir.Type | None) -> mir.Value:
     """Materialize a return value: runtime values must already have
     the target type, compile-time values adopt it (or, without a
     target, their Python type mapping)."""
@@ -385,7 +343,7 @@ def _to_runtime(ev: InterpVal, target: Type | None) -> mir.Value:
         t = typeof(value)
         if target is not None and t != target:
             raise CompileError(
-                f"cannot return a {type_str(t)} value where {type_str(target)} "
+                f"cannot return a {mir.type_str(t)} value where {mir.type_str(target)} "
                 "is expected"
             )
         return value
@@ -394,14 +352,14 @@ def _to_runtime(ev: InterpVal, target: Type | None) -> mir.Value:
             raise CompileError("cannot return None (functions must return a value)")
         if target is not None:
             return _const_of_py(ev.obj, target)
-        t = value_type(ev.obj)
+        t = stype.value_type(ev.obj)
         if t is None:
             raise CompileError(f"cannot return the compile-time value {ev.obj!r}")
         return _const_of_py(ev.obj, to_mir_type(t))
     raise CompileError('cannot return this value')
 
 
-def _to_slot(ev: InterpVal, type: Type) -> mir.Value:
+def _to_slot(ev: InterpVal, type: mir.Type) -> mir.Value:
     """Materialize ``ev`` as a value of exactly ``type`` for a store
     into an already-typed slot (the strict sibling of
     ``_to_runtime``, whose messages talk about stores)."""
@@ -409,22 +367,22 @@ def _to_slot(ev: InterpVal, type: Type) -> mir.Value:
         case RuntimeVal(value):
             if typeof(value) != type:
                 raise CompileError(
-                    f"cannot store a {type_str(typeof(value))} value into a "
-                    f"slot of type {type_str(type)}"
+                    f"cannot store a {mir.type_str(typeof(value))} value into a "
+                    f"slot of type {mir.type_str(type)}"
                 )
             return value
         case ComptimeVal(obj):
             return _const_of_py(obj, type)
         case _:
             raise CompileError(
-                f"cannot store this value into a slot of type {type_str(type)}"
+                f"cannot store this value into a slot of type {mir.type_str(type)}"
             )
 
 
 def _convert_evals(
     fn_ir: astgen.FunctionIR,
     evals: list[InterpVal],
-    formal: tuple[SpyType, ...],
+    formal: tuple[stype.Type, ...],
 ) -> tuple[mir.Value, ...]:
     """Materialize the (possibly defaulted) arguments of one call as
     values of the given formal types."""
@@ -439,9 +397,9 @@ def _convert_evals(
                 value = ev.value
                 if typeof(value) != formal_types[i]:
                     raise CompileError(
-                        f"cannot pass a {type_str(typeof(value))} value as the "
+                        f"cannot pass a {mir.type_str(typeof(value))} value as the "
                         f"'{param.name}' argument of function {fn_ir.name} "
-                        f"(expected {type_str(formal_types[i])})"
+                        f"(expected {mir.type_str(formal_types[i])})"
                     )
                 values.append(value)
             else:
@@ -452,7 +410,7 @@ def _convert_evals(
     return tuple(values)
 
 
-def _materialize_arg(ev: InterpVal, target: Type, what: str) -> mir.Value:
+def _materialize_arg(ev: InterpVal, target: mir.Type, what: str) -> mir.Value:
     """Materialize one argument value of exactly the type ``target``
     (used by constructors, whose parameters are the struct fields)."""
     match ev:
@@ -461,8 +419,8 @@ def _materialize_arg(ev: InterpVal, target: Type, what: str) -> mir.Value:
         case RuntimeVal(value):
             if typeof(value) != target:
                 raise CompileError(
-                    f"cannot pass a {type_str(typeof(value))} value as {what} "
-                    f"(expected {type_str(target)})"
+                    f"cannot pass a {mir.type_str(typeof(value))} value as {what} "
+                    f"(expected {mir.type_str(target)})"
                 )
             return value
         case _:
@@ -503,8 +461,8 @@ class HirRunner:
         # the function proper whose body is currently being typed (see
         # ``_bind_result_ptr``)
         self._fn: mir.Function | None = None
-        self._ret_type: Type | None = None
-        self._ret_target: Type | None = None
+        self._ret_type: mir.Type | None = None
+        self._ret_target: mir.Type | None = None
         # True when a path of the function proper ended in a void return
         # (a bare ``return``, or a fall-off of a void function)
         self._saw_void_return = False
@@ -567,7 +525,7 @@ class HirRunner:
             # the declared return type is delivered through a result
             # pointer: lower the signature before the body is typed, so
             # that recursive calls the body makes see the final form
-            assert isinstance(declared, StructType)
+            assert isinstance(declared, mir.StructType)
             self._bind_result_ptr(fn, declared)
         param_values = tuple(
             mir.Param(i, arg.type, arg.name) for i, arg in enumerate(fn.args)
@@ -590,19 +548,19 @@ class HirRunner:
                     f"function {fn_ir.name} returns a value on some paths but "
                     'falls off its end (without a return) on others'
                 )
-            if declared is not None and declared != VoidType():
+            if declared is not None and declared != mir.VoidType():
                 raise CompileError(
                     f"function {fn_ir.name} must end with a 'return' statement"
                 )
             self._finish_void()
-            ret_type = VoidType()
+            ret_type = mir.VoidType()
         elif self._saw_void_return:
             if self._ret_type is not None:
                 raise CompileError(
                     f"function {fn_ir.name} returns a value on some paths but "
                     'returns without a value on others'
                 )
-            ret_type = VoidType()
+            ret_type = mir.VoidType()
         else:
             ret_type = self._ret_type
             assert ret_type is not None
@@ -615,17 +573,17 @@ class HirRunner:
             # a result-pointer function: its MIR signature was lowered to
             # a trailing result pointer formal and a void return when the
             # mode was bound (see ``_bind_result_ptr``)
-            fn.ret_type = VoidType()
+            fn.ret_type = mir.VoidType()
             return
         fn.ret_type = ret_type
 
-    def _bind_result_ptr(self, fn: mir.Function, logical: StructType) -> None:
+    def _bind_result_ptr(self, fn: mir.Function, logical: mir.StructType) -> None:
         """Lower the signature of the function proper to its result
         pointer form: append the trailing result pointer formal and fix
         the return type to void.  ``logical`` is the type of the value
         the function returns (kept in ``fn.result_type``)."""
         index = len(fn.args)
-        formal = mir.FormalArg('$result', PointerType(logical))
+        formal = mir.FormalArg('$result', mir.PointerType(logical))
         fn.args = fn.args + (formal,)
         fn.result_type = logical
         param = mir.Param(index, formal.type, formal.name)
@@ -652,7 +610,7 @@ class HirRunner:
         declared return type) and cross-path consistency is checked."""
         retloc = self._result_loc_of()
         target = self._ret_target
-        if target is VoidType():
+        if target is mir.VoidType():
             raise CompileError(
                 'cannot return a value from a void function (its return '
                 'type is None)'
@@ -668,14 +626,14 @@ class HirRunner:
         if self._ret_type is not None and self._ret_type != t:
             raise CompileError(
                 f"function returns values of conflicting types "
-                f"{type_str(self._ret_type)} and {type_str(t)}"
+                f"{mir.type_str(self._ret_type)} and {mir.type_str(t)}"
             )
         self._ret_type = t
         if self._result_mode is None:
             # the return type is inferred from this site: decide the
             # return convention from it
             if mir.via_result_ptr(t):
-                assert isinstance(t, StructType)
+                assert isinstance(t, mir.StructType)
                 # the signature is still being typed and nothing has
                 # referenced the function yet (an inferred function can
                 # never be recursive), so appending the formal is safe
@@ -695,14 +653,14 @@ class HirRunner:
         retloc.value = RuntimeVal(value)
         self._ret_written = True
 
-    def _note_inplace_ret(self, type: Type) -> None:
+    def _note_inplace_ret(self, type: mir.Type) -> None:
         """A return-path write that happened in place (a constructor or
         a result-pointer callee wrote straight into the result location):
         the cross-path return-type bookkeeping, without a value."""
         if self._ret_type is not None and self._ret_type != type:
             raise CompileError(
                 f"function returns values of conflicting types "
-                f"{type_str(self._ret_type)} and {type_str(type)}"
+                f"{mir.type_str(self._ret_type)} and {mir.type_str(type)}"
             )
         self._ret_type = type
         self._ret_written = True
@@ -721,10 +679,10 @@ class HirRunner:
                 ptr = self._result_ptr
                 assert ptr is not None
                 logical = typeof(ptr)
-                assert isinstance(logical, PointerType)
+                assert isinstance(logical, mir.PointerType)
                 raise CompileError(
                     'cannot return without a value where '
-                    f'{type_str(logical.elem)} is expected'
+                    f'{mir.type_str(logical.elem)} is expected'
                 )
             self._emit(mir.Ret(None))
             return
@@ -891,8 +849,8 @@ class HirRunner:
             return RuntimeVal(self._emit(mir.Load(ptr.ptr, ptr.type)))
         if isinstance(ptr, RuntimeVal):
             ptype = typeof(ptr.value)
-            if not isinstance(ptype, PointerType):
-                raise CompileError(f"cannot load from a {type_str(ptype)} value")
+            if not isinstance(ptype, mir.PointerType):
+                raise CompileError(f"cannot load from a {mir.type_str(ptype)} value")
             return RuntimeVal(self._emit(mir.Load(ptr.value, ptype.elem)))
         raise CompileError('cannot load from a compile-time pointer')
 
@@ -918,7 +876,7 @@ class HirRunner:
                 ptr.value = None
                 v0 = _to_runtime(recorded, None)
                 t0 = typeof(v0)
-                ptr.ptr = self._emit(mir.Alloca(PointerType(t0)))
+                ptr.ptr = self._emit(mir.Alloca(mir.PointerType(t0)))
                 ptr.type = t0
                 self._emit(mir.Store(ptr.ptr, v0))
             # the first store types the slot
@@ -926,19 +884,19 @@ class HirRunner:
             t = typeof(v)
             if ptr.ptr is None:
                 assert ptr.type is None
-                ptr.ptr = self._emit(mir.Alloca(PointerType(t)))
+                ptr.ptr = self._emit(mir.Alloca(mir.PointerType(t)))
                 ptr.type = t
             elif ptr.type is None or ptr.type != t:
                 raise CompileError(
-                    f"cannot store a {type_str(t)} value into a slot of a "
+                    f"cannot store a {mir.type_str(t)} value into a slot of a "
                     f"different type"
                 )
             self._emit(mir.Store(ptr.ptr, v))
             return
         if isinstance(ptr, RuntimeVal):
             ptype = typeof(ptr.value)
-            if not isinstance(ptype, PointerType):
-                raise CompileError(f"cannot store through a {type_str(ptype)} value")
+            if not isinstance(ptype, mir.PointerType):
+                raise CompileError(f"cannot store through a {mir.type_str(ptype)} value")
             v = _to_runtime(value, ptype.elem)
             self._emit(mir.Store(ptr.value, v))
             return
@@ -946,7 +904,7 @@ class HirRunner:
 
     # -- struct values ---------------------------------------------------------
 
-    def _struct_addr_of(self, ev: InterpVal) -> tuple[mir.Value, StructType]:
+    def _struct_addr_of(self, ev: InterpVal) -> tuple[mir.Value, mir.StructType]:
         """The address of the struct value ``ev`` denotes, and the static
         struct type at that address.  A struct value lives in memory: a
         variable whose slot holds the struct gives its slot, a slot that
@@ -959,24 +917,24 @@ class HirRunner:
                 t = ev.type
                 if t is None:
                     raise CompileError('cannot access the fields of a variable that has not been assigned yet')
-                if isinstance(t, StructType):
+                if isinstance(t, mir.StructType):
                     assert ev.ptr is not None
                     return ev.ptr, t
-                if isinstance(t, PointerType) and isinstance(t.elem, StructType):
+                if isinstance(t, mir.PointerType) and isinstance(t.elem, mir.StructType):
                     # the slot holds the address of the struct: dereference
                     assert ev.ptr is not None
                     ptr = self._emit(mir.Load(ev.ptr, t))
                     return ptr, t.elem
                 raise CompileError(
-                    f"cannot access fields of a {type_str(t)} value: "
+                    f"cannot access fields of a {mir.type_str(t)} value: "
                     'only struct values have fields'
                 )
             case RuntimeVal(value):
                 t = typeof(value)
-                if isinstance(t, PointerType) and isinstance(t.elem, StructType):
+                if isinstance(t, mir.PointerType) and isinstance(t.elem, mir.StructType):
                     return value, t.elem
                 raise CompileError(
-                    f"cannot access fields of a {type_str(t)} value: "
+                    f"cannot access fields of a {mir.type_str(t)} value: "
                     'only struct values have fields'
                 )
             case _:
@@ -1019,7 +977,7 @@ class HirRunner:
             raise CompileError(
                 "runtime 'if' inside inlined functions is not supported yet"
             )
-        if not isinstance(cond, RuntimeVal) or typeof(cond.value) != BoolType():
+        if not isinstance(cond, RuntimeVal) or typeof(cond.value) != mir.BoolType():
             raise CompileError('runtime if conditions must be boolean values')
         then_body, then_returns = self._run_region(inst.then_body)
         else_body, else_returns = self._run_region(inst.else_body)
@@ -1037,9 +995,9 @@ class HirRunner:
         """End one path of the function proper with a void return (a bare
         ``return``, or the implicit end of a void function body)."""
         target = self._ret_target
-        if target is not None and target != VoidType():
+        if target is not None and target != mir.VoidType():
             raise CompileError(
-                f"cannot return without a value where {type_str(target)} is expected"
+                f"cannot return without a value where {mir.type_str(target)} is expected"
             )
         self._saw_void_return = True
         self._emit(mir.Ret(None))
@@ -1047,16 +1005,16 @@ class HirRunner:
     # -- helpers -------------------------------------------------------------
 
     @staticmethod
-    def _type_of(ev: InterpVal) -> Type | None:
+    def _type_of(ev: InterpVal) -> mir.Type | None:
         match ev:
             case RuntimeVal(value):
                 return typeof(value)
             case ComptimeVal(obj):
-                t = value_type(obj)
+                t = stype.value_type(obj)
                 return to_mir_type(t) if t is not None else None
             case ComptimeRefVal(obj):
-                t = value_type(obj)
-                return PointerType(to_mir_type(t), True) if t is not None else None
+                t = stype.value_type(obj)
+                return mir.PointerType(to_mir_type(t), True) if t is not None else None
             case _:
                 return None
 
@@ -1066,9 +1024,9 @@ class HirRunner:
         t = self._type_of(ev)
         if t is None:
             return 'an untyped value'
-        return f'a {type_str(t)} value'
+        return f'a {mir.type_str(t)} value'
 
-    def _coerce(self, ev: InterpVal, target: Type) -> mir.Value:
+    def _coerce(self, ev: InterpVal, target: mir.Type) -> mir.Value:
         """Materialize a value of type ``target``; numeric widening
         conversions (int -> float, float32 -> float64) are applied."""
         match ev:
@@ -1080,28 +1038,28 @@ class HirRunner:
             case _:
                 raise CompileError('cannot materialize this value')
 
-    def _convert(self, value: mir.Value, from_type: Type, to_type: Type) -> mir.Value:
+    def _convert(self, value: mir.Value, from_type: mir.Type, to_type: mir.Type) -> mir.Value:
         if from_type == to_type:
             return value
-        if isinstance(from_type, IntType) and isinstance(to_type, IntType):
+        if isinstance(from_type, mir.IntType) and isinstance(to_type, mir.IntType):
             if from_type.bits < to_type.bits:
                 kind = 'sext' if from_type.signed else 'zext'
             else:
                 kind = 'trunc'
             return self._emit(mir.Convert(kind, value, to_type))
-        if isinstance(from_type, IntType) and isinstance(to_type, FloatType):
+        if isinstance(from_type, mir.IntType) and isinstance(to_type, mir.FloatType):
             kind = 'sitofp' if from_type.signed else 'uitofp'
             return self._emit(mir.Convert(kind, value, to_type))
-        if isinstance(from_type, FloatType) and isinstance(to_type, FloatType):
+        if isinstance(from_type, mir.FloatType) and isinstance(to_type, mir.FloatType):
             kind = 'fpext' if from_type.bits < to_type.bits else 'fptrunc'
             return self._emit(mir.Convert(kind, value, to_type))
         raise CompileError(
-            f"cannot convert a {type_str(from_type)} value to {type_str(to_type)}"
+            f"cannot convert a {mir.type_str(from_type)} value to {mir.type_str(to_type)}"
         )
 
     # -- operators ------------------------------------------------------------
 
-    def _bin_types(self, lhs: InterpVal, rhs: InterpVal) -> tuple[Type | None, Type | None]:
+    def _bin_types(self, lhs: InterpVal, rhs: InterpVal) -> tuple[mir.Type | None, mir.Type | None]:
         """The static types of the two operands of a binary operation.  A
         compile-time integer constant adopts the type of a runtime
         integer operand (``x + 1`` with ``x: u64`` is a u64 addition,
@@ -1114,14 +1072,14 @@ class HirRunner:
             isinstance(rhs, ComptimeVal)
             and not isinstance(rhs.obj, bool)
             and isinstance(rhs.obj, int)
-            and isinstance(lt, IntType)
+            and isinstance(lt, mir.IntType)
         ):
             rt = lt
         elif (
             isinstance(lhs, ComptimeVal)
             and not isinstance(lhs.obj, bool)
             and isinstance(lhs.obj, int)
-            and isinstance(rt, IntType)
+            and isinstance(rt, mir.IntType)
         ):
             lt = rt
         return lt, rt
@@ -1136,7 +1094,7 @@ class HirRunner:
         type = _binary_type(op, lt, rt, f"apply '{op}' to") if lt is not None and rt is not None else None
         if type is None:
             raise _unsupported_type_error(op, lt)
-        if isinstance(type, IntType):
+        if isinstance(type, mir.IntType):
             if op == '/':
                 raise CompileError(
                     "integer division ('/') is not supported; divide float values instead"
@@ -1157,7 +1115,7 @@ class HirRunner:
 
         lv = self._coerce(lhs, type)
         rv = self._coerce(rhs, type)
-        signed = isinstance(type, IntType) and type.signed
+        signed = isinstance(type, mir.IntType) and type.signed
         value = self._emit(mir.Arith(_ARITH_OPS[op], signed, lv, rv, type))
         return RuntimeVal(value)
 
@@ -1173,8 +1131,8 @@ class HirRunner:
             raise _unsupported_type_error(op, lt)
         lv = self._coerce(lhs, type)
         rv = self._coerce(rhs, type)
-        kind = 'int' if isinstance(type, IntType) else 'float'
-        signed = isinstance(type, IntType) and type.signed
+        kind = 'int' if isinstance(type, mir.IntType) else 'float'
+        signed = isinstance(type, mir.IntType) and type.signed
         value = self._emit(mir.Cmp(_CMP_OPS[op], signed, kind, lv, rv))
         return RuntimeVal(value)
 
@@ -1208,18 +1166,18 @@ class HirRunner:
             raise CompileError(f"cannot apply unary '{op}' to a compile-time object")
         value = self._coerce(operand, type)
         if op == 'not':
-            if type != BoolType():
-                raise CompileError(f"cannot apply 'not' to a {type_str(type)} value")
-            one = BoolValue(True)
+            if type != mir.BoolType():
+                raise CompileError(f"cannot apply 'not' to a {mir.type_str(type)} value")
+            one = mir.BoolValue(True)
             return RuntimeVal(self._emit(mir.Arith('xor', False, value, one, type)))
         if op == 'neg':
-            if isinstance(type, FloatType):
-                zero = FloatValue(0.0, type.bits)
+            if isinstance(type, mir.FloatType):
+                zero = mir.FloatValue(0.0, type.bits)
                 return RuntimeVal(self._emit(mir.Arith('sub', False, zero, value, type)))
-            if isinstance(type, IntType):
-                zero = IntValue(0, type.bits, type.signed)
+            if isinstance(type, mir.IntType):
+                zero = mir.IntValue(0, type.bits, type.signed)
                 return RuntimeVal(self._emit(mir.Arith('sub', False, zero, value, type)))
-            raise CompileError(f"cannot negate a {type_str(type)} value")
+            raise CompileError(f"cannot negate a {mir.type_str(type)} value")
         raise CompileError(f"unsupported unary operator '{op}'")
 
     # -- calls ----------------------------------------------------------------
@@ -1265,11 +1223,11 @@ class HirRunner:
             return
         if isinstance(slot, PendingSlot):
             if slot.ptr is None:
-                if isinstance(ev, RuntimeVal) and isinstance(typeof(ev.value), StructType):
+                if isinstance(ev, RuntimeVal) and isinstance(typeof(ev.value), mir.StructType):
                     # a struct call result needs real memory (its address
                     # may escape: fields are accessed and values passed on)
                     struct = typeof(ev.value)
-                    assert isinstance(struct, StructType)
+                    assert isinstance(struct, mir.StructType)
                     ptr = self._materialize_location(slot, struct)
                     self._emit(mir.Store(ptr, ev.value))
                     return
@@ -1283,9 +1241,9 @@ class HirRunner:
             return
         if isinstance(slot, RuntimeVal):
             ptype = typeof(slot.value)
-            if not isinstance(ptype, PointerType):
+            if not isinstance(ptype, mir.PointerType):
                 raise CompileError(
-                    f"cannot write a call result through a {type_str(ptype)} value"
+                    f"cannot write a call result through a {mir.type_str(ptype)} value"
                 )
             v = _to_slot(ev, ptype.elem)
             self._emit(mir.Store(slot.value, v))
@@ -1305,7 +1263,7 @@ class HirRunner:
                 "calls through runtime function values are not supported yet"
             )
         obj = callee.obj
-        if obj is spy_builtins.spy_type:
+        if obj is spy_builtins.spy_typeof:
             return self._call_builtin_type(inst)
         if obj is spy_builtins.spy_compile_log:
             return self._call_builtin_compile_log(inst)
@@ -1315,7 +1273,7 @@ class HirRunner:
             )
         if isinstance(obj, FunctionEntry):
             return self._call_spy_function(obj, inst)
-        if isinstance(obj, SpyStructType):
+        if isinstance(obj, stype.StructType):
             # a constructor ``Bar(...)``
             return self._call_constructor(obj, inst)
         if isinstance(obj, pytypes.FunctionType):
@@ -1327,18 +1285,18 @@ class HirRunner:
 
     def _call_builtin_type(self, inst: hir.CallInplace) -> InterpVal:
         if len(inst.args) != 1:
-            raise CompileError('spy.type takes exactly one argument')
+            raise CompileError('spy.typeof takes exactly one argument')
         arg = self._operand(inst.args[0])
         match arg:
             case ComptimeVal(obj):
-                type = value_type(obj)
+                type = stype.value_type(obj)
             case RuntimeVal(value):
                 type = to_spy_type(typeof(value))
             case _:
                 type = None
         if type is None:
             raise CompileError(
-                f"spy.type of the compile-time value {self._describe(arg)} is not supported"
+                f"spy.typeof of the compile-time value {self._describe(arg)} is not supported"
             )
         return ComptimeVal(type)
 
@@ -1356,7 +1314,7 @@ class HirRunner:
 
     # -- struct constructors and methods ----------------------------------------
 
-    def _materialize_location(self, loc: InterpVal, struct: StructType) -> mir.Value:
+    def _materialize_location(self, loc: InterpVal, struct: mir.StructType) -> mir.Value:
         """The address one call writes a struct result of type ``struct``
         into - the result location of the enclosing statement: a slot that
         is given the memory of the struct when it has none yet (a slot
@@ -1368,12 +1326,12 @@ class HirRunner:
                     # the slot only recorded a scalar call result that was
                     # never materialized: it is discarded by this assignment
                     loc.value = None
-                loc.ptr = self._emit(mir.Alloca(PointerType(struct)))
+                loc.ptr = self._emit(mir.Alloca(mir.PointerType(struct)))
                 loc.type = struct
             elif loc.type is None or loc.type != struct:
                 raise CompileError(
-                    f'cannot write a {type_str(struct)} value into a slot that '
-                    f'already holds a {type_str(loc.type)} value'  # type: ignore[arg-type]
+                    f'cannot write a {mir.type_str(struct)} value into a slot that '
+                    f'already holds a {mir.type_str(loc.type)} value'  # type: ignore[arg-type]
                 )
             return loc.ptr
         if isinstance(loc, RetLocVal):
@@ -1388,33 +1346,33 @@ class HirRunner:
                     return loc.ptr
                 # a direct-return function (or an inlined body) returning
                 # a value written in place: give the location memory
-                loc.ptr = self._emit(mir.Alloca(PointerType(struct)))
+                loc.ptr = self._emit(mir.Alloca(mir.PointerType(struct)))
                 loc.type = struct
                 loc.value = None
             elif loc.type is None or loc.type != struct:
                 raise CompileError(
-                    f'cannot write a {type_str(struct)} value into the result '
-                    f'location that already holds a {type_str(loc.type)} value'  # type: ignore[arg-type]
+                    f'cannot write a {mir.type_str(struct)} value into the result '
+                    f'location that already holds a {mir.type_str(loc.type)} value'  # type: ignore[arg-type]
                 )
             return loc.ptr
         raise CompileError('cannot write a struct value into this location')
 
-    def _call_result_addr(self, ret: hir.Value, struct: StructType) -> mir.Value:
+    def _call_result_addr(self, ret: hir.Value, struct: mir.StructType) -> mir.Value:
         """The address a call whose result is delivered through a result
         pointer (a function returning a large struct) writes into: its
         result location."""
         loc = self._operand(ret)
         if isinstance(loc, RuntimeVal):
             ptype = typeof(loc.value)
-            if not isinstance(ptype, PointerType) or ptype.elem != struct:
+            if not isinstance(ptype, mir.PointerType) or ptype.elem != struct:
                 raise CompileError(
-                    f'cannot write a {type_str(struct)} value through a '
-                    f'{type_str(ptype)} pointer'
+                    f'cannot write a {mir.type_str(struct)} value through a '
+                    f'{mir.type_str(ptype)} pointer'
                 )
             return loc.value
         return self._materialize_location(loc, struct)
 
-    def _call_constructor(self, desc: SpyStructType, inst: hir.CallInplace) -> InterpVal:
+    def _call_constructor(self, desc: stype.StructType, inst: hir.CallInplace) -> InterpVal:
         """A struct constructor ``Bar(a, b)``: the result slot receives a
         new struct value.  With a user ``__init__`` the call is dispatched
         to it with ``self`` pointing at the result slot; otherwise every
@@ -1460,7 +1418,7 @@ class HirRunner:
         method - as the address of the struct, so that the method can
         modify it in place)."""
         addr, struct = self._struct_addr_of(self._operand(inst.base))
-        desc: SpyStructType = struct.spy_type
+        desc: stype.StructType = struct.spy_type
         target = self._resolver.resolve_method(desc, inst.name)
         if target is None:
             raise CompileError(f"type {desc.name} has no method named '{inst.name}'")
@@ -1474,13 +1432,13 @@ class HirRunner:
         self._store_result(ev, inst.ret)
 
     def _self_value(
-        self, ptr_self: bool, struct: StructType, addr: mir.Value
-    ) -> tuple[InterpVal, SpyType]:
+        self, ptr_self: bool, struct: mir.StructType, addr: mir.Value
+    ) -> tuple[InterpVal, stype.Type]:
         """The ``self`` argument of a method call: by value it is the
         struct loaded from its address, by pointer it is the address
         itself."""
         if ptr_self:
-            return RuntimeVal(addr), SpyPointerType(struct.spy_type, is_const=False)
+            return RuntimeVal(addr), stype.PointerType(struct.spy_type, is_const=False)
         value = self._emit(mir.Load(addr, struct))
         return RuntimeVal(value), struct.spy_type
 
@@ -1489,7 +1447,7 @@ class HirRunner:
         entry: FunctionEntry,
         ptr_self: bool,
         inst: hir.CallMethodInplace | hir.CallInplace,
-        struct: StructType,
+        struct: mir.StructType,
         addr: mir.Value,
         evals: list[InterpVal],
     ) -> InterpVal:
@@ -1518,12 +1476,12 @@ class HirRunner:
             # the method returns a large struct: it writes into the
             # result location, whose address is passed as its trailing
             # result pointer argument, and returns void
-            assert isinstance(ret_type, StructType)
+            assert isinstance(ret_type, mir.StructType)
             dest = self._call_result_addr(inst.ret, ret_type)
-            self._emit(mir.Call(callee, values + (dest,), VoidType()))
+            self._emit(mir.Call(callee, values + (dest,), mir.VoidType()))
             return InPlaceResult()
         value = self._emit(mir.Call(callee, values, ret_type))
-        if ret_type == VoidType():
+        if ret_type == mir.VoidType():
             return ComptimeVal(None)
         return RuntimeVal(value)
 
@@ -1531,7 +1489,7 @@ class HirRunner:
         self,
         fn: Any,
         ptr_self: bool,
-        struct: StructType,
+        struct: mir.StructType,
         addr: mir.Value,
         evals: list[InterpVal],
     ) -> InterpVal:
@@ -1554,7 +1512,7 @@ class HirRunner:
 
     def _solve_types(
         self, fn_ir: astgen.FunctionIR, evals: list[InterpVal], mode: str
-    ) -> tuple[SpyType, ...]:
+    ) -> tuple[stype.Type, ...]:
         """The concrete spy types of all formal parameters of one call,
         solved from the provided arguments (defaults included), plus the
         argument count check."""
@@ -1563,11 +1521,11 @@ class HirRunner:
                 f"function {fn_ir.name} takes {len(fn_ir.params)} arguments, "
                 f"got {len(evals)}"
             )
-        provided: list[SpyType | None] = [None] * len(fn_ir.params)
+        provided: list[stype.Type | None] = [None] * len(fn_ir.params)
         for i, ev in enumerate(evals):
             match ev:
                 case ComptimeVal(obj):
-                    t = value_type(obj)
+                    t = stype.value_type(obj)
                 case RuntimeVal(value):
                     t = to_spy_type(typeof(value))
                 case _:
@@ -1585,7 +1543,7 @@ class HirRunner:
 
     def _arg_values_of(
         self, fn_ir: astgen.FunctionIR, args: tuple[hir.Value, ...], mode: str
-    ) -> tuple[tuple[mir.Value, ...], tuple[SpyType, ...]]:
+    ) -> tuple[tuple[mir.Value, ...], tuple[stype.Type, ...]]:
         """Resolve the arguments of one call against the callee signature.
 
         Returns the marshaled argument values (defaults included) and the
@@ -1609,12 +1567,12 @@ class HirRunner:
             # the callee returns a large struct: it writes into the
             # result location, whose address is passed as its trailing
             # result pointer argument, and returns void
-            assert isinstance(ret_type, StructType)
+            assert isinstance(ret_type, mir.StructType)
             dest = self._call_result_addr(inst.ret, ret_type)
-            self._emit(mir.Call(callee, values + (dest,), VoidType()))
+            self._emit(mir.Call(callee, values + (dest,), mir.VoidType()))
             return InPlaceResult()
         value = self._emit(mir.Call(callee, values, ret_type))
-        if ret_type == VoidType():
+        if ret_type == mir.VoidType():
             # a void call produces no value: it only has effects
             return ComptimeVal(None)
         return RuntimeVal(value)

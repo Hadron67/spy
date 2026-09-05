@@ -2,8 +2,8 @@
 
 At the Python level these are ordinary functions; the compile-time
 interpreter recognizes them by object identity and evaluates them while
-running the HIR (``spy.type``, ``spy.compile_log``).  Calling them from
-plain Python raises an error: ``spy.type`` and ``spy.compile_log`` only
+running the HIR (``spy.typeof``, ``spy.compile_log``).  Calling them from
+plain Python raises an error: ``spy.typeof`` and ``spy.compile_log`` only
 make sense during compilation, and ``spy.as`` is meant to build typed
 arguments at the call boundary (it returns an :class:`AsValue` that the
 marshal layer understands).
@@ -28,9 +28,9 @@ class AsValue:
         return f'AsValue({self.value!r}, {self.type!r})'
 
 
-def spy_type(value: Any) -> None:
+def spy_typeof(value: Any) -> None:
     raise SpyError(
-        'spy.type may only be called from inside a spy function, '
+        'spy.typeof may only be called from inside a spy function, '
         'where it is evaluated at compile time'
     )
 

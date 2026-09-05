@@ -37,7 +37,7 @@ read embeds the object as a ``hir.Const`` leaf; in a reference context
 a const reference to the value (see ``_gen_name``).  A name captured
 from an enclosing Python scope (a spy function may be defined inside a
 factory) is read from its closure cell the same way.  Attributes on
-such compile-time objects (``spy.type``, ``spy.u64``, ...) are
+such compile-time objects (``spy.typeof``, ``spy.u64``, ...) are
 evaluated here as well.  Whether a function object denotes a registered
 spy function - and which function value it stands for - is decided by
 the interpreter when a call runs: a function body may be parsed before

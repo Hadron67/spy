@@ -4,7 +4,7 @@ Types appear in two roles:
 
 * as the type annotation values in AOT functions (``spy.u64``,
   ``spy.f64``, ...), and
-* as compile-time values inside a function body (``spy.type(a) ==
+* as compile-time values inside a function body (``spy.typeof(a) ==
   spy.u64``).
 
 The static types attached to the registers of the typed MIR are the
@@ -13,7 +13,7 @@ between the two when it emits instructions.
 
 Types are immutable and compare structurally (two ``IntType(64, False)``
 are equal), which is what makes the compile-time comparisons in
-``spy.type(a) == spy.u64`` work.
+``spy.typeof(a) == spy.u64`` work.
 """
 
 from abc import abstractmethod
@@ -29,7 +29,7 @@ default (see ``value_type``)."""
 
 class Value:
     """Base of the *spy values* of the compile-time domain: types
-    (used as values by ``spy.type``) and other compile-time objects.
+    (used as values by ``spy.typeof``) and other compile-time objects.
     Concrete values expose their spy type as ``.type``."""
     @abstractmethod
     def type(self) -> 'Type':
@@ -123,7 +123,7 @@ class StructType(Type):
 
     The identity of the object *is* the identity of the type (two structs
     are equal only if they are the same object), which is what makes
-    ``spy.type(x) == Foo`` work.
+    ``spy.typeof(x) == Foo`` work.
     """
 
     def __init__(self, name: str) -> None:
