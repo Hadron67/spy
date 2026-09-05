@@ -31,24 +31,26 @@ from typing_extensions import override
 from . import astgen, mir
 from .builtins import AsValue
 from .errors import CompileError, SpyError, TypeMismatchError
-from .fn import FunctionEntry, FunctionValue, LazyJitFunction
-from .interp import FunctionResolver, HirRunner, to_mir_type, to_spy_type
+from .fn import FunctionEntry, FunctionValue, LazyJitFunction, LazyJitFunctionInstance
+from .interp import FunctionResolver, HirRunner
 from .lower import NativeFn, compile_module
-from .mir import FormalArg as MirFormalArg
-from .mir import Function as MirFunction
-from .mir import FunctionType as MirFunctionType
-from .mir import Symbol as MirSymbol
 from .type import (
     BoolType,
     FloatType,
     FormalArg,
+    FunctionCallInfo,
     IntType,
     PointerType,
     Type,
     Value,
+    function_call_info,
     int_range,
+    to_mir_type,
     type_str,
     value_type,
+)
+from .type import (
+    FunctionType as SpyFunctionType,
 )
 from .type import (
     StructType as SpyStructType,
@@ -371,10 +373,27 @@ def _native_spec(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> NativeFn 
     An aot function has exactly one specialization, fixed by its
     annotations and lowered at its first use: its native function is
     stored on the value (the value also keeps the MIR, in
-    ``mir_fn``)."""
+    ``mir_fn``).  A jit specialization stores it - together with its
+    call lowering plan - in a :class:`LazyJitFunctionInstance` (see
+    ``LazyJitFunction.specs``)."""
     if isinstance(entry, FunctionValue):
         return entry.native_fn
-    return entry.specs.get(arg_types)
+    instance = entry.specs.get(arg_types)
+    return instance.native_fn if instance is not None else None
+
+
+def _spec_function_type(
+    entry: FunctionEntry, arg_types: tuple[Type, ...], ret: Type
+) -> SpyFunctionType:
+    """The spy function type of one specialization: its (concrete)
+    argument types bound to the names of its parameters, and its
+    logical return type.  The call lowering plan of the specialization
+    is derived from this type (see ``type.function_call_info``)."""
+    params = entry.hir.params
+    return SpyFunctionType(
+        tuple(FormalArg(params[i].name, arg_types[i]) for i in range(len(arg_types))),
+        ret,
+    )
 
 
 def _declared_ret_type(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> Type | None:
@@ -508,7 +527,7 @@ class JitContext(FunctionResolver):
         # the MIR functions defined by the module under construction
         # (see ``ensure_spec``), keyed like the per-function
         # ``mir_cache``; None outside a build
-        self._module: dict[tuple[FunctionEntry, tuple[Type, ...]], MirFunction] | None = None
+        self._module: dict[tuple[FunctionEntry, tuple[Type, ...]], mir.Function] | None = None
 
     # -- decorators ----------------------------------------------------------
 
@@ -808,7 +827,7 @@ class JitContext(FunctionResolver):
         finally:
             self._module = None
 
-    def _compile_mir(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> MirFunction:
+    def _compile_mir(self, entry: FunctionEntry, arg_types: tuple[Type, ...]) -> mir.Function:
         """Produce (and cache) the typed MIR of one specialization.
 
         The function is created - with an empty body - and registered
@@ -853,10 +872,10 @@ class JitContext(FunctionResolver):
         # return type is inferred from the return sites
         ret_hint = _declared_ret_type(entry, arg_types)
         args = tuple(
-            MirFormalArg(fn_ir.params[i].name, to_mir_type(arg_types[i]))
+            mir.FormalArg(fn_ir.params[i].name, to_mir_type(arg_types[i]))
             for i in range(len(arg_types))
         )
-        fn = MirFunction(
+        fn = mir.Function(
             symbol_of(entry.name_base, arg_types),
             args,
             to_mir_type(ret_hint) if ret_hint is not None else None,
@@ -875,7 +894,12 @@ class JitContext(FunctionResolver):
         module[key] = fn
         try:
             runner = HirRunner(self)
-            runner.run_function(fn, fn_ir, arg_types, ret_hint)
+            ret = runner.run_function(fn, fn_ir, arg_types, ret_hint)
+            # the logical spy return type of the specialization (see
+            # ``run_function``), kept with its MIR so that callers of a
+            # later build can re-derive its function type without reading
+            # the MIR types back
+            fn.spy_ret = ret  # type: ignore[attr-defined]
             return fn
         except BaseException:
             # the body typing failed: drop the partially-filled function
@@ -903,38 +927,71 @@ class JitContext(FunctionResolver):
                 # ``_native_spec``)
                 entry.native_fn = native
             else:
-                entry.specs[arg_types] = native
+                # a jit specialization also records the call lowering
+                # plan of its signature, so that spy functions of later
+                # modules can call it without recomputing it
+                ret = getattr(mir_fn, 'spy_ret', None)
+                assert ret is not None, f'internal error: {entry.fn.__name__} is not typed'
+                ft = _spec_function_type(entry, arg_types, ret)
+                entry.specs[arg_types] = LazyJitFunctionInstance(native, function_call_info(ft))
             result[key] = native
         return result
+
+    def _logical_spy_ret(
+        self, entry: FunctionEntry, arg_types: tuple[Type, ...]
+    ) -> Type:
+        """The logical spy return type of one specialization: the type
+        the callers of the specialization see.  For a specialization
+        whose body has been typed it is the type the body inferred (or
+        declared) - recorded on its MIR function when it was typed (see
+        ``_compile_mir``); while a function is still being typed - a
+        recursive call - it can only be its declared type."""
+        fn = entry.mir_fn if isinstance(entry, FunctionValue) else entry.mir_cache.get(arg_types)
+        if fn is not None:
+            ret = getattr(fn, 'spy_ret', None)
+            if ret is not None:
+                return ret
+        declared = _declared_ret_type(entry, arg_types)
+        if declared is None:
+            raise CompileError(_recursion_ret_type_error(entry, arg_types))
+        return declared
 
     @override
     def resolve_call(
         self, entry: FunctionEntry, arg_types: tuple[Type, ...]
-    ) -> tuple[mir.Value, Type]:
+    ) -> tuple[mir.Value, Type, FunctionCallInfo]:
         """The callable value of one callee specialization as seen from
         inside a compiled function: a :class:`mir.Function` of the
         module under construction - already compiled, or still being
         compiled when the call is a recursive one - or a
         :class:`mir.Symbol` of a specialization compiled in an earlier
-        module.  Together with it the *logical spy return type* of the
-        specialization: the interpreter decides everything about the
-        call in the ``spy`` type system, so the MIR return type of the
-        callee (which its own lowering fixed) is unwrapped here at the
-        host boundary."""
+        module.
+
+        Together with it the *logical spy return type* of the
+        specialization (all the interpreter's type checks happen on it)
+        and its *call lowering plan* (a :class:`FunctionCallInfo`,
+        derived from the specialization's spy function type - see
+        ``type.function_call_info``): the interpreter emits the
+        ``mir.Call`` by following the plan."""
         native = _native_spec(entry, arg_types)
         if native is not None:
-            fn_type = MirFunctionType(native.arg_types, native.ret_type)
-            logical = (
-                native.result_type if native.result_type is not None else native.ret_type
-            )
-            return MirSymbol(native.name, fn_type), to_spy_type(logical)
+            # native function exists: external symbol call
+            fn_type = mir.FunctionType(native.arg_types, native.ret_type)
+            callee: mir.Value = mir.Symbol(native.name, fn_type)
+            ret = self._logical_spy_ret(entry, arg_types)
+            if isinstance(entry, FunctionValue):
+                info = function_call_info(entry.type())
+            else:
+                # a jit specialization recorded its plan when it was
+                # registered (see ``_compile_module``)
+                instance = entry.specs.get(arg_types)
+                assert instance is not None, 'internal error: unregistered jit spec'
+                info = instance.call_info
+            return callee, ret, info
         fn = self._compile_mir(entry, arg_types)
-        ret = fn.logical_ret
-        if ret is None:
-            # the callee is still being typed (a recursive call) and has
-            # no declared return type: the call cannot be typed
-            raise CompileError(_recursion_ret_type_error(entry, arg_types))
-        return fn, to_spy_type(ret)
+        ret = self._logical_spy_ret(entry, arg_types)
+        info = function_call_info(_spec_function_type(entry, arg_types, ret))
+        return fn, ret, info
 
     @override
     def resolve_global(self, value: Any) -> Value | None:
@@ -1048,6 +1105,6 @@ class JitContext(FunctionResolver):
                 if native is not None:
                     externs[native.name] = native
             else:
-                for native in entry.specs.values():
-                    externs[native.name] = native
+                for instance in entry.specs.values():
+                    externs[instance.native_fn.name] = instance.native_fn
         return externs

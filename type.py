@@ -20,7 +20,9 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, override
 
-from .errors import SpyError
+from spy import mir
+
+from .errors import CompileError, SpyError
 
 INT_DEFAULT_BITS = 32
 """A plain Python ``int`` argument is mapped to this signedness/width by
@@ -108,6 +110,28 @@ class FunctionType(Type):
         :func:`returns_via_result_ptr`)."""
         return returns_via_result_ptr(self.return_type)
 
+@dataclass(frozen=True)
+class FunctionCallArgInfo:
+    index: int # pass this argument at the given index
+
+class FunctionReturnInfo:
+    pass
+
+@dataclass(frozen=True)
+class FunctionValueReturnInfo(FunctionReturnInfo):
+    """Return by value: No result location pointer, mir function returns `mir_type`."""
+    mir_type: mir.Type
+
+@dataclass(frozen=True)
+class FunctionRetLocReturnInfo(FunctionReturnInfo):
+    """Return by result location: the result pointer is the `arg_index`-th argument, mir function returns void."""
+    arg_index: int
+
+@dataclass(frozen=True)
+class FunctionCallInfo:
+    total_mir_args: int
+    args_map: tuple[FunctionCallArgInfo | None, ...] # non-None: pass this argument using the given info; None: don't pass this argument
+    return_info: FunctionReturnInfo
 
 @dataclass(frozen=True)
 class StructField:
@@ -150,7 +174,7 @@ class StructType(Type):
         self._py_cls: Any = None
         # the MIR mirror of the type, created lazily when a function
         # body needs it (see ``interp.to_mir_type``)
-        self._mir: Any | None = None
+        self._mir: mir.Type | None = None
 
     def add_field(self, name: str, type: Type) -> None:
         assert all(f.name != name for f in self._fields)
@@ -318,6 +342,72 @@ def returns_via_result_ptr(type: Type) -> bool:
             return _size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
+
+
+def function_call_info(type: FunctionType) -> FunctionCallInfo:
+    """The lowering plan of one call of a function of this signature
+    into MIR: how the by-value arguments map onto the positions of the
+    lowered MIR argument list, and how the result is returned.  This is
+    the single place the lowered form of a call is derived from the
+    *function type* (so a future call through a function pointer lowers
+    identically): every argument keeps its position, and a return type
+    delivered through a result location (see :func:`returns_via_result_ptr`)
+    appends the hidden result pointer as the trailing MIR argument."""
+    n = len(type.args)
+    args_map = tuple(FunctionCallArgInfo(i) for i in range(n))
+    if returns_via_result_ptr(type.return_type):
+        return FunctionCallInfo(n + 1, args_map, FunctionRetLocReturnInfo(arg_index=n))
+    return FunctionCallInfo(
+        n, args_map, FunctionValueReturnInfo(mir_type=to_mir_type(type.return_type))
+    )
+
+
+# ---------------------------------------------------------------------------
+# mirroring spy types into MIR types: the only place MIR types are produced
+# from spy types (valid spy types always mirror to valid MIR - ``lower`` maps
+# MIR onto LLVM the same one-way way)
+# ---------------------------------------------------------------------------
+
+
+def to_mir_type(type: Type) -> mir.Type:
+    """The MIR mirror of a spy type: the static type the runtime register
+    of a value of ``type`` has.  The mapping is one-to-one over the types
+    that can cross into runtime code.  A spy struct type mirrors to one
+    :class:`mir.StructType` object (created lazily and cached on the
+    descriptor), so that all values of one struct share one identity."""
+    match type:
+        case BoolType():
+            return mir.BoolType()
+        case IntType():
+            return mir.IntType(type.bits, type.signed)
+        case FloatType():
+            return mir.FloatType(type.bits)
+        case VoidType():
+            return mir.VoidType()
+        case StructType():
+            return struct_mir_type(type)
+        case PointerType(elem, _):
+            # const-ness is not tracked in the MIR
+            return mir.PointerType(to_mir_type(elem))
+        case FunctionType(args, ret):
+            return mir.FunctionType(tuple(to_mir_type(a.type) for a in args), to_mir_type(ret))
+        case _:
+            raise CompileError(f"spy type {type!r} has no MIR representation")
+
+
+def struct_mir_type(type: StructType) -> mir.Type:
+    """The (cached) MIR mirror of one spy struct type: fields in
+    declaration order, mirroring the LLVM layout of the struct."""
+    ret = type._mir
+    if ret is not None:
+        return ret
+    fields: list[mir.FormalArg] = []
+    for field in type.fields:
+        fields.append(mir.FormalArg(field.name, to_mir_type(field.type)))
+    ret = mir.StructType(type, tuple(fields))
+    ret.ctype = type._py_cls
+    type._mir = ret
+    return ret
 
 
 # ---------------------------------------------------------------------------

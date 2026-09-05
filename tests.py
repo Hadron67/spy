@@ -318,7 +318,7 @@ def _spec_lines(wrapper, arg_types) -> list[str]:
     (used by tests that inspect the generated code)."""
     entry = wrapper._entry
     spec = entry.specs[arg_types]
-    return spec.lines
+    return spec.native_fn.lines
 
 
 class SpyExampleTest(TestCase):
@@ -472,7 +472,7 @@ class SpyExampleTest(TestCase):
         for entry in (first._entry, second._entry):
             assert isinstance(entry, LazyJitFunction)
             for spec in entry.specs.values():
-                names.append(spec.name)
+                names.append(spec.native_fn.name)
         names.sort()
         self.assertEqual(len(names), 2, names)
         # the first registration keeps the plain name, the second one
@@ -533,7 +533,7 @@ class SpyExampleTest(TestCase):
         # specialization recurses to itself
         self.assertEqual(self.pow2(5), 32)
         self.assertEqual(self.pow2(3.0), 8.0)
-        names = sorted(spec.name for spec in self.pow2._entry.specs.values())
+        names = sorted(spec.native_fn.name for spec in self.pow2._entry.specs.values())
         self.assertEqual(names, ['spy.pow2.f64', 'spy.pow2.i32'], names)
 
     def test_recursion_with_type_parameter_return(self) -> None:

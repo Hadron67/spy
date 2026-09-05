@@ -4,9 +4,16 @@ from typing import Any
 
 from . import astgen, mir
 from .fn import FunctionEntry
-from .type import StructType as SpyStructType
-from .type import Type as SpyType
-from .type import Value
+from .type import (
+    FunctionCallInfo,
+    Value,
+)
+from .type import (
+    StructType as SpyStructType,
+)
+from .type import (
+    Type as SpyType,
+)
 
 
 class FunctionResolver:
@@ -27,14 +34,19 @@ class FunctionResolver:
     @abstractmethod
     def resolve_call(
         self, entry: FunctionEntry, arg_types: tuple[SpyType, ...]
-    ) -> tuple[mir.Value, SpyType]:
+    ) -> tuple[mir.Value, SpyType, FunctionCallInfo]:
         """Resolve the callable value of one callee specialization from
         inside a compiled function: functions that are not compiled yet
         are compiled (MIR-wise) and defined in the module of the caller;
-        functions of earlier modules are returned as symbols.  The
-        second element is the *logical spy return type* of the callee
-        (the type its callers see, in ``type.py``) - the interpreter's
-        only type information about the call."""
+        functions of earlier modules are returned as symbols.
+
+        Returns the callable value (a :class:`mir.Function` or a
+        :class:`mir.Symbol`), the *logical spy return type* of the
+        callee (the type its callers see, in ``type.py`` - all the
+        interpreter's type checks happen on it) and the *call lowering
+        plan* of the callee signature (a :class:`FunctionCallInfo`, see
+        ``type.function_call_info``), which the interpreter follows when
+        it emits the ``mir.Call``."""
         raise NotImplementedError
 
     @abstractmethod

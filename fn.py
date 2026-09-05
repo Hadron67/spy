@@ -6,7 +6,14 @@ from types import FunctionType as PyFunctionType
 from typing import Any, TypeAlias, TypeVar, override
 
 from . import hir, mir
-from .type import AnyFunction, FormalArg, FunctionType, Type, Value
+from .type import (
+    AnyFunction,
+    FormalArg,
+    FunctionCallInfo,
+    FunctionType,
+    Type,
+    Value,
+)
 
 
 @dataclass(frozen=True)
@@ -39,8 +46,7 @@ class NativeFn:
     """A compiled native function of one specialization.
 
     ``arg_types``/``ret_type`` are the *lowered* signature (see
-    ``type.returns_via_result_ptr``, which the interpreter consults when
-    it lowers a signature into MIR): a function that returns through a
+    ``mir.returns_via_result_ptr``): a function that returns through a
     result pointer carries its trailing result pointer formal in
     ``arg_types``, a void ``ret_type`` and its logical return type in
     ``result_type``.  The Python-facing ``_entry`` is pointer-ABI form
@@ -77,6 +83,17 @@ class NativeFn:
         return self.lines
 
 
+@dataclass(frozen=True)
+class LazyJitFunctionInstance:
+    """The compiled artifact of one ``@jit`` specialization: its native
+    function (what a Python-side call invokes, see :class:`NativeFn`)
+    and the call lowering plan a spy function body follows when it
+    calls the specialization (see ``type.function_call_info``)."""
+
+    native_fn: NativeFn
+    call_info: FunctionCallInfo
+
+
 class LazyJitFunction(Value):
     """The function value of a ``@jit`` function: only compiled - and
     thereby typed - when a call specializes it, so as a value its type
@@ -108,8 +125,9 @@ class LazyJitFunction(Value):
         # references it (its spec is only registered when the module it
         # was lowered into finishes).
         self.mir_cache: dict[tuple[Type, ...], mir.Function] = {}
-        # spy argument types -> compiled native function (see ``lower``)
-        self.specs: dict[tuple[Type, ...], NativeFn] = {}
+        # spy argument types -> the compiled artifacts of the
+        # specialization (see ``LazyJitFunctionInstance``)
+        self.specs: dict[tuple[Type, ...], LazyJitFunctionInstance] = {}
         # spy argument types -> error message of a failed compilation
         self.failed: dict[tuple[Type, ...], str] = {}
 
@@ -175,7 +193,7 @@ class FunctionValue(Value):
         return object.__hash__(self)
 
     @override
-    def type(self) -> Type:
+    def type(self) -> FunctionType:
         """The spy type of the function *value*: its signature - a
         function type.  A function type is a runtime DST (dynamically
         sized type: it has no runtime representation of its own), so a
