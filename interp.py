@@ -241,7 +241,7 @@ def _comptime_py_op(op: str, lhs: Any, rhs: Any) -> Any:
         ) from e
 
 
-def _binary_type(op: str, lt: sval.Type, rt: sval.Type, what: str) -> sval.Type | None:
+def _binary_type(lt: sval.Type, rt: sval.Type, what: str) -> sval.Type | None:
     """The spy type a binary operation on ``lt``/``rt`` is performed on,
     or None if the operand combination is not a number pair."""
     if isinstance(lt, sval.IntType) and isinstance(rt, sval.IntType):
@@ -387,6 +387,33 @@ def _describe(ev: InterpVal) -> str:
         return 'an untyped value'
     return f'a {sval.type_str(t)} value'
 
+def _bin_types(
+    lhs: InterpVal, rhs: InterpVal
+) -> tuple[sval.Type | None, sval.Type | None]:
+    """The spy types of the two operands of a binary operation.  A
+    compile-time integer constant adopts the type of a runtime
+    integer operand (``x + 1`` with ``x: u64`` is a u64 addition,
+    like an integer argument marshals to the annotated type at the
+    Python boundary); compile-time floats keep the default mapping
+    and mix with integers by promotion."""
+    lt = _type_of(lhs)
+    rt = _type_of(rhs)
+    if (
+        isinstance(rhs, ComptimeVal)
+        and not isinstance(rhs.obj, bool)
+        and isinstance(rhs.obj, int)
+        and isinstance(lt, sval.IntType)
+    ):
+        rt = lt
+    elif (
+        isinstance(lhs, ComptimeVal)
+        and not isinstance(lhs.obj, bool)
+        and isinstance(lhs.obj, int)
+        and isinstance(rt, sval.IntType)
+    ):
+        lt = rt
+    return lt, rt
+
 # ---------------------------------------------------------------------------
 # the compile-time host interface
 # ---------------------------------------------------------------------------
@@ -414,6 +441,9 @@ class HirRunner:
 
     def __init__(self, resolver: FunctionResolver) -> None:
         self._resolver = resolver
+        # the frames of the function bodies under execution: the function
+        # proper at the bottom, one frame per inlined plain function
+        # above it (see ``_in_function_proper``)
         self._frames: list[Frame] = []
         self._regs: dict[hir.Inst, InterpVal] = {}
         self._inline_stack: list[astgen.FunctionIR] = []
@@ -432,10 +462,6 @@ class HirRunner:
         # True when a path of the function proper ended in a void return
         # (a bare ``return``, or a fall-off of a void function)
         self._saw_void_return = False
-        # True while typing the body of the function proper (a ``Ret``
-        # emits a typed return); False inside an inlined plain function,
-        # whose return just yields a value to the caller
-        self._ret_emit = True
         # the emission regions (see ``_emit``): a stack of lists whose
         # top is the region currently being typed
         self._regions: list[list[mir.Inst]] = []
@@ -525,7 +551,6 @@ decision).  The return convention of the function is decided here
         frame.arg_values = param_values
         self._ret_type = None
         self._saw_void_return = False
-        self._ret_emit = True
         self._regions = [fn.insts]
 
         flow, _ = self._run_list(fn_ir.body)
@@ -597,6 +622,16 @@ decision).  The return convention of the function is decided here
     def _result_loc_of(self) -> RetLocVal:
         assert len(self._frames) > 0, 'internal error: no function result location'
         return self._frames[-1].ret_loc[1]
+
+    def _in_function_proper(self) -> bool:
+        """Whether the instructions currently being executed are those
+        of the function proper (whose ``return`` emits a typed return)
+        rather than of an inlined plain function (whose ``return`` just
+        yields a value to the caller): the frames stack holds the
+        function proper at its bottom and one frame per inlined body
+        above it, so the innermost body is the function proper exactly
+        when it is the only frame."""
+        return len(self._frames) == 1
 
     def _write_result(self, ev: InterpVal) -> None:
         """The value of one return expression of the function proper is
@@ -713,7 +748,7 @@ decision).  The return convention of the function is decided here
     def _exec_inst(self, inst: hir.Inst) -> tuple[Flow, InterpVal | None]:
         match inst:
             case hir.Ret():
-                if not self._ret_emit:
+                if not self._in_function_proper():
                     # an inlined callee ends: yield the value its return
                     # statements wrote into its result location (the raw
                     # return expression value, or None for a void body)
@@ -872,7 +907,7 @@ decision).  The return convention of the function is decided here
             # direct-return function records the value of the path, a
             # result-pointer function stores it through its result
             # pointer
-            if self._ret_emit:
+            if self._in_function_proper():
                 self._write_result(value)
             else:
                 # an inlined body: the return expression is only recorded
@@ -1004,7 +1039,7 @@ decision).  The return convention of the function is decided here
         path; a branch that falls off continues with the code after the
         ``if``.  Both branches falling through (a join) is not supported
         yet, and neither are runtime branches inside inlined functions."""
-        if not self._ret_emit:
+        if not self._in_function_proper():
             raise CompileError(
                 "runtime 'if' inside inlined functions is not supported yet"
             )
@@ -1070,41 +1105,14 @@ decision).  The return convention of the function is decided here
 
     # -- operators ------------------------------------------------------------
 
-    def _bin_types(
-        self, lhs: InterpVal, rhs: InterpVal
-    ) -> tuple[sval.Type | None, sval.Type | None]:
-        """The spy types of the two operands of a binary operation.  A
-        compile-time integer constant adopts the type of a runtime
-        integer operand (``x + 1`` with ``x: u64`` is a u64 addition,
-        like an integer argument marshals to the annotated type at the
-        Python boundary); compile-time floats keep the default mapping
-        and mix with integers by promotion."""
-        lt = _type_of(lhs)
-        rt = _type_of(rhs)
-        if (
-            isinstance(rhs, ComptimeVal)
-            and not isinstance(rhs.obj, bool)
-            and isinstance(rhs.obj, int)
-            and isinstance(lt, sval.IntType)
-        ):
-            rt = lt
-        elif (
-            isinstance(lhs, ComptimeVal)
-            and not isinstance(lhs.obj, bool)
-            and isinstance(lhs.obj, int)
-            and isinstance(rt, sval.IntType)
-        ):
-            lt = rt
-        return lt, rt
-
     def _eval_binary(self, inst: hir.Binary) -> InterpVal:
         op = inst.op
         lhs = self._operand(inst.lhs)
         rhs = self._operand(inst.rhs)
         if isinstance(lhs, ComptimeVal) and isinstance(rhs, ComptimeVal):
             return ComptimeVal(_comptime_py_op(op, lhs.obj, rhs.obj))
-        lt, rt = self._bin_types(lhs, rhs)
-        type = _binary_type(op, lt, rt, f"apply '{op}' to") if lt is not None and rt is not None else None
+        lt, rt = _bin_types(lhs, rhs)
+        type = _binary_type(lt, rt, f"apply '{op}' to") if lt is not None and rt is not None else None
         if type is None:
             raise _unsupported_type_error(op, lt)
         if isinstance(type, sval.IntType):
@@ -1138,8 +1146,8 @@ decision).  The return convention of the function is decided here
         rhs = self._operand(inst.rhs)
         if isinstance(lhs, ComptimeVal) and isinstance(rhs, ComptimeVal):
             return ComptimeVal(_comptime_py_op(op, lhs.obj, rhs.obj))
-        lt, rt = self._bin_types(lhs, rhs)
-        type = _binary_type(op, lt, rt, 'compare') if lt is not None and rt is not None else None
+        lt, rt = _bin_types(lhs, rhs)
+        type = _binary_type(lt, rt, 'compare') if lt is not None and rt is not None else None
         if type is None:
             raise _unsupported_type_error(op, lt)
         lv = self._coerce(lhs, type)
@@ -1227,10 +1235,10 @@ decision).  The return convention of the function is decided here
             if isinstance(ev, InPlaceResult):
                 # the callee (a constructor, or a call whose result goes
                 # through a result pointer) wrote into the location itself
-                if self._ret_emit and slot.type is not None:
+                if self._in_function_proper() and slot.type is not None:
                     self._note_inplace_ret(slot.type)
                 return
-            if self._ret_emit:
+            if self._in_function_proper():
                 self._write_result(ev)
             else:
                 # an inlined body: the return value is only recorded and
@@ -1357,7 +1365,7 @@ decision).  The return convention of the function is decided here
             return loc.ptr
         if isinstance(loc, RetLocVal):
             if loc.ptr is None:
-                if self._ret_emit and self._result_mode is None and sval.returns_via_result_ptr(type):
+                if self._in_function_proper() and self._result_mode is None and sval.returns_via_result_ptr(type):
                     # the function proper turns out to return this value
                     # through a result pointer: return through it instead
                     # of an extra local copy
@@ -1631,12 +1639,9 @@ decision).  The return convention of the function is decided here
         self._inline_stack.append(fn_ir)
         self._inline_depth += 1
         self._push_frame(tuple(zip(values, formal)), fn_ir.ret_loc)
-        saved_ret_emit = self._ret_emit
-        self._ret_emit = False
         try:
             flow, value = self._run_list(fn_ir.body)
         finally:
-            self._ret_emit = saved_ret_emit
             self._frames.pop()
             self._inline_depth -= 1
             self._inline_stack.pop()
