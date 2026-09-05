@@ -46,7 +46,7 @@ type information of its own.
 
 import operator
 import types as pytypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import Any, cast
 
@@ -179,7 +179,6 @@ class BlockFrame:
     then_returns: bool | None = None
 
 
-@dataclass
 class Frame:
     """One function body being executed at compile time: the IR of the
     body it runs (``fn_ir``, which also fixes its by-value arguments -
@@ -193,7 +192,11 @@ class Frame:
     open blocks (see ``BlockFrame``) and, for an inlined callee, the
     pending call of the caller that the callee's value resumes when its
     run ends (``resume``; None for the function proper, whose run end
-    just ends the machine).
+    just ends the machine) and the register table of its body
+    (``regs``: the value of every executed instruction of the body,
+    keyed by the instruction object - an instruction's register is only
+    ever read by other instructions of the same body, so the table
+    lives with the frame).
 
     Every frame carries its own ``fn_ir``, so the chain of frames above
     the function proper - one frame per inlined plain function - is
@@ -201,16 +204,18 @@ class Frame:
     inline stack (see ``HirRunner._start_inline``), and the number of
     inlined bodies under execution is ``len(frames) - 1``."""
 
-    arg_values: tuple[tuple[mir.Value, sval.Type], ...]
-    fn_ir: astgen.FunctionIR
-    ret_loc: tuple[hir.ResultLoc, RetLocVal]
-    insts: tuple[hir.Inst, ...]
-    pc: int = 0
-    block_stack: list[BlockFrame] = field(default_factory=list)
-    # the call instruction of the caller and whether it is the
-    # ``__init__`` of a constructor (whose in-place write makes the call
-    # result an ``InPlaceResult`` rather than the value the body yielded)
-    resume: tuple[hir.CallInplace | hir.CallMethodInplace, bool] | None = None
+    def __init__(self, arg_values: tuple[tuple[mir.Value, sval.Type], ...], fn_ir: astgen.FunctionIR, ret_loc: tuple[hir.ResultLoc, RetLocVal], insts: tuple[hir.Inst, ...]) -> None:
+        self.arg_values: tuple[tuple[mir.Value, sval.Type], ...] = arg_values
+        self.fn_ir = fn_ir
+        self.ret_loc = ret_loc
+        self.insts = insts
+        self.pc: int = 0
+        self.block_stack: list[BlockFrame] = []
+        # the call instruction of the caller and whether it is the
+        # ``__init__`` of a constructor (whose in-place write makes the call
+        # result an ``InPlaceResult`` rather than the value the body yielded)
+        self.resume: tuple[hir.CallInplace | hir.CallMethodInplace, bool] | None = None
+        self.regs: dict[hir.Inst, InterpVal] = {}
 
 
 class Flow(IntEnum):
@@ -487,7 +492,6 @@ class HirRunner:
         # above it (see ``_in_function_proper``; each frame carries the
         # IR of its body, see ``Frame``)
         self._frames: list[Frame] = []
-        self._regs: dict[hir.Inst, InterpVal] = {}
         # the function proper whose body is currently being typed (see
         # ``_bind_result_ptr``)
         self._fn: mir.Function | None = None
@@ -832,6 +836,8 @@ decision).  The return convention of the function is decided here
         ``Else``/``End`` markers close the branch being walked, a
         ``return`` cuts the current path (see ``_cut``); every other
         instruction only updates the register table."""
+
+        regs = self._frames[-1].regs
         match inst:
             case hir.Ret():
                 if not self._in_function_proper():
@@ -865,25 +871,25 @@ decision).  The return convention of the function is decided here
             case hir.End():
                 self._exec_end()
             case hir.Load():
-                self._regs[inst] = self._load(self._operand(inst.ptr))
+                regs[inst] = self._load(self._operand(inst.ptr))
             case hir.Alloca():
-                self._regs[inst] = PendingSlot()
+                regs[inst] = PendingSlot()
             case hir.Store():
                 self._store(self._operand(inst.ptr), self._operand(inst.value))
             case hir.Binary():
-                self._regs[inst] = self._eval_binary(inst)
+                regs[inst] = self._eval_binary(inst)
             case hir.Compare():
-                self._regs[inst] = self._eval_cmp(inst)
+                regs[inst] = self._eval_cmp(inst)
             case hir.BoolOp():
-                self._regs[inst] = self._eval_boolop(inst)
+                regs[inst] = self._eval_boolop(inst)
             case hir.Unary():
-                self._regs[inst] = self._eval_unary(inst)
+                regs[inst] = self._eval_unary(inst)
             case hir.CallInplace():
                 self._exec_call_inplace(inst)
             case hir.CallMethodInplace():
                 self._exec_call_method(inst)
             case hir.FieldAddr():
-                self._regs[inst] = self._exec_field_addr(inst)
+                regs[inst] = self._exec_field_addr(inst)
             case _:
                 raise CompileError(f"unsupported instruction {type(inst).__name__}")
 
@@ -1114,6 +1120,7 @@ decision).  The return convention of the function is decided here
         self._store_result(ev, inst.ret)
 
     def _operand(self, value: hir.Value) -> InterpVal:
+        regs = self._frames[-1].regs
         match value:
             case hir.Const():
                 # the value of an immutable global (or a literal): an
@@ -1160,7 +1167,7 @@ decision).  The return convention of the function is decided here
                         return retloc
                 raise CompileError('internal error: result location outside of any function')
             case hir.Inst():
-                reg = self._regs.get(value)
+                reg = regs.get(value)
                 if reg is None:
                     raise CompileError('internal error: register not evaluated')
                 return reg
