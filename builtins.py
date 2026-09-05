@@ -12,7 +12,7 @@ marshal layer understands).
 from typing import Any, cast
 
 from .errors import SpyError
-from .type import Type
+from .sval import Type
 
 
 class AsValue:

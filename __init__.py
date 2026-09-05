@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 from . import builtins as _builtins
 from .dsl import JitContext
 from .errors import CompileError, SpyError, TypeMismatchError
-from .type import BoolType, FloatType, IntType
+from .sval import BoolType, FloatType, IntType
 
 typeof = _builtins.spy_typeof  # ``spy.typeof`` is evaluated at compile time
 compile_log = _builtins.spy_compile_log

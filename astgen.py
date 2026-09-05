@@ -67,7 +67,7 @@ from typing import Any, TypeVar
 from . import hir
 from .errors import CompileError, TypeMismatchError
 from .fn import FunctionIR, ParamDef
-from .type import Type, VoidType, type_str, value_type
+from .sval import Type, VoidType, type_str, value_type
 
 _BIN_OPS = {
     ast.Add: '+',

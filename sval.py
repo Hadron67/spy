@@ -20,8 +20,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, override
 
-from spy import mir
-
+from . import mir
 from .errors import CompileError, SpyError
 
 INT_DEFAULT_BITS = 32

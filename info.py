@@ -2,18 +2,8 @@ import types as pytypes
 from abc import abstractmethod
 from typing import Any
 
-from . import astgen, mir
+from . import astgen, mir, sval
 from .fn import FunctionEntry
-from .type import (
-    FunctionCallInfo,
-    Value,
-)
-from .type import (
-    StructType as SpyStructType,
-)
-from .type import (
-    Type as SpyType,
-)
 
 
 class FunctionResolver:
@@ -33,8 +23,8 @@ class FunctionResolver:
 
     @abstractmethod
     def resolve_call(
-        self, entry: FunctionEntry, arg_types: tuple[SpyType, ...]
-    ) -> tuple[mir.Value, SpyType, FunctionCallInfo]:
+        self, entry: FunctionEntry, arg_types: tuple[sval.Type, ...]
+    ) -> tuple[mir.Value, sval.Type, sval.FunctionCallInfo]:
         """Resolve the callable value of one callee specialization from
         inside a compiled function: functions that are not compiled yet
         are compiled (MIR-wise) and defined in the module of the caller;
@@ -50,7 +40,7 @@ class FunctionResolver:
         raise NotImplementedError
 
     @abstractmethod
-    def resolve_global(self, value: Any) -> Value | None:
+    def resolve_global(self, value: Any) -> sval.Value | None:
         """The spy value a global object referenced inside a function
         body resolves to.  A function registered in this host - reached
         as the raw function object or through the callable view its
@@ -61,7 +51,7 @@ class FunctionResolver:
         raise NotImplementedError
 
     @abstractmethod
-    def resolve_method(self, struct: 'SpyStructType', name: str) -> tuple[Any, bool] | None:
+    def resolve_method(self, struct: sval.StructType, name: str) -> tuple[Any, bool] | None:
         """The method ``name`` of the struct type ``struct``, as the
         interpreter needs it for a method call ``x.name(...)``: a pair of
         the method - the entry of a registered ``@aot``/``@jit`` method,

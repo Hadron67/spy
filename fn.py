@@ -6,7 +6,7 @@ from types import FunctionType as PyFunctionType
 from typing import Any, TypeAlias, TypeVar, override
 
 from . import hir, mir
-from .type import (
+from .sval import (
     AnyFunction,
     FormalArg,
     FunctionCallInfo,

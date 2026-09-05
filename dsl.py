@@ -28,13 +28,13 @@ from typing import Any, dataclass_transform
 
 from typing_extensions import override
 
-from . import astgen, mir
+from . import astgen, mir, sval
 from .builtins import AsValue
 from .errors import CompileError, SpyError, TypeMismatchError
 from .fn import FunctionEntry, FunctionValue, LazyJitFunction, LazyJitFunctionInstance
 from .interp import FunctionResolver, HirRunner
 from .lower import NativeFn, compile_module
-from .type import (
+from .sval import (
     BoolType,
     FloatType,
     FormalArg,
@@ -48,12 +48,6 @@ from .type import (
     to_mir_type,
     type_str,
     value_type,
-)
-from .type import (
-    FunctionType as SpyFunctionType,
-)
-from .type import (
-    StructType as SpyStructType,
 )
 
 # ---------------------------------------------------------------------------
@@ -94,7 +88,7 @@ def ctypes_of(type: Type) -> type:
             return ct
         case FloatType():
             return ctypes.c_float if type.bits == 32 else ctypes.c_double
-        case SpyStructType():
+        case sval.StructType():
             return type._py_cls
         case _:
             raise CompileError(
@@ -146,7 +140,7 @@ def _coerce_py(value: object, target: Type, what: str) -> object:
                     f"passed as {what} (expected a string)"
                 )
             return value.encode('utf-8')
-        case SpyStructType():
+        case sval.StructType():
             if not isinstance(value, target._py_cls):
                 raise TypeMismatchError(
                     f"type mismatch: a {type(value).__name__} value cannot be "
@@ -203,13 +197,13 @@ def _marshal(fn_name: str, param_name: str, value: object, target: Type) -> obje
         value = value.value
 
     what = f"the '{param_name}' argument of {fn_name}"
-    if isinstance(target, PointerType) and isinstance(target.elem, SpyStructType):
+    if isinstance(target, PointerType) and isinstance(target.elem, sval.StructType):
         # a struct *pointer* parameter (the ``self`` of a ``ptr_self``
         # method): the Python instance is passed by reference - the
         # callee sees (and may modify) its native memory
         value = _coerce_py(value, target.elem, what)
         return ctypes.addressof(value)  # type: ignore[arg-type]
-    if isinstance(target, SpyStructType):
+    if isinstance(target, sval.StructType):
         # a by-value struct parameter: the Python-facing entry is a
         # pointer-form thunk (see ``lower._ctypes_thunk``) that loads
         # the struct and calls the by-value function, so the instance is
@@ -272,7 +266,7 @@ class _RegisteredFunction:
         self._ptr_self = ptr_self
         # the owning struct type, when the function is the method of a
         # struct (see ``JitContext.struct``)
-        self._method: SpyStructType | None = None
+        self._method: sval.StructType | None = None
         # the function entry, created at the first use
         self._entry: FunctionEntry | None = None
 
@@ -383,13 +377,13 @@ def _native_spec(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> NativeFn 
 
 def _spec_function_type(
     entry: FunctionEntry, arg_types: tuple[Type, ...], ret: Type
-) -> SpyFunctionType:
+) -> sval.FunctionType:
     """The spy function type of one specialization: its (concrete)
     argument types bound to the names of its parameters, and its
     logical return type.  The call lowering plan of the specialization
     is derived from this type (see ``type.function_call_info``)."""
     params = entry.hir.params
-    return SpyFunctionType(
+    return sval.FunctionType(
         tuple(FormalArg(params[i].name, arg_types[i]) for i in range(len(arg_types))),
         ret,
     )
@@ -420,7 +414,7 @@ def _recursion_ret_type_error(entry: FunctionEntry, arg_types: tuple[Type, ...])
     )
 
 
-def _build_instance_class(cls: type, desc: SpyStructType) -> type:
+def _build_instance_class(cls: type, desc: sval.StructType) -> type:
     """The Python class of the struct instances: a ctypes.Structure
     subclass whose memory follows the LLVM layout of the struct (the
     same layout the native code compiles against)."""
@@ -440,7 +434,7 @@ def _copy_memory(instance: StructInstance, field: str, value: Any) -> None:
     ctypes.memmove(ctypes.addressof(view), ctypes.addressof(value), ctypes.sizeof(view))
 
 def _write_fields(
-    desc: SpyStructType,
+    desc: sval.StructType,
     instance: StructInstance,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
@@ -469,7 +463,7 @@ def _write_fields(
         raise TypeError(f"{desc.name}() missing required argument '{missing[0]}'")
     for field, value in bound:
         converted = _coerce_py(value, field.type, f"field '{field.name}' of {desc.name}")
-        if isinstance(field.type, SpyStructType):
+        if isinstance(field.type, sval.StructType):
             # copy the memory of the nested struct into the field
             _copy_memory(instance, field.name, converted)
         else:
@@ -543,13 +537,13 @@ class JitContext(FunctionResolver):
         return wrapper
     # -- struct types ----------------------------------------------------------
 
-    def _struct(self, cls: type) -> SpyStructType:
+    def _struct(self, cls: type) -> sval.StructType:
         """Build the spy struct type of ``cls``: the fields from the
         annotations (in declaration order), the spy methods from the
         class members, and the Python class of the instances (a ctypes
         layout mirroring the LLVM struct)."""
         annotations = getattr(cls, '__annotations__', {})
-        desc = SpyStructType(cls.__name__)
+        desc = sval.StructType(cls.__name__)
         for name, annotation in annotations.items():
             if not isinstance(annotation, Type):
                 raise CompileError(
@@ -609,17 +603,17 @@ class JitContext(FunctionResolver):
         self._build_constructor(desc)
         return desc
 
-    def _check_struct_cycles(self, desc: SpyStructType, stack: list[SpyStructType]) -> None:
+    def _check_struct_cycles(self, desc: sval.StructType, stack: list[sval.StructType]) -> None:
         """Reject recursive struct definitions (a struct cannot contain a
         struct value of its own type)."""
         for field in desc.fields:
-            if isinstance(field.type, SpyStructType):
+            if isinstance(field.type, sval.StructType):
                 if field.type in stack:
                     names = ' -> '.join(t.name for t in stack + [field.type])
                     raise CompileError(f'recursive struct definition: {names}')
                 self._check_struct_cycles(field.type, stack + [field.type])
 
-    def _build_constructor(self, desc: SpyStructType) -> None:
+    def _build_constructor(self, desc: sval.StructType) -> None:
         """The Python-side constructor ``Foo(a, b)`` of a struct: create
         the native instance and run the constructor (the ``__init__``
         method, or the default field-wise constructor) on it."""
@@ -998,7 +992,7 @@ class JitContext(FunctionResolver):
         return None
 
     @override
-    def resolve_method(self, struct: SpyStructType, name: str) -> tuple[Any, bool] | None:
+    def resolve_method(self, struct: sval.StructType, name: str) -> tuple[Any, bool] | None:
         """The spy method ``name`` of ``struct`` as seen from inside a
         compiled function body (see :class:`FunctionResolver`): the
         entry of the registered ``@aot``/``@jit`` method, or the plain
