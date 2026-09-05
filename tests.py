@@ -1149,6 +1149,38 @@ class StructTest(TestCase):
             bad(self.Counter(0))
         self.assertIn("has no method named 'nope'", str(ctx.exception))
 
+    def test_method_reused_across_modules(self) -> None:
+        # a void aot method (whose return type is inferred from its
+        # body, not annotated) is callable from several spy functions:
+        # the second caller compiles a fresh module that references the
+        # specialization compiled with the first one as an extern, like
+        # any other function
+        @self.cache.struct()
+        class Ticker:
+            x: i32
+
+            @self.cache.aot(ptr_self=True)
+            def tick(self):
+                self.x += 1
+
+        @self.cache.aot()
+        def first(t: Ticker) -> i32:  # type: ignore[name-defined]
+            t.tick()
+            return t.x
+
+        @self.cache.aot()
+        def second(t: Ticker) -> i32:  # type: ignore[name-defined]
+            t.tick()
+            t.tick()
+            return t.x
+
+        a = Ticker(0)
+        self.assertEqual(first(a), 1)  # compiles {first, tick}
+        b = Ticker(0)
+        # compiles {second} and calls tick as an extern of the earlier
+        # module
+        self.assertEqual(second(b), 2)
+
     # -- constructors ---------------------------------------------------------
 
     def test_custom_init(self) -> None:

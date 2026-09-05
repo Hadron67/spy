@@ -151,7 +151,9 @@ class FieldAddr(Inst):
     at.  ``base`` denotes the *storage* of a struct value: the slot of a
     variable (an ``Alloca``), or the address of a nested field (another
     ``FieldAddr``); the interpreter resolves it - and the field's type -
-    from the static type it has typed ``base`` with (see ``interp``)."""
+    from the static type it has typed ``base`` with (see ``interp``),
+    auto-dereferencing a base that points at a pointer (a ``self``
+    passed by pointer, a pointer-valued field, ...) first."""
 
     base: Value
     name: str
@@ -160,10 +162,12 @@ class FieldAddr(Inst):
 @dataclass(eq=False)
 class CallMethodInplace(Inst):
     """A call of the method ``name`` of the struct ``base`` points at
-    (result-location semantics like :class:`CallInplace`): the method is
-    resolved from the static type of the struct and the ``self``
-    argument is injected by the interpreter according to the method's
-    ``ptr_self`` mode."""
+    (result-location semantics like :class:`CallInplace`).  A method is
+    an ordinary function whose first parameter is the struct type of
+    ``base`` (by value) or a pointer to it (``ptr_self``): the
+    interpreter resolves the method from the static type of the struct
+    and runs the call like any other, with the base prepended as that
+    first argument (see ``interp``)."""
 
     base: Value
     name: str

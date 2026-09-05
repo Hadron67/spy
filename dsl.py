@@ -959,7 +959,11 @@ class JitContext(FunctionResolver):
             callee: mir.Value = mir.Symbol(native.name, fn_type)
             ret = self._logical_spy_ret(entry, arg_types)
             if isinstance(entry, FunctionValue):
-                info = function_call_info(entry.type())
+                # an aot function has one specialization; its logical
+                # return type is the declared one, or the type inferred
+                # from the body of a method without a return annotation
+                # (see ``_logical_spy_ret``)
+                info = function_call_info(_spec_function_type(entry, arg_types, ret))
             else:
                 # a jit specialization recorded its plan when it was
                 # registered (see ``_compile_module``)
