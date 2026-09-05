@@ -48,7 +48,7 @@ import operator
 import types as pytypes
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import Any
+from typing import Any, cast
 
 from . import astgen, hir, mir, sval
 from . import builtins as spy_builtins
@@ -504,7 +504,6 @@ decision).  The return convention of the function is decided here
             # the declared return type is delivered through a result
             # pointer: lower the signature before the body is typed, so
             # that recursive calls the body makes see the final form
-            assert isinstance(declared, sval.StructType)
             self._bind_result_ptr(fn, declared)
         param_values = tuple(
             (mir.Param(i, sval.to_mir_type(t), fn_ir.params[i].name), t)
@@ -516,7 +515,7 @@ decision).  The return convention of the function is decided here
             result_ptr = self._result_ptr
             assert result_ptr is not None
             result_type = ret_hint
-            assert isinstance(result_type, sval.StructType)
+            assert result_type is not None
             param_values += (
                 (result_ptr, sval.PointerType(result_type, is_const=False)),
             )
@@ -568,17 +567,19 @@ decision).  The return convention of the function is decided here
             fn.ret_type = sval.to_mir_type(ret_type)
         return ret_type
 
-    def _bind_result_ptr(self, fn: mir.Function, logical: sval.StructType) -> None:
+    def _bind_result_ptr(self, fn: mir.Function, logical: sval.Type) -> None:
         """Lower the signature of the function proper to its result
         pointer form: append the trailing result pointer formal and fix
         the return type to void.  ``logical`` is the spy type of the
         value the function returns (kept in ``fn.result_type``, mirrored
-        to the MIR struct type)."""
+        into MIR) - a type delivered through a result pointer is not
+        necessarily a struct (arrays and other aggregates will use the
+        same convention)."""
         index = len(fn.args)
-        struct = sval.struct_mir_type(logical)
-        formal = mir.FormalArg('$result', mir.PointerType(struct))
+        result_type = sval.to_mir_type(logical)
+        formal = mir.FormalArg('$result', mir.PointerType(result_type))
         fn.args = fn.args + (formal,)
-        fn.result_type = struct
+        fn.result_type = result_type
         param = mir.Param(index, formal.type, formal.name)
         self._result_ptr = param
         self._result_mode = 'ptr'
@@ -625,7 +626,6 @@ decision).  The return convention of the function is decided here
             # the return type is inferred from this site: decide the
             # return convention from it
             if sval.returns_via_result_ptr(t):
-                assert isinstance(t, sval.StructType)
                 # the signature is still being typed and nothing has
                 # referenced the function yet (an inferred function can
                 # never be recursive), so appending the formal is safe
@@ -1224,8 +1224,9 @@ decision).  The return convention of the function is decided here
                 slot.value = ev
             return
         if isinstance(ev, InPlaceResult):
-            # the callee (a struct constructor) already wrote the result
-            # into the result location itself
+            # the callee (a constructor, or a call whose result goes
+            # through a result pointer) wrote the result into the result
+            # location itself
             return
         if isinstance(slot, PendingSlot):
             if slot.ptr is None:
@@ -1319,67 +1320,64 @@ decision).  The return convention of the function is decided here
 
     # -- struct constructors and methods ----------------------------------------
 
-    def _materialize_location(self, loc: InterpVal, struct: sval.StructType) -> mir.Value:
-        """The address one call writes a struct result of spy type
-        ``struct`` into - the result location of the enclosing statement:
-        a slot that is given the memory of the struct when it has none
-        yet (a slot that already holds a struct is reused), or the result
-        pointer of a result-pointer function."""
+    def _materialize_location(self, loc: InterpVal, type: sval.Type) -> mir.Value:
+        """The address one call writes a result of spy type ``type``
+        into - the result location of the enclosing statement: a slot
+        that is given the memory of the type when it has none yet (a
+        slot that already holds one is reused), or the result pointer of
+        a result-pointer function.  The type is an aggregate (a struct
+        today, arrays and others later); scalars never materialize."""
         if isinstance(loc, PendingSlot):
             if loc.ptr is None:
                 if loc.value is not None:
                     # the slot only recorded a scalar call result that was
                     # never materialized: it is discarded by this assignment
                     loc.value = None
-                loc.ptr = self._emit(
-                    mir.Alloca(mir.PointerType(sval.struct_mir_type(struct)))
-                )
-                loc.type = struct
-            elif loc.type is None or loc.type != struct:
+                loc.ptr = self._emit(mir.Alloca(mir.PointerType(sval.to_mir_type(type))))
+                loc.type = type
+            elif loc.type is None or loc.type != type:
                 raise CompileError(
-                    f'cannot write a {sval.type_str(struct)} value into a slot that '
+                    f'cannot write a {sval.type_str(type)} value into a slot that '
                     f'already holds a {sval.type_str(loc.type)} value'  # type: ignore[arg-type]
                 )
             return loc.ptr
         if isinstance(loc, RetLocVal):
             if loc.ptr is None:
-                if self._ret_emit and self._result_mode is None and sval.returns_via_result_ptr(struct):
-                    # the function proper turns out to return this struct
+                if self._ret_emit and self._result_mode is None and sval.returns_via_result_ptr(type):
+                    # the function proper turns out to return this value
                     # through a result pointer: return through it instead
                     # of an extra local copy
                     assert self._fn is not None
-                    self._bind_result_ptr(self._fn, struct)
+                    self._bind_result_ptr(self._fn, type)
                     assert loc.ptr is not None
                     return loc.ptr
                 # a direct-return function (or an inlined body) returning
                 # a value written in place: give the location memory
-                loc.ptr = self._emit(
-                    mir.Alloca(mir.PointerType(sval.struct_mir_type(struct)))
-                )
-                loc.type = struct
+                loc.ptr = self._emit(mir.Alloca(mir.PointerType(sval.to_mir_type(type))))
+                loc.type = type
                 loc.value = None
-            elif loc.type is None or loc.type != struct:
+            elif loc.type is None or loc.type != type:
                 raise CompileError(
-                    f'cannot write a {sval.type_str(struct)} value into the result '
+                    f'cannot write a {sval.type_str(type)} value into the result '
                     f'location that already holds a {sval.type_str(loc.type)} value'  # type: ignore[arg-type]
                 )
             return loc.ptr
-        raise CompileError('cannot write a struct value into this location')
+        raise CompileError(f'cannot write a {sval.type_str(type)} value into this location')
 
-    def _call_result_addr(self, ret: hir.Value, struct: sval.StructType) -> mir.Value:
+    def _call_result_addr(self, ret: hir.Value, type: sval.Type) -> mir.Value:
         """The address a call whose result is delivered through a result
-        pointer (a function returning a large struct) writes into: its
+        pointer (a function returning a large aggregate) writes into: its
         result location."""
         loc = self._operand(ret)
         if isinstance(loc, RuntimeVal):
             ptype = loc.type
-            if not isinstance(ptype, sval.PointerType) or ptype.elem != struct:
+            if not isinstance(ptype, sval.PointerType) or ptype.elem != type:
                 raise CompileError(
-                    f'cannot write a {sval.type_str(struct)} value through a '
+                    f'cannot write a {sval.type_str(type)} value through a '
                     f'{sval.type_str(ptype)} pointer'
                 )
             return loc.value
-        return self._materialize_location(loc, struct)
+        return self._materialize_location(loc, type)
 
     def _call_constructor(self, desc: sval.StructType, inst: hir.CallInplace) -> InterpVal:
         """A struct constructor ``Bar(a, b)``: the result slot receives a
@@ -1526,19 +1524,18 @@ decision).  The return convention of the function is decided here
         assert len(values) == len(info.args_map)
         # the lowered MIR argument list: every position is filled either
         # by a by-value argument or by the result-location pointer
-        placed: dict[int, mir.Value] = {}
+        placed: list[mir.Value | None] = [None] * info.total_mir_args
         for i, mapped in enumerate(info.args_map):
             if mapped is not None:
-                assert mapped.index not in placed
+                assert placed[mapped.index] is None
                 placed[mapped.index] = values[i]
         if isinstance(info.return_info, sval.FunctionRetLocReturnInfo):
             # the callee writes the result into the result location,
             # whose address is passed as the trailing MIR argument
-            assert isinstance(ret_type, sval.StructType)
-            assert info.return_info.arg_index not in placed
             placed[info.return_info.arg_index] = self._call_result_addr(inst.ret, ret_type)
-        assert sorted(placed) == list(range(info.total_mir_args))
-        args = tuple(placed[i] for i in range(info.total_mir_args))
+        for arg in placed:
+            assert arg is not None
+        args = cast(tuple[mir.Value, ...], tuple(placed))
         if isinstance(info.return_info, sval.FunctionRetLocReturnInfo):
             self._emit(mir.Call(callee, args, mir.VoidType()))
             return InPlaceResult()
