@@ -10,17 +10,9 @@ code.  Every test builds a fresh context in ``setUp``, so no module
 globals are touched.
 """
 
-# pyright: reportGeneralTypeIssues=false
-# pyright: reportInvalidTypeForm=false
-# pyright: reportOperatorIssue=false
-# pyright: reportReturnType=false
-# The sample functions are DSL source compiled by spy, not ordinary
-# Python that a type checker could understand (e.g. ``a + b`` with ``a,
-# b: T``).
-
 import io
 from contextlib import redirect_stdout
-from typing import Any
+from typing import Any, Protocol, Self
 from unittest import TestCase
 
 from . import (
@@ -44,6 +36,14 @@ from .fn import LazyJitFunction
 # functions under test (the example of spy/instructions.md)
 # ---------------------------------------------------------------------------
 
+class Numeric(Protocol):
+    def __add__(self, other: Self, /) -> Self: ...
+    def __sub__(self, other: Self, /) -> Self: ...
+    def __mod__(self, other: Self, /) -> Self: ...
+    def __lt__(self, other: Self, /) -> spy_bool: ...
+    def __gt__(self, other: Self, /) -> spy_bool: ...
+    def __le__(self, other: Self, /) -> spy_bool: ...
+    def __ge__(self, other: Self, /) -> spy_bool: ...
 
 def make_samples(cache: JitContext) -> dict[str, object]:
     """Define and register the sample spy functions of the test suite
@@ -52,7 +52,7 @@ def make_samples(cache: JitContext) -> dict[str, object]:
     ``foo`` inlines."""
 
     @cache.jit()
-    def add[T](a: T, b: T) -> T:
+    def add[T: Numeric](a: T, b: T) -> T:
         return a + b
 
     @cache.aot()
@@ -60,10 +60,10 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         return a + b
 
     @cache.jit()
-    def add_default[T](a: T, b: T = 0) -> T:
+    def add_default[T: Numeric](a: T, b: T = 0) -> T:
         return a + b
 
-    def add_inline[T](a: T, b: T) -> T:
+    def add_inline[T: Numeric](a: T, b: T) -> T:
         compile_log("add_inline was compiled")
         return a + b
 
@@ -152,14 +152,14 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         return n * fact_aot(n - 1)
 
     @cache.jit()
-    def gcd[T](a: T, b: T) -> T:
+    def gcd[T: Numeric](a: T, b: T) -> T:
         # recursion whose return annotation is the type parameter ``T``
         if b == 0:
             return a
         return gcd(b, a % b)
 
     @cache.jit()
-    def pow2[T](n: T) -> T:
+    def pow2[T: Numeric](n: T) -> T:
         # a generic recursion that is specialized to several types
         if n <= 0:
             return 1
@@ -235,7 +235,7 @@ def make_samples(cache: JitContext) -> dict[str, object]:
 def bad_aot(a: u64, b: u64) -> u64:
     # body computes a float; the return type annotation does not match;
     # only ever registered in the test that expects the failure
-    return a + b + 1.5
+    return a + b + 1.5  # pyright: ignore[reportReturnType]
 
 
 def _make_twin():
@@ -976,7 +976,7 @@ def _make_struct_bad_field(cache: JitContext) -> tuple[Any, Any]:
 
     @cache.aot()
     def use(w: Wrong) -> i32:
-        return w.y
+        return w.y # pyright: ignore[reportAttributeAccessIssue]
 
     return use, Wrong
 

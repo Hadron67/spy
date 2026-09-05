@@ -9,7 +9,7 @@ arguments at the call boundary (it returns an :class:`AsValue` that the
 marshal layer understands).
 """
 
-from typing import Any
+from typing import Any, cast
 
 from .errors import SpyError
 from .type import Type
@@ -35,10 +35,10 @@ def spy_type(value: Any) -> None:
     )
 
 
-def spy_as(value: Any, type: Type) -> AsValue:
+def spy_as[T](value: T, type: type[T]) -> T:
     if not isinstance(type, Type):
         raise TypeError(f'spy.as requires a spy type, got {type!r}')
-    return AsValue(value, type)
+    return cast(T, AsValue(value, type))
 
 
 def spy_compile_log(*args: Any) -> None:

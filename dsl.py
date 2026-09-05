@@ -24,7 +24,7 @@ resolved to its function entry when the reference runs (see
 
 import ctypes
 from types import FunctionType
-from typing import Any
+from typing import Any, dataclass_transform
 
 from typing_extensions import override
 
@@ -538,7 +538,8 @@ class JitContext(FunctionResolver):
             return self._register(fn, 'aot', ptr_self)
         return lambda f: self._register(f, 'aot', ptr_self)
 
-    def struct(self, cls: type | None = None):
+    @dataclass_transform()
+    def struct[T](self):
         """``@cache.struct()``: turn a class whose annotations declare
         spy-typed fields into a spy struct type (bound to the class
         name).  Methods decorated with ``@cache.aot()``/``@cache.jit()``
@@ -546,10 +547,11 @@ class JitContext(FunctionResolver):
         (undecorated) method is inlined on call; a ``def __init__``
         becomes the user constructor (default: arguments are written
         into the fields in declaration order)."""
-        if cls is not None:
-            return self._struct(cls)
-        return lambda c: self._struct(c)
 
+        def wrapper(cls):
+            return self._struct(cls)
+
+        return wrapper
     # -- struct types ----------------------------------------------------------
 
     def _struct(self, cls: type) -> SpyStructType:

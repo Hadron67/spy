@@ -24,6 +24,9 @@ concrete argument types (comptime semantics: ``spy.type``, compile-time
 ``lower`` turns into native code via LLVM.
 """
 
+import builtins as pybuiltins
+from typing import TYPE_CHECKING
+
 from . import builtins as _builtins
 from .dsl import JitContext
 from .errors import CompileError, SpyError, TypeMismatchError
@@ -36,17 +39,30 @@ compile_log = _builtins.spy_compile_log
 as_ = _builtins.spy_as
 globals()['as'] = _builtins.spy_as
 
-u8 = IntType(8, False)
-u16 = IntType(16, False)
-u32 = IntType(32, False)
-u64 = IntType(64, False)
-i8 = IntType(8, True)
-i16 = IntType(16, True)
-i32 = IntType(32, True)
-i64 = IntType(64, True)
-f32 = FloatType(32)
-f64 = FloatType(64)
-bool = BoolType()
+if TYPE_CHECKING:
+    u8 = int
+    u16 = int
+    u32 = int
+    u64 = int
+    i8 = int
+    i16 = int
+    i32 = int
+    i64 = int
+    f32 = float
+    f64 = float
+    bool = pybuiltins.bool
+else:
+    u8 = IntType(8, False)
+    u16 = IntType(16, False)
+    u32 = IntType(32, False)
+    u64 = IntType(64, False)
+    i8 = IntType(8, True)
+    i16 = IntType(16, True)
+    i32 = IntType(32, True)
+    i64 = IntType(64, True)
+    f32 = FloatType(32)
+    f64 = FloatType(64)
+    bool = BoolType()
 
 __all__ = [
     'CompileError',
