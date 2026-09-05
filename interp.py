@@ -1556,7 +1556,8 @@ decision).  The return convention of the function is decided here
                 )
             provided[i] = t
         try:
-            return astgen.solve_call_types(fn_ir, mode, tuple(provided))
+            param_types, _ = astgen.solve_call_types(fn_ir, mode, tuple(provided))
+            return param_types
         except TypeMismatchError as e:
             raise CompileError(str(e)) from e
 

@@ -315,8 +315,7 @@ class _RegisteredFunction:
             if self._method is None:
                 # resolve the fixed signature from the annotations
                 params = fn_ir.params
-                formal = astgen.solve_call_types(fn_ir, 'aot', (None,) * len(params))
-                ret = astgen.return_annotation_type(fn_ir)
+                formal, ret = astgen.solve_call_types(fn_ir, 'aot', (None,) * len(params))
                 args = tuple(FormalArg(params[i].name, formal[i]) for i in range(len(params)))
             else:
                 args, ret = self._method_args(fn_ir)
@@ -394,35 +393,6 @@ def _spec_function_type(
         tuple(FormalArg(params[i].name, arg_types[i]) for i in range(len(arg_types))),
         ret,
     )
-
-
-def _declared_ret_type(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> Type | None:
-    """The concrete spy return type of one specialization declared by
-    its annotations, or ``None`` when none is declared.
-
-    An ``aot`` function fixes its signature at registration.  A
-    ``jit`` function with a return annotation uses it as the return
-    type of the specialization: the annotation is either a concrete
-    spy type or a type parameter bound by the parameters (which
-    binds it to the argument types of the specialization).
-    """
-    if isinstance(entry, FunctionValue):
-        return entry.ret
-    fn_ir = entry.hir
-    ret_ann = fn_ir.ret_annotation
-    if ret_ann is None:
-        return None
-    for type_param in fn_ir.type_params:
-        if ret_ann is type_param:
-            # the return type parameter is bound by the (concrete)
-            # arguments of the parameters annotated with it
-            for i, param in enumerate(fn_ir.params):
-                if param.annotation is ret_ann:
-                    return arg_types[i]
-            return None
-    if not isinstance(ret_ann, Type):
-        return None
-    return ret_ann
 
 
 def _recursion_ret_type_error(entry: FunctionEntry, arg_types: tuple[Type, ...]) -> str:
@@ -717,7 +687,7 @@ class JitContext(FunctionResolver):
                     provided.append(_candidate_type(name, param.name, present[param.name]))
                 else:
                     provided.append(None)
-            formal = astgen.solve_call_types(fn_ir, 'jit', tuple(provided))
+            formal, _ = astgen.solve_call_types(fn_ir, 'jit', tuple(provided))
 
         marshaled = [_marshal(name, 'self', instance, self_type)]
         for i, param in enumerate(rest):
@@ -762,7 +732,7 @@ class JitContext(FunctionResolver):
                 provided.append(_candidate_type(name, param.name, present[param.name]))
             else:
                 provided.append(None)
-        formal = astgen.solve_call_types(fn_ir, entry.kind, tuple(provided))
+        formal, _ = astgen.solve_call_types(fn_ir, entry.kind, tuple(provided))
 
         marshaled: list[Any] = []
         for i, param in enumerate(params):
@@ -869,8 +839,14 @@ class JitContext(FunctionResolver):
         # bound by the parameters - fixes the return type of the
         # specialization (a recursive function needs it: its calls are
         # typed while its body is still being compiled); without one the
-        # return type is inferred from the return sites
-        ret_hint = _declared_ret_type(entry, arg_types)
+        # return type is inferred from the return sites.  An aot
+        # function carries its (fixed) return type on its entry; a jit
+        # function declares one by its return annotation (see
+        # ``astgen.solve_call_types``)
+        if isinstance(entry, FunctionValue):
+            ret_hint = entry.ret
+        else:
+            ret_hint = astgen.solve_call_types(fn_ir, 'jit', arg_types)[1]
         args = tuple(
             mir.FormalArg(fn_ir.params[i].name, to_mir_type(arg_types[i]))
             for i in range(len(arg_types))
@@ -951,7 +927,10 @@ class JitContext(FunctionResolver):
             ret = getattr(fn, 'spy_ret', None)
             if ret is not None:
                 return ret
-        declared = _declared_ret_type(entry, arg_types)
+        if isinstance(entry, FunctionValue):
+            declared = entry.ret
+        else:
+            declared = astgen.solve_call_types(entry.hir, 'jit', arg_types)[1]
         if declared is None:
             raise CompileError(_recursion_ret_type_error(entry, arg_types))
         return declared

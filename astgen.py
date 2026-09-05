@@ -45,13 +45,17 @@ its callees, or even itself (an aot function parses its own body while
 it is being registered), are registered.
 
 ``solve_call_types`` computes the concrete spy types of all formal
-parameters of one call:
+parameters of one call - and, together with them, the return type the
+callee's annotation declares for it:
 
 * in *jit* mode every provided argument contributes the type it marshals
   to, and parameters annotated with the same type parameter ``T`` must
-  all marshal to the same type (``T`` is unified);
+  all marshal to the same type (``T`` is unified); the declared return
+  type is the return annotation when it is a concrete spy type, or the
+  bound type when the return annotation names a type parameter;
 * in *aot* mode the parameter types are simply the (concrete,
-  non-generic) annotations.
+  non-generic) annotations, and the declared return type is the
+  mandatory return annotation.
 """
 
 import ast
@@ -613,16 +617,33 @@ def _param_missing_error(fn_ir: FunctionIR, param: ParamDef) -> TypeMismatchErro
 
 def solve_call_types(
     fn_ir: FunctionIR, mode: str, provided: tuple[Type | None, ...]
-) -> tuple[Type, ...]:
-    """Compute the spy type of every formal parameter of a call.
+) -> tuple[tuple[Type, ...], Type | None]:
+    """Compute the concrete spy type of every formal parameter of a
+    call, and the return type its annotation declares for the call
+    (``None`` when none is declared and the body infers it).
 
     ``provided`` holds the marshaled type of every provided argument, in
     parameter order, and ``None`` for parameters whose default value
     applies.
+
+    In *jit* mode every provided argument contributes the type it
+    marshals to, and parameters annotated with the same type parameter
+    ``T`` must all marshal to the same type (``T`` is unified); the
+    declared return type is the return annotation when it is a concrete
+    spy type, or the bound type of a return annotation naming a type
+    parameter.  In *aot* mode the parameter types are simply the
+    (concrete, non-generic) annotations and the return type is the
+    mandatory return annotation.
     """
     assert len(provided) == len(fn_ir.params), 'argument count mismatch'
     if mode == 'aot':
-        return tuple(annotation_type(fn_ir, p) for p in fn_ir.params)
+        # an aot signature is fixed by the annotations alone (type
+        # parameters are not allowed); the return annotation is
+        # mandatory - ``return_annotation_type`` raises without one
+        return (
+            tuple(annotation_type(fn_ir, p) for p in fn_ir.params),
+            return_annotation_type(fn_ir),
+        )
 
     if mode != 'jit':
         raise ValueError(f"unknown call mode {mode!r}")
@@ -644,30 +665,44 @@ def solve_call_types(
         else:
             bound[tp] = cand
 
-    ret: list[Type] = []
+    param_types: list[Type] = []
     for param, cand in zip(fn_ir.params, provided):
         tp = _type_param_of(fn_ir, param)
         if tp is not None:
             if cand is not None:
                 assert tp in bound and bound[tp] == cand
-                ret.append(cand)
+                param_types.append(cand)
             elif tp in bound:
-                ret.append(bound[tp])
+                param_types.append(bound[tp])
             elif param.has_default:
                 t = value_type(param.default_value)
                 if t is None:
                     raise _param_missing_error(fn_ir, param)
-                ret.append(t)
+                param_types.append(t)
             else:
                 raise _param_missing_error(fn_ir, param)
         else:
             if cand is not None:
-                ret.append(cand)
+                param_types.append(cand)
             elif param.has_default:
                 t = value_type(param.default_value)
                 if t is None:
                     raise _param_missing_error(fn_ir, param)
-                ret.append(t)
+                param_types.append(t)
             else:
                 raise _param_missing_error(fn_ir, param)
-    return tuple(ret)
+
+    declared_ret: Type | None = None
+    ret_ann = fn_ir.ret_annotation
+    if ret_ann is not None:
+        type_param = next((tp for tp in fn_ir.type_params if ret_ann is tp), None)
+        if type_param is not None:
+            # a return type naming a type parameter is bound by the
+            # argument types of the parameters annotated with it
+            for i, param in enumerate(fn_ir.params):
+                if param.annotation is type_param:
+                    declared_ret = param_types[i]
+                    break
+        elif isinstance(ret_ann, Type):
+            declared_ret = ret_ann
+    return tuple(param_types), declared_ret
