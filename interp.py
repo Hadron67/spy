@@ -181,20 +181,28 @@ class BlockFrame:
 
 @dataclass
 class Frame:
-    """One function body being executed at compile time: its by-value
-    arguments (resolved by ``hir.Arg`` leaves: each argument value with
-    its spy type) together with its result location - the
-    ``hir.ResultLoc`` leaf its return statements write into and the
-    ``RetLocVal`` holding the location's content (see ``RetLocVal``) -
-    and the execution state of its body: the flat instruction list of
-    the body with the pc of its next instruction (the walk of the list
-    is driven by ``HirRunner``), the stack of its open blocks (see
-    ``BlockFrame``) and, for an inlined callee, the pending call of the
-    caller that the callee's value resumes when its run ends
-    (``resume``; None for the function proper, whose run end just ends
-    the machine)."""
+    """One function body being executed at compile time: the IR of the
+    body it runs (``fn_ir``, which also fixes its by-value arguments -
+    resolved by ``hir.Arg`` leaves: each argument value with its spy
+    type - and its result location, the ``hir.ResultLoc`` leaf its
+    return statements write into, paired with the ``RetLocVal`` holding
+    the location's content, see ``RetLocVal``), together with the
+    execution state of its body: the flat instruction list of the body
+    (``insts``, its ``fn_ir.body``) with the pc of its next instruction
+    (the walk of the list is driven by ``HirRunner``), the stack of its
+    open blocks (see ``BlockFrame``) and, for an inlined callee, the
+    pending call of the caller that the callee's value resumes when its
+    run ends (``resume``; None for the function proper, whose run end
+    just ends the machine).
+
+    Every frame carries its own ``fn_ir``, so the chain of frames above
+    the function proper - one frame per inlined plain function - is
+    also the chain of inlined bodies: the runner needs no separate
+    inline stack (see ``HirRunner._start_inline``), and the number of
+    inlined bodies under execution is ``len(frames) - 1``."""
 
     arg_values: tuple[tuple[mir.Value, sval.Type], ...]
+    fn_ir: astgen.FunctionIR
     ret_loc: tuple[hir.ResultLoc, RetLocVal]
     insts: tuple[hir.Inst, ...]
     pc: int = 0
@@ -476,11 +484,10 @@ class HirRunner:
         self._resolver = resolver
         # the frames of the function bodies under execution: the function
         # proper at the bottom, one frame per inlined plain function
-        # above it (see ``_in_function_proper``)
+        # above it (see ``_in_function_proper``; each frame carries the
+        # IR of its body, see ``Frame``)
         self._frames: list[Frame] = []
         self._regs: dict[hir.Inst, InterpVal] = {}
-        self._inline_stack: list[astgen.FunctionIR] = []
-        self._inline_depth = 0
         # the function proper whose body is currently being typed (see
         # ``_bind_result_ptr``)
         self._fn: mir.Function | None = None
@@ -561,7 +568,7 @@ decision).  The return convention of the function is decided here
         # location must be in place when the result pointer is bound
         # (see ``_bind_result_ptr``); its argument values are filled in
         # once the signature is fixed
-        frame = self._push_frame((), fn_ir.ret_loc, fn_ir.body)
+        frame = self._push_frame((), fn_ir)
         declared = ret_hint
         if declared is not None and sval.returns_via_result_ptr(declared):
             # the declared return type is delivered through a result
@@ -1085,8 +1092,6 @@ decision).  The return convention of the function is decided here
             self._flow = Flow.RET if returns else Flow.FALL
             return
         frame = self._frames.pop()
-        self._inline_depth -= 1
-        self._inline_stack.pop()
         if returns:
             assert value is not None
             self._resume_call(frame, value)
@@ -1165,17 +1170,15 @@ decision).  The return convention of the function is decided here
     # -- memory instructions -------------------------------------------------
 
     def _push_frame(
-        self,
-        arg_values: tuple[tuple[mir.Value, sval.Type], ...],
-        ret_loc: hir.ResultLoc,
-        insts: tuple[hir.Inst, ...],
+        self, arg_values: tuple[tuple[mir.Value, sval.Type], ...], fn_ir: astgen.FunctionIR
     ) -> Frame:
         """Push the frame of one function body: its by-value arguments
-        and its result location (the ``hir.ResultLoc`` leaf its return
-        statements write into, with a fresh ``RetLocVal``) together with
-        the flat instruction list of its body (its walk starts at pc 0);
-        returns the frame."""
-        frame = Frame(arg_values, (ret_loc, RetLocVal()), insts)
+        (filled in later for the function proper, whose signature is
+        lowered after the frame is pushed - see ``run_function``) and
+        its function IR (which fixes the body to walk and the result
+        location its return statements write into, with a fresh
+        ``RetLocVal``); returns the frame."""
+        frame = Frame(arg_values, fn_ir, (fn_ir.ret_loc, RetLocVal()), fn_ir.body)
         self._frames.append(frame)
         return frame
 
@@ -1885,7 +1888,11 @@ decision).  The return convention of the function is decided here
         the callee's body until it ends, then resumes the call (see
         ``_frame_ended`` and ``_resume_call``)."""
         fn_ir = self._resolver.hir_of_plain_fn(fn)
-        if any(f.fn is fn for f in self._inline_stack):
+        # the frames above the function proper are exactly the inlined
+        # bodies under execution, each carrying its own ``fn_ir`` (see
+        # ``Frame``): inlining a function that is already being inlined
+        # would never finish compiling
+        if any(f.fn_ir.fn is fn for f in self._frames[1:]):
             if what == 'method':
                 raise CompileError(
                     f'a plain Python method cannot call itself recursively '
@@ -1897,14 +1904,12 @@ decision).  The return convention of the function is decided here
                 'recursive inline would never finish compiling - declare it '
                 'as a spy function instead'
             )
-        if self._inline_depth >= _MAX_INLINE_DEPTH:
+        if len(self._frames) - 1 >= _MAX_INLINE_DEPTH:
             raise CompileError('too deeply nested inlined functions')
         formal = self._solve_types(fn_ir, evals, 'jit')
         values = _convert_evals(fn_ir, evals, formal)
-        frame = self._push_frame(tuple(zip(values, formal)), fn_ir.ret_loc, fn_ir.body)
+        frame = self._push_frame(tuple(zip(values, formal)), fn_ir)
         frame.resume = (inst, is_ctor)
-        self._inline_stack.append(fn_ir)
-        self._inline_depth += 1
 
     def _solve_types(
         self, fn_ir: astgen.FunctionIR, evals: list[InterpVal], mode: str
