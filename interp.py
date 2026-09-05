@@ -161,37 +161,22 @@ class RetLocVal(InterpVal):
 
 
 @dataclass
-class _RuntimeIfState:
-    """The typing state of one runtime ``if`` whose two branch regions
-    are being typed (both branches are always typed, as both survive at
-    runtime): the ``if`` itself, its already-evaluated condition, the
-    emission regions being typed for the two branches, and whether each
-    branch's run ended in a ``return`` (None while the branch region is
-    still being typed).  The two region :class:`BlockFrame`s of the
-    branches share one state, which they advance when their runs end
-    (see ``HirRunner._end_block``)."""
-
-    inst: hir.If
-    cond: RuntimeVal
-    then_region: list[mir.Inst] | None = None
-    else_region: list[mir.Inst] | None = None
-    then_returns: bool | None = None
-    else_returns: bool | None = None
-
-
-@dataclass
 class BlockFrame:
-    """The execution state of one block being run: a straight-line list
-    of instructions - the body of a function, the chosen branch of a
-    compile-time ``if``, or the body of one branch of a runtime ``if`` -
-    with the index of its next instruction.  A runtime-``if`` branch
-    block additionally carries the state of the ``if`` it belongs to
-    (``runtime_if``); the block of a compile-time branch carries none,
-    since its end just lets the enclosing block continue."""
+    """One open structured block of the flat instruction stream of the
+    executing frame - an ``If`` whose branches are being typed (future
+    block instructions will use the same frame).  The frame records the
+    *entry* - the pc of the block-opening ``If`` in the frame's
+    instruction list, from which the matching ``Else``/``End`` markers
+    are found by a balanced scan - and the typing state of the ``if``:
+    for a compile-time ``if`` the chosen branch (``chosen`` True: then,
+    False: else), for a runtime ``if`` whether its then-region ended in
+    a ``return`` (set once its typing leaves the then-region; the
+    else-region is being typed once it is set, since both regions of a
+    runtime ``if`` are always typed)."""
 
-    insts: tuple[hir.Inst, ...]
-    pc: int = 0
-    runtime_if: _RuntimeIfState | None = None
+    entry: int
+    chosen: bool | None = None
+    then_returns: bool | None = None
 
 
 @dataclass
@@ -201,14 +186,18 @@ class Frame:
     its spy type) together with its result location - the
     ``hir.ResultLoc`` leaf its return statements write into and the
     ``RetLocVal`` holding the location's content (see ``RetLocVal``) -
-    and the execution state of its body: the stack of blocks it is
-    currently running (see ``BlockFrame``) and, for an inlined callee,
-    the pending call of the caller that the callee's value resumes when
-    its run ends (``resume``; None for the function proper, whose run
-    end just ends the machine)."""
+    and the execution state of its body: the flat instruction list of
+    the body with the pc of its next instruction (the walk of the list
+    is driven by ``HirRunner``), the stack of its open blocks (see
+    ``BlockFrame``) and, for an inlined callee, the pending call of the
+    caller that the callee's value resumes when its run ends
+    (``resume``; None for the function proper, whose run end just ends
+    the machine)."""
 
     arg_values: tuple[tuple[mir.Value, sval.Type], ...]
     ret_loc: tuple[hir.ResultLoc, RetLocVal]
+    insts: tuple[hir.Inst, ...]
+    pc: int = 0
     block_stack: list[BlockFrame] = field(default_factory=list)
     # the call instruction of the caller and whether it is the
     # ``__init__`` of a constructor (whose in-place write makes the call
@@ -217,8 +206,8 @@ class Frame:
 
 
 class Flow(IntEnum):
-    """How executing a straight-line list of instructions ended: the
-    list ``FALL`` off its end, or was cut short by a ``return``
+    """How the run of one function body ended: it ``FALL`` off the end
+    of its instruction list, or was cut short by a ``return``
     (``RET``) - the only case that carries a returned value."""
 
     FALL = auto()
@@ -506,9 +495,6 @@ class HirRunner:
         # True when a path of the function proper ended in a void return
         # (a bare ``return``, or a fall-off of a void function)
         self._saw_void_return = False
-        # the emission regions (see ``_emit``): a stack of lists whose
-        # top is the region currently being typed
-        self._regions: list[list[mir.Inst]] = []
         # the spy return type of the function proper declared by its
         # annotation (or None when it is inferred from the body); the
         # target every return site is checked against
@@ -575,7 +561,7 @@ decision).  The return convention of the function is decided here
         # location must be in place when the result pointer is bound
         # (see ``_bind_result_ptr``); its argument values are filled in
         # once the signature is fixed
-        frame = self._push_frame((), fn_ir.ret_loc)
+        frame = self._push_frame((), fn_ir.ret_loc, fn_ir.body)
         declared = ret_hint
         if declared is not None and sval.returns_via_result_ptr(declared):
             # the declared return type is delivered through a result
@@ -599,9 +585,7 @@ decision).  The return convention of the function is decided here
         frame.arg_values = param_values
         self._ret_type = None
         self._saw_void_return = False
-        self._regions = [fn.insts]
         self._flow = None
-        frame.block_stack.append(BlockFrame(fn_ir.body))
         self._run_machine()
         flow = self._flow
         assert flow is not None
@@ -784,51 +768,63 @@ decision).  The return convention of the function is decided here
         assert isinstance(value, RuntimeVal)
         self._emit(mir.Ret(value.value))
 
-    # -- running blocks -----------------------------------------------------
+    # -- running the flat stream -------------------------------------------
 
     def _run_machine(self) -> None:
-        """The flat execution loop: executes one instruction at a time
-        from the top block of the executing frame (see ``_step``) until
-        the run of the function proper ended - its outcome recorded in
-        ``self._flow`` by ``_frame_ended``.  There is no recursion: the
-        control state of every suspended context lives in the block
-        stacks of the frames (an ``if`` branch, a runtime-``if`` region,
-        an inlined callee are all pushed as blocks and popped when they
-        end)."""
+        """The flat execution loop: walks the instruction list of the
+        executing frame (see ``_step``) until the run of the function
+        proper ended - its outcome recorded in ``self._flow`` by
+        ``_frame_ended``.  There is no recursion: the walk is linear
+        over one flat list per frame; the ``If``/``Else``/``End`` markers
+        delimit the blocks, and every control state lives in the block
+        stacks of the frames."""
         while self._flow is None:
             self._step()
 
     def _step(self) -> None:
-        """Execute one step of the machine: the next instruction of the
-        top block of the executing frame - or the end of that block,
-        when it has no next instruction (it fell off its end)."""
+        """Execute one step of the machine: the instruction at the pc of
+        the executing frame, advancing the pc - or the end of the
+        frame's instruction list (its body fell off its end)."""
         frame = self._frames[-1]
-        block = frame.block_stack[-1]
-        if block.pc >= len(block.insts):
-            self._end_block(False, None)
+        if frame.pc >= len(frame.insts):
+            # the body fell off its end: every block is closed (see the
+            # marker transitions) - the run of the frame ended
+            assert not frame.block_stack
+            self._frame_ended(False, None)
             return
-        inst = block.insts[block.pc]
-        block.pc += 1
+        inst = frame.insts[frame.pc]
+        frame.pc += 1
         self._exec_inst(inst)
 
-    def _push_block(
-        self, insts: tuple[hir.Inst, ...], runtime_if: _RuntimeIfState | None = None
-    ) -> None:
-        """Push one block onto the block stack of the executing frame:
-        the chosen branch of a compile-time ``if`` (``runtime_if``
-        None), the body of one branch of a runtime ``if``, or the body
-        of an inlined callee."""
-        frame = self._frames[-1]
-        frame.block_stack.append(BlockFrame(insts, runtime_if=runtime_if))
+    def _scan_block(self, entry: int) -> tuple[int | None, int]:
+        """The positions of the ``Else`` (or None when the block has no
+        else branch) and ``End`` markers that close the block opened at
+        ``entry`` (an ``hir.If``) of the executing frame's flat
+        instruction list, found by a balanced scan forward from the
+        entry (nested blocks close their own markers first)."""
+        insts = self._frames[-1].insts
+        depth = 0
+        p_else: int | None = None
+        for i in range(entry + 1, len(insts)):
+            inst = insts[i]
+            if isinstance(inst, hir.If):
+                depth += 1
+            elif isinstance(inst, hir.End):
+                if depth == 0:
+                    return p_else, i
+                depth -= 1
+            elif isinstance(inst, hir.Else) and depth == 0:
+                p_else = i
+        raise CompileError('internal error: unclosed block in the HIR')
 
     def _exec_inst(self, inst: hir.Inst) -> None:
-        """Execute one instruction of the current block.  A control
-        instruction changes the execution state: an ``if`` pushes the
-        block of a branch (or starts typing the branch regions of a
-        runtime ``if``), a ``return`` cuts the current path (see
-        ``_end_block``); every other instruction only updates the
-        register table.  Straight-line instructions of the same block
-        are then executed one after another by ``_step``."""
+        """Execute one instruction of the executing frame.  A control
+        instruction changes the execution state: an ``If`` opens a block
+        (the walk continues into the chosen branch of a compile-time
+        ``if``, or types the branch regions of a runtime ``if``), the
+        ``Else``/``End`` markers close the branch being walked, a
+        ``return`` cuts the current path (see ``_cut``); every other
+        instruction only updates the register table."""
         match inst:
             case hir.Ret():
                 if not self._in_function_proper():
@@ -849,21 +845,18 @@ decision).  The return convention of the function is decided here
                     else:
                         value = retloc.value
                         retloc.value = None
-                    self._end_block(True, value if value is not None else ComptimeVal(None))
+                    self._cut(value if value is not None else ComptimeVal(None))
                 else:
                     # a path of the function proper ends: emit its return
                     # and cut the path
                     self._finish_path()
-                    self._end_block(True, None)
+                    self._cut(None)
             case hir.If():
-                cond = self._operand(inst.cond)
-                if isinstance(cond, ComptimeVal):
-                    # only the chosen branch is run: the other one is
-                    # dead (its code is never typed or emitted)
-                    chosen = inst.then_body if cond.obj else inst.else_body
-                    self._push_block(chosen)
-                else:
-                    self._exec_runtime_if(inst, cond)
+                self._exec_if(inst)
+            case hir.Else():
+                self._exec_else()
+            case hir.End():
+                self._exec_end()
             case hir.Load():
                 self._regs[inst] = self._load(self._operand(inst.ptr))
             case hir.Alloca():
@@ -887,85 +880,207 @@ decision).  The return convention of the function is decided here
             case _:
                 raise CompileError(f"unsupported instruction {type(inst).__name__}")
 
-    def _end_block(self, returns: bool, value: InterpVal | None) -> None:
-        """The run of a block of the executing frame ended: its list
-        fell off its end (``returns`` False), or its path was cut short
-        by a ``return`` (``returns`` True, ``value`` the returned value
-        when one applies - the value an inlined body yields).  The
-        outcome propagates to the enclosing execution: the chosen branch
-        of a compile-time ``if`` that fell through lets the enclosing
-        block resume; the branch region of a runtime ``if`` feeds the
-        state of the ``if`` (typing its other branch, or completing the
-        ``if`` once both branches have been typed); the body block of a
-        function ends the run of its frame.  A ``return`` cuts through
-        every compile-time branch above the boundary: the code after
-        them belongs to the dead path."""
-        while True:
-            frame = self._frames[-1]
-            block = frame.block_stack.pop()
-            if not frame.block_stack:
-                # the popped block is the body block: the run of the
-                # frame's function ended
-                self._frame_ended(returns, value)
+    def _exec_if(self, inst: hir.If) -> None:
+        """An ``if`` at the pc of the executing frame: the walk just
+        passed its ``If`` marker.  A compile-time condition keeps only
+        the chosen branch - the other branch is dead, its instructions
+        are skipped (never typed or emitted); a runtime condition types
+        both branches (both survive at runtime, see
+        ``_exec_runtime_if``).  The block is pushed on the frame's block
+        stack, recording its entry (the pc of this ``If``) so that the
+        matching ``Else``/``End`` markers can be found when the branches
+        are walked off (see ``_scan_block``)."""
+        frame = self._frames[-1]
+        entry = frame.pc - 1
+        cond = self._operand(inst.cond)
+        if isinstance(cond, ComptimeVal):
+            if cond.obj:
+                # the then branch is chosen: it follows the ``If``
+                frame.block_stack.append(BlockFrame(entry, chosen=True))
                 return
-            runtime_if = block.runtime_if
-            if runtime_if is None:
-                # the popped block is the chosen branch of a
-                # compile-time ``if``
-                if returns:
-                    # the branch returned: everything enclosing is dead
-                    # - keep unwinding the path
-                    continue
-                # the branch fell through: the enclosing block resumes
-                # (its pc already points past the ``if``)
+            # the else branch is chosen: skip the (dead) then branch
+            p_else, p_end = self._scan_block(entry)
+            if p_else is None:
+                # no else branch either: the whole ``if`` is dead
+                frame.pc = p_end + 1
                 return
-            # the popped block is one branch region of a runtime ``if``
-            # whose MIR instructions were typed into the region on top
-            # of ``self._regions``
-            self._regions.pop()
-            if runtime_if.then_returns is None:
-                # the then-branch was just typed: type the else-branch
-                # next (both branches are always typed and emitted)
-                runtime_if.then_returns = returns
-                self._run_rt_region(runtime_if, runtime_if.inst.else_body)
-                return
-            # the else-branch region just ended: the ``if`` is complete -
-            # its MIR ``If`` is emitted into the enclosing region (the
-            # branch regions were already popped off ``self._regions``)
-            runtime_if.else_returns = returns
-            then_returns = runtime_if.then_returns
-            assert then_returns is not None
-            if not then_returns and not returns:
+            frame.block_stack.append(BlockFrame(entry, chosen=False))
+            frame.pc = p_else + 1
+            return
+        self._exec_runtime_if(inst, cond, entry)
+
+    def _exec_else(self) -> None:
+        """The walk fell off the end of the then branch and reached the
+        ``Else`` marker of the innermost open block."""
+        frame = self._frames[-1]
+        bf = frame.block_stack[-1]
+        if bf.chosen is None:
+            # a runtime ``if``: its then-region fell off its end (it
+            # does not return); the else-region is typed next
+            self._rt_then_fell()
+            return
+        # a compile-time ``if`` whose chosen branch is the then branch,
+        # which fell off its end: the (unchosen) else branch is dead -
+        # skip it and close the block
+        assert bf.chosen
+        frame.block_stack.pop()
+        _, p_end = self._scan_block(bf.entry)
+        frame.pc = p_end + 1
+
+    def _exec_end(self) -> None:
+        """The walk fell off the end of a branch and reached the ``End``
+        marker of the innermost open block."""
+        frame = self._frames[-1]
+        bf = frame.block_stack[-1]
+        if bf.chosen is None:
+            if bf.then_returns is None:
+                # still typing the then-region: there is no else branch
+                # (an else would be delimited by an ``Else`` marker), so
+                # the then-region fell off its end and joins the empty
+                # else
                 raise CompileError(
                     "runtime 'if' branches that both fall through are not supported yet"
                 )
-            then_region = runtime_if.then_region
-            else_region = runtime_if.else_region
-            assert then_region is not None
-            assert else_region is not None
-            self._emit(
-                mir.If(
-                    runtime_if.cond.value,
-                    tuple(then_region),
-                    tuple(else_region),
-                )
+            # the else-region fell off its end: the ``if`` is complete
+            self._rt_else_fell()
+            return
+        # a compile-time ``if``: the chosen branch fell off its end
+        frame.block_stack.pop()
+
+    # -- runtime ``if`` regions --------------------------------------------
+
+    def _exec_runtime_if(
+        self, inst: hir.If, cond: InterpVal, entry: int
+    ) -> None:
+        """A runtime ``if``: both branch bodies are typed and emitted
+        (both survive at runtime): the walk continues into the
+        then-region, then - once it ends, by falling off at its ``Else``
+        marker or by a ``return`` (see ``_rt_then_fell`` and
+        ``_rt_then_returned``) - into the else-region.  The MIR is
+        emitted inline: a ``mir.If`` marker is opened here, closed by
+        the ``mir.Else``/``mir.End`` markers emitted when the regions
+        end.  A branch that falls off continues with the code after the
+        ``End``; both branches falling through (a join) is not supported
+        yet, and neither are runtime branches inside inlined functions."""
+        if not self._in_function_proper():
+            raise CompileError(
+                "runtime 'if' inside inlined functions is not supported yet"
             )
-            if then_returns and returns:
-                # every path of the ``if`` returns: everything after it
-                # is dead, so the enclosing path is cut as well
-                returns = True
-                value = None
+        if not isinstance(cond, RuntimeVal) or cond.type != sval.BoolType():
+            raise CompileError('runtime if conditions must be boolean values')
+        self._emit(mir.If(cond.value))
+        frame = self._frames[-1]
+        frame.block_stack.append(BlockFrame(entry))
+
+    def _rt_then_fell(self) -> None:
+        """The then-region of the runtime ``if`` on top of the executing
+        frame's block stack fell off its end (its ``Else`` marker was
+        reached): the else-region is typed next - the ``mir.Else``
+        marker is emitted and the walk continues (its pc already points
+        into the else-region)."""
+        bf = self._frames[-1].block_stack[-1]
+        assert bf.chosen is None and bf.then_returns is None
+        bf.then_returns = False
+        self._emit(mir.Else())
+
+    def _rt_then_returned(self) -> None:
+        """The then-region of the runtime ``if`` on top of the executing
+        frame's block stack ended in a ``return`` (the path was cut):
+        the else-region is typed next - or, when the ``if`` has no else
+        branch, the ``if`` is complete (the empty else branch falls
+        through) and the code after it is typed."""
+        frame = self._frames[-1]
+        bf = frame.block_stack[-1]
+        assert bf.chosen is None and bf.then_returns is None
+        bf.then_returns = True
+        p_else, p_end = self._scan_block(bf.entry)
+        if p_else is not None:
+            self._emit(mir.Else())
+            frame.pc = p_else + 1
+            return
+        self._emit(mir.End())
+        frame.block_stack.pop()
+        frame.pc = p_end + 1
+
+    def _rt_else_fell(self) -> None:
+        """The else-region of the runtime ``if`` on top of the executing
+        frame's block stack fell off its end (its ``End`` marker was
+        reached): the ``if`` is complete - unless the then-region fell
+        off as well (a join).  The walk continues after the ``End``."""
+        frame = self._frames[-1]
+        bf = frame.block_stack[-1]
+        assert bf.chosen is None
+        then_returns = bf.then_returns
+        assert then_returns is not None
+        if not then_returns:
+            raise CompileError(
+                "runtime 'if' branches that both fall through are not supported yet"
+            )
+        self._emit(mir.End())
+        frame.block_stack.pop()
+
+    def _rt_else_returned(self) -> bool:
+        """The else-region of the runtime ``if`` on top of the executing
+        frame's block stack ended in a ``return``: the ``if`` is
+        complete.  Returns True when every path of the ``if`` returned
+        (the code after it is dead and the enclosing path is cut too);
+        otherwise the code after the ``if`` is typed next (it is the
+        continuation of the then-region, which fell through)."""
+        frame = self._frames[-1]
+        bf = frame.block_stack[-1]
+        assert bf.chosen is None
+        then_returns = bf.then_returns
+        assert then_returns is not None
+        self._emit(mir.End())
+        frame.block_stack.pop()
+        if not then_returns:
+            _, p_end = self._scan_block(bf.entry)
+            frame.pc = p_end + 1
+        return then_returns
+
+    def _cut(self, value: InterpVal | None) -> None:
+        """The current path of the executing frame ended - a ``return``
+        was executed, or the path turned out dead (a runtime ``if``
+        whose every branch returned): unwind the open blocks of the
+        frame.  A compile-time ``if`` whose (chosen) branch the path ran
+        through is just popped (the code after it is dead); a runtime
+        ``if`` whose currently-typed region the path ended in continues
+        with its sibling region, or - when its else-region ended - is
+        complete: a single falling branch resumes the code after the
+        ``if``, and when both branches returned the cut keeps unwinding.
+        With no open block left, the run of the frame's body ended (see
+        ``_frame_ended``)."""
+        while True:
+            frame = self._frames[-1]
+            if not frame.block_stack:
+                # the body run ended in a return: skip the dead code
+                # after it
+                self._frame_ended(True, value)
+                return
+            bf = frame.block_stack[-1]
+            if bf.chosen is not None:
+                # the path ran through the chosen branch of a
+                # compile-time ``if`` and returned: dead code after it
+                frame.block_stack.pop()
                 continue
-            # one branch falls through: the enclosing block resumes
+            if bf.then_returns is None:
+                # the path ended inside the then-region: type the
+                # else-region next (it is a fresh path)
+                self._rt_then_returned()
+                return
+            # the path ended inside the else-region: the ``if`` is
+            # complete; when every path returned the cut keeps unwinding
+            if self._rt_else_returned():
+                continue
             return
 
     def _frame_ended(self, returns: bool, value: InterpVal | None) -> None:
-        """The body block of the executing frame was popped: the run of
-        its function ended - falling off its end (``returns`` False, a
-        void body) or cut by a ``return``.  The run of the function
-        proper ends the machine (its outcome is recorded in
-        ``self._flow``); an inlined callee is popped and its value
-        resumes the pending call of the caller (see ``_resume_call``)."""
+        """The run of the executing frame's function ended - falling off
+        its end (``returns`` False, a void body) or cut by a ``return``
+        (``returns`` True).  The run of the function proper ends the
+        machine (its outcome is recorded in ``self._flow``); an inlined
+        callee is popped and its value resumes the pending call of the
+        caller (see ``_resume_call``)."""
         if len(self._frames) == 1:
             self._flow = Flow.RET if returns else Flow.FALL
             return
@@ -982,8 +1097,8 @@ decision).  The return convention of the function is decided here
     def _resume_call(self, frame: Frame, value: InterpVal) -> None:
         """The run of an inlined callee ended: resume the call of the
         caller that suspended on it - the call's result is handed to its
-        result location (``_store_result``), and the block run of the
-        caller continues with the instructions after the call."""
+        result location (``_store_result``), and the walk of the caller
+        continues with the instructions after the call."""
         resume = frame.resume
         assert resume is not None
         inst, is_ctor = resume
@@ -1053,12 +1168,14 @@ decision).  The return convention of the function is decided here
         self,
         arg_values: tuple[tuple[mir.Value, sval.Type], ...],
         ret_loc: hir.ResultLoc,
+        insts: tuple[hir.Inst, ...],
     ) -> Frame:
-        """Push the frame of one function body (its by-value arguments
-        and its result location, the ``hir.ResultLoc`` leaf its return
-        statements write into, with a fresh ``RetLocVal``); returns the
-        frame."""
-        frame = Frame(arg_values, (ret_loc, RetLocVal()))
+        """Push the frame of one function body: its by-value arguments
+        and its result location (the ``hir.ResultLoc`` leaf its return
+        statements write into, with a fresh ``RetLocVal``) together with
+        the flat instruction list of its body (its walk starts at pc 0);
+        returns the frame."""
+        frame = Frame(arg_values, (ret_loc, RetLocVal()), insts)
         self._frames.append(frame)
         return frame
 
@@ -1200,45 +1317,15 @@ decision).  The return convention of the function is decided here
         return RuntimeVal(value, sval.PointerType(type.fields[index].type, is_const=False))
 
     def _emit(self, inst: mir.Inst) -> mir.Value:
-        self._regions[-1].append(inst)
+        """Append one instruction to the flat body of the function
+        being typed (``fn.insts``): the interpreter emits the whole MIR
+        of a specialization into one list, delimited by the
+        ``If``/``Else``/``End`` markers (there are no separate
+        regions)."""
+        fn = self._fn
+        assert fn is not None
+        fn.insts.append(inst)
         return inst
-
-    # -- regions and runtime branches -----------------------------------------
-
-    def _run_rt_region(
-        self, state: _RuntimeIfState, body: tuple[hir.Inst, ...]
-    ) -> None:
-        """Begin typing one branch region of the runtime ``if``
-        ``state``: its then-branch when the state is still fresh, its
-        else-branch once the then-branch has been typed (both branches
-        are always typed and emitted).  The branch body is pushed on the
-        block stack of the executing frame as a region block typing into
-        a fresh emission region, which is complete when the block's run
-        ends (see ``_end_block``)."""
-        region: list[mir.Inst] = []
-        if state.then_region is None:
-            state.then_region = region
-        else:
-            state.else_region = region
-        self._regions.append(region)
-        self._push_block(body, state)
-
-    def _exec_runtime_if(self, inst: hir.If, cond: InterpVal) -> None:
-        """A runtime ``if``: both branch bodies are typed and emitted as
-        regions of a :class:`mir.If`.  A branch that returns ends its
-        path; a branch that falls off continues with the code after the
-        ``if``.  Both branches falling through (a join) is not supported
-        yet, and neither are runtime branches inside inlined functions.
-        The typing of the two regions runs under the machine (see
-        ``_RuntimeIfState`` and ``_end_block``)."""
-        if not self._in_function_proper():
-            raise CompileError(
-                "runtime 'if' inside inlined functions is not supported yet"
-            )
-        if not isinstance(cond, RuntimeVal) or cond.type != sval.BoolType():
-            raise CompileError('runtime if conditions must be boolean values')
-        state = _RuntimeIfState(inst, cond)
-        self._run_rt_region(state, inst.then_body)
 
     def _finish_void(self) -> None:
         """End one path of the function proper with a void return (a bare
@@ -1814,11 +1901,10 @@ decision).  The return convention of the function is decided here
             raise CompileError('too deeply nested inlined functions')
         formal = self._solve_types(fn_ir, evals, 'jit')
         values = _convert_evals(fn_ir, evals, formal)
-        frame = self._push_frame(tuple(zip(values, formal)), fn_ir.ret_loc)
+        frame = self._push_frame(tuple(zip(values, formal)), fn_ir.ret_loc, fn_ir.body)
         frame.resume = (inst, is_ctor)
         self._inline_stack.append(fn_ir)
         self._inline_depth += 1
-        self._push_block(fn_ir.body)
 
     def _solve_types(
         self, fn_ir: astgen.FunctionIR, evals: list[InterpVal], mode: str

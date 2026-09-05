@@ -54,11 +54,16 @@ Operands of instructions are therefore either
 * :class:`Arg` leaves - the by-value arguments of the function,
 * instruction objects produced by earlier instructions.
 
-Statements and sub-lists: a function body is one list of instructions;
-a compile-time ``if`` is an :class:`If` instruction carrying the two
-branch bodies as plain instruction lists (the branches are not executed
-together; runtime control flow with blocks and phis will build on the
-same list representation later).
+Statements: every function body is one *flat* list of instructions
+containing all of its control flow.  A conditional is an :class:`If`
+instruction followed - in the same list - by the instructions of its
+then branch, the :class:`Else` marker and the else branch (when one
+exists), and the :class:`End` marker that closes the block, like WASM's
+``if ... else ... end``.  The interpreter walks the flat list: a
+compile-time ``if`` skips the branch it does not choose (its
+instructions are never run, so the branch is dead), a runtime ``if``
+types both branches (both survive at runtime).  Future block
+instructions (loops, ...) will use the same marker representation.
 """
 
 from dataclasses import dataclass
@@ -238,11 +243,32 @@ class Ret(Inst):
 
 @dataclass(eq=False)
 class If(Inst):
-    """Conditional statement.  A compile-time condition is evaluated
-    while the HIR runs and only the chosen branch survives; a runtime
+    """Conditional statement (WASM-style): the instructions of the two
+    branches follow this instruction in the same list, delimited by the
+    matching :class:`Else` (when an else branch exists) and
+    :class:`End` markers.  A compile-time condition is evaluated while
+    the HIR runs and only the chosen branch survives; a runtime
     condition becomes a runtime branch in the MIR (both branch bodies
     are typed and compiled then)."""
 
     cond: Value
-    then_body: tuple[Inst, ...]
-    else_body: tuple[Inst, ...]
+
+
+@dataclass(eq=False)
+class Else(Inst):
+    """The marker that starts the else branch of an :class:`If` block
+    (absent when the ``if`` has no else branch): everything between the
+    ``If`` and this marker is the then branch, everything between this
+    marker and the matching :class:`End` is the else branch.  A marker
+    produces no register; it only delimits the flat instruction
+    stream."""
+
+
+@dataclass(eq=False)
+class End(Inst):
+    """The marker that closes a block opened by an :class:`If` (or a
+    future block instruction): everything between the ``If`` (or its
+    :class:`Else`) and this marker is one branch body, and the code
+    after this marker is the continuation of the enclosing block.  A
+    marker produces no register; it only delimits the flat instruction
+    stream."""

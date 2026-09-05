@@ -171,24 +171,30 @@ class _Builder:
             case ast.AugAssign():
                 self._gen_augassign(node)
             case ast.If():
+                # the branches are generated into the same flat list,
+                # delimited by the ``Else``/``End`` markers (WASM-style)
                 cond = self._gen_value(node.test)
-                then_body = self._gen_body(node.body)
-                else_body = self._gen_body(node.orelse)
-                self.add(hir.If(cond, tuple(then_body), tuple(else_body)))
+                self.add(hir.If(cond))
+                self._gen_branch(node.body)
+                if len(node.orelse) > 0:
+                    self.add(hir.Else())
+                    self._gen_branch(node.orelse)
+                self.add(hir.End())
             case _:
                 raise CompileError(
                     f"unsupported statement {type(node).__name__} in spy function {fn_name}"
                 )
 
-    def _gen_body(self, stmts: list[ast.stmt]) -> list[hir.Inst]:
-        """Translate a statement block into its own linear instruction
-        list.  A block is a lexical scope of its own - a child of the
-        enclosing block - so declarations inside it shadow outer
-        bindings and are not visible after the block."""
+    def _gen_branch(self, stmts: list[ast.stmt]) -> None:
+        """Translate one branch body of an ``if``, appending its
+        instructions to this builder's list (between the ``If``/``Else``
+        and ``End`` markers).  A branch is a lexical scope of its own -
+        a child of the enclosing scope - so declarations inside it
+        shadow outer bindings and are not visible after the block."""
         sub = _Builder(self._fn_ir, _Scope(self._scope), self._ret_loc)
         for stmt in stmts:
             sub._gen_stmt(stmt)
-        return sub.insts
+        self.insts.extend(sub.insts)
 
     # -- variables ------------------------------------------------------------
 

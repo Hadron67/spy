@@ -122,9 +122,11 @@ def to_ctype(type: Type) -> type[ctypes._CDataType] | None:
 
 
 class _Lowerer:
-    """Lowers the region trees of the MIR functions of one module onto
-    their shared ``sllvm.Function`` definitions (every region becomes a
-    chain of LLVM basic blocks).  A call whose callee is a
+    """Lowers the flat instruction lists of the MIR functions of one
+    module onto their shared ``sllvm.Function`` definitions (each list
+    becomes a chain of LLVM basic blocks; an ``If`` branches into its
+    two marker-delimited regions, whose falling branches join the code
+    after the matching ``End``).  A call whose callee is a
     :class:`mir.Function` - of the module itself, or a function that is
     being compiled into it (recursion) - references the in-module
     ``define``; a call to a :class:`mir.Symbol` of an earlier module
@@ -142,58 +144,102 @@ class _Lowerer:
         return self._types.to_llvm(type)
 
     def lower(self, fn: mir.Function) -> None:
-        """Lower the region tree of ``fn`` into its pre-created
-        ``sllvm.Function``."""
+        """Lower the flat instruction list of ``fn`` into its
+        pre-created ``sllvm.Function``."""
         llvm_fn = self._llvm_fns[fn.name]
         arg_values = llvm_fn.get_args()
-        self._lower_region(llvm_fn, llvm_fn.entry, fn.insts, arg_values, None)
+        self._lower_region(
+            llvm_fn, llvm_fn.entry, fn.insts, 0, len(fn.insts), arg_values, None
+        )
+
+    def _scan_if(self, insts: list[mir.Inst], i: int) -> tuple[int | None, int]:
+        """The positions of the ``Else`` (or None when the ``if`` has no
+        else branch) and ``End`` markers that close the ``mir.If`` at
+        index ``i``, found by a balanced scan forward (nested blocks
+        close their own markers first)."""
+        depth = 0
+        p_else: int | None = None
+        for j in range(i + 1, len(insts)):
+            inst = insts[j]
+            if isinstance(inst, mir.If):
+                depth += 1
+            elif isinstance(inst, mir.End):
+                if depth == 0:
+                    return p_else, j
+                depth -= 1
+            elif isinstance(inst, mir.Else) and depth == 0:
+                p_else = j
+        raise CompileError('internal error: unclosed block in the MIR')
 
     def _lower_region(
         self,
         llvm_fn: sllvm.Function,
         block: sllvm.BasicBlock,
-        insts: tuple[mir.Inst, ...] | list[mir.Inst],
+        insts: list[mir.Inst],
+        start: int,
+        end: int,
         arg_values: tuple[sllvm.Value, ...],
         cont: sllvm.BasicBlock | None,
     ) -> None:
-        """Lower one region into LLVM blocks.  ``cont`` is the block
-        that a region falling off its end jumps to (None only at the end
-        of the function, where falling off is a compile error)."""
-        if len(insts) == 0:
-            if not block._finished:
-                assert cont is not None, 'function must not fall off its end'
-                block.jmp(cont)
-            return
-        inst = insts[0]
-        if isinstance(inst, mir.Ret):
-            if inst.value is None:
-                # a void return (``ret void``)
-                block.ret(None)
-            else:
-                value = self._value(inst.value, arg_values)
-                block.ret(value)
-            return
-        if isinstance(inst, mir.If):
-            cond = self._value(inst.cond, arg_values)
-            rest = insts[1:]
-            cont_block = sllvm.BasicBlock() if rest else cont
-            then_block = sllvm.BasicBlock()
-            if len(inst.else_body) == 0:
-                assert cont_block is not None
-                block.br(cond, then_block, cont_block)
-                self._lower_region(llvm_fn, then_block, inst.then_body, arg_values, cont_block)
-            else:
-                else_block = sllvm.BasicBlock()
-                block.br(cond, then_block, else_block)
-                self._lower_region(llvm_fn, then_block, inst.then_body, arg_values, cont_block)
-                self._lower_region(llvm_fn, else_block, inst.else_body, arg_values, cont_block)
-            if rest:
-                assert cont_block is not None
-                self._lower_region(llvm_fn, cont_block, rest, arg_values, cont)
-            return
-        # a plain instruction
-        self._lower_inst(block, inst, arg_values)
-        self._lower_region(llvm_fn, block, insts[1:], arg_values, cont)
+        """Lower the instructions ``insts[start:end]`` - one branch
+        body of the flat stream, delimited by its enclosing markers -
+        into LLVM blocks.  ``cont`` is the block the code jumps to when
+        it runs off the end of its region (None only at the very end of
+        the function, which never falls off).  A nested ``If`` is
+        lowered whole (its regions and the code after its ``End``, which
+        the falling branches join); a ``Ret`` ends the region."""
+        i = start
+        while i < end:
+            inst = insts[i]
+            if isinstance(inst, mir.Ret):
+                if inst.value is None:
+                    # a void return (``ret void``)
+                    block.ret(None)
+                else:
+                    value = self._value(inst.value, arg_values)
+                    block.ret(value)
+                return
+            if isinstance(inst, mir.If):
+                p_else, p_end = self._scan_if(insts, i)
+                cond = self._value(inst.cond, arg_values)
+                after = p_end + 1
+                # the code after the ``If`` (which the falling branch
+                # joins) starts in a fresh block - unless the ``If`` is
+                # the last thing of this region, when it is the region's
+                # own continuation
+                cont_block = sllvm.BasicBlock() if after < end else cont
+                then_block = sllvm.BasicBlock()
+                if p_else is None:
+                    # an empty else branch: a false condition goes to
+                    # the code after the ``If``
+                    assert cont_block is not None
+                    block.br(cond, then_block, cont_block)
+                    self._lower_region(
+                        llvm_fn, then_block, insts, i + 1, p_end, arg_values, cont_block
+                    )
+                else:
+                    else_block = sllvm.BasicBlock()
+                    block.br(cond, then_block, else_block)
+                    self._lower_region(
+                        llvm_fn, then_block, insts, i + 1, p_else, arg_values, cont_block
+                    )
+                    self._lower_region(
+                        llvm_fn, else_block, insts, p_else + 1, p_end, arg_values, cont_block
+                    )
+                if after < end:
+                    assert cont_block is not None
+                    self._lower_region(
+                        llvm_fn, cont_block, insts, after, end, arg_values, cont
+                    )
+                return
+            # a plain instruction
+            self._lower_inst(block, inst, arg_values)
+            i += 1
+        # the region ran off its end (its last instruction did not
+        # terminate the block): it falls through to the continuation
+        if not block._finished:
+            assert cont is not None, 'function must not fall off its end'
+            block.jmp(cont)
 
     def _value(self, value: mir.Value, arg_values: tuple[sllvm.Value, ...]) -> sllvm.Value:
         if isinstance(value, mir.Param):
