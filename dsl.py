@@ -507,7 +507,7 @@ class JitContext(FunctionResolver):
             return self._register(fn, 'jit', ptr_self)
         return lambda f: self._register(f, 'jit', ptr_self)
 
-    def aot(self, fn: FunctionType | None = None, *, ptr_self: bool = False):
+    def aot(self, fn: FunctionType | None = None, *, ptr_self: bool = False) -> Any:
         """``@cache.aot()``: compile lazily at the first use from the
         (concrete) type annotations, which are required for every
         parameter (except the ``self`` of a method) and for the return
@@ -644,7 +644,15 @@ class JitContext(FunctionResolver):
         """A Python-side call of a spy method on a struct instance
         (``bar.hkm()``): bind the arguments to the parameters after
         ``self``, marshal the instance according to ``ptr_self`` and
-        call the compiled method."""
+        call the compiled method.
+
+        Like a call from spy code, every *logical* parameter takes an
+        argument - ``self`` is the instance, and a zero-sized parameter
+        accepts ``None`` (the void value).  Only parameters with a
+        runtime representation are actually passed to the native
+        function: a zero-sized ``self`` (the by-value ``self`` of a ZST
+        struct) and zero-sized parameters are consumed but not
+        marshaled."""
         entry = handle.entry()
         fn_ir = entry.hir
         name = entry.fn.__name__
@@ -656,26 +664,25 @@ class JitContext(FunctionResolver):
         self_type: Type = PointerType(desc) if handle._ptr_self else desc
 
         rest = params[1:]
-        # a parameter of a zero-sized type (a ``self`` of a ZST struct,
-        # or an aot parameter annotated with one) takes no argument from
-        # the Python side; a jit method's parameters are all visible
+        # an aot signature carries its fixed types (a zero-sized ``self``
+        # or parameter is known there); a jit method's parameters are
+        # typed from the arguments, none of which can marshal to a
+        # zero-sized type
         if isinstance(entry, FunctionValue):
-            zst = tuple(is_zst(a.type) for a in entry.args)
-            assert len(zst) == len(params)
+            is_zst_param = tuple(is_zst(a.type) for a in entry.args)
+            assert len(is_zst_param) == len(params)
         else:
-            zst = (False,) * len(params)
-        rest_visible = [i for i in range(1, len(params)) if not zst[i]]
-        names = [params[i].name for i in rest_visible]
-        if len(args) > len(rest_visible):
+            is_zst_param = (False,) * len(params)
+        rest_names = [p.name for p in rest]
+        if len(args) > len(rest):
             raise TypeError(
-                f'{name}() takes {len(rest_visible)} positional arguments but '
-                f'{len(args)} were given'
+                f'{name}() takes {len(rest)} positional arguments but {len(args)} were given'
             )
         present: dict[str, Any] = {}
         for i, value in enumerate(args):
-            present[names[i]] = value
+            present[rest_names[i]] = value
         for key, value in kwargs.items():
-            if key not in names:
+            if key not in rest_names:
                 raise TypeError(f"{name}() got an unexpected keyword argument '{key}'")
             if key in present:
                 raise TypeError(f"{name}() got multiple values for argument '{key}'")
@@ -687,8 +694,7 @@ class JitContext(FunctionResolver):
             # a jit method: solve the formal types from the marshaled
             # arguments; ``self`` is pinned to its pointer/value type
             provided: list[Type | None] = [self_type]
-            for i in range(1, len(params)):
-                param = params[i]
+            for i, param in enumerate(rest):
                 provided.append(
                     _candidate_type(name, param.name, present[param.name])
                     if param.name in present
@@ -699,15 +705,24 @@ class JitContext(FunctionResolver):
         marshaled: list[Any] = []
         if not is_zst(self_type):
             marshaled.append(_marshal(name, 'self', instance, self_type))
-        for i in rest_visible:
-            param = params[i]
+        for i, param in enumerate(rest):
             if param.name in present:
                 value = present[param.name]
             else:
                 if not param.has_default:
                     raise TypeError(f"{name}() missing required argument '{param.name}'")
                 value = param.default_value
-            marshaled.append(_marshal(name, param.name, value, formal[i]))
+            if is_zst_param[i + 1]:
+                # a zero-sized parameter has no runtime representation:
+                # its logical value (the void value, ``None``) is
+                # consumed but not passed to the native function
+                if value is not None:
+                    raise TypeError(
+                        f"the '{param.name}' argument of {name} is a zero-sized "
+                        f'(void) parameter and must be None'
+                    )
+                continue
+            marshaled.append(_marshal(name, param.name, value, formal[i + 1]))
         spec = self.ensure_spec(entry, formal)
         return spec.call(*marshaled)
 
@@ -717,10 +732,12 @@ class JitContext(FunctionResolver):
         """Bind Python arguments to the formal parameters of ``entry``
         and call the (possibly just compiled) specialization; this is
         what the registration handle of a spy function forwards to.
-        A parameter of a zero-sized type (which an aot signature may
-        declare) takes no argument and is not part of the Python-facing
-        signature: it has no runtime representation and its value is its
-        unit value."""
+
+        Every *logical* parameter takes an argument, exactly like a call
+        from spy code; a parameter of a zero-sized type accepts ``None``
+        (the void value) and is consumed without being passed to the
+        native function, whose lowered signature carries no argument for
+        it."""
         fn_ir = entry.hir
         name = entry.fn.__name__
         params = fn_ir.params
@@ -728,42 +745,53 @@ class JitContext(FunctionResolver):
             is_zst_param = tuple(is_zst(a.type) for a in entry.args)
             assert len(is_zst_param) == len(params)
         else:
-            # a jit signature is typed from the provided arguments, none
-            # of which can marshal to a zero-sized type
+            # a jit signature is typed from the provided arguments; a
+            # Python value never marshals to a zero-sized type
             is_zst_param = (False,) * len(params)
-        visible = [i for i in range(len(params)) if not is_zst_param[i]]
-        names = [params[i].name for i in visible]
+        param_names = [p.name for p in params]
 
-        if len(args) > len(visible):
+        if len(args) > len(params):
             raise TypeError(
-                f"{name}() takes {len(visible)} positional arguments but {len(args)} were given"
+                f"{name}() takes {len(params)} positional arguments but {len(args)} were given"
             )
         present: dict[str, Any] = {}
         for i, value in enumerate(args):
-            present[names[i]] = value
+            present[param_names[i]] = value
         for key, value in kwargs.items():
-            if key not in names:
+            if key not in param_names:
                 raise TypeError(f"{name}() got an unexpected keyword argument '{key}'")
             if key in present:
                 raise TypeError(f"{name}() got multiple values for argument '{key}'")
             present[key] = value
 
         provided: list[Type | None] = [None] * len(params)
-        for i in visible:
-            param = params[i]
+        for i, param in enumerate(params):
+            if is_zst_param[i]:
+                # its type is fixed by the (aot) signature: the argument
+                # is the void value and contributes no type
+                continue
             if param.name in present:
                 provided[i] = _candidate_type(name, param.name, present[param.name])
         formal, _ = astgen.solve_call_types(fn_ir, entry.kind, tuple(provided))
 
         marshaled: list[Any] = []
-        for i in visible:
-            param = params[i]
+        for i, param in enumerate(params):
             if param.name in present:
                 value = present[param.name]
             else:
                 if not param.has_default:
                     raise TypeError(f"{name}() missing required argument '{param.name}'")
                 value = param.default_value
+            if is_zst_param[i]:
+                # a zero-sized parameter has no runtime representation:
+                # its logical value (the void value, ``None``) is
+                # consumed but not passed to the native function
+                if value is not None:
+                    raise TypeError(
+                        f"the '{param.name}' argument of {name} is a zero-sized "
+                        f'(void) parameter and must be None'
+                    )
+                continue
             marshaled.append(_marshal(name, param.name, value, formal[i]))
 
         spec = self.ensure_spec(entry, formal)
@@ -1019,6 +1047,16 @@ class JitContext(FunctionResolver):
         if value in self._entries:
             return self._entries[value].entry()
         return None
+
+    def resolve_function(self, value: Any) -> FunctionEntry:
+        fn = self.resolve_global(value)
+        assert isinstance(fn, FunctionEntry)
+        return fn
+
+    def resolve_struct(self, value: Any) -> sval.StructType:
+        struct = self.resolve_global(value)
+        assert isinstance(struct, sval.StructType)
+        return struct
 
     @override
     def resolve_method(self, struct: sval.StructType, name: str) -> tuple[Any, bool] | None:

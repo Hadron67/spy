@@ -26,8 +26,10 @@ from . import (
     i32,
     mir,
     sval,
+    u0,
     u32,
     u64,
+    void,
 )
 from . import as_ as spy_as
 from . import bool as spy_bool
@@ -1886,6 +1888,7 @@ class SvalZstTest(TestCase):
         s.add_field('c', sval.VoidType())
         s.add_field('d', sval.FloatType(64))
         m = sval.struct_mir_type(s)
+        assert isinstance(m, mir.StructType)
         self.assertEqual([f.name for f in m.fields], ['b', 'd'])
         # spy declaration indices map onto the mirror positions; a ZST
         # field itself has no position in the mirror
@@ -1909,7 +1912,9 @@ class SvalZstTest(TestCase):
         # only the sized parameter occupies a lowered position
         self.assertEqual(info.total_mir_args, 1)
         self.assertIsNone(info.args_map[0])
-        self.assertEqual(info.args_map[1].index, 0)
+        m1 = info.args_map[1]
+        assert m1 is not None
+        self.assertEqual(m1.index, 0)
         self.assertIsNone(info.args_map[2])
 
     def test_zst_parameters_and_self_are_skipped(self) -> None:
@@ -1927,7 +1932,7 @@ class SvalZstTest(TestCase):
             pass
 
         @self.cache.aot()
-        def take(x: sval.VoidType(), b: i32) -> i32:
+        def take(x: void, b: i32) -> i32:
             return b
 
         @self.cache.jit()
@@ -1938,7 +1943,13 @@ class SvalZstTest(TestCase):
 
         u = Unit()
         self.assertEqual(u.val(), 7)
-        self.assertEqual(take(5), 5)
+        # a Python-side call provides every logical parameter - the
+        # zero-sized one takes None - but passes only the sized values
+        # to the native function
+        self.assertEqual(take(None, 5), 5)
+        self.assertEqual(take(x=None, b=8), 8)
+        with self.assertRaises(TypeError):
+            take(1, 5)  # the zero-sized parameter takes None only
         self.assertEqual(caller(7), 7)
         # the lowered signatures carry no zero-sized parameters
         self.assertEqual(

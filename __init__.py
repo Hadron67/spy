@@ -25,12 +25,13 @@ concrete argument types (comptime semantics: ``spy.typeof``, compile-time
 """
 
 import builtins as pybuiltins
+from types import NoneType
 from typing import TYPE_CHECKING
 
 from . import builtins as _builtins
 from .dsl import JitContext
 from .errors import CompileError, SpyError, TypeMismatchError
-from .sval import BoolType, FloatType, IntType
+from .sval import BoolType, FloatType, IntType, VoidType
 
 typeof = _builtins.spy_typeof  # ``spy.typeof`` is evaluated at compile time
 compile_log = _builtins.spy_compile_log
@@ -40,6 +41,7 @@ as_ = _builtins.spy_as
 globals()['as'] = _builtins.spy_as
 
 if TYPE_CHECKING:
+    u0 = int
     u8 = int
     u16 = int
     u32 = int
@@ -51,7 +53,9 @@ if TYPE_CHECKING:
     f32 = float
     f64 = float
     bool = pybuiltins.bool
+    void = NoneType
 else:
+    u0 = IntType(0, False)
     u8 = IntType(8, False)
     u16 = IntType(16, False)
     u32 = IntType(32, False)
@@ -63,6 +67,7 @@ else:
     f32 = FloatType(32)
     f64 = FloatType(64)
     bool = BoolType()
+    void = VoidType()
 
 __all__ = [
     'CompileError',
