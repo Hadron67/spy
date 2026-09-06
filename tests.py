@@ -129,12 +129,14 @@ def make_samples(cache: JitContext) -> dict[str, object]:
             return 0
 
     @cache.jit()
-    def bad_join(n):
-        # both branches fall through (a join): not supported yet
+    def join_paths(n):
+        # both branches of a runtime if fall through: they join at the
+        # code after the if (a join - the slots the branches wrote are
+        # memory, so no phi is needed)
         if n > 0:
-            pass
+            n += 10
         else:
-            pass
+            n += 100
         return n
 
     # -- inlining into runtime-``if`` regions --------------------------------
@@ -174,6 +176,21 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         if n > 100:
             return 100
         return n
+
+    def joiner_inline(n):
+        # an inlined body with runtime ifs whose branches all fall
+        # through (with and without an else): the paths join
+        if n > 0:
+            n += 1
+        else:
+            n += 2
+        if n < 0:
+            n += 4
+        return n
+
+    @cache.jit()
+    def use_joiner(n):
+        return joiner_inline(n)
 
     def inner_rt(n):
         if n > 0:
@@ -298,7 +315,7 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         'clamped': clamped,
         'classify': classify,
         'nested_if': nested_if,
-        'bad_join': bad_join,
+        'join_paths': join_paths,
         'branch_inline': branch_inline,
         'nested_inline': nested_inline,
         'use_sign_local': use_sign_local,
@@ -306,6 +323,7 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         'use_early': use_early,
         'use_outer': use_outer,
         'use_sign_in_branch': use_sign_in_branch,
+        'use_joiner': use_joiner,
         'fact': fact,
         'fact_aot': fact_aot,
         'gcd': gcd,
@@ -422,7 +440,7 @@ class SpyExampleTest(TestCase):
     clamped: Any
     classify: Any
     nested_if: Any
-    bad_join: Any
+    join_paths: Any
     branch_inline: Any
     nested_inline: Any
     use_sign_local: Any
@@ -430,6 +448,7 @@ class SpyExampleTest(TestCase):
     use_early: Any
     use_outer: Any
     use_sign_in_branch: Any
+    use_joiner: Any
     fact: Any
     fact_aot: Any
     gcd: Any
@@ -595,12 +614,13 @@ class SpyExampleTest(TestCase):
         self.assertEqual(self.nested_if(5), 1)
         self.assertEqual(self.nested_if(500), 2)
 
-    def test_runtime_if_join_error(self) -> None:
-        # a runtime if whose branches both fall through needs a join,
-        # which the structured MIR does not support yet
-        with self.assertRaises(CompileError) as ctx:
-            self.bad_join(1)
-        self.assertIn('both fall through', str(ctx.exception))
+    def test_runtime_if_join(self) -> None:
+        # a runtime if whose branches both fall through: the branches
+        # join at the code after the if; the value written in the
+        # branches (a memory slot) is read back after the join
+        self.assertEqual(self.join_paths(5), 15)
+        self.assertEqual(self.join_paths(-5), 95)
+        self.assertEqual(self.join_paths(0), 100)
 
     # -- inlining into runtime-``if`` regions --------------------------------
 
@@ -674,6 +694,13 @@ class SpyExampleTest(TestCase):
         self.assertEqual(self.use_sign_in_branch(200), -1)
         self.assertEqual(self.use_sign_in_branch(50), 0)
         self.assertEqual(self.use_sign_in_branch(-200), 0)
+
+    def test_inline_runtime_if_join(self) -> None:
+        # an inlined body whose runtime-if branches all fall through
+        # (with and without an else): the paths join inside the body
+        self.assertEqual(self.use_joiner(5), 6)
+        self.assertEqual(self.use_joiner(-5), 1)
+        self.assertEqual(self.use_joiner(0), 2)
 
     def test_inline_runtime_if_conflicting_types(self) -> None:
         # the runtime paths of the inlined body return different types

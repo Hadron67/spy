@@ -1025,23 +1025,22 @@ decision).  The return convention of the function is decided here
 
     def _exec_end(self) -> None:
         """The walk fell off the end of a branch and reached the ``End``
-        marker of the innermost open block."""
+        marker of the innermost open block.  A runtime ``if`` whose
+        currently-typed region fell off its end - the then-region of an
+        ``if`` without an else, or the else-region - is complete: the
+        falling branch continues with the code after the ``End``.  Both
+        branches falling through (a join) is fine: the MIR's falling
+        branches already continue at that shared continuation, and block
+        scoping (a branch declaration never escapes its branch) keeps
+        the state crossing the join in memory slots, where it needs no
+        phi."""
         frame = self._frames[-1]
         bf = frame.block_stack[-1]
-        if bf.chosen is None:
-            if bf.then_returns is None:
-                # still typing the then-region: there is no else branch
-                # (an else would be delimited by an ``Else`` marker), so
-                # the then-region fell off its end and joins the empty
-                # else
-                raise CompileError(
-                    "runtime 'if' branches that both fall through are not supported yet"
-                )
-            # the else-region fell off its end: the ``if`` is complete
-            self._rt_else_fell()
+        if bf.chosen is not None:
+            # a compile-time ``if``: the chosen branch fell off its end
+            frame.block_stack.pop()
             return
-        # a compile-time ``if``: the chosen branch fell off its end
-        frame.block_stack.pop()
+        self._rt_else_fell()
 
     # -- runtime ``if`` regions --------------------------------------------
 
@@ -1056,8 +1055,8 @@ decision).  The return convention of the function is decided here
         emitted inline: a ``mir.If`` marker is opened here, closed by
         the ``mir.Else``/``mir.End`` markers emitted when the regions
         end.  A branch that falls off continues with the code after the
-        ``End``; both branches falling through (a join) is not supported
-        yet.
+        ``End`` (both branches may fall through: the MIR's falling
+        branches join there, see ``_rt_else_fell``).
 
         Inside an inlined body the ``if`` makes the body multi-path (see
         ``Frame.multi_path``): the body may now deliver its result from
@@ -1103,15 +1102,17 @@ decision).  The return convention of the function is decided here
         frame.pc = p_end + 1
 
     def _rt_else_fell(self) -> None:
-        """The else-region of the runtime ``if`` on top of the executing
-        frame's block stack fell off its end (its ``End`` marker was
-        reached): the ``if`` is complete - unless the then-region fell
-        off as well (a join).  The walk continues after the ``End``."""
+        """The region of the runtime ``if`` on top of the executing
+        frame's block stack that is currently being typed fell off its
+        end (the ``End`` marker was reached): the ``if`` is complete and
+        the code after the ``End`` is typed next.  A region that fell
+        off continues at runtime with that code; when both branches fell
+        through, both join it (a join - the MIR's falling branches
+        already continue at the shared post-``End`` code, and block
+        scoping keeps cross-join state in memory)."""
         frame = self._frames[-1]
         bf = frame.block_stack[-1]
         assert bf.chosen is None
-        then_returns = bf.then_returns
-        assert then_returns is not None
         self._emit(mir.End())
         frame.block_stack.pop()
 
