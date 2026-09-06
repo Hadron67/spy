@@ -45,6 +45,7 @@ from .sval import (
     Value,
     function_call_info,
     int_range,
+    is_zst,
     to_mir_type,
     type_of,
     type_str,
@@ -655,10 +656,20 @@ class JitContext(FunctionResolver):
         self_type: Type = PointerType(desc) if handle._ptr_self else desc
 
         rest = params[1:]
-        names = [p.name for p in rest]
-        if len(args) > len(rest):
+        # a parameter of a zero-sized type (a ``self`` of a ZST struct,
+        # or an aot parameter annotated with one) takes no argument from
+        # the Python side; a jit method's parameters are all visible
+        if isinstance(entry, FunctionValue):
+            zst = tuple(is_zst(a.type) for a in entry.args)
+            assert len(zst) == len(params)
+        else:
+            zst = (False,) * len(params)
+        rest_visible = [i for i in range(1, len(params)) if not zst[i]]
+        names = [params[i].name for i in rest_visible]
+        if len(args) > len(rest_visible):
             raise TypeError(
-                f'{name}() takes {len(rest)} positional arguments but {len(args)} were given'
+                f'{name}() takes {len(rest_visible)} positional arguments but '
+                f'{len(args)} were given'
             )
         present: dict[str, Any] = {}
         for i, value in enumerate(args):
@@ -676,22 +687,27 @@ class JitContext(FunctionResolver):
             # a jit method: solve the formal types from the marshaled
             # arguments; ``self`` is pinned to its pointer/value type
             provided: list[Type | None] = [self_type]
-            for param in rest:
-                if param.name in present:
-                    provided.append(_candidate_type(name, param.name, present[param.name]))
-                else:
-                    provided.append(None)
+            for i in range(1, len(params)):
+                param = params[i]
+                provided.append(
+                    _candidate_type(name, param.name, present[param.name])
+                    if param.name in present
+                    else None
+                )
             formal, _ = astgen.solve_call_types(fn_ir, 'jit', tuple(provided))
 
-        marshaled = [_marshal(name, 'self', instance, self_type)]
-        for i, param in enumerate(rest):
+        marshaled: list[Any] = []
+        if not is_zst(self_type):
+            marshaled.append(_marshal(name, 'self', instance, self_type))
+        for i in rest_visible:
+            param = params[i]
             if param.name in present:
                 value = present[param.name]
             else:
                 if not param.has_default:
                     raise TypeError(f"{name}() missing required argument '{param.name}'")
                 value = param.default_value
-            marshaled.append(_marshal(name, param.name, value, formal[i + 1]))
+            marshaled.append(_marshal(name, param.name, value, formal[i]))
         spec = self.ensure_spec(entry, formal)
         return spec.call(*marshaled)
 
@@ -700,36 +716,48 @@ class JitContext(FunctionResolver):
     def _dispatch(self, entry: FunctionEntry, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         """Bind Python arguments to the formal parameters of ``entry``
         and call the (possibly just compiled) specialization; this is
-        what the registration handle of a spy function forwards to."""
+        what the registration handle of a spy function forwards to.
+        A parameter of a zero-sized type (which an aot signature may
+        declare) takes no argument and is not part of the Python-facing
+        signature: it has no runtime representation and its value is its
+        unit value."""
         fn_ir = entry.hir
         name = entry.fn.__name__
         params = fn_ir.params
-        param_names = [p.name for p in params]
+        if isinstance(entry, FunctionValue):
+            is_zst_param = tuple(is_zst(a.type) for a in entry.args)
+            assert len(is_zst_param) == len(params)
+        else:
+            # a jit signature is typed from the provided arguments, none
+            # of which can marshal to a zero-sized type
+            is_zst_param = (False,) * len(params)
+        visible = [i for i in range(len(params)) if not is_zst_param[i]]
+        names = [params[i].name for i in visible]
 
-        if len(args) > len(params):
+        if len(args) > len(visible):
             raise TypeError(
-                f"{name}() takes {len(params)} positional arguments but {len(args)} were given"
+                f"{name}() takes {len(visible)} positional arguments but {len(args)} were given"
             )
         present: dict[str, Any] = {}
         for i, value in enumerate(args):
-            present[param_names[i]] = value
+            present[names[i]] = value
         for key, value in kwargs.items():
-            if key not in param_names:
+            if key not in names:
                 raise TypeError(f"{name}() got an unexpected keyword argument '{key}'")
             if key in present:
                 raise TypeError(f"{name}() got multiple values for argument '{key}'")
             present[key] = value
 
-        provided: list[Type | None] = []
-        for param in params:
+        provided: list[Type | None] = [None] * len(params)
+        for i in visible:
+            param = params[i]
             if param.name in present:
-                provided.append(_candidate_type(name, param.name, present[param.name]))
-            else:
-                provided.append(None)
+                provided[i] = _candidate_type(name, param.name, present[param.name])
         formal, _ = astgen.solve_call_types(fn_ir, entry.kind, tuple(provided))
 
         marshaled: list[Any] = []
-        for i, param in enumerate(params):
+        for i in visible:
+            param = params[i]
             if param.name in present:
                 value = present[param.name]
             else:
@@ -844,6 +872,7 @@ class JitContext(FunctionResolver):
         args = tuple(
             mir.FormalArg(fn_ir.params[i].name, to_mir_type(arg_types[i]))
             for i in range(len(arg_types))
+            if not is_zst(arg_types[i])
         )
         fn = mir.Function(
             symbol_of(entry.name_base, arg_types),

@@ -9,12 +9,16 @@ references to earlier instruction objects.
 
 Values in the register table are either
 
-* :class:`ComptimeVal` - a compile-time Python object (a literal, a spy
-  type descriptor, a function to call/inline, ...),
+* :class:`ComptimeVal` - a compile-time value of the ``spy`` domain
+  (an ``sval.AnyValue``: a Python scalar, a spy type descriptor, a
+  function to call/inline, ...).  "No value" is the unit value
+  ``sval.Void()`` - the unique value of the zero-sized void type - never
+  Python ``None``,
 * :class:`RuntimeVal` - the object of an already emitted MIR
   instruction (a typed runtime value), or
 * :class:`PendingSlot` - an executed ``Alloca`` whose typed MIR alloca
-  is emitted by its first store.
+  is emitted by its first store (a slot whose content type is a
+  zero-sized type never gets memory: it only records its unit value).
 
 Instructions whose operands are all compile-time values are evaluated
 eagerly in Python (the comptime semantics of the DSL); instructions
@@ -94,12 +98,12 @@ class InterpVal:
 
 @dataclass
 class ComptimeVal(InterpVal):
-    obj: Any
+    obj: sval.AnyValue
 
 
 @dataclass
 class ComptimeRefVal(InterpVal):
-    obj: Any
+    obj: sval.AnyValue
 
 
 @dataclass
@@ -130,8 +134,11 @@ class PendingSlot(InterpVal):
     # by its first store, in ``type.py``)
     type: sval.Type | None = None
     ptr: mir.Value | None = None
-    # the value an RLS call result recorded in the slot; ``Load`` returns
-    # it while no memory has been allocated yet
+    # the value recorded in the slot: an RLS call result, or the unit
+    # value of a zero-sized slot (a ZST slot never gets memory - its
+    # stores and loads only record and hand out the unit value, nothing
+    # is emitted); ``Load`` returns it while no memory has been
+    # allocated yet
     value: InterpVal | None = None
 
 
@@ -191,10 +198,10 @@ class BlockFrame:
 class Frame:
     """One function body being executed at compile time: the IR of the
     body it runs (``fn_ir``, which also fixes its by-value arguments -
-    resolved by ``hir.Arg`` leaves: each argument value with its spy
-    type - and its result location, the ``hir.ResultLoc`` leaf its
-    return statements write into, paired with the ``RetLocVal`` holding
-    the location's content, see ``RetLocVal``), together with the
+    resolved by ``hir.Arg`` leaves: one ``InterpVal`` per argument, in
+    declaration order - and its result location, the ``hir.ResultLoc``
+    leaf its return statements write into, paired with the ``RetLocVal``
+    holding the location's content, see ``RetLocVal``), together with the
     execution state of its body: the flat instruction list of the body
     (``insts``, its ``fn_ir.body``) with the pc of its next instruction
     (the walk of the list is driven by ``HirRunner``), the stack of its
@@ -213,8 +220,8 @@ class Frame:
     inline stack (see ``HirRunner._start_inline``), and the number of
     inlined bodies under execution is ``len(frames) - 1``."""
 
-    def __init__(self, arg_values: tuple[tuple[mir.Value, sval.Type], ...], fn_ir: astgen.FunctionIR, ret_loc: tuple[hir.ResultLoc, RetLocVal], insts: tuple[hir.Inst, ...]) -> None:
-        self.arg_values: tuple[tuple[mir.Value, sval.Type], ...] = arg_values
+    def __init__(self, arg_values: tuple[InterpVal, ...], fn_ir: astgen.FunctionIR, ret_loc: tuple[hir.ResultLoc, RetLocVal], insts: tuple[hir.Inst, ...]) -> None:
+        self.arg_values: tuple[InterpVal, ...] = arg_values
         self.fn_ir = fn_ir
         self.ret_loc = ret_loc
         self.insts = insts
@@ -358,6 +365,10 @@ def _to_runtime(ev: InterpVal, target: sval.Type | None) -> tuple[mir.Value, sva
             )
         return value, ev.type
     if isinstance(ev, ComptimeVal):
+        if sval.is_zst_value(ev.obj):
+            raise CompileError(
+                'a zero-sized (void) value has no runtime representation'
+            )
         if ev.obj is None:
             raise CompileError("cannot return None (functions must return a value)")
         if target is not None:
@@ -389,15 +400,21 @@ def _to_slot(ev: InterpVal, type: sval.Type) -> mir.Value:
             )
 
 
-def _convert_evals(
+def _call_arg_values(
     fn_ir: astgen.FunctionIR,
     evals: list[InterpVal],
     formal: tuple[sval.Type, ...],
-) -> tuple[mir.Value, ...]:
-    """Materialize the (possibly defaulted) arguments of one call as
-    values of the given formal spy types."""
-    values: list[mir.Value] = []
+) -> tuple[mir.Value | None, ...]:
+    """The runtime argument values of one *native* call, one entry per
+    spy parameter in declaration order: a parameter of a zero-sized type
+    occupies no lowered position and is never passed (``None`` - the
+    callee binds its own unit value); every other parameter is
+    materialized to the value of its formal type (defaults included)."""
+    values: list[mir.Value | None] = []
     for i, param in enumerate(fn_ir.params):
+        if sval.is_zst(formal[i]):
+            values.append(None)
+            continue
         if i < len(evals):
             ev = evals[i]
             if isinstance(ev, ComptimeVal):
@@ -416,6 +433,44 @@ def _convert_evals(
             assert param.has_default
             values.append(_const_of_py(param.default_value, formal[i]))
     return tuple(values)
+
+
+def _bind_frame_args(
+    fn_ir: astgen.FunctionIR,
+    evals: list[InterpVal],
+    formal: tuple[sval.Type, ...],
+) -> tuple[InterpVal, ...]:
+    """Bind the (possibly defaulted) arguments of one call to the
+    callee's parameters for the run of its body, one ``InterpVal`` per
+    parameter in declaration order (the order ``hir.Arg`` indexes): a
+    parameter of a zero-sized type binds its type's unit value (nothing
+    is passed for it), every other parameter its materialized value."""
+    out: list[InterpVal] = []
+    for i, param in enumerate(fn_ir.params):
+        t = formal[i]
+        if sval.is_zst(t):
+            unit = t.get_unit_value()
+            assert unit is not None
+            out.append(ComptimeVal(unit))
+            continue
+        if i < len(evals):
+            ev = evals[i]
+            if isinstance(ev, ComptimeVal):
+                out.append(RuntimeVal(_const_of_py(ev.obj, t), t))
+            elif isinstance(ev, RuntimeVal):
+                if ev.type != t:
+                    raise CompileError(
+                        f"cannot pass a {sval.type_str(ev.type)} value as the "
+                        f"'{param.name}' argument of function {fn_ir.name} "
+                        f"(expected {sval.type_str(t)})"
+                    )
+                out.append(ev)
+            else:
+                raise CompileError('cannot pass this value as an argument')
+        else:
+            assert param.has_default
+            out.append(RuntimeVal(_const_of_py(param.default_value, t), t))
+    return tuple(out)
 
 
 def _materialize_arg(ev: InterpVal, target: sval.Type, what: str) -> mir.Value:
@@ -607,21 +662,25 @@ decision).  The return convention of the function is decided here
             # pointer: lower the signature before the body is typed, so
             # that recursive calls the body makes see the final form
             self._bind_result_ptr(fn, declared)
-        param_values = tuple(
-            (mir.Param(i, sval.to_mir_type(t), fn_ir.params[i].name), t)
-            for i, t in enumerate(arg_types)
-        )
-        if self._result_mode == ResultMode.INPLACE:
-            # the result pointer formal of a result-pointer function is a
-            # parameter of the lowered signature like any other
-            result_ptr = self._result_ptr
-            assert result_ptr is not None
-            result_type = ret_hint
-            assert result_type is not None
-            param_values += (
-                (result_ptr, sval.PointerType(result_type, is_const=False)),
-            )
-        frame.arg_values = param_values
+        # The frame binds one ``InterpVal`` per spy parameter
+        # (declaration order, the order ``hir.Arg`` indexes).  A
+        # parameter of a zero-sized type is dropped from the lowered
+        # signature - the MIR (whose ``fn.args`` the host mirrored the
+        # same way) has no argument for it: it binds the type's canonical
+        # unit value, which never reaches runtime code.  Every other
+        # parameter is the next argument of the lowered signature.
+        lowered = 0
+        arg_evals: list[InterpVal] = []
+        for i, t in enumerate(arg_types):
+            if sval.is_zst(t):
+                unit = t.get_unit_value()
+                assert unit is not None
+                arg_evals.append(ComptimeVal(unit))
+                continue
+            param = mir.Param(lowered, sval.to_mir_type(t), fn_ir.params[i].name)
+            arg_evals.append(RuntimeVal(param, t))
+            lowered += 1
+        frame.arg_values = tuple(arg_evals)
         self._ret_type = None
         self._saw_void_return = False
         self._flow = None
@@ -736,12 +795,15 @@ decision).  The return convention of the function is decided here
                 'cannot return a value from a void function (its return '
                 'type is None)'
             )
-        if isinstance(ev, ComptimeVal) and ev.obj is None and target is None:
+        if isinstance(ev, ComptimeVal) and sval.is_zst_value(ev.obj) and target is None:
             # the value of a void expression (e.g. a call of a void
             # function) in return position: the function is void
             return
-        if isinstance(ev, ComptimeVal) and ev.obj is None:
-            raise CompileError('cannot return None (functions must return a value)')
+        if isinstance(ev, ComptimeVal) and sval.is_zst_value(ev.obj):
+            raise CompileError(
+                'cannot return a void (zero-sized) value: functions must '
+                'return a value'
+            )
         value, t = _to_runtime(ev, target)
         if self._ret_type is not None and self._ret_type != t:
             raise CompileError(
@@ -928,7 +990,8 @@ decision).  The return convention of the function is decided here
                         # void, like a single-path ``__init__``
                         void = (
                             value is None
-                            or isinstance(value, ComptimeVal) and value.obj is None
+                            or isinstance(value, ComptimeVal)
+                            and sval.is_zst_value(value.obj)
                             or frame.result_loc is None
                         )
                         if void:
@@ -940,7 +1003,7 @@ decision).  The return convention of the function is decided here
                         level = self._break_level(frame)
                         if level > 0:
                             self._emit(mir.Break(level))
-                    self._cut(value if value is not None else ComptimeVal(None))
+                    self._cut(value if value is not None else ComptimeVal(sval.Void()))
                 else:
                     # a path of the function proper ends: emit its return
                     # and cut the path
@@ -1203,7 +1266,7 @@ decision).  The return convention of the function is decided here
             self._resume_call(frame, value)
         else:
             # the inlined body fell off its end: a void inline
-            self._resume_call(frame, ComptimeVal(None))
+            self._resume_call(frame, ComptimeVal(sval.Void()))
 
     def _resume_call(self, frame: Frame, value: InterpVal) -> None:
         """The run of an inlined callee ended: resume the call of the
@@ -1326,7 +1389,7 @@ decision).  The return convention of the function is decided here
                     resolved = self._resolver.resolve_global(obj)
                     if resolved is not None:
                         return ComptimeVal(resolved)
-                return ComptimeVal(obj)
+                return ComptimeVal(sval.as_value(obj))
             case hir.ConstRef():
                 # a reference to an immutable global.  At compile time a
                 # reference to a global behaves exactly like the value it
@@ -1344,8 +1407,7 @@ decision).  The return convention of the function is decided here
                 assert len(self._frames) > 0, 'Arg outside of any function frame'
                 frame = self._frames[-1]
                 assert index < len(frame.arg_values), 'Arg index out of range'
-                arg_value, arg_type = frame.arg_values[index]
-                return RuntimeVal(arg_value, arg_type)
+                return frame.arg_values[index]
             case hir.ResultLoc():
                 # the result location of the innermost body being typed
                 # whose leaf this is (its own, or - during an inlined
@@ -1365,7 +1427,7 @@ decision).  The return convention of the function is decided here
     # -- memory instructions -------------------------------------------------
 
     def _push_frame(
-        self, arg_values: tuple[tuple[mir.Value, sval.Type], ...], fn_ir: astgen.FunctionIR
+        self, arg_values: tuple[InterpVal, ...], fn_ir: astgen.FunctionIR
     ) -> Frame:
         """Push the frame of one function body: its by-value arguments
         (filled in later for the function proper, whose signature is
@@ -1415,7 +1477,47 @@ decision).  The return convention of the function is decided here
                 ptr.value = value
             return
         if isinstance(ptr, PendingSlot):
+            if isinstance(value, ComptimeVal) and sval.is_zst_value(value.obj):
+                # a store of a zero-sized (unit) value: it occupies no
+                # storage - the slot records it (its loads hand the value
+                # out directly) and nothing is emitted: no alloca, no
+                # store.  A slot that holds a unit value never gets
+                # memory; a later store of a value with a runtime
+                # representation is a type conflict (below)
+                t = sval.type_of(value.obj)
+                assert t is not None
+                if ptr.type is not None and ptr.type != t:
+                    raise CompileError(
+                        f"cannot store a {sval.type_str(t)} value into a slot of a "
+                        f"different type"
+                    )
+                if ptr.value is not None and not (
+                    isinstance(ptr.value, ComptimeVal)
+                    and sval.is_zst_value(ptr.value.obj)
+                ):
+                    # the slot only recorded an RLS result with a runtime
+                    # representation: a unit value cannot overwrite it
+                    raise CompileError(
+                        f"cannot store a {sval.type_str(t)} value into a slot "
+                        "holding a value with a runtime representation"
+                    )
+                assert ptr.ptr is None, 'a zero-sized slot never gets memory'
+                if ptr.type is None:
+                    ptr.type = t
+                ptr.value = value
+                return
             if ptr.ptr is None and ptr.value is not None:
+                if isinstance(ptr.value, ComptimeVal) and sval.is_zst_value(
+                    ptr.value.obj
+                ):
+                    # the slot only ever held a zero-sized value: a value
+                    # with a runtime representation cannot overwrite it -
+                    # a unit slot has no memory to write to
+                    assert ptr.type is not None
+                    raise CompileError(
+                        f"cannot store {_describe(value)} into a slot holding a "
+                        f"zero-sized value of {sval.type_str(ptr.type)}"
+                    )
                 # the slot holds an RLS call result that was only
                 # recorded: materialize it before overwriting the slot
                 recorded = ptr.value
@@ -1476,7 +1578,14 @@ decision).  The return convention of the function is decided here
             if not isinstance(t, sval.PointerType):
                 # the slot itself holds the struct value
                 if isinstance(t, sval.StructType):
-                    assert ev.ptr is not None
+                    if ev.ptr is None:
+                        # a zero-sized struct field reference (see
+                        # ``_exec_field_addr``): it has no address, so no
+                        # field or method of it can be reached
+                        raise CompileError(
+                            f'cannot access a field or method of the zero-sized '
+                            f'value of {t.name}'
+                        )
                     return ev.ptr, t
                 raise CompileError(
                     f"cannot access fields of a {sval.type_str(t)} value: "
@@ -1514,11 +1623,24 @@ decision).  The return convention of the function is decided here
         """One step of an attribute chain on a struct value: the address
         of the field ``inst.name`` of the struct ``inst.base`` denotes
         (the base's pointer layers are auto-dereferenced here, see
-        ``_struct_addr_of``)."""
+        ``_struct_addr_of``).
+
+        A zero-sized (ZST) field has no position in the struct layout
+        (see ``sval.struct_mir_type``): its address cannot be taken.  A
+        read of it (the matching ``Load``) hands out the field type's
+        canonical unit value (``get_unit_value``) instead, without
+        emitting anything - a ZST field's value is statically its unit
+        value."""
         ptr, type = self._struct_addr_of(self._operand(inst.base))
         index = _field_index(type, inst.name)
-        value = self._emit(mir.Gep(ptr, index))
-        return RuntimeVal(value, sval.PointerType(type.fields[index].type, is_const=False))
+        field_type = type.fields[index].type
+        mir_index = sval.struct_mir_index(type, index)
+        if mir_index is None:
+            unit = field_type.get_unit_value()
+            assert unit is not None
+            return PendingSlot(type=field_type, value=ComptimeVal(unit))
+        value = self._emit(mir.Gep(ptr, mir_index))
+        return RuntimeVal(value, sval.PointerType(field_type, is_const=False))
 
     def _emit(self, inst: mir.Inst) -> mir.Value:
         """Append one instruction to the flat body of the function
@@ -1828,7 +1950,7 @@ decision).  The return convention of the function is decided here
                 )
             objs.append(ev.obj)
         print(*objs)  # a compile-time log, exactly like spy.compile_log
-        return ComptimeVal(None)
+        return ComptimeVal(sval.Void())
 
     # -- struct constructors and methods ----------------------------------------
 
@@ -1839,6 +1961,12 @@ decision).  The return convention of the function is decided here
         slot that already holds one is reused), or the result pointer of
         a result-pointer function.  The type is an aggregate (a struct
         today, arrays and others later); scalars never materialize."""
+        if sval.is_zst(type):
+            # a zero-sized type has no memory (its slots never fall, no
+            # loads/stores are emitted for them): nothing can address it
+            raise CompileError(
+                f'cannot give the zero-sized type {sval.type_str(type)} a memory location'
+            )
         if isinstance(loc, PendingSlot):
             if loc.ptr is None:
                 if loc.value is not None:
@@ -1933,11 +2061,15 @@ decision).  The return convention of the function is decided here
                 f"(one per field), got {len(inst.args)}"
             )
         for i, f in enumerate(fields):
+            mir_index = sval.struct_mir_index(desc, i)
+            if mir_index is None:
+                # a zero-sized field: it has no storage to write
+                continue
             ev = self._operand(inst.args[i])
             value = _materialize_arg(
                 ev, f.type, f"the '{f.name}' argument of {desc.name}"
             )
-            field_ptr = self._emit(mir.Gep(ptr, i))
+            field_ptr = self._emit(mir.Gep(ptr, mir_index))
             self._emit(mir.Store(field_ptr, value))
         return InPlaceResult()
 
@@ -2025,10 +2157,10 @@ decision).  The return convention of the function is decided here
                     f'function {fn_ir.name} takes {len(formal)} arguments, '
                     f'got {len(evals)}'
                 )
-            values = _convert_evals(fn_ir, evals, formal)
+            values = _call_arg_values(fn_ir, evals, formal)
         else:
             formal = self._solve_types(fn_ir, evals, 'jit')
-            values = _convert_evals(fn_ir, evals, formal)
+            values = _call_arg_values(fn_ir, evals, formal)
         callee, ret_type, info = self._resolver.resolve_call(entry, formal)
         return self._emit_native_call(callee, inst, ret_type, info, values)
 
@@ -2038,7 +2170,7 @@ decision).  The return convention of the function is decided here
         inst: hir.CallInplace | hir.CallMethodInplace,
         ret_type: sval.Type,
         info: sval.FunctionCallInfo,
-        values: tuple[mir.Value, ...],
+        values: tuple[mir.Value | None, ...],
     ) -> InterpVal:
         """Emit one native call from its lowering plan - a
         :class:`FunctionCallInfo` the host derived from the callee's
@@ -2046,7 +2178,9 @@ decision).  The return convention of the function is decided here
         by-value arguments are placed onto their lowered MIR positions,
         and the result convention of the plan decides whether the call
         returns a value or writes the result into the result location
-        through a trailing result pointer."""
+        through a trailing result pointer.  A zero-sized argument
+        (``values[i]`` is None - it maps to no lowered position) is
+        simply not passed."""
         assert len(values) == len(info.args_map)
         # the lowered MIR argument list: every position is filled either
         # by a by-value argument or by the result-location pointer
@@ -2054,7 +2188,9 @@ decision).  The return convention of the function is decided here
         for i, mapped in enumerate(info.args_map):
             if mapped is not None:
                 assert placed[mapped.index] is None
-                placed[mapped.index] = values[i]
+                value = values[i]
+                assert value is not None, 'a mapped argument has no value'
+                placed[mapped.index] = value
         if isinstance(info.return_info, sval.FunctionRetLocReturnInfo):
             # the callee writes the result into the result location,
             # whose address is passed as the trailing MIR argument
@@ -2067,9 +2203,14 @@ decision).  The return convention of the function is decided here
             return InPlaceResult()
         assert isinstance(info.return_info, sval.FunctionValueReturnInfo)
         value = self._emit(mir.Call(callee, args, info.return_info.mir_type))
-        if ret_type == sval.VoidType():
-            # a void call produces no value: it only has effects
-            return ComptimeVal(None)
+        if sval.is_zst(ret_type):
+            # a call whose result type is a zero-sized type (the void
+            # type, a zero-bit integer, ...) produces no runtime value:
+            # its compile-time value is the canonical unit value of the
+            # type (``sval.Void()`` for the void type)
+            unit = ret_type.get_unit_value()
+            assert unit is not None
+            return ComptimeVal(unit)
         return RuntimeVal(value, ret_type)
 
     def _start_inline(
@@ -2118,12 +2259,11 @@ decision).  The return convention of the function is decided here
                 '(@jit/@aot) instead'
             )
         formal = self._solve_types(fn_ir, evals, 'jit')
-        values = _convert_evals(fn_ir, evals, formal)
         # the call's result location, resolved in the caller (whose frame
         # is still current here): a constructor writes in place and never
         # hands a value back, so it has no result to deliver
         result_loc = None if is_ctor else self._operand(inst.ret)
-        frame = self._push_frame(tuple(zip(values, formal)), fn_ir)
+        frame = self._push_frame(_bind_frame_args(fn_ir, evals, formal), fn_ir)
         frame.resume = (inst, is_ctor)
         frame.result_loc = result_loc
         # open the block that delimits the inlined body in the MIR: its
