@@ -464,6 +464,10 @@ def _bin_types(
 # the compile-time host interface
 # ---------------------------------------------------------------------------
 
+class ResultMode(IntEnum):
+    VALUE = auto()
+    INPLACE = auto()
+
 
 class HirRunner:
     """Runs one function body (and everything it inlines) at compile
@@ -514,7 +518,7 @@ class HirRunner:
         # has a trailing result pointer formal and returns void), 'value'
         # when it returns the value directly; None while the return type
         # is still unknown (a body that never returns a value is void)
-        self._result_mode: str | None = None
+        self._result_mode: ResultMode | None = None
         # the result pointer parameter of a result-pointer function
         # proper (its trailing formal; see ``_bind_result_ptr``)
         self._result_ptr: mir.Value | None = None
@@ -583,7 +587,7 @@ decision).  The return convention of the function is decided here
             (mir.Param(i, sval.to_mir_type(t), fn_ir.params[i].name), t)
             for i, t in enumerate(arg_types)
         )
-        if self._result_mode == 'ptr':
+        if self._result_mode == ResultMode.INPLACE:
             # the result pointer formal of a result-pointer function is a
             # parameter of the lowered signature like any other
             result_ptr = self._result_ptr
@@ -632,7 +636,7 @@ decision).  The return convention of the function is decided here
                 # (see ``_write_result``), so the two must agree
                 assert declared == ret_type
         self._frames.pop()
-        if self._result_mode == 'ptr':
+        if self._result_mode == ResultMode.INPLACE:
             # a result-pointer function: its MIR signature was lowered to
             # a trailing result pointer formal and a void return when the
             # mode was bound (see ``_bind_result_ptr``)
@@ -656,7 +660,7 @@ decision).  The return convention of the function is decided here
         fn.result_type = result_type
         param = mir.Param(index, formal.type, formal.name)
         self._result_ptr = param
-        self._result_mode = 'ptr'
+        self._result_mode = ResultMode.INPLACE
         # the result location of the function is its result pointer: return
         # values are written through it and the function returns void
         retloc = self._result_loc_of()
@@ -717,15 +721,15 @@ decision).  The return convention of the function is decided here
                 assert fn is not None
                 self._bind_result_ptr(fn, t)
             else:
-                self._result_mode = 'value'
-        if self._result_mode == 'ptr':
+                self._result_mode = ResultMode.VALUE
+        if self._result_mode == ResultMode.INPLACE:
             assert self._result_ptr is not None
             self._emit(mir.Store(self._result_ptr, value))
             self._ret_written = True
             return
         # a direct-return function: the value of the path is recorded and
         # the terminating ``Ret`` returns it
-        assert self._result_mode == 'value'
+        assert self._result_mode == ResultMode.VALUE
         retloc.value = RuntimeVal(value, t)
         self._ret_written = True
 
@@ -749,7 +753,7 @@ decision).  The return convention of the function is decided here
         bare ``return`` of a void path."""
         written = self._ret_written
         self._ret_written = False
-        if self._result_mode == 'ptr':
+        if self._result_mode == ResultMode.INPLACE:
             if not written:
                 # a result-pointer function always returns a value
                 retloc = self._result_loc_of()
@@ -920,7 +924,7 @@ decision).  The return convention of the function is decided here
             frame.block_stack.append(BlockFrame(entry, chosen=False))
             frame.pc = p_else + 1
             return
-        self._exec_runtime_if(inst, cond, entry)
+        self._exec_runtime_if(cond, entry)
 
     def _exec_else(self) -> None:
         """The walk fell off the end of the then branch and reached the
@@ -963,7 +967,7 @@ decision).  The return convention of the function is decided here
     # -- runtime ``if`` regions --------------------------------------------
 
     def _exec_runtime_if(
-        self, inst: hir.If, cond: InterpVal, entry: int
+        self, cond: InterpVal, entry: int
     ) -> None:
         """A runtime ``if``: both branch bodies are typed and emitted
         (both survive at runtime): the walk continues into the
@@ -1257,6 +1261,12 @@ decision).  The return convention of the function is decided here
             self._emit(mir.Store(ptr.value, v))
             return
         raise CompileError('cannot store through a compile-time pointer')
+
+    def _auto_deref(self, ev: InterpVal) -> InterpVal:
+        t = _type_of(ev)
+        if isinstance(t, sval.PointerType) and isinstance(t.elem, sval.PointerType):
+            return self._load(ev)
+        return ev
 
     # -- struct values ---------------------------------------------------------
 
