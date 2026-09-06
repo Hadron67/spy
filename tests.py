@@ -26,7 +26,6 @@ from . import (
     i32,
     mir,
     sval,
-    u0,
     u32,
     u64,
     void,
@@ -1953,7 +1952,7 @@ class SvalZstTest(TestCase):
         self.assertEqual(caller(7), 7)
         # the lowered signatures carry no zero-sized parameters
         self.assertEqual(
-            [a.name for a in Unit.methods['val']._entry.mir_fn.args], []
+            [a.name for a in Unit.methods['val']._entry.mir_fn.args], [] # pyright: ignore
         )
         self.assertEqual([a.name for a in take._entry.mir_fn.args], ['b'])
         # the interpreter sees the unit value: a body may return it

@@ -1773,10 +1773,10 @@ decision).  The return convention of the function is decided here
             if op == 'not':
                 return ComptimeVal(not obj)
             if op == 'neg':
-                try:
-                    return ComptimeVal(-obj)
-                except Exception as e:
-                    raise CompileError(f"cannot negate {obj!r} at compile time: {e}") from e
+                val = sval.negate(obj)
+                if val is None:
+                    raise CompileError(f"cannot negate {obj!r} at compile time")
+                return ComptimeVal(val)
             raise CompileError(f"unsupported unary operator '{op}'")
         type = _type_of(operand)
         if type is None:

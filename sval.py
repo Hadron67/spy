@@ -641,3 +641,8 @@ def as_value(value: Any) -> AnyValue:
         return BoolType()
 
     raise TypeError(f'cannot convert {value} to a value')
+
+def negate(value: AnyValue) -> AnyValue | None:
+    if isinstance(value, (int, float)):
+        return -value
+    return None
