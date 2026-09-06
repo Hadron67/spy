@@ -46,8 +46,8 @@ from .sval import (
     function_call_info,
     int_range,
     to_mir_type,
+    type_of,
     type_str,
-    value_type,
 )
 
 # ---------------------------------------------------------------------------
@@ -175,7 +175,7 @@ def _candidate_type(fn_name: str, param_name: str, value: object) -> Type:
     """The spy type a provided Python argument marshals to."""
     if isinstance(value, AsValue):
         return value.type
-    t = value_type(value)
+    t = type_of(value)
     if t is None:
         raise TypeMismatchError(
             f"cannot pass a {type(value).__name__} value as the '{param_name}' argument "

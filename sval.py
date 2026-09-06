@@ -33,19 +33,17 @@ class Value:
     (used as values by ``spy.typeof``) and other compile-time objects.
     Concrete values expose their spy type as ``.type``."""
     @abstractmethod
-    def type(self) -> 'Type':
+    def get_type(self) -> 'Type':
         raise NotImplementedError
 
 class Type(Value):
-    @override
-    def type(self) -> 'Type':
-        return TYPE_TYPE
+    pass
 
 @dataclass(frozen=True)
 class TypeType(Type):
     level: int
     @override
-    def type(self) -> Type:
+    def get_type(self) -> Type:
         return TypeType(self.level + 1)
 
 TYPE_TYPE = TypeType(0)
@@ -55,7 +53,7 @@ class BoolType(Type):
     """The boolean type; values are ``i1`` at the LLVM level."""
 
     @override
-    def type(self) -> Type:
+    def get_type(self) -> Type:
         return TYPE_TYPE
 
 
@@ -68,13 +66,17 @@ class VoidType(Type):
     produces no value)."""
 
     @override
-    def type(self) -> Type:
+    def get_type(self) -> Type:
         return TYPE_TYPE
 
 @dataclass(frozen=True)
 class IntType(Type):
     bits: int
     signed: bool
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
 
 
 @dataclass(frozen=True)
@@ -84,11 +86,21 @@ class FloatType(Type):
     def __post_init__(self) -> None:
         assert self.bits in (32, 64), f"unsupported float bits {self.bits}"
 
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
 
 @dataclass(frozen=True)
 class PointerType(Type):
     elem: Type
     is_const: bool = False
+
+    @override
+    def get_type(self) -> Type:
+        child = self.elem.get_type()
+        assert isinstance(child, TypeType)
+        return TypeType(child.level + 1)
 
 
 @dataclass(frozen=True)
@@ -108,6 +120,19 @@ class FunctionType(Type):
         result by writing into a caller-provided result location (see
         :func:`returns_via_result_ptr`)."""
         return returns_via_result_ptr(self.return_type)
+
+    @override
+    def get_type(self) -> Type:
+        level = 0
+        for arg in self.args:
+            child = arg.type.get_type()
+            assert isinstance(child, TypeType)
+            level = max(level, child.level)
+        child = self.return_type.get_type()
+        assert isinstance(child, TypeType)
+        level = max(level, child.level)
+        return TypeType(level)
+
 
 @dataclass(frozen=True)
 class FunctionCallArgInfo:
@@ -220,8 +245,13 @@ class StructType(Type):
         return f'<spy struct {self.name}>'
 
     @override
-    def type(self) -> Type:
-        return TYPE_TYPE
+    def get_type(self) -> Type:
+        level = 0
+        for field in self._fields:
+            child = field.type.get_type()
+            assert isinstance(child, TypeType)
+            level = max(level, child.level)
+        return TypeType(level)
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -240,6 +270,10 @@ class AnyFunction(Type):
     """The type of a function value whose signature is not known: a lazy
     ``@jit`` function is only typed when a call specializes it.  It has
     no MIR mirror - such a value never crosses into runtime code."""
+
+    @override
+    def get_type(self) -> 'Type':
+        return TYPE_TYPE
 
 def int_range(type: IntType) -> tuple[int, int]:
     if type.signed:
@@ -414,7 +448,7 @@ def struct_mir_type(type: StructType) -> mir.Type:
 # ---------------------------------------------------------------------------
 
 
-def value_type(value: object) -> Type | None:
+def type_of(value: object) -> Type | None:
     """The spy type a Python *value* is marshaled to at the call boundary.
 
     ``None`` is returned for values that have no spy representation (e.g.

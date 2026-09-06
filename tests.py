@@ -303,6 +303,21 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         v_fn(n)
         return abort_after_call(n - 1)
 
+    def inline_rec_test(n, a):
+        # a recursive plain function: inlining re-enters its own body at
+        # the recursive call (its arguments are runtime values, so the
+        # recursion can never settle at compile time) - a compile-time
+        # infinite loop that the interpreter stops at the inline nesting
+        # limit (see ``run_inline_rec_test`` below)
+        if n <= 0:
+            return 0
+        else:
+            return inline_rec_test(n - 1, a)
+
+    @cache.aot()
+    def run_inline_rec_test(a: i32) -> i32:
+        return inline_rec_test(10, a)
+
     return {
         'add': add,
         'add_aot': add_aot,
@@ -334,6 +349,7 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         'fact_untyped': fact_untyped,
         'v_fn': v_fn,
         'abort_after_call': abort_after_call,
+        'run_inline_rec_test': run_inline_rec_test,
     }
 
 
@@ -459,6 +475,7 @@ class SpyExampleTest(TestCase):
     fact_untyped: Any
     v_fn: Any
     abort_after_call: Any
+    run_inline_rec_test: Any
 
     def setUp(self) -> None:
         self.cache = JitContext()
@@ -814,6 +831,23 @@ class SpyExampleTest(TestCase):
             self.abort_after_call(3)
         self.assertEqual(self.v_fn(41), 42)
         self.assertEqual(self.v_fn(1), 2)
+
+    def test_recursive_inline_stops_at_the_nesting_limit(self) -> None:
+        # a plain function may now call itself, but inlining the same
+        # body again at the recursive call is a compile-time infinite
+        # loop (the arguments are runtime values, so the recursion never
+        # settles while typing): the interpreter stops it at the inline
+        # nesting limit instead of banning recursion up front
+        with self.assertRaises(CompileError) as ctx:
+            self.run_inline_rec_test(5)
+        message = str(ctx.exception)
+        self.assertIn('inline_rec_test', message)
+        self.assertIn('64 levels', message)
+        self.assertIn('never finish at compile time', message)
+        # compilation failures are deterministic (and cached)
+        with self.assertRaises(CompileError) as ctx:
+            self.run_inline_rec_test(5)
+        self.assertIn('64 levels', str(ctx.exception))
 
     # -- local variables and block scope --------------------------------------
 

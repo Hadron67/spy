@@ -67,7 +67,7 @@ from typing import Any, TypeVar
 from . import hir
 from .errors import CompileError, TypeMismatchError
 from .fn import FunctionIR, ParamDef
-from .sval import Type, VoidType, type_str, value_type
+from .sval import Type, VoidType, type_of, type_str
 
 _BIN_OPS = {
     ast.Add: '+',
@@ -681,7 +681,7 @@ def solve_call_types(
             elif tp in bound:
                 param_types.append(bound[tp])
             elif param.has_default:
-                t = value_type(param.default_value)
+                t = type_of(param.default_value)
                 if t is None:
                     raise _param_missing_error(fn_ir, param)
                 param_types.append(t)
@@ -691,7 +691,7 @@ def solve_call_types(
             if cand is not None:
                 param_types.append(cand)
             elif param.has_default:
-                t = value_type(param.default_value)
+                t = type_of(param.default_value)
                 if t is None:
                     raise _param_missing_error(fn_ir, param)
                 param_types.append(t)

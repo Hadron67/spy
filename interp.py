@@ -363,7 +363,7 @@ def _to_runtime(ev: InterpVal, target: sval.Type | None) -> tuple[mir.Value, sva
             raise CompileError("cannot return None (functions must return a value)")
         if target is not None:
             return _const_of_py(ev.obj, target), target
-        t = sval.value_type(ev.obj)
+        t = sval.type_of(ev.obj)
         if t is None:
             raise CompileError(f"cannot return the compile-time value {ev.obj!r}")
         return _const_of_py(ev.obj, t), t
@@ -443,9 +443,9 @@ def _type_of(ev: InterpVal) -> sval.Type | None:
         case RuntimeVal(_, type):
             return type
         case ComptimeVal(obj):
-            return sval.value_type(obj)
+            return sval.type_of(obj)
         case ComptimeRefVal(obj):
-            t = sval.value_type(obj)
+            t = sval.type_of(obj)
             return sval.PointerType(t, is_const=True) if t is not None else None
         case _:
             return None
@@ -700,7 +700,7 @@ decision).  The return convention of the function is decided here
     # -- return statements ------------------------------------------------
 
     def _result_loc_of(self) -> RetLocVal:
-        assert len(self._frames) > 0, 'internal error: no function result location'
+        assert len(self._frames) > 0, 'no function result location'
         return self._frames[-1].ret_loc[1]
 
     def _in_function_proper(self) -> bool:
@@ -883,7 +883,7 @@ decision).  The return convention of the function is decided here
                 depth -= 1
             elif isinstance(inst, hir.Else) and depth == 0:
                 p_else = i
-        raise CompileError('internal error: unclosed block in the HIR')
+        assert False, 'unclosed block in the HIR'
 
     def _exec_inst(self, inst: hir.Inst) -> None:
         """Execute one instruction of the executing frame.  A control
@@ -1342,11 +1342,9 @@ decision).  The return convention of the function is decided here
                 resolved = self._resolver.resolve_global(obj)
                 return ComptimeRefVal(resolved if resolved is not None else obj)
             case hir.Arg(index):
-                if len(self._frames) == 0:
-                    raise CompileError('internal error: Arg outside of any function frame')
+                assert len(self._frames) > 0, 'Arg outside of any function frame'
                 frame = self._frames[-1]
-                if index >= len(frame.arg_values):
-                    raise CompileError('internal error: Arg index out of range')
+                assert index < len(frame.arg_values), 'Arg index out of range'
                 arg_value, arg_type = frame.arg_values[index]
                 return RuntimeVal(arg_value, arg_type)
             case hir.ResultLoc():
@@ -1357,11 +1355,10 @@ decision).  The return convention of the function is decided here
                     leaf, retloc = frame.ret_loc
                     if leaf is value:
                         return retloc
-                raise CompileError('internal error: result location outside of any function')
+                raise AssertionError('result location outside of any function')
             case hir.Inst():
                 reg = regs.get(value)
-                if reg is None:
-                    raise CompileError('internal error: register not evaluated')
+                assert reg is not None, 'register not evaluated'
                 return reg
             case _:
                 raise CompileError(f"unsupported operand {type(value).__name__}")
@@ -1798,7 +1795,7 @@ decision).  The return convention of the function is decided here
             return self._call_constructor(obj, inst)
         if isinstance(obj, pytypes.FunctionType):
             return self._start_inline(
-                obj, [self._operand(a) for a in inst.args], 'function', inst, False
+                obj, [self._operand(a) for a in inst.args], inst, False
             )
         raise CompileError(
             f"cannot compile a call to {obj!r}; only spy functions, plain Python "
@@ -1811,7 +1808,7 @@ decision).  The return convention of the function is decided here
         arg = self._operand(inst.args[0])
         match arg:
             case ComptimeVal(obj):
-                type = sval.value_type(obj)
+                type = sval.type_of(obj)
             case RuntimeVal(_, type):
                 pass
             case _:
@@ -1929,7 +1926,7 @@ decision).  The return convention of the function is decided here
             # the result slot itself, so the call result that resumes
             # the constructor is the in-place marker (its run ends, see
             # ``_resume_call``)
-            return self._start_inline(target, evals, 'method', inst, True)
+            return self._start_inline(target, evals, inst, True)
         fields = desc.fields
         if len(inst.args) != len(fields):
             raise CompileError(
@@ -1967,7 +1964,7 @@ decision).  The return convention of the function is decided here
             ev = self._call_entry(method, inst, evals)
         else:
             # a plain method is inlined: its run resumes this call
-            ev = self._start_inline(method, evals, 'method', inst, False)
+            ev = self._start_inline(method, evals, inst, False)
         if ev is None:
             return
         # the method's result lands in the result location like any call
@@ -1984,7 +1981,7 @@ decision).  The return convention of the function is decided here
         registered ``ptr_self`` flag (a plain method's ``self`` is always
         by value)."""
         if isinstance(method, FunctionValue):
-            assert len(method.args) > 0, 'internal error: method entry has no self parameter'
+            assert len(method.args) > 0, 'method entry has no self parameter'
             return method.args[0].type
         if ptr_self:
             return sval.PointerType(struct, is_const=False)
@@ -2080,13 +2077,11 @@ decision).  The return convention of the function is decided here
         self,
         fn: Any,
         evals: list[InterpVal],
-        what: str,
         inst: hir.CallInplace | hir.CallMethodInplace,
         is_ctor: bool,
     ) -> None:
         """Start running the body of a plain Python function - a helper,
-        or the plain (undecorated) method of a struct (``what`` is
-        'function' or 'method', used in the error messages) - inlined
+        or the plain (undecorated) method of a struct - inlined
         into the current stream like any plain Python function (its body
         may only use what inlining supports).  The callee's frame is
         pushed, carrying the pending call of the caller: the machine runs
@@ -2105,24 +2100,24 @@ decision).  The return convention of the function is decided here
         delivers its result from several runtime paths (see
         ``_deliver_inline_result``)."""
         fn_ir = self._resolver.hir_of_plain_fn(fn)
-        # the frames above the function proper are exactly the inlined
+        # The frames above the function proper are exactly the inlined
         # bodies under execution, each carrying its own ``fn_ir`` (see
-        # ``Frame``): inlining a function that is already being inlined
-        # would never finish compiling
-        if any(f.fn_ir.fn is fn for f in self._frames[1:]):
-            if what == 'method':
-                raise CompileError(
-                    f'a plain Python method cannot call itself recursively '
-                    f'(method {fn_ir.name}) - declare it with @aot/@jit instead'
-                )
-            raise CompileError(
-                f'a plain Python function cannot call itself recursively '
-                f'(function {fn_ir.name}); plain functions are inlined, and a '
-                'recursive inline would never finish compiling - declare it '
-                'as a spy function instead'
-            )
+        # ``Frame``).  Inlining a function that is already being inlined
+        # is recursion of a plain function: the recursive call re-enters
+        # the callee, which inlines its body again.  The arguments of an
+        # inlined callee are bound as runtime values, so a recursion
+        # driven by them can never settle while the body is being typed
+        # - it is a compile-time infinite loop, which the nesting guard
+        # below stops (recursion that must run at runtime belongs in a
+        # spy function, @jit/@aot).  A recursion that is never reached
+        # on the typed path (a dead compile-time branch) is fine.
         if len(self._frames) - 1 >= _MAX_INLINE_DEPTH:
-            raise CompileError('too deeply nested inlined functions')
+            raise CompileError(
+                f'inline recursion or nesting of {fn_ir.name} exceeded '
+                f'{_MAX_INLINE_DEPTH} levels: a recursion that would never '
+                'finish at compile time must be declared as a spy function '
+                '(@jit/@aot) instead'
+            )
         formal = self._solve_types(fn_ir, evals, 'jit')
         values = _convert_evals(fn_ir, evals, formal)
         # the call's result location, resolved in the caller (whose frame
@@ -2152,7 +2147,7 @@ decision).  The return convention of the function is decided here
         for i, ev in enumerate(evals):
             match ev:
                 case ComptimeVal(obj):
-                    t = sval.value_type(obj)
+                    t = sval.type_of(obj)
                 case RuntimeVal(_, type):
                     t = type
                 case _:
