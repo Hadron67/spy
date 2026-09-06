@@ -1097,10 +1097,14 @@ decision).  The return convention of the function is decided here
         (``returns`` True).  The run of the function proper ends the
         machine (its outcome is recorded in ``self._flow``); an inlined
         callee is popped and its value resumes the pending call of the
-        caller (see ``_resume_call``)."""
+        caller (see ``_resume_call``).  The ``End`` of the block that
+        delimits the inlined body (opened at its start, see
+        ``_start_inline``) is emitted here, closing the body's emitted
+        code before the caller's continuation is emitted by the resume."""
         if len(self._frames) == 1:
             self._flow = Flow.RET if returns else Flow.FALL
             return
+        self._emit(mir.End())
         frame = self._frames.pop()
         if returns:
             assert value is not None
@@ -1903,7 +1907,13 @@ decision).  The return convention of the function is decided here
         may only use what inlining supports).  The callee's frame is
         pushed, carrying the pending call of the caller: the machine runs
         the callee's body until it ends, then resumes the call (see
-        ``_frame_ended`` and ``_resume_call``)."""
+        ``_frame_ended`` and ``_resume_call``).
+
+        The inlined body is delimited in the emitted MIR by a
+        ``mir.Block`` opened here and closed by the matching ``mir.End``
+        when the body's run ends (see ``_frame_ended``): the block is
+        what a ``return`` of the inlined body breaks out of when it
+        happens inside a runtime branch."""
         fn_ir = self._resolver.hir_of_plain_fn(fn)
         # the frames above the function proper are exactly the inlined
         # bodies under execution, each carrying its own ``fn_ir`` (see
@@ -1927,6 +1937,10 @@ decision).  The return convention of the function is decided here
         values = _convert_evals(fn_ir, evals, formal)
         frame = self._push_frame(tuple(zip(values, formal)), fn_ir)
         frame.resume = (inst, is_ctor)
+        # open the block that delimits the inlined body in the MIR: its
+        # ``End`` is emitted when the body's run ends (``_frame_ended``),
+        # and a ``return`` inside the body will break out of it
+        self._emit(mir.Block())
 
     def _solve_types(
         self, fn_ir: astgen.FunctionIR, evals: list[InterpVal], mode: str

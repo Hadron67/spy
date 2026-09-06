@@ -149,25 +149,33 @@ class _Lowerer:
         llvm_fn = self._llvm_fns[fn.name]
         arg_values = llvm_fn.get_args()
         self._lower_region(
-            llvm_fn, llvm_fn.entry, fn.insts, 0, len(fn.insts), arg_values, None
+            llvm_fn, llvm_fn.entry, fn.insts, 0, len(fn.insts), arg_values, None, ()
         )
 
-    def _scan_if(self, insts: list[mir.Inst], i: int) -> tuple[int | None, int]:
-        """The positions of the ``Else`` (or None when the ``if`` has no
-        else branch) and ``End`` markers that close the ``mir.If`` at
-        index ``i``, found by a balanced scan forward (nested blocks
-        close their own markers first)."""
+    def _scan_block(
+        self, insts: list[mir.Inst], i: int, has_else: bool
+    ) -> tuple[int | None, int]:
+        """The positions of the ``Else`` (only when ``has_else``, i.e.
+        the opener at ``i`` is an ``mir.If``; ``None`` when the block
+        has no else branch) and ``End`` markers that close the block
+        opened at ``i``, found by a balanced scan forward (nested
+        blocks - both ``If`` and ``Block`` - close their own markers
+        first)."""
         depth = 0
         p_else: int | None = None
         for j in range(i + 1, len(insts)):
             inst = insts[j]
-            if isinstance(inst, mir.If):
+            if isinstance(inst, (mir.If, mir.Block)):
                 depth += 1
             elif isinstance(inst, mir.End):
                 if depth == 0:
                     return p_else, j
                 depth -= 1
             elif isinstance(inst, mir.Else) and depth == 0:
+                if not has_else:
+                    raise CompileError(
+                        'internal error: an Else marker inside a Block'
+                    )
                 p_else = j
         raise CompileError('internal error: unclosed block in the MIR')
 
@@ -180,14 +188,19 @@ class _Lowerer:
         end: int,
         arg_values: tuple[sllvm.Value, ...],
         cont: sllvm.BasicBlock | None,
+        exits: tuple[sllvm.BasicBlock | None, ...],
     ) -> None:
         """Lower the instructions ``insts[start:end]`` - one branch
         body of the flat stream, delimited by its enclosing markers -
         into LLVM blocks.  ``cont`` is the block the code jumps to when
         it runs off the end of its region (None only at the very end of
-        the function, which never falls off).  A nested ``If`` is
-        lowered whole (its regions and the code after its ``End``, which
-        the falling branches join); a ``Ret`` ends the region."""
+        the function, which never falls off).  ``exits`` holds the jump
+        target of a ``mir.Break`` per enclosing block, innermost last:
+        ``exits[-level]`` is the block just after the ``End`` of the
+        ``level``-th enclosing block (a ``mir.Block`` or ``mir.If``).  A
+        nested ``If``/``Block`` is lowered whole (its regions and the
+        code after its ``End``, which the falling branches join); a
+        ``Ret`` ends the region."""
         i = start
         while i < end:
             inst = insts[i]
@@ -199,37 +212,68 @@ class _Lowerer:
                     value = self._value(inst.value, arg_values)
                     block.ret(value)
                 return
-            if isinstance(inst, mir.If):
-                p_else, p_end = self._scan_if(insts, i)
-                cond = self._value(inst.cond, arg_values)
+            if isinstance(inst, mir.Break):
+                # leave ``level`` enclosing blocks: jump to the code
+                # just after the ``End`` of the ``level``-th one
+                level = inst.level
+                if level < 1 or level > len(exits):
+                    raise CompileError(
+                        f'internal error: break level {level} out of range'
+                    )
+                target = exits[-level]
+                assert target is not None
+                block.jmp(target)
+                return
+            if isinstance(inst, (mir.If, mir.Block)):
+                has_else = isinstance(inst, mir.If)
+                p_else, p_end = self._scan_block(insts, i, has_else)
                 after = p_end + 1
-                # the code after the ``If`` (which the falling branch
-                # joins) starts in a fresh block - unless the ``If`` is
-                # the last thing of this region, when it is the region's
-                # own continuation
+                # the code after the block (which the falling branches
+                # join) starts in a fresh block - unless the block is
+                # the last thing of this region, when it is the
+                # region's own continuation
                 cont_block = sllvm.BasicBlock() if after < end else cont
-                then_block = sllvm.BasicBlock()
-                if p_else is None:
-                    # an empty else branch: a false condition goes to
-                    # the code after the ``If``
-                    assert cont_block is not None
-                    block.br(cond, then_block, cont_block)
-                    self._lower_region(
-                        llvm_fn, then_block, insts, i + 1, p_end, arg_values, cont_block
-                    )
+                # the code inside the block can break out of it (and of
+                # the enclosing blocks) to ``cont_block``
+                inner_exits = exits + (cont_block,)
+                if has_else:
+                    cond = self._value(inst.cond, arg_values)
+                    then_block = sllvm.BasicBlock()
+                    if p_else is None:
+                        # an empty else branch: a false condition goes
+                        # to the code after the ``If``
+                        assert cont_block is not None
+                        block.br(cond, then_block, cont_block)
+                        self._lower_region(
+                            llvm_fn, then_block, insts, i + 1, p_end,
+                            arg_values, cont_block, inner_exits,
+                        )
+                    else:
+                        else_block = sllvm.BasicBlock()
+                        block.br(cond, then_block, else_block)
+                        self._lower_region(
+                            llvm_fn, then_block, insts, i + 1, p_else,
+                            arg_values, cont_block, inner_exits,
+                        )
+                        self._lower_region(
+                            llvm_fn, else_block, insts, p_else + 1, p_end,
+                            arg_values, cont_block, inner_exits,
+                        )
                 else:
-                    else_block = sllvm.BasicBlock()
-                    block.br(cond, then_block, else_block)
+                    # a ``Block`` is entered unconditionally: its body
+                    # runs in the current block
                     self._lower_region(
-                        llvm_fn, then_block, insts, i + 1, p_else, arg_values, cont_block
-                    )
-                    self._lower_region(
-                        llvm_fn, else_block, insts, p_else + 1, p_end, arg_values, cont_block
+                        llvm_fn, block, insts, i + 1, p_end,
+                        arg_values, cont_block, inner_exits,
                     )
                 if after < end:
                     assert cont_block is not None
+                    # the code after the block's ``End`` is outside the
+                    # closed block: only the outer blocks still enclose
+                    # it
                     self._lower_region(
-                        llvm_fn, cont_block, insts, after, end, arg_values, cont
+                        llvm_fn, cont_block, insts, after, end,
+                        arg_values, cont, exits,
                     )
                 return
             # a plain instruction

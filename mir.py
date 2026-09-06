@@ -8,7 +8,12 @@ mirroring the HIR.  Control flow is structured (no basic blocks, no
 phi): a branch that ends in a :class:`Ret` returns on that path, a
 branch that does not return falls through to the code after its
 ``End`` marker in the enclosing list - exactly the shape of control
-flow that recursion needs.
+flow that recursion needs.  An inlined function body is delimited by
+:class:`Block`/``End`` markers (a ``Block`` is entered unconditionally,
+like a WASM ``block``), and a path may leave it early with a
+:class:`Break` (WASM ``br``) - the way an inlined ``return`` leaves the
+inlined body; ``If`` and ``Block`` both count as blocks for a
+``Break``'s ``level``.
 
 The MIR owns its static type system (:class:`Type`): a closed,
 LLVM-shaped universe of the types a runtime register can have.  The
@@ -326,11 +331,23 @@ class If(Inst):
     the instructions of the two branches follow it in the same list,
     delimited by the matching :class:`Else` (when the ``if`` has an
     else branch) and :class:`End` markers.  A branch that ends in a
-    :class:`Ret` returns on that path; a branch that does not return
-    falls through to the code after the matching ``End`` (the
-    interpreter only emits code after an ``If`` that is reachable)."""
+    :class:`Ret` (or a :class:`Break` that leaves it) returns on that
+    path; a branch that does not return falls through to the code after
+    the matching ``End`` (the interpreter only emits code after an
+    ``If`` that is reachable)."""
 
     cond: Value
+
+
+@dataclass(eq=False)
+class Block(Inst):
+    """An anonymous code block (WASM-style marker), opened by the
+    interpreter around the body of every inlined function: the body
+    follows it in the same list, closed by the matching :class:`End`
+    marker.  Unlike an :class:`If`, a ``Block`` is entered
+    unconditionally - it produces no branch of its own - but a
+    :class:`Break` may leave it early (the way an inlined ``return``
+    leaves the inlined body before it ends)."""
 
 
 @dataclass(eq=False)
@@ -342,9 +359,24 @@ class Else(Inst):
 
 @dataclass(eq=False)
 class End(Inst):
-    """The marker that closes a block opened by an :class:`If` (or a
-    future block instruction).  It produces no value; it only delimits
-    the flat instruction list."""
+    """The marker that closes a block opened by an :class:`If` or a
+    :class:`Block`.  It produces no value; it only delimits the flat
+    instruction list."""
+
+
+@dataclass(eq=False)
+class Break(Inst):
+    """Leave ``level`` enclosing blocks (a :class:`Block` or an
+    :class:`If` each count as one block, the innermost enclosing block
+    being ``level`` 1 - the WASM ``br level - 1``) and continue with
+    the code just after the ``End`` of the last block left, skipping
+    any code of the exited blocks in between.  Like a :class:`Ret`, a
+    ``Break`` ends the path of the region it sits in: the interpreter
+    emits no code of the same region after it (the regions of the
+    exited blocks - sibling branches, code after their ``End`` - are
+    emitted after the ``Break`` and are still lowered)."""
+
+    level: int
 
 
 @dataclass(eq=False)

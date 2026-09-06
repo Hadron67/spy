@@ -24,6 +24,7 @@ from . import (
     f64,
     hir,
     i32,
+    mir,
     u32,
     u64,
 )
@@ -136,6 +137,28 @@ def make_samples(cache: JitContext) -> dict[str, object]:
             pass
         return n
 
+    # -- inlining into runtime-``if`` regions --------------------------------
+
+    def one_plus(n):
+        # a plain (undecorated) helper: inlined where called
+        return n + 1
+
+    @cache.jit()
+    def branch_inline(n):
+        # an inlined helper called from each region of a runtime ``if``:
+        # its emitted ``Block``/``End`` pair nests inside the ``If``
+        # markers of the caller
+        if n > 0:
+            return one_plus(n)
+        else:
+            return one_plus(n + 10)
+
+    @cache.jit()
+    def nested_inline(n):
+        # an inline call whose (inlined) body itself inlines: the inner
+        # ``Block`` nests inside the outer one
+        return one_plus(one_plus(n))
+
     # -- recursion ---------------------------------------------------------
 
     @cache.jit()
@@ -219,6 +242,8 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         'classify': classify,
         'nested_if': nested_if,
         'bad_join': bad_join,
+        'branch_inline': branch_inline,
+        'nested_inline': nested_inline,
         'fact': fact,
         'fact_aot': fact_aot,
         'gcd': gcd,
@@ -336,6 +361,8 @@ class SpyExampleTest(TestCase):
     classify: Any
     nested_if: Any
     bad_join: Any
+    branch_inline: Any
+    nested_inline: Any
     fact: Any
     fact_aot: Any
     gcd: Any
@@ -507,6 +534,40 @@ class SpyExampleTest(TestCase):
         with self.assertRaises(CompileError) as ctx:
             self.bad_join(1)
         self.assertIn('both fall through', str(ctx.exception))
+
+    # -- inlining into runtime-``if`` regions --------------------------------
+
+    def test_inline_called_inside_runtime_if(self) -> None:
+        # an inlined helper may be called from a runtime-if region (the
+        # ``Block`` of the inline body nests inside the ``If`` markers)
+        self.assertEqual(self.branch_inline(5), 6)
+        self.assertEqual(self.branch_inline(-5), 6)
+        self.assertEqual(self.branch_inline(0), 11)
+
+    def test_inline_blocks_are_balanced_in_mir(self) -> None:
+        # every inlined body is delimited in the emitted MIR by a
+        # ``Block``/``End`` pair; nested inlines nest their blocks, and
+        # an inline inside a runtime-if region keeps its pair balanced
+        # inside the ``If`` markers
+        self.branch_inline(1)
+        self.nested_inline(1)
+        for wrapper, arg_types in (
+            (self.branch_inline, (i32,)),
+            (self.nested_inline, (i32,)),
+        ):
+            insts = wrapper._entry.mir_cache[arg_types].insts
+            depth = 0
+            for inst in insts:
+                if isinstance(inst, (mir.If, mir.Block)):
+                    depth += 1
+                elif isinstance(inst, mir.End):
+                    depth -= 1
+                    self.assertGreaterEqual(depth, 0)
+            self.assertEqual(depth, 0)
+        # the nested inline body inlines exactly two helpers
+        insts = self.nested_inline._entry.mir_cache[(i32,)].insts
+        blocks = sum(1 for inst in insts if isinstance(inst, mir.Block))
+        self.assertEqual(blocks, 2)
 
     # -- recursion -----------------------------------------------------------
 
