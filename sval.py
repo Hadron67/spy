@@ -37,7 +37,9 @@ class Value:
         raise NotImplementedError
 
 class Type(Value):
-    pass
+    def get_unit_value(self) -> Value | None:
+        """Get the value of this type, if this type is equivalent to unit type"""
+        return None
 
 @dataclass(frozen=True)
 class TypeType(Type):
@@ -69,6 +71,16 @@ class VoidType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
+    @override
+    def get_unit_value(self) -> Value | None:
+        return Void()
+
+
+class Void(Value):
+    @override
+    def get_type(self) -> 'Type':
+        return TYPE_TYPE
+
 @dataclass(frozen=True)
 class IntType(Type):
     bits: int
@@ -78,6 +90,20 @@ class IntType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
+    @override
+    def get_unit_value(self) -> Value | None:
+        if self.bits == 0:
+            return Int(0, self)
+        return None
+
+@dataclass(frozen=True)
+class Int(Value):
+    value: int
+    type: IntType
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
 
 @dataclass(frozen=True)
 class FloatType(Type):
@@ -162,6 +188,14 @@ class StructField:
     name: str
     type: Type
 
+@dataclass(frozen=True)
+class AggregateValue(Value):
+    values: tuple[Value, ...]
+    type: Type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
 
 class StructType(Type):
     """A spy struct type: the object ``@cache.struct()`` binds to the class
@@ -252,6 +286,16 @@ class StructType(Type):
             assert isinstance(child, TypeType)
             level = max(level, child.level)
         return TypeType(level)
+
+    @override
+    def get_unit_value(self) -> Value | None:
+        values: list[Value] = []
+        for field in self._fields:
+            val = field.type.get_unit_value()
+            if val is None:
+                return None
+            values.append(val)
+        return AggregateValue(tuple(values), self)
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -442,19 +486,20 @@ def struct_mir_type(type: StructType) -> mir.Type:
     type._mir = ret
     return ret
 
-
 # ---------------------------------------------------------------------------
 # mapping Python values to spy types
 # ---------------------------------------------------------------------------
 
 
-def type_of(value: object) -> Type | None:
+def type_of(value: Any) -> Type | None:
     """The spy type a Python *value* is marshaled to at the call boundary.
 
     ``None`` is returned for values that have no spy representation (e.g.
     compile-time objects like type descriptors, which never cross the
     boundary).
     """
+    if isinstance(value, Value):
+        return value.get_type()
     match value:
         case bool():
             return BoolType()

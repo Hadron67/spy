@@ -138,7 +138,7 @@ class LazyJitFunction(Value):
         return object.__hash__(self)
 
     @override
-    def type(self) -> Type:
+    def get_type(self) -> Type:
         return AnyFunction()
 
 
@@ -193,7 +193,7 @@ class FunctionValue(Value):
         return object.__hash__(self)
 
     @override
-    def type(self) -> FunctionType:
+    def get_type(self) -> FunctionType:
         """The spy type of the function *value*: its signature - a
         function type.  A function type is a runtime DST (dynamically
         sized type: it has no runtime representation of its own), so a

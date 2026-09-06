@@ -258,7 +258,6 @@ class Flow(IntEnum):
 # so none of them is a method of :class:`HirRunner`
 # ---------------------------------------------------------------------------
 
-
 def _field_index(type: sval.StructType, name: str) -> int:
     """The declaration index of the field ``name`` of a struct type."""
     index = type.field_index(name)
