@@ -36,6 +36,15 @@ Calls are dispatched at compile time:
 * calls to plain Python functions inline the callee body into the
   current stream.
 
+An inlined body is delimited in the emitted MIR by a ``Block``/``End``
+pair, and it may contain runtime ``if`` branches like the function
+proper: once a runtime branch opens inside an inlined body (see
+``Frame.multi_path``), every return of the body stores its value into
+the call's result location on its own runtime path and leaves the body
+with a ``Break`` out of its ``Block`` - the result location's memory is
+the join of the paths (its alloca is hoisted by ``lower`` so every
+path shares one address).
+
 Both kinds of function calls push a *frame* holding the by-value
 arguments (resolved by ``hir.Arg`` leaves); the addressable parameter
 slots themselves are the ``Alloca``/``Store`` prologue that ``astgen``
@@ -216,6 +225,22 @@ class Frame:
         # result an ``InPlaceResult`` rather than the value the body yielded)
         self.resume: tuple[hir.CallInplace | hir.CallMethodInplace, bool] | None = None
         self.regs: dict[hir.Inst, InterpVal] = {}
+        # the location the call's result goes to, resolved from the pending
+        # call in the caller (see ``_start_inline``); the target of the
+        # per-path stores of an inlined body that delivers its result from
+        # several runtime paths (``multi_path``)
+        self.result_loc: InterpVal | None = None
+        # True once a runtime ``if`` has been typed inside this body: from
+        # then on the body may deliver its result from several runtime
+        # paths, and every return site stores its value into the call's
+        # result location (``result_loc``) on its own path instead of the
+        # single hand-off of a single-path inline
+        self.multi_path: bool = False
+        # the number of return sites typed while ``multi_path`` that
+        # carried a value / were void (used to reject a body that returns
+        # a value on some paths but not on others)
+        self.val_rets: int = 0
+        self.void_rets: int = 0
 
 
 class Flow(IntEnum):
@@ -645,14 +670,18 @@ decision).  The return convention of the function is decided here
             fn.ret_type = sval.to_mir_type(ret_type)
         return ret_type
 
-    def _bind_result_ptr(self, fn: mir.Function, logical: sval.Type) -> None:
+    def _bind_result_ptr(
+        self, fn: mir.Function, logical: sval.Type, retloc: RetLocVal | None = None
+    ) -> None:
         """Lower the signature of the function proper to its result
         pointer form: append the trailing result pointer formal and fix
         the return type to void.  ``logical`` is the spy type of the
         value the function returns (kept in ``fn.result_type``, mirrored
         into MIR) - a type delivered through a result pointer is not
         necessarily a struct (arrays and other aggregates will use the
-        same convention)."""
+        same convention).  ``retloc`` is the result location the bound
+        pointer becomes the memory of (defaults to the location of the
+        innermost body)."""
         index = len(fn.args)
         result_type = sval.to_mir_type(logical)
         formal = mir.FormalArg('$result', mir.PointerType(result_type))
@@ -663,7 +692,8 @@ decision).  The return convention of the function is decided here
         self._result_mode = ResultMode.INPLACE
         # the result location of the function is its result pointer: return
         # values are written through it and the function returns void
-        retloc = self._result_loc_of()
+        if retloc is None:
+            retloc = self._result_loc_of()
         retloc.ptr = param
         retloc.type = logical
 
@@ -683,14 +713,24 @@ decision).  The return convention of the function is decided here
         when it is the only frame."""
         return len(self._frames) == 1
 
-    def _write_result(self, ev: InterpVal) -> None:
+    def _write_result(
+        self, ev: InterpVal, retloc: RetLocVal | None = None, memory: bool = False
+    ) -> None:
         """The value of one return expression of the function proper is
         written into its result location: a direct-return function
         records it (the terminating ``Ret`` turns it into the return
         value), a result-pointer function stores it through its result
         pointer.  This is where every return site is typed (against the
-        declared return type) and cross-path consistency is checked."""
-        retloc = self._result_loc_of()
+        declared return type) and cross-path consistency is checked.
+
+        With ``memory`` (a return delivered from several runtime paths
+        of an inlined body, see ``_deliver_inline_result``) the value of
+        a direct-return function is stored into the (created) memory of
+        ``retloc`` on the current path instead of being recorded, and
+        the terminating ``Ret`` loads it back.  ``retloc`` defaults to
+        the result location of the innermost body."""
+        if retloc is None:
+            retloc = self._result_loc_of()
         target = self._ret_target
         if target == sval.VoidType():
             raise CompileError(
@@ -719,7 +759,7 @@ decision).  The return convention of the function is decided here
                 # never be recursive), so appending the formal is safe
                 fn = self._fn
                 assert fn is not None
-                self._bind_result_ptr(fn, t)
+                self._bind_result_ptr(fn, t, retloc)
             else:
                 self._result_mode = ResultMode.VALUE
         if self._result_mode == ResultMode.INPLACE:
@@ -728,9 +768,22 @@ decision).  The return convention of the function is decided here
             self._ret_written = True
             return
         # a direct-return function: the value of the path is recorded and
-        # the terminating ``Ret`` returns it
+        # the terminating ``Ret`` returns it - or, with ``memory``,
+        # stored into the result location's memory (which the ``Ret``
+        # loads back), so that every runtime path of a multi-path
+        # inlined body leaves its own value there
         assert self._result_mode == ResultMode.VALUE
-        retloc.value = RuntimeVal(value, t)
+        if memory:
+            if retloc.ptr is None:
+                retloc.ptr = self._emit(
+                    mir.Alloca(mir.PointerType(sval.to_mir_type(t)))
+                )
+                retloc.type = t
+            else:
+                assert retloc.type == t
+            self._emit(mir.Store(retloc.ptr, value))
+        else:
+            retloc.value = RuntimeVal(value, t)
         self._ret_written = True
 
     def _note_inplace_ret(self, type: sval.Type) -> None:
@@ -848,6 +901,7 @@ decision).  The return convention of the function is decided here
                     # an inlined callee ends: yield the value its return
                     # statements wrote into its result location (the raw
                     # return expression value, or None for a void body)
+                    frame = self._frames[-1]
                     retloc = self._result_loc_of()
                     if retloc.ptr is not None:
                         # the value was written in place (a constructor):
@@ -862,6 +916,31 @@ decision).  The return convention of the function is decided here
                     else:
                         value = retloc.value
                         retloc.value = None
+                    if frame.multi_path:
+                        # a body that delivers its result from several
+                        # runtime paths: the value is stored into the
+                        # call's result location on this path (see
+                        # ``_deliver_inline_result``), and a return
+                        # inside a runtime branch leaves the body with a
+                        # ``Break`` (the falling paths continue, the
+                        # other paths jump to the caller continuation).  A
+                        # constructor's ``__init__`` has no result location
+                        # (it writes the struct in place): its returns are
+                        # void, like a single-path ``__init__``
+                        void = (
+                            value is None
+                            or isinstance(value, ComptimeVal) and value.obj is None
+                            or frame.result_loc is None
+                        )
+                        if void:
+                            frame.void_rets += 1
+                        else:
+                            assert value is not None
+                            frame.val_rets += 1
+                            self._deliver_inline_result(frame, value)
+                        level = self._break_level(frame)
+                        if level > 0:
+                            self._emit(mir.Break(level))
                     self._cut(value if value is not None else ComptimeVal(None))
                 else:
                     # a path of the function proper ends: emit its return
@@ -978,15 +1057,19 @@ decision).  The return convention of the function is decided here
         the ``mir.Else``/``mir.End`` markers emitted when the regions
         end.  A branch that falls off continues with the code after the
         ``End``; both branches falling through (a join) is not supported
-        yet, and neither are runtime branches inside inlined functions."""
-        if not self._in_function_proper():
-            raise CompileError(
-                "runtime 'if' inside inlined functions is not supported yet"
-            )
+        yet.
+
+        Inside an inlined body the ``if`` makes the body multi-path (see
+        ``Frame.multi_path``): the body may now deliver its result from
+        several runtime paths, so its returns store into the call's
+        result location on their own paths and leave the body with a
+        ``mir.Break`` (see the ``hir.Ret`` handling)."""
         if not isinstance(cond, RuntimeVal) or cond.type != sval.BoolType():
             raise CompileError('runtime if conditions must be boolean values')
-        self._emit(mir.If(cond.value))
         frame = self._frames[-1]
+        if not self._in_function_proper():
+            frame.multi_path = True
+        self._emit(mir.If(cond.value))
         frame.block_stack.append(BlockFrame(entry))
 
     def _rt_then_fell(self) -> None:
@@ -1029,10 +1112,6 @@ decision).  The return convention of the function is decided here
         assert bf.chosen is None
         then_returns = bf.then_returns
         assert then_returns is not None
-        if not then_returns:
-            raise CompileError(
-                "runtime 'if' branches that both fall through are not supported yet"
-            )
         self._emit(mir.End())
         frame.block_stack.pop()
 
@@ -1100,12 +1179,25 @@ decision).  The return convention of the function is decided here
         caller (see ``_resume_call``).  The ``End`` of the block that
         delimits the inlined body (opened at its start, see
         ``_start_inline``) is emitted here, closing the body's emitted
-        code before the caller's continuation is emitted by the resume."""
+        code before the caller's continuation is emitted by the resume.
+
+        An inlined body that delivers its result from several runtime
+        paths (``Frame.multi_path``) must return a value on every path:
+        a body that returns a value on some paths but is void - a bare
+        ``return`` or a fall-off its end - on others is rejected here,
+        where the typing of the body is complete."""
         if len(self._frames) == 1:
             self._flow = Flow.RET if returns else Flow.FALL
             return
         self._emit(mir.End())
         frame = self._frames.pop()
+        if frame.multi_path and frame.val_rets > 0 and (
+            not returns or frame.void_rets > 0
+        ):
+            raise CompileError(
+                f"function {frame.fn_ir.name} returns a value on some paths but "
+                'returns without a value (or falls off its end) on others'
+            )
         if returns:
             assert value is not None
             self._resume_call(frame, value)
@@ -1117,15 +1209,106 @@ decision).  The return convention of the function is decided here
         """The run of an inlined callee ended: resume the call of the
         caller that suspended on it - the call's result is handed to its
         result location (``_store_result``), and the walk of the caller
-        continues with the instructions after the call."""
+        continues with the instructions after the call.  A callee that
+        delivered its result from several runtime paths already stored
+        it into the result location on each path (see
+        ``_deliver_inline_result``): only the caller's walk resumes."""
         resume = frame.resume
         assert resume is not None
         inst, is_ctor = resume
+        if frame.multi_path and frame.val_rets > 0 and not is_ctor:
+            # every runtime path that returns stored its value into the
+            # shared result location; a void body (``val_rets`` 0) still
+            # hands its ``None`` over like a single-path one
+            return
         # a constructor's ``__init__`` wrote the struct into the result
         # location itself: the call result is the in-place marker, not
         # the (void) value the body yielded
         ev = InPlaceResult() if is_ctor else value
         self._store_result(ev, inst.ret)
+
+    def _break_level(self, frame: Frame) -> int:
+        """The ``mir.Break`` level of a return of the inlined body of
+        ``frame``: the number of enclosing blocks the return must leave
+        to get out of the inlined body - the runtime ``if`` blocks of
+        the body that are still open, plus the body's own ``Block``.  A
+        return outside any runtime branch (0) needs no ``Break``: the
+        walk ends the body there and nothing is emitted between the
+        return and the body's ``End``."""
+        open_ifs = 0
+        for bf in frame.block_stack:
+            if bf.chosen is None:
+                open_ifs += 1
+        return open_ifs + 1 if open_ifs > 0 else 0
+
+    def _deliver_inline_result(self, frame: Frame, ev: InterpVal) -> None:
+        """Hand the value of one return site of an inlined body that
+        delivers its result from several runtime paths (see
+        ``Frame.multi_path``) to the location the call's result goes to
+        (``frame.result_loc``): the value is stored into the location's
+        memory on this path.
+
+        The memory is created here, at the first return site, typed by
+        its value - the interpreter emits the alloca at the site, but
+        ``lower`` hoists every alloca into the function's entry block,
+        so the stores of all paths (and the reads of the caller's
+        continuation after the inlined body) see one shared address.
+
+        A return-position call into the result location of the function
+        proper goes through ``_write_result``, whose return-type checks
+        apply on each path; the result location of an enclosing inlined
+        body (a ``return``-position call inside another inlined body)
+        and a plain slot are typed by their first store here."""
+        loc = frame.result_loc
+        if isinstance(loc, PendingSlot):
+            if loc.ptr is None:
+                value, t = _to_runtime(ev, None)
+                loc.ptr = self._emit(mir.Alloca(mir.PointerType(sval.to_mir_type(t))))
+                loc.type = t
+                loc.value = None
+                self._emit(mir.Store(loc.ptr, value))
+            else:
+                assert loc.type is not None
+                value = _to_slot(ev, loc.type)
+                self._emit(mir.Store(loc.ptr, value))
+            return
+        if isinstance(loc, RetLocVal):
+            if self._frames[0].ret_loc[1] is loc:
+                # the call is the return expression of the function
+                # proper: the value is a return value of the function on
+                # this path
+                self._write_result(ev, retloc=loc, memory=True)
+            else:
+                # the result location of an enclosing inlined body (the
+                # call is the ``return`` expression of that body): the
+                # body's own return loads the stored value back and
+                # yields it when its run ends
+                if loc.ptr is None:
+                    value, t = _to_runtime(ev, None)
+                    loc.ptr = self._emit(
+                        mir.Alloca(mir.PointerType(sval.to_mir_type(t)))
+                    )
+                    loc.type = t
+                    loc.value = None
+                    self._emit(mir.Store(loc.ptr, value))
+                else:
+                    assert loc.type is not None
+                    value = _to_slot(ev, loc.type)
+                    self._emit(mir.Store(loc.ptr, value))
+            return
+        if isinstance(loc, RuntimeVal):
+            ptype = loc.type
+            if not isinstance(ptype, sval.PointerType):
+                raise CompileError(
+                    f"cannot write the inlined result through a "
+                    f"{sval.type_str(ptype)} value"
+                )
+            value = _to_slot(ev, ptype.elem)
+            self._emit(mir.Store(loc.value, value))
+            return
+        raise CompileError(
+            'cannot deliver the inlined result to this location'
+        )
 
     def _operand(self, value: hir.Value) -> InterpVal:
         regs = self._frames[-1].regs
@@ -1913,7 +2096,13 @@ decision).  The return convention of the function is decided here
         ``mir.Block`` opened here and closed by the matching ``mir.End``
         when the body's run ends (see ``_frame_ended``): the block is
         what a ``return`` of the inlined body breaks out of when it
-        happens inside a runtime branch."""
+        happens inside a runtime branch.
+
+        The frame also records the location the call's result goes to
+        (``Frame.result_loc``), resolved from the pending call in the
+        caller: the target of the per-path stores of a body that
+        delivers its result from several runtime paths (see
+        ``_deliver_inline_result``)."""
         fn_ir = self._resolver.hir_of_plain_fn(fn)
         # the frames above the function proper are exactly the inlined
         # bodies under execution, each carrying its own ``fn_ir`` (see
@@ -1935,8 +2124,13 @@ decision).  The return convention of the function is decided here
             raise CompileError('too deeply nested inlined functions')
         formal = self._solve_types(fn_ir, evals, 'jit')
         values = _convert_evals(fn_ir, evals, formal)
+        # the call's result location, resolved in the caller (whose frame
+        # is still current here): a constructor writes in place and never
+        # hands a value back, so it has no result to deliver
+        result_loc = None if is_ctor else self._operand(inst.ret)
         frame = self._push_frame(tuple(zip(values, formal)), fn_ir)
         frame.resume = (inst, is_ctor)
+        frame.result_loc = result_loc
         # open the block that delimits the inlined body in the MIR: its
         # ``End`` is emitted when the body's run ends (``_frame_ended``),
         # and a ``return`` inside the body will break out of it

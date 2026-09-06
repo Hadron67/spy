@@ -159,6 +159,63 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         # ``Block`` nests inside the outer one
         return one_plus(one_plus(n))
 
+    # -- runtime ``if`` inside inlined bodies --------------------------------
+
+    def sign_pick(n):
+        # an inlined body with a runtime if whose branches both return
+        if n > 0:
+            return 1
+        else:
+            return -1
+
+    def early_out(n):
+        # the then-branch returns; the else falls through to the trailing
+        # return of the inlined body
+        if n > 100:
+            return 100
+        return n
+
+    def inner_rt(n):
+        if n > 0:
+            return 1
+        return 2
+
+    def outer_rt(n):
+        # an inline whose runtime-if branches call another inline whose
+        # body has its own runtime if (both bodies are multi-path)
+        if n < 0:
+            return inner_rt(n) + 10
+        return inner_rt(n) + 20
+
+    @cache.jit()
+    def use_sign_local(n):
+        # a multi-path inline result assigned to a local, then used
+        y = sign_pick(n)
+        return y * 10
+
+    @cache.jit()
+    def use_sign_ret(n):
+        # a multi-path inline call in return position
+        return sign_pick(n)
+
+    @cache.jit()
+    def use_early(n):
+        # a multi-path inline whose falling path continues after the if
+        return early_out(n)
+
+    @cache.jit()
+    def use_outer(n):
+        # multi-path inlines nested in a multi-path inline
+        return outer_rt(n)
+
+    @cache.jit()
+    def use_sign_in_branch(n):
+        # a multi-path inline in return position, inside a runtime-if
+        # region of the function proper
+        if n > 100:
+            return sign_pick(n - 200)
+        return 0
+
     # -- recursion ---------------------------------------------------------
 
     @cache.jit()
@@ -244,6 +301,11 @@ def make_samples(cache: JitContext) -> dict[str, object]:
         'bad_join': bad_join,
         'branch_inline': branch_inline,
         'nested_inline': nested_inline,
+        'use_sign_local': use_sign_local,
+        'use_sign_ret': use_sign_ret,
+        'use_early': use_early,
+        'use_outer': use_outer,
+        'use_sign_in_branch': use_sign_in_branch,
         'fact': fact,
         'fact_aot': fact_aot,
         'gcd': gcd,
@@ -363,6 +425,11 @@ class SpyExampleTest(TestCase):
     bad_join: Any
     branch_inline: Any
     nested_inline: Any
+    use_sign_local: Any
+    use_sign_ret: Any
+    use_early: Any
+    use_outer: Any
+    use_sign_in_branch: Any
     fact: Any
     fact_aot: Any
     gcd: Any
@@ -568,6 +635,94 @@ class SpyExampleTest(TestCase):
         insts = self.nested_inline._entry.mir_cache[(i32,)].insts
         blocks = sum(1 for inst in insts if isinstance(inst, mir.Block))
         self.assertEqual(blocks, 2)
+
+    # -- runtime ``if`` inside inlined bodies --------------------------------
+
+    def test_inline_runtime_if_local_result(self) -> None:
+        # a multi-path inline result assigned to a local: each runtime
+        # path of the inlined body stores its own value, which the code
+        # after the call reads back
+        self.assertEqual(self.use_sign_local(5), 10)
+        self.assertEqual(self.use_sign_local(-5), -10)
+        self.assertEqual(self.use_sign_local(0), -10)
+
+    def test_inline_runtime_if_return_position(self) -> None:
+        # a multi-path inline call in return position of the function
+        # proper: the value of every path is the function's return value
+        self.assertEqual(self.use_sign_ret(5), 1)
+        self.assertEqual(self.use_sign_ret(-5), -1)
+        self.assertEqual(self.use_sign_ret(0), -1)
+
+    def test_inline_runtime_if_falling_branch(self) -> None:
+        # one branch of the inlined runtime if returns, the other falls
+        # through to the trailing return of the inlined body
+        self.assertEqual(self.use_early(50), 50)
+        self.assertEqual(self.use_early(500), 100)
+        self.assertEqual(self.use_early(-1), -1)
+
+    def test_inline_runtime_if_nested_inlines(self) -> None:
+        # a multi-path inline called from the branches of a multi-path
+        # inline
+        self.assertEqual(self.use_outer(5), 21)
+        self.assertEqual(self.use_outer(-5), 12)
+        self.assertEqual(self.use_outer(0), 22)
+
+    def test_inline_runtime_if_in_caller_branch(self) -> None:
+        # a multi-path inline in return position, inside a runtime-if
+        # region of the function proper
+        self.assertEqual(self.use_sign_in_branch(250), 1)
+        self.assertEqual(self.use_sign_in_branch(200), -1)
+        self.assertEqual(self.use_sign_in_branch(50), 0)
+        self.assertEqual(self.use_sign_in_branch(-200), 0)
+
+    def test_inline_runtime_if_conflicting_types(self) -> None:
+        # the runtime paths of the inlined body return different types
+        with self.assertRaises(CompileError) as ctx:
+            self._bad_conflict()(1)
+        message = str(ctx.exception)
+        self.assertIn('conflicting types', message)
+        self.assertIn('i32', message)
+        self.assertIn('f64', message)
+
+    def _bad_conflict(self):
+        # a plain helper whose runtime-if paths return different types,
+        # inlined into a jit function
+        cache = JitContext()
+
+        def bad_conflict(x):
+            if x > 0:
+                return 1
+            else:
+                return 1.5
+
+        @cache.jit()
+        def use(n):
+            return bad_conflict(n)
+
+        return use
+
+    def test_inline_runtime_if_mixed_value_and_void(self) -> None:
+        # one runtime path of the inlined body returns a value, another
+        # is void: rejected when the body's typing completes
+        with self.assertRaises(CompileError) as ctx:
+            self._bad_mixed()(1)
+        message = str(ctx.exception)
+        self.assertIn('returns a value on some paths', message)
+        self.assertIn('bad_mixed', message)
+
+    def _bad_mixed(self):
+        cache = JitContext()
+
+        def bad_mixed(x):
+            if x > 0:
+                return 1
+            return
+
+        @cache.jit()
+        def use(n):
+            return bad_mixed(n)
+
+        return use
 
     # -- recursion -----------------------------------------------------------
 

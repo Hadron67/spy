@@ -145,9 +145,19 @@ class _Lowerer:
 
     def lower(self, fn: mir.Function) -> None:
         """Lower the flat instruction list of ``fn`` into its
-        pre-created ``sllvm.Function``."""
+        pre-created ``sllvm.Function``.
+
+        Every ``mir.Alloca`` is lowered into the function's entry block
+        first, whatever position the interpreter emitted it at: a slot
+        may first be stored inside a runtime branch (an inlined body
+        whose result is delivered per path, see ``interp``), and its
+        address must then be defined on every path that stores to it or
+        reads it later."""
         llvm_fn = self._llvm_fns[fn.name]
         arg_values = llvm_fn.get_args()
+        for inst in fn.insts:
+            if isinstance(inst, mir.Alloca):
+                self._lower_inst(llvm_fn.entry, inst, arg_values)
         self._lower_region(
             llvm_fn, llvm_fn.entry, fn.insts, 0, len(fn.insts), arg_values, None, ()
         )
@@ -277,6 +287,10 @@ class _Lowerer:
                     )
                 return
             # a plain instruction
+            if isinstance(inst, mir.Alloca):
+                # already lowered into the entry block (see ``lower``)
+                i += 1
+                continue
             self._lower_inst(block, inst, arg_values)
             i += 1
         # the region ran off its end (its last instruction did not
