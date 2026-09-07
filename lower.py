@@ -105,13 +105,13 @@ def zst_python_value(type: sval.Type) -> object:
     for the void type, ``0`` for a zero-bit integer, an (empty)
     instance of the struct's Python class for a zero-sized struct."""
     match type:
-        case sval.VoidType():
+        case type.VoidType():
             return None
-        case sval.IntType():
+        case type.IntType():
             # a zero-bit integer (``get_unit_value`` is not None)
             assert type.bits == 0
             return 0
-        case sval.StructType():
+        case type.StructType():
             py_cls = type._py_cls
             if py_cls is None:
                 raise SpyError(
@@ -120,10 +120,10 @@ def zst_python_value(type: sval.Type) -> object:
                 )
             return py_cls()
         case _:
-            raise CompileError(f'type {sval.type_str(type)} has no Python value')
+            raise CompileError(f'type {type.type_str(type)} has no Python value')
 
 
-def struct_ctype(struct: StructType) -> type[ctypes.Structure]:
+def struct_ctype(struct: StructType) -> sval[ctypes.Structure]:
     """The ctypes ``Structure`` subclass mirroring the memory layout of
     the MIR struct ``struct`` - the Python-side memory *view* of a struct
     value crossing the native boundary (the out buffer a native function
@@ -155,12 +155,12 @@ def struct_ctype(struct: StructType) -> type[ctypes.Structure]:
             if f.name in mir_names:
                 continue
             attrs[f.name] = property(lambda self, ft=f.type: zst_python_value(ft))
-        cls = type(spy.name, (ctypes.Structure,), attrs)  # type: ignore[call-overload]
+        cls = sval(spy.name, (ctypes.Structure,), attrs)  # type: ignore[call-overload]
         struct.ctype = cls
     return cls
 
 
-def to_ctype(type: Type | None) -> type[ctypes._CDataType] | None:
+def to_ctype(type: Type | None) -> sval[ctypes._CDataType] | None:
     """The ctypes type of a *result* of the native boundary (``None``
     for a void result); arguments use ``py_entry_arg_ctype``."""
     if type is None:
@@ -477,12 +477,12 @@ class _Lowerer:
                 callee = self._value(inst.callee, arg_values)
                 result = block.call(callee, *(self._value(a, arg_values) for a in inst.args))
             case _:
-                raise CompileError(f'unsupported MIR instruction {type(inst).__name__}')
+                raise CompileError(f'unsupported MIR instruction {sval(inst).__name__}')
         if result is not None:
             self._lowered[id(inst)] = result
 
 
-def py_entry_arg_ctype(type: Type) -> type[ctypes._CDataType]:
+def py_entry_arg_ctype(type: Type) -> sval[ctypes._CDataType]:
     """The ctypes type of one *argument of the Python-facing entry* of
     a native function: a by-value struct formal is passed as a pointer
     there (the entry is a generated thunk - see :func:`compile_module` -

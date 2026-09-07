@@ -111,6 +111,16 @@ class Void(Value):
     def get_type(self) -> Type:
         return VoidType()
 
+class BuiltinFn(Value):
+    @override
+    def get_type(self) -> 'Type':
+        return AnyFunction()
+
+@dataclass
+class ComptimeIntType(Type):
+    def get_type(self) -> 'Type':
+        return TYPE_TYPE
+
 @dataclass(frozen=True)
 class IntType(Type):
     bits: int
@@ -146,6 +156,15 @@ class FloatType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
+@dataclass(frozen=True)
+class Float(Type):
+    value: float
+    type: FloatType
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
 
 @dataclass(frozen=True)
 class PointerType(Type):
@@ -171,6 +190,7 @@ class Undefined(Value):
 class FormalArg:
     name: str
     type: Type
+    default_value: AnyValue | None
 
 
 @dataclass(frozen=True)
@@ -196,30 +216,6 @@ class FunctionType(Type):
         assert isinstance(child, TypeType)
         level = max(level, child.level)
         return TypeType(level)
-
-
-@dataclass(frozen=True)
-class FunctionCallArgInfo:
-    index: int # pass this argument at the given index
-
-class FunctionReturnInfo:
-    pass
-
-@dataclass(frozen=True)
-class FunctionValueReturnInfo(FunctionReturnInfo):
-    """Return by value: No result location pointer, mir function returns `mir_type`."""
-    mir_type: mir.Type | None
-
-@dataclass(frozen=True)
-class FunctionRetLocReturnInfo(FunctionReturnInfo):
-    """Return by result location: the result pointer is the `arg_index`-th argument, mir function returns void."""
-    arg_index: int
-
-@dataclass(frozen=True)
-class FunctionCallInfo:
-    total_mir_args: int
-    args_map: tuple[FunctionCallArgInfo | None, ...] # non-None: pass this argument using the given info; None: don't pass this argument
-    return_info: FunctionReturnInfo
 
 @dataclass(frozen=True)
 class StructField:
@@ -271,7 +267,7 @@ class StructType(Type):
         # the MIR mirror of the type, created lazily when the lowering
         # of a function body needs it (see ``to_mir_type``); None until
         # then
-        self._mir: mir.StructType | None = None
+        self._mir: mir.MayBeVoidType | None = None
         # the mirror position of every field, in declaration order (see
         # ``get_field_mir_indices``), computed together with the mirror
         self._field_mir_indices: tuple[int | None, ...] | None = None
@@ -279,6 +275,11 @@ class StructType(Type):
     def add_field(self, name: str, type: Type) -> None:
         assert all(f.name != name for f in self._fields)
         self._fields.append(StructField(name, type))
+
+    def bind_default_ctor_args[T](self, positional: tuple[T, ...], named: dict[str, T]) -> tuple[T, ...]:
+        ret: list[T | None] = []
+        # TODO
+        raise NotImplementedError
 
     @property
     def fields(self) -> tuple[StructField, ...]:
@@ -353,15 +354,18 @@ class StructType(Type):
             field_mir_indices: list[int | None] = []
             for field in self._fields:
                 field_type = to_mir_type(field.type)
-                if field_type is None:
+                if isinstance(field_type, mir.VoidType):
                     field_mir_indices.append(None)
                 else:
                     field_mir_indices.append(len(fields))
                     fields.append(mir.FormalArg(field.name, field_type))
-            self._mir = mir.StructType(self, tuple(fields))
             self._field_mir_indices = tuple(field_mir_indices)
+            if all(a is None for a in self._field_mir_indices):
+                self._mir = None
+            else:
+                self._mir = mir.StructType(self, tuple(fields))
 
-    def get_mir_type(self) -> mir.StructType:
+    def get_mir_type(self) -> mir.MayBeVoidType:
         """The (cached) MIR mirror of the struct: the one
         :class:`mir.StructType` object every value of the struct
         mirrors to (created lazily, shared by all users), with the
@@ -538,7 +542,7 @@ def function_call_info(type: FunctionType) -> tuple[FunctionCallInfo, mir.Functi
     mir_args: list[mir.Type] = []
     for arg in type.args:
         mir_type = to_mir_type(arg.type)
-        if mir_type is None:
+        if isinstance(mir_type, mir.VoidType):
             args_map.append(None)
         else:
             args_map.append(FunctionCallArgInfo(len(mir_args)))
@@ -548,12 +552,12 @@ def function_call_info(type: FunctionType) -> tuple[FunctionCallInfo, mir.Functi
         # address is appended as the trailing MIR argument; the lowered
         # function returns void
         result_type = to_mir_type(type.return_type)
-        assert result_type is not None
+        assert not isinstance(result_type, mir.VoidType)
         return FunctionCallInfo(
             len(mir_args) + 1,
             tuple(args_map),
             FunctionRetLocReturnInfo(arg_index=len(mir_args)),
-        ), mir.FunctionType(tuple(mir_args) + (mir.PointerType(result_type),), None)
+        ), mir.FunctionType(tuple(mir_args) + (mir.PointerType(result_type),), mir.VOID)
     return (
         FunctionCallInfo(
             len(mir_args),
@@ -571,7 +575,7 @@ def function_call_info(type: FunctionType) -> tuple[FunctionCallInfo, mir.Functi
 # ---------------------------------------------------------------------------
 
 
-def to_mir_type(type: Type) -> mir.Type | None:
+def to_mir_type(type: Type) -> mir.MayBeVoidType:
     """The MIR mirror of a spy type: the static type the runtime register
     of a value of ``type`` has.  The mapping is one-to-one over the types
     that can cross into runtime code.  A zero-sized type has no runtime
@@ -585,17 +589,12 @@ def to_mir_type(type: Type) -> mir.Type | None:
         case BoolType():
             return mir.BoolType()
         case IntType():
-            return None if type.bits == 0 else mir.IntType(type.bits, type.signed)
+            return mir.VOID if type.bits == 0 else mir.IntType(type.bits, type.signed)
         case FloatType():
             return mir.FloatType(type.bits)
         case VoidType():
-            return None
+            return mir.VOID
         case StructType():
-            # a struct whose fields are all zero-sized has no runtime
-            # representation of its own (every value of it is its
-            # canonical unit value): it mirrors to void
-            if type.get_unit_value() is not None:
-                return None
             return type.get_mir_type()
         case PointerType():
             return mir.PointerType(to_mir_type(type.elem), type.is_const)
@@ -603,7 +602,7 @@ def to_mir_type(type: Type) -> mir.Type | None:
             args: list[mir.Type] = []
             for arg in type.args:
                 mir_type = to_mir_type(arg.type)
-                if mir_type is not None:
+                if not isinstance(mir_type, mir.VoidType):
                     args.append(mir_type)
             return mir.FunctionType(tuple(args), to_mir_type(type.return_type))
         case _:
@@ -627,7 +626,7 @@ def type_of(value: Any) -> Type | None:
         case bool():
             return BoolType()
         case int():
-            return IntType(INT_DEFAULT_BITS, True)
+            return ComptimeIntType()
         case float():
             return FloatType(64)
         case str():
@@ -828,7 +827,7 @@ class TypeVarSolver:
 
     def get_solved(self) -> dict[TypeVar, Value]:
         return {
-            k: self._whnf(v._value)  # type: ignore[arg-type]
+            k: self._whnf(v._value)
             for k, v in self._type_var_values.items()
             if v._value is not None
         }
@@ -887,3 +886,10 @@ class TypeVarSolver:
             return True
         stv._value = rhs
         return True
+
+def replace_type_var(value: Value, reps: dict[TypeVar, Value]) -> Value:
+    match value:
+        case TypeVar():
+            return reps.get(value, value)
+        case _:
+            return value

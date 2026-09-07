@@ -49,15 +49,3 @@ class FunctionResolver:
         any other object is not a spy value of this host and returns
         ``None`` (the object stays a plain compile-time Python value)."""
         raise NotImplementedError
-
-    @abstractmethod
-    def resolve_method(self, struct: sval.StructType, name: str) -> tuple[Any, bool] | None:
-        """The method ``name`` of the struct type ``struct``, as the
-        interpreter needs it for a method call ``x.name(...)``: a pair of
-        the method - the entry of a registered ``@aot``/``@jit`` method,
-        or the plain Python function of an undecorated method (inlined on
-        call) - and whether its ``self`` is passed by pointer
-        (``ptr_self``).  Returns None when the struct has no such method
-        (a field of that name is read by ``astgen`` through ``FieldAddr``
-        instead)."""
-        raise NotImplementedError

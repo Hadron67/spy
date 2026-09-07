@@ -1,4 +1,5 @@
 import ctypes
+from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import FunctionType as PyFunctionType
@@ -12,13 +13,13 @@ from .sval import (
     AnyFunction,
     AnyValue,
     FormalArg,
-    FunctionCallInfo,
     FunctionType,
     Type,
     TypeVar,
     TypeVarSolver,
     Value,
-    type_of,
+    returns_via_result_ptr,
+    to_mir_type,
 )
 
 
@@ -196,33 +197,34 @@ class Signature:
             return None
         return ret
 
+    def is_generic(self) -> bool:
+        if len(self.generic_args.by_id) > 0 or self.varargs is not None or self.kwargs is not None:
+            return True
+        if self.ret_type is None:
+            return True
+        for arg in self.positional.by_id:
+            if arg.type is None:
+                return True
+        return False
 
-def _default_value_type(param: ParamDef) -> Type:
-    """The spy type of the default value of ``param`` (which has one)."""
-    assert param.default_value is not None
-    t = type_of(param.default_value)
-    if t is None:
-        raise TypeMismatchError(
-            'cannot determine the type of the default value of '
-            f"parameter '{param.name}'"
-        )
-    return t
+    def as_non_generic_fn_type(self) -> FunctionType | None:
+        if self.is_generic():
+            return None
+        assert self.ret_type is not None
+        formal: list[FormalArg] = []
+        for arg in self.positional.by_id:
+            assert arg.type is not None
+            formal.append(FormalArg(arg.name, arg.type, arg.default_value))
+        return FunctionType(tuple(formal), self.ret_type)
 
 
 @dataclass
 class FunctionIR:
-    fn: Callable
     name: str
-    # how the function is compiled and typed when it is called: ``jit``
-    # (the marshaled argument types solve each specialization) or
-    # ``aot`` (the concrete annotations fix its single signature).  A
-    # plain function the interpreter inlines is parsed in ``jit`` mode.
-    mode: str
     signature: Signature
     body: tuple[hir.Inst, ...]
     # The result location the return statements of the body write into
     # (see ``hir.ResultLoc``)
-    ret_loc: 'hir.ResultLoc' = None  # type: ignore[assignment]
 
     # -- the aot signature (``mode == 'aot'``) ---------------------------
 
@@ -312,8 +314,98 @@ class NativeFn:
         return self.lines
 
 
+class ArgSignatureNode:
+    pass
+
 @dataclass(frozen=True)
-class LazyJitFunctionInstance:
+class ComptimeValSignatureNode(ArgSignatureNode):
+    value: AnyValue
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+@dataclass(frozen=True)
+class RuntimeValSignatureNode(ArgSignatureNode):
+    type: Type
+    by_ref: bool
+    mir_arg_index: int
+
+    def __str__(self) -> str:
+        return f"<{self.type}>"
+
+@dataclass(frozen=True)
+class FnInstanceSignature:
+    """
+        A function signature.
+
+        Serves both as the cache key of the specialization and how to call the MIR function
+    """
+    positional: tuple[ArgSignatureNode, ...]
+    varargs: tuple[ArgSignatureNode, ...]
+    kwargs: frozenset[tuple[str, ArgSignatureNode]]
+
+    def __str__(self) -> str:
+        positional = ", ".join(str(a) for a in self.positional)
+        varargs = ", ".join(str(a) for a in self.varargs)
+        kwargs = ", ".join(f"{k}={v}" for k, v in self.kwargs)
+        return f"({positional}{", " if varargs else ""}({varargs}){", " if kwargs else ""}{{{kwargs}}})"
+
+    def mir_arg_count(self):
+        count = 0
+        for arg in self.positional + self.varargs + tuple(a[1] for a in self.kwargs):
+            if isinstance(arg, RuntimeValSignatureNode):
+                count += 1
+        return count
+
+class FunctionReturnInfo:
+    pass
+
+@dataclass(frozen=True)
+class FunctionValueReturnInfo(FunctionReturnInfo):
+    """Return by value: No result location pointer, mir function returns `mir_type`."""
+    mir_type: mir.MayBeVoidType
+
+@dataclass(frozen=True)
+class FunctionRetLocReturnInfo(FunctionReturnInfo):
+    """Return by result location: the result pointer is the `arg_index`-th argument, mir function returns void."""
+    arg_index: int
+
+def function_call_info(type: FunctionType) -> tuple[FnInstanceSignature, FunctionReturnInfo, mir.FunctionType]:
+    positional: list[ArgSignatureNode] = []
+    mir_args: list[mir.Type] = []
+    for arg in type.args:
+        mir_type = to_mir_type(arg.type)
+        if isinstance(mir_type, mir.VoidType):
+            val = arg.type.get_unit_value()
+            assert val is not None
+            positional.append(ComptimeValSignatureNode(val))
+        else:
+            positional.append(RuntimeValSignatureNode(arg.type, False, len(mir_args)))
+            mir_args.append(mir_type)
+    return_info = None
+    if returns_via_result_ptr(type.return_type):
+        # the result is written into a caller-provided location whose
+        # address is appended as the trailing MIR argument; the lowered
+        # function returns void
+        result_type = to_mir_type(type.return_type)
+        assert not isinstance(result_type, mir.VoidType)
+        return_info = FunctionRetLocReturnInfo(arg_index=len(mir_args))
+        mir_args.append(mir.PointerType(result_type, False))
+    else:
+        return_info = FunctionValueReturnInfo(mir_type=to_mir_type(type.return_type))
+    signature = FnInstanceSignature(
+        positional=tuple(positional),
+        varargs=(),
+        kwargs=frozenset(),
+    )
+    return (
+        signature,
+        return_info,
+        mir.FunctionType(tuple(mir_args), to_mir_type(type.return_type)),
+    )
+
+@dataclass(frozen=True)
+class FunctionInstance:
     """The compiled artifact of one ``@jit`` specialization: its native
     function (what a Python-side call invokes, see :class:`NativeFn`)
     and the lowering result its spy function type yields - the call
@@ -321,11 +413,17 @@ class LazyJitFunctionInstance:
     specialization, together with its lowered MIR signature (see
     ``type.function_call_info``)."""
 
-    native_fn: NativeFn
-    call_info: tuple[FunctionCallInfo, mir.FunctionType]
+    mir: mir.Function
+    native_fn: NativeFn | None = None
+    mir_type: mir.FunctionType | None = None
+    complete: bool = False
 
+class HirCompiler:
+    @abstractmethod
+    def compile(self, signature: FnInstanceSignature) -> FunctionInstance:
+        ...
 
-class LazyJitFunction(Value):
+class FunctionValue(Value):
     """The function value of a ``@jit`` function: only compiled - and
     thereby typed - when a call specializes it, so as a value its type
     is the untyped :class:`AnyFunction`.
@@ -336,31 +434,18 @@ class LazyJitFunction(Value):
     lives in the interpreter and the host, not here.
     """
 
-    kind = 'jit'
-
-    def __init__(self, fn: PyFunctionType, hir: FunctionIR) -> None:
-        self.fn = fn
-        # the hosting JitContext (set when the value is registered),
-        # only used when checking whether the function is called within
-        # the same context
-        self.context: Any = None
+    def __init__(self, name_base: str, hir: FunctionIR) -> None:
         # the context-unique base name of the native symbols
-        self.name_base = ''
+        self.name_base = name_base
         # the parsed HIR of the function (see ``JitContext.hir_of``)
         self.hir = hir
-        # spy argument types -> the typed MIR function of the
-        # specialization.  The function is registered here - with an
-        # empty body - before its body is typed, so a recursive call
-        # made by the body resolves to it.  A function whose module
-        # build aborted stays cached until the next build that
-        # references it (its spec is only registered when the module it
-        # was lowered into finishes).
-        self.mir_cache: dict[tuple[Type, ...], mir.Function] = {}
         # spy argument types -> the compiled artifacts of the
         # specialization (see ``LazyJitFunctionInstance``)
-        self.specs: dict[tuple[Type, ...], LazyJitFunctionInstance] = {}
+        self.specs: dict[FnInstanceSignature, FunctionInstance] = {}
         # spy argument types -> error message of a failed compilation
-        self.failed: dict[tuple[Type, ...], str] = {}
+        self.failed: dict[FnInstanceSignature, str] = {}
+
+        self._non_generic_instance: FunctionInstance | None = None
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -370,74 +455,9 @@ class LazyJitFunction(Value):
 
     @override
     def get_type(self) -> Type:
-        return AnyFunction()
+        return self.hir.signature.as_non_generic_fn_type() or AnyFunction()
 
 
-class FunctionValue(Value):
-    """The function value of a ``@aot`` function: compiled from its type
-    annotations at its first use, so the value carries the concrete
-    signature (``args`` and ``ret``) and the compiled
-    :class:`mir.Function` (calling it emits a ``mir.Call`` of that
-    function).
-
-    An aot function has exactly one specialization (its signature is
-    fixed by the annotations), so unlike :class:`LazyJitFunction` it
-    needs no per-argument-type registries: ``mir_fn`` is the single
-    typed MIR function - it is set before the body is typed (so a
-    recursive call the body makes resolves to it) and filled in by the
-    typing.  Function values are identity objects: two are equal only
-    if they are the same object.  The call logic itself lives in the
-    interpreter and the host, not here.
-    """
-
-    kind = 'aot'
-
-    def __init__(
-        self,
-        fn: PyFunctionType,
-        hir: FunctionIR,
-        args: tuple[FormalArg, ...],
-        ret: Type | None,
-        mir_fn: mir.Function | None = None,
-    ) -> None:
-        self.fn = fn
-        # the hosting JitContext (set when the value is registered),
-        # only used when checking whether the function is called within
-        # the same context
-        self.context: Any = None
-        # the context-unique base name of the native symbols
-        self.name_base = ''
-        # the parsed HIR of the function (see ``JitContext.hir_of``)
-        self.hir = hir
-        self.args = args
-        # the declared return type, or None when it is inferred from the
-        # body (an ``aot`` method without a return annotation)
-        self.ret: Type | None = ret
-        self.mir_fn = mir_fn
-
-        self.native_fn: NativeFn | None = None
-
-    def __eq__(self, value: object, /) -> bool:
-        return self is value
-
-    def __hash__(self) -> int:
-        return object.__hash__(self)
-
-    @override
-    def get_type(self) -> FunctionType:
-        """The spy type of the function *value*: its signature - a
-        function type.  A function type is a runtime DST (dynamically
-        sized type: it has no runtime representation of its own), so a
-        function value is never a legal runtime value by itself; it can
-        only be *referenced* - a ``hir.ConstRef`` of it, whose type is a
-        const pointer to this function type (a function pointer)."""
-        ret = self.ret
-        assert ret is not None, 'the function is still being typed'
-        return FunctionType(self.args, ret)
-
-
-# A registered spy function of either kind: the per-function entry of
-# its host context.  jit and aot functions share no base class; the
-# union only types the code that works with entries of both kinds
-# (``dsl``/``interp``).
-FunctionEntry: TypeAlias = LazyJitFunction | FunctionValue
+class SymbolTable:
+    def __init__(self) -> None:
+        self._symbols: dict[str, FunctionInstance] = {}

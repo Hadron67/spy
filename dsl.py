@@ -31,7 +31,7 @@ from typing_extensions import override
 from . import astgen, mir, opt, sval
 from .builtins import AsValue
 from .errors import CompileError, SpyError, TypeMismatchError
-from .fn import FunctionEntry, FunctionValue, LazyJitFunction, LazyJitFunctionInstance
+from .fn import FunctionEntry, FunctionValue, LazyJitFunction, FunctionInstance
 from .interp import FunctionResolver, HirRunner
 from .lower import NativeFn, compile_module, zst_python_value
 from .sval import (
@@ -77,7 +77,7 @@ _CTYPE_INT = {
 }
 
 
-def ctypes_of(type: Type) -> type:
+def ctypes_of(type: Type) -> sval:
     """The ctypes field type mirroring the LLVM layout of a spy type."""
     match type:
         case BoolType():
@@ -89,7 +89,7 @@ def ctypes_of(type: Type) -> type:
             return ct
         case FloatType():
             return ctypes.c_float if type.bits == 32 else ctypes.c_double
-        case sval.StructType():
+        case type.StructType():
             return type._py_cls
         case _:
             raise CompileError(
@@ -105,14 +105,14 @@ def _coerce_py(value: object, target: Type, what: str) -> object:
         case BoolType():
             if not isinstance(value, bool):
                 raise TypeMismatchError(
-                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"type mismatch: a {sval(value).__name__} value cannot be "
                     f"passed as {what} (expected bool)"
                 )
             return bool(value)
         case IntType():
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeMismatchError(
-                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"type mismatch: a {sval(value).__name__} value cannot be "
                     f"passed as {what} (expected {type_str(target)})"
                 )
             lo, hi = int_range(target)
@@ -125,7 +125,7 @@ def _coerce_py(value: object, target: Type, what: str) -> object:
         case FloatType():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise TypeMismatchError(
-                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"type mismatch: a {sval(value).__name__} value cannot be "
                     f"passed as {what} (expected {type_str(target)})"
                 )
             try:
@@ -137,14 +137,14 @@ def _coerce_py(value: object, target: Type, what: str) -> object:
         case PointerType():
             if not isinstance(value, str):
                 raise TypeMismatchError(
-                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"type mismatch: a {sval(value).__name__} value cannot be "
                     f"passed as {what} (expected a string)"
                 )
             return value.encode('utf-8')
         case sval.StructType():
             if not isinstance(value, target._py_cls):
                 raise TypeMismatchError(
-                    f"type mismatch: a {type(value).__name__} value cannot be "
+                    f"type mismatch: a {sval(value).__name__} value cannot be "
                     f"passed as {what} (expected a {target.name} struct)"
                 )
             return value
@@ -179,7 +179,7 @@ def _candidate_type(fn_name: str, param_name: str, value: object) -> Type:
     t = type_of(value)
     if t is None:
         raise TypeMismatchError(
-            f"cannot pass a {type(value).__name__} value as the '{param_name}' argument "
+            f"cannot pass a {sval(value).__name__} value as the '{param_name}' argument "
             f"of {fn_name} (not a spy value)"
         )
     return t
@@ -317,7 +317,10 @@ class _RegisteredFunction:
         entry = self._entry
         if entry is not None:
             return entry
-        fn_ir = astgen.parse_function(self._fn, self._kind)
+        self_type: Type | None = None
+        if self._ptr_self and self._method is not None:
+            self_type = PointerType(self._method, False)
+        fn_ir = astgen.parse_function(self._fn, self._kind, self_type)
         if self._kind == 'aot':
             if self._method is None:
                 # the fixed signature is the (concrete, complete)
@@ -430,7 +433,7 @@ def _recursion_ret_type_error(entry: FunctionEntry, arg_types: tuple[Type, ...])
     )
 
 
-def _build_instance_class(cls: type, desc: sval.StructType) -> type:
+def _build_instance_class(cls: sval, desc: sval.StructType) -> sval:
     """The Python class of the struct instances: a ctypes.Structure
     subclass whose memory follows the LLVM layout of the struct (the
     same layout the native code compiles against).
@@ -440,7 +443,7 @@ def _build_instance_class(cls: type, desc: sval.StructType) -> type:
     left out of ``_fields_`` and exposed instead as a read-only view
     that returns the field's unit value (in its Python form, see
     ``lower.zst_python_value``) without touching memory."""
-    fields: list[tuple[str, type]] = []
+    fields: list[tuple[str, sval]] = []
     attrs: dict[str, object] = {}
     for f in desc.fields:
         if f.type.get_unit_value() is not None:
@@ -452,7 +455,7 @@ def _build_instance_class(cls: type, desc: sval.StructType) -> type:
     attrs['_fields_'] = fields
     attrs['__module__'] = cls.__module__
     attrs['__doc__'] = cls.__doc__
-    py_cls = type(cls.__name__, (StructInstance,), attrs)
+    py_cls = sval(cls.__name__, (StructInstance,), attrs)
     py_cls.__spy_struct_type__ = desc  # type: ignore[attr-defined]
     return py_cls
 
@@ -516,17 +519,17 @@ def _check_zst_field_arg(desc: sval.StructType, field: StructField, value: objec
     A zero-sized field occupies no storage: its argument is only checked
     here, never written."""
     type = field.type
-    if isinstance(type, sval.VoidType):
+    if isinstance(type, type.VoidType):
         ok = value is None
-    elif isinstance(type, sval.IntType):
+    elif isinstance(type, type.IntType):
         ok = not isinstance(value, bool) and value == 0
     else:
-        assert isinstance(type, sval.StructType)
+        assert isinstance(type, type.StructType)
         ok = type._py_cls is not None and isinstance(value, type._py_cls)
     if not ok:
         what = (
             'its unit value (an empty instance of the struct)'
-            if isinstance(type, sval.StructType)
+            if isinstance(type, type.StructType)
             else f'its unit value ({zst_python_value(type)!r})'
         )
         raise TypeMismatchError(
@@ -602,7 +605,7 @@ class JitContext(FunctionResolver):
         return wrapper
     # -- struct types ----------------------------------------------------------
 
-    def _struct(self, cls: type) -> sval.StructType:
+    def _struct(self, cls: sval) -> sval.StructType:
         """Build the spy struct type of ``cls``: the fields from the
         annotations (in declaration order), the spy methods from the
         class members, and the Python class of the instances (a ctypes
@@ -999,7 +1002,7 @@ class JitContext(FunctionResolver):
                 ret = getattr(mir_fn, 'spy_ret', None)
                 assert ret is not None, f'internal error: {entry.fn.__name__} is not typed'
                 ft = _spec_function_type(entry, arg_types, ret)
-                entry.specs[arg_types] = LazyJitFunctionInstance(native, function_call_info(ft))
+                entry.specs[arg_types] = FunctionInstance(native, function_call_info(ft))
             result[key] = native
         return result
 
@@ -1100,34 +1103,6 @@ class JitContext(FunctionResolver):
         struct = self.resolve_global(value)
         assert isinstance(struct, sval.StructType)
         return struct
-
-    @override
-    def resolve_method(self, struct: sval.StructType, name: str) -> tuple[Any, bool] | None:
-        """The spy method ``name`` of ``struct`` as seen from inside a
-        compiled function body (see :class:`FunctionResolver`): the
-        entry of the registered ``@aot``/``@jit`` method, or the plain
-        Python function of an undecorated method (which the interpreter
-        inlines), together with its ``ptr_self`` flag.  ``None`` when
-        the struct has no such method."""
-        method = struct.methods.get(name)
-        if method is None:
-            return None
-        if isinstance(method, _RegisteredFunction):
-            if method._method is None:
-                method._method = struct
-                if name == '__init__':
-                    method._ptr_self = True
-            if method._context is not self:
-                raise CompileError(
-                    f"cannot call method {method.__name__} of struct "
-                    f'{struct.name} from another JitContext'
-                )
-            return method.entry(), method._ptr_self
-        if isinstance(method, FunctionType):
-            return method, False
-        raise CompileError(
-            f'method {name} of struct {struct.name} is not a spy method'
-        )
 
     def _register(
         self, fn: FunctionType, kind: str, ptr_self: bool = False

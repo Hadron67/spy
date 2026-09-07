@@ -34,8 +34,11 @@ being typed; calls within one LLVM module reference the callee's
 external declaration).
 """
 
+from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeAlias
+
+from typing_extensions import override
 
 from .errors import CompileError
 
@@ -47,6 +50,16 @@ from .errors import CompileError
 class Type:
     pass
 
+
+class VoidType:
+    """The void type, representing no value."""
+
+    def __repr__(self) -> str:
+        return 'void'
+
+VOID = VoidType()
+
+MayBeVoidType: TypeAlias = Type | VoidType
 
 @dataclass(frozen=True)
 class BoolType(Type):
@@ -108,7 +121,7 @@ class StructType(Type):
 
 @dataclass(frozen=True)
 class PointerType(Type):
-    elem: Type | None
+    elem: MayBeVoidType
     is_const: bool = False
 
 @dataclass(frozen=True)
@@ -117,7 +130,7 @@ class FunctionType(Type):
     pointer)."""
 
     args: tuple[Type, ...]
-    return_type: Type | None
+    return_type: MayBeVoidType
 
 
 def type_str(type: Type) -> str:
@@ -133,11 +146,11 @@ def type_str(type: Type) -> str:
         case FloatType():
             return 'f' + str(type.bits)
         case PointerType(elem):
-            return '*' + (type_str(elem) if elem is not None else 'void')
+            return '*' + str(elem)
         case StructType():
             return type.spy_type.name
         case FunctionType(args, ret):
-            return f'fn({", ".join(type_str(a) for a in args)}) -> {type_str(ret) if ret is not None else "void"}'
+            return f'fn({", ".join(type_str(a) for a in args)}) -> {ret}'
         case _:
             return str(type)
 
@@ -148,37 +161,38 @@ def type_str(type: Type) -> str:
 
 
 class Value:
-    pass
+    @abstractmethod
+    def get_type(self) -> MayBeVoidType:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
 class BoolValue(Value):
     value: bool
 
-    @property
-    def type(self) -> Type:
+    @override
+    def get_type(self) -> MayBeVoidType:
         return BoolType()
 
 
 @dataclass(frozen=True)
-class IntValue(Value):
+class Int(Value):
     value: int
-    bits: int
-    signed: bool
+    type: IntType
 
-    @property
-    def type(self) -> Type:
-        return IntType(self.bits, self.signed)
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
 
 
 @dataclass(frozen=True)
-class FloatValue(Value):
+class Float(Value):
     value: float
-    bits: int
+    type: FloatType
 
-    @property
-    def type(self) -> Type:
-        return FloatType(self.bits)
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
 
 
 @dataclass(frozen=True)
@@ -191,8 +205,8 @@ class Symbol(Value):
     name: str
     fn_type: FunctionType
 
-    @property
-    def type(self) -> Type:
+    @override
+    def get_type(self) -> MayBeVoidType:
         return PointerType(self.fn_type)
 
 
@@ -203,6 +217,10 @@ class Param(Value):
     index: int
     type: Type
     name: str = ''
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
 
 
 class Inst(Value):
@@ -215,18 +233,30 @@ class Inst(Value):
     def __hash__(self) -> int:
         return object.__hash__(self)
 
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return VOID
 
 @dataclass(eq=False)
 class Alloca(Inst):
     """Allocate a slot for one value; produces a pointer to ``type``."""
 
-    type: PointerType
+    type: Type
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return PointerType(self.type)
 
 
 @dataclass(eq=False)
 class Load(Inst):
     ptr: Value
-    type: Type
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        ptr_type = self.ptr.get_type()
+        assert isinstance(ptr_type, PointerType) and ptr_type.elem is not None
+        return ptr_type.elem
 
 
 @dataclass(eq=False)
@@ -273,6 +303,10 @@ class Arith(Inst):
     rhs: Value
     type: Type
 
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
 
 @dataclass(eq=False)
 class Convert(Inst):
@@ -282,6 +316,10 @@ class Convert(Inst):
     kind: str
     value: Value
     type: Type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
 
 
 @dataclass(eq=False)
@@ -295,8 +333,8 @@ class Cmp(Inst):
     lhs: Value
     rhs: Value
 
-    @property
-    def type(self) -> Type:
+    @override
+    def get_type(self) -> MayBeVoidType:
         return BoolType()
 
 
@@ -310,7 +348,11 @@ class Call(Inst):
 
     callee: Value
     args: tuple[Value, ...]
-    type: Type | None
+    type: MayBeVoidType
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
 
 
 @dataclass(eq=False)
@@ -320,6 +362,13 @@ class Ret(Inst):
     for a void return (a ``ret void``)."""
 
     value: Value | None
+
+
+@dataclass(eq=False)
+class Nop(Inst):
+    """A no-op instruction; used to reserve space in the MIR body for
+    a future instruction to be emitted at a known position."""
+
 
 
 @dataclass(eq=False)
@@ -381,55 +430,18 @@ class Function(Value):
     """One compiled MIR function.  As a value it is the in-module
     function value of a call target: a call whose callee is this object
     is lowered to a call of the ``define``d function (functions of one
-    module are compiled together).
-
-    The host creates the function (with an empty body) and registers it
-    before the body is typed, so that recursive calls made by the body
-    resolve to the very object being filled in.  ``ret_type`` is fixed
-    at creation when the function declares one; otherwise it stays
-    ``None`` until the body has been typed (a function still being
-    typed and without a declared return type can only be observed by a
-    recursive call, which then is a compile error).
-
-    The signature the object carries is the *lowered* (MIR) form: a
-    function whose return type is returned through a result pointer (see
-    ``type.returns_via_result_ptr``) has its trailing result pointer
-    formal appended to ``args`` and a ``None`` (void) ``ret_type`` - the
-    original return type is then kept in ``result_type`` - while a
-    direct-return function returns its value type (a function returning
-    a zero-sized type returns void: ``ret_type`` is ``None``).  ``interp``
-    performs this lowering when it decides the return type;
-    ``args``/``ret_type`` are the python formals and the logical return
-    type before that."""
+    module are compiled together)."""
 
     name: str
-    args: tuple[FormalArg, ...]
-    ret_type: Type | None
+    args: tuple[Type, ...]
+    arg_names: tuple[str | None, ...]
+    ret_type: MayBeVoidType
     insts: list[Inst]
-    # the return type of a function that delivers its result through a
-    # result pointer (``type.returns_via_result_ptr``): ``ret_type`` is
-    # then ``None`` (void) and ``args`` carries the trailing result
-    # pointer formal; None for a direct-return function
-    result_type: Type | None = None
 
-    @property
-    def logical_ret(self) -> Type | None:
-        """The logical return type of the function: the type its callers
-        see - ``result_type`` when the result is written through a result
-        pointer, ``ret_type`` otherwise (``None`` - void - for a
-        function returning no value)."""
-        return self.result_type if self.result_type is not None else self.ret_type
-
-    @property
-    def type(self) -> Type:
+    @override
+    def get_type(self) -> Type:
         """The type of the function value: a pointer to the function's
         (logical) signature - the callee side of calls in the MIR is
         always the *lowered* form, so this logical view is only used by
         the host."""
-        ret = self.logical_ret
-        args = self.args
-        if self.result_type is not None:
-            # drop the lowered trailing result pointer formal
-            assert len(args) > 0
-            args = args[:-1]
-        return PointerType(FunctionType(tuple(a.type for a in args), ret))
+        return PointerType(FunctionType(self.args, self.ret_type), True)

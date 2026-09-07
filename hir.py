@@ -105,17 +105,9 @@ class Arg(Value):
     index: int
 
 
-@dataclass(eq=False)
+@dataclass(frozen=True)
 class ResultLoc(Value):
-    """The result location of the function whose body is being executed:
-    a per-function leaf that only ever appears as the *target* of a
-    return statement (see :class:`Ret`).  ``astgen`` evaluates the
-    expression of a ``return`` into this location (result-location
-    semantics, like the ``ret`` of a :class:`CallInplace`); the
-    interpreter types it and decides from the function's return type how
-    the value is delivered: written into the result pointer of a
-    result-pointer function, or handed back as the return value of a
-    direct-return function."""
+    """The result location of the function whose body is being executed"""
 
 
 class Inst(Value):
@@ -137,7 +129,7 @@ class Alloca(Inst):
     given real memory, but an inlined callee's result is stored into it
     (see ``interp``).
     Function bodies start with one Alloca/Store pair per parameter."""
-
+    allow_comptime: bool = False
 
 @dataclass(eq=False)
 class Load(Inst):

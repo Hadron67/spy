@@ -134,12 +134,10 @@ class _Builder:
     of nested blocks look up names through the chain.
     """
 
-    def __init__(self, fn_ir: FunctionIR, scope: _Scope, ret_loc: hir.ResultLoc) -> None:
+    def __init__(self, fn: Any, fn_ir: FunctionIR, scope: _Scope) -> None:
+        self.fn = fn
         self._fn_ir = fn_ir
         self._scope = scope
-        # the result location of the function: the target of its return
-        # statements (see ``_gen_stmt``)
-        self._ret_loc = ret_loc
         self.insts: list[hir.Inst] = []
 
     def add(self, inst: hir.Inst) -> hir.Inst:
@@ -158,7 +156,7 @@ class _Builder:
                 # location the function returns through, instead of
                 # materializing a temporary value first
                 if node.value is not None:
-                    self._gen_result_loc(node.value, self._ret_loc)
+                    self._gen_result_loc(node.value, hir.ResultLoc())
                 self.add(hir.Ret())
             case ast.Pass():
                 pass
@@ -193,7 +191,7 @@ class _Builder:
         and ``End`` markers).  A branch is a lexical scope of its own -
         a child of the enclosing scope - so declarations inside it
         shadow outer bindings and are not visible after the block."""
-        sub = _Builder(self._fn_ir, _Scope(self._scope), self._ret_loc)
+        sub = _Builder(self._fn_ir, self.fn, _Scope(self._scope))
         for stmt in stmts:
             sub._gen_stmt(stmt)
         self.insts.extend(sub.insts)
@@ -242,7 +240,7 @@ class _Builder:
         k``), or None when the name is not a free variable.  A captured
         variable behaves like a global: the value of its closure cell at
         parse time is embedded as a compile-time constant."""
-        fn = self._fn_ir.fn
+        fn = self.fn
         closure = fn.__closure__
         if closure is not None:
             for i, free_var in enumerate(fn.__code__.co_freevars):
@@ -273,7 +271,7 @@ class _Builder:
         closure = self._resolve_closure(name)
         if closure is not None:
             return closure
-        fn = self._fn_ir.fn
+        fn = self.fn
         globals = fn.__globals__
         if name in globals:
             return globals[name]
@@ -468,7 +466,7 @@ class _Builder:
                 )
 
 
-def parse_function(fn: Callable, mode: str = 'jit') -> FunctionIR:
+def parse_function(fn: Callable, mode: str = 'jit', self_type: Type | None = None) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
     ``mode`` is how the function will be compiled and typed when it is
@@ -582,17 +580,20 @@ def parse_function(fn: Callable, mode: str = 'jit') -> FunctionIR:
     for i, arg in enumerate(all_args):
         has_default = i >= offset
         default_value = default_of(defaults[i - offset]) if has_default else None
+        arg_type = annotation_of(annotations.get(arg.arg))
+        if i == 0 and self_type is not None:
+            arg_type = self_type
         positional.add(
-            i, ParamDef(arg.arg, annotation_of(annotations.get(arg.arg)), default_value)
+            i, ParamDef(arg.arg, arg_type, default_value)
         )
+
     # spy function definitions reject *args/**kwargs (above), so the
     # ``*args``/``**kwargs`` parameters are always absent for now
     signature = Signature(
         generic_args, positional, None, None, annotation_of(ret_annotation)
     )
 
-    ir = FunctionIR(fn, node.name, mode, signature, ())
-    ir.ret_loc = hir.ResultLoc()
+    ir = FunctionIR(node.name, signature, ())
 
     # prologue: every parameter is addressable, so allocate one slot per
     # parameter and store its by-value argument into it.  The function
@@ -609,7 +610,7 @@ def parse_function(fn: Callable, mode: str = 'jit') -> FunctionIR:
         prologue.append(hir.Store(alloca, hir.Arg(i)))
         scope.bindings[param.name] = alloca
 
-    builder = _Builder(ir, scope, ir.ret_loc)
+    builder = _Builder(fn, ir, scope)
     for stmt in node.body:
         builder._gen_stmt(stmt)
     ir.body = tuple(prologue + builder.insts)
