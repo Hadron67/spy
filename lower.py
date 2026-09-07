@@ -20,8 +20,8 @@ from collections.abc import Sequence
 from llvmlite import binding as llvm
 
 from . import llvm as sllvm
-from . import mir
-from .errors import CompileError
+from . import mir, sval
+from .errors import CompileError, SpyError
 from .fn import NativeFn
 from .mir import (
     BoolType,
@@ -33,7 +33,6 @@ from .mir import (
     PointerType,
     StructType,
     Type,
-    VoidType,
     type_str,
 )
 
@@ -70,16 +69,17 @@ class _ModuleTypes:
     def __init__(self) -> None:
         self._structs: dict[StructType, sllvm.StructType] = {}
 
-    def to_llvm(self, type: Type) -> sllvm.Type:
+    def to_llvm(self, type: Type | None) -> sllvm.Type:
         match type:
+            case None:
+                # the MIR's "void": only the return type of a function
+                return sllvm.VoidType()
             case BoolType():
                 return sllvm.IntType(1)
             case IntType():
                 return sllvm.IntType(type.bits)
             case FloatType():
                 return sllvm.FloatType(type.bits)
-            case VoidType():
-                return sllvm.VoidType()
             case PointerType(elem):
                 return sllvm.PointerType(self.to_llvm(elem))
             case StructType():
@@ -97,9 +97,75 @@ class _ModuleTypes:
         return list(self._structs.values())
 
 
-def to_ctype(type: Type) -> type[ctypes._CDataType] | None:
+def zst_python_value(type: sval.Type) -> object:
+    """The Python-domain value of a zero-sized (ZST) spy type: what a
+    Python-side *read* of a field of this type yields.  A ZST occupies
+    no storage in the struct layout, so it cannot be loaded: its value
+    is always its canonical unit value, in its Python form - ``None``
+    for the void type, ``0`` for a zero-bit integer, an (empty)
+    instance of the struct's Python class for a zero-sized struct."""
+    match type:
+        case sval.VoidType():
+            return None
+        case sval.IntType():
+            # a zero-bit integer (``get_unit_value`` is not None)
+            assert type.bits == 0
+            return 0
+        case sval.StructType():
+            py_cls = type._py_cls
+            if py_cls is None:
+                raise SpyError(
+                    f'struct {type.name} is not bound to a JitContext; '
+                    'cannot read a value of it'
+                )
+            return py_cls()
+        case _:
+            raise CompileError(f'type {sval.type_str(type)} has no Python value')
+
+
+def struct_ctype(struct: StructType) -> type[ctypes.Structure]:
+    """The ctypes ``Structure`` subclass mirroring the memory layout of
+    the MIR struct ``struct`` - the Python-side memory *view* of a struct
+    value crossing the native boundary (the out buffer a native function
+    returning the struct writes into, see ``NativeFn.call``).  Its
+    fields follow the MIR struct (which mirrors the LLVM layout), so the
+    view always matches what the native code compiled against.
+
+    Zero-sized spy fields occupy no storage and are dropped from the MIR
+    struct: the view still exposes them, as read-only attributes that
+    return the field's unit value (see :func:`zst_python_value`) without
+    touching memory.
+
+    The class is built once and cached on ``struct.ctype``; the fields of
+    a nested struct are typed by the (cached) view classes of their own
+    MIR types."""
+    cls = struct.ctype
+    if cls is None:
+        fields = [(f.name, to_ctype(f.type)) for f in struct.fields]
+        # zero-sized fields of the spy struct have no mirror entry: they
+        # occupy no storage, but stay readable through the view
+        mir_names = {f.name for f in struct.fields}
+        attrs: dict[str, object] = {
+            '_fields_': fields,
+            '__module__': __name__,
+        }
+        spy = struct.spy_type
+        assert isinstance(spy, sval.StructType)
+        for f in spy.fields:
+            if f.name in mir_names:
+                continue
+            attrs[f.name] = property(lambda self, ft=f.type: zst_python_value(ft))
+        cls = type(spy.name, (ctypes.Structure,), attrs)  # type: ignore[call-overload]
+        struct.ctype = cls
+    return cls
+
+
+def to_ctype(type: Type | None) -> type[ctypes._CDataType] | None:
     """The ctypes type of a *result* of the native boundary (``None``
     for a void result); arguments use ``py_entry_arg_ctype``."""
+    if type is None:
+        # a void result: ctypes restype ``None``
+        return None
     match type:
         case BoolType():
             return ctypes.c_bool
@@ -112,11 +178,8 @@ def to_ctype(type: Type) -> type[ctypes._CDataType] | None:
             return ctypes.c_float if type.bits == 32 else ctypes.c_double
         case PointerType():
             return ctypes.c_void_p
-        case VoidType():
-            # a void result: ctypes restype ``None``
-            return None
         case StructType():
-            return type.ctype
+            return struct_ctype(type)
         case _:
             raise CompileError(f"type {type_str(type)} has no ctypes mapping")
 
@@ -140,7 +203,7 @@ class _Lowerer:
         self._lowered: dict[object, sllvm.Value] = {}
         self._declarations: dict[str, sllvm.DeclareFunction] = {}
 
-    def _to_llvm(self, type: Type) -> sllvm.Type:
+    def _to_llvm(self, type: Type | None) -> sllvm.Type:
         return self._types.to_llvm(type)
 
     def lower(self, fn: mir.Function) -> None:
@@ -445,7 +508,6 @@ def _ctypes_arg_thunk(
     performs the copy.  Spy-to-spy calls never go through it: they call
     the value-form function directly."""
     assert any(isinstance(a.type, StructType) for a in fn.args)
-    assert fn.ret_type is not None, f'function {fn.name} is not fully typed'
     thunk = sllvm.Function(f'{fn.name}.py')
     arg_types = tuple(
         sllvm.PointerType(types.to_llvm(a.type))
@@ -460,7 +522,8 @@ def _ctypes_arg_thunk(
         block.load(arg) if isinstance(a.type, StructType) else arg
         for a, arg in zip(fn.args, args)
     )
-    if isinstance(fn.ret_type, VoidType):
+    if fn.ret_type is None:
+        # a void return
         block.call(value_fn, *call_args)
         block.ret(None)
     else:
@@ -500,14 +563,13 @@ def _ctypes_ret_thunk(
     return thunk
 
 
-def _py_entry_ret_type(fn: mir.Function) -> Type:
+def _py_entry_ret_type(fn: mir.Function) -> Type | None:
     """The return type of the Python-facing entry of one MIR function:
     the entry of a by-value struct return is a void thunk (see
     ``_ctypes_ret_thunk``); every other entry returns the (lowered) MIR
-    return type."""
-    assert fn.ret_type is not None, f'function {fn.name} is not fully typed'
+    return type (``None`` - void - for a void function)."""
     if isinstance(fn.ret_type, StructType):
-        return VoidType()
+        return None
     return fn.ret_type
 
 
@@ -536,7 +598,6 @@ def compile_module(
     # both sides of every spy-to-spy call)
     llvm_fns: dict[str, sllvm.Function] = {}
     for fn in fns:
-        assert fn.ret_type is not None, f'function {fn.name} is not fully typed'
         llvm_fn = sllvm.Function(fn.name)
         llvm_fn.add_args(*(types.to_llvm(a.type) for a in fn.args))
         llvm_fn.set_return_type(types.to_llvm(fn.ret_type))
@@ -589,7 +650,6 @@ def compile_module(
 
     rets: list[NativeFn] = []
     for fn in fns:
-        assert fn.ret_type is not None, f'function {fn.name} is not fully typed'
         # spy-to-spy calls (in-module, recursive or across modules)
         # link to the value-form function; the ctypes entry bound below
         # is the pointer-form thunk, when one exists (see the thunk
@@ -611,6 +671,13 @@ def compile_module(
         restype = to_ctype(_py_entry_ret_type(fn))
         proto = ctypes.CFUNCTYPE(restype, *arg_ctypes)  # type: ignore[arg-type]
         entry = ctypes.cast(entry_addr, proto)
+        # a function that returns a struct hands the Python side a memory
+        # view of the result (see ``NativeFn.call``): materialize the
+        # view class of the struct type - derived from its MIR fields -
+        # so that ``ctype`` is ready when the call happens
+        logical = fn.result_type if fn.result_type is not None else fn.ret_type
+        if isinstance(logical, StructType):
+            struct_ctype(logical)
         ret = NativeFn(fn.name, tuple(a.type for a in fn.args), fn.ret_type, lines)
         ret.result_type = fn.result_type
         ret._engine = engine

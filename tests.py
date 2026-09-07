@@ -1575,6 +1575,49 @@ class StructTest(TestCase):
             fn(Wrong(0))
         self.assertIn("no field named 'y'", str(ctx.exception))
 
+    def test_struct_with_zero_sized_fields(self) -> None:
+        # a zero-sized field occupies no storage in the struct layout
+        # (it is dropped from the MIR struct and from the ctypes view):
+        # the Python side still reads it - its unit value, in Python
+        # form - without touching memory
+        @self.cache.struct()
+        class Marker:
+            pass
+
+        @self.cache.struct()
+        class Tagged:
+            tag: void
+            n: i32
+            marker: Marker
+
+        MarkerT: Any = Marker
+        TaggedT: Any = Tagged
+
+        @self.cache.aot()
+        def id(t: Tagged) -> Tagged:
+            return t
+
+        @self.cache.aot()
+        def read(t: Tagged) -> i32:
+            return t.n
+
+        # the view layout carries only the sized field
+        self.assertEqual([f[0] for f in TaggedT._py_cls._fields_], ['n'])
+        t = TaggedT(None, 3, MarkerT())
+        self.assertEqual(t.n, 3)
+        self.assertIsNone(t.tag)
+        self.assertIsInstance(t.marker, MarkerT._py_cls)
+        self.assertEqual(read(t), 3)
+        # a returned struct is the MIR-derived memory view: it reads the
+        # same way
+        o = id(t)
+        self.assertEqual(o.n, 3)
+        self.assertIsNone(o.tag)
+        self.assertIsInstance(o.marker, MarkerT._py_cls)
+        # the zero-sized field argument is its unit value only
+        with self.assertRaises(TypeMismatchError):
+            TaggedT(1, 2, MarkerT())
+
     # -- returning structs ---------------------------------------------------
     # a function may return a struct either directly (a small struct is
     # returned by value) or through a result pointer (a large one); the
@@ -1877,11 +1920,12 @@ class StructTest(TestCase):
 
 class SvalZstTest(TestCase):
     """The zero-sized (unit) type machinery of ``sval``: ZST
-    detection, the canonical unit values (``sval.Void()`` standing in
-    for the ``None`` the interpreter used before), the lowering
-    rules - any ZST mirrors to ``mir.VoidType`` and ZST fields are
-    dropped from the MIR mirror of a struct - and the skipping of
-    zero-sized function parameters."""
+    detection (a type has no runtime representation iff it mirrors to
+    ``None`` - the MIR's "void"), the canonical unit values
+    (``sval.Void()`` standing in for the ``None`` the interpreter used
+    before), the lowering rules - a ZST mirrors to ``None`` and ZST
+    fields are dropped from the MIR mirror of a struct - and the
+    skipping of zero-sized function parameters."""
 
     def setUp(self) -> None:
         self.cache = JitContext()
@@ -1890,34 +1934,39 @@ class SvalZstTest(TestCase):
         v = sval.Void()
         self.assertEqual(v.get_type(), sval.VoidType())
         self.assertEqual(sval.type_of(v), sval.VoidType())
-        self.assertTrue(sval.is_zst(sval.VoidType()))
-        self.assertTrue(sval.is_zst_value(v))
+        # the void type has no runtime representation: its mirror is None
+        self.assertIsNone(sval.to_mir_type(sval.VoidType()))
+        self.assertIsInstance(sval.VoidType().get_unit_value(), sval.Void)
         # ``None`` is normalized to the void value at the comptime side
         self.assertIsInstance(sval.as_value(None), sval.Void)
 
     def test_zst_detection(self) -> None:
-        self.assertTrue(sval.is_zst(sval.IntType(0, True)))
-        self.assertFalse(sval.is_zst(sval.IntType(32, True)))
-        self.assertFalse(sval.is_zst(sval.BoolType()))
-        self.assertFalse(sval.is_zst(sval.FloatType(64)))
+        self.assertIsNone(sval.to_mir_type(sval.IntType(0, True)))
+        self.assertEqual(
+            sval.to_mir_type(sval.IntType(32, True)), mir.IntType(32, True)
+        )
+        self.assertEqual(sval.to_mir_type(sval.BoolType()), mir.BoolType())
+        self.assertEqual(
+            sval.to_mir_type(sval.FloatType(64)), mir.FloatType(64)
+        )
         # an empty struct (and one whose fields are all ZSTs) is a ZST;
         # its unit value is an AggregateValue
         empty = sval.StructType('Empty')
-        self.assertTrue(sval.is_zst(empty))
+        self.assertIsNone(sval.to_mir_type(empty))
         self.assertEqual(empty.get_unit_value(), sval.AggregateValue((), empty))
         all_zst = sval.StructType('AllZst')
         all_zst.add_field('z', sval.VoidType())
-        self.assertTrue(sval.is_zst(all_zst))
+        self.assertIsNone(sval.to_mir_type(all_zst))
         # a struct with any sized field is not a ZST
         sized = sval.StructType('Sized')
         sized.add_field('x', sval.IntType(32, True))
-        self.assertFalse(sval.is_zst(sized))
+        self.assertEqual(sval.to_mir_type(sized), sized.get_mir_type())
 
-    def test_any_zst_lowers_to_mir_void(self) -> None:
-        self.assertEqual(sval.to_mir_type(sval.VoidType()), mir.VoidType())
-        self.assertEqual(sval.to_mir_type(sval.IntType(0, True)), mir.VoidType())
+    def test_any_zst_mirrors_to_none(self) -> None:
+        self.assertIsNone(sval.to_mir_type(sval.VoidType()))
+        self.assertIsNone(sval.to_mir_type(sval.IntType(0, True)))
         empty = sval.StructType('Empty')
-        self.assertEqual(sval.to_mir_type(empty), mir.VoidType())
+        self.assertIsNone(sval.to_mir_type(empty))
         self.assertEqual(
             sval.to_mir_type(sval.IntType(32, True)), mir.IntType(32, True)
         )
@@ -1928,14 +1977,12 @@ class SvalZstTest(TestCase):
         s.add_field('b', sval.IntType(32, True))
         s.add_field('c', sval.VoidType())
         s.add_field('d', sval.FloatType(64))
-        m = sval.struct_mir_type(s)
+        m = s.get_mir_type()
         assert isinstance(m, mir.StructType)
         self.assertEqual([f.name for f in m.fields], ['b', 'd'])
         # spy declaration indices map onto the mirror positions; a ZST
         # field itself has no position in the mirror
-        self.assertEqual(
-            [sval.struct_mir_index(s, i) for i in range(4)], [None, 0, None, 1]
-        )
+        self.assertEqual(s.get_field_mir_indices(), (None, 0, None, 1))
         # ZST fields contribute nothing to the layout
         self.assertEqual(sval._alignment_of(s), 8)
         self.assertEqual(sval._size_of(s), 16)
@@ -1949,7 +1996,7 @@ class SvalZstTest(TestCase):
             ),
             sval.IntType(32, True),
         )
-        info = sval.function_call_info(t)
+        info, fn_type = sval.function_call_info(t)
         # only the sized parameter occupies a lowered position
         self.assertEqual(info.total_mir_args, 1)
         self.assertIsNone(info.args_map[0])
@@ -1957,6 +2004,26 @@ class SvalZstTest(TestCase):
         assert m1 is not None
         self.assertEqual(m1.index, 0)
         self.assertIsNone(info.args_map[2])
+        # the lowered MIR signature mirrors the same argument list
+        self.assertEqual(
+            fn_type, mir.FunctionType((mir.IntType(32, True),), mir.IntType(32, True))
+        )
+
+    def test_function_call_info_of_a_result_pointer_return(self) -> None:
+        # a function returning a large aggregate carries the hidden
+        # result pointer as its trailing MIR argument and returns void
+        big = sval.StructType('Big')
+        for i in range(5):
+            big.add_field(f'f{i}', sval.IntType(64, False))
+        t = sval.FunctionType((), big)
+        info, fn_type = sval.function_call_info(t)
+        assert isinstance(info.return_info, sval.FunctionRetLocReturnInfo)
+        self.assertEqual(info.total_mir_args, 1)
+        self.assertEqual(info.return_info.arg_index, 0)
+        self.assertEqual(
+            fn_type,
+            mir.FunctionType((mir.PointerType(big.get_mir_type()),), None),
+        )
 
     def test_zst_parameters_and_self_are_skipped(self) -> None:
         # an empty struct is a zero-sized type: its methods' by-value

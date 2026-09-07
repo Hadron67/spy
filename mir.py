@@ -65,13 +65,6 @@ class FloatType(Type):
 
 
 @dataclass(frozen=True)
-class VoidType(Type):
-    """The return type of a void function (its body returns no value).
-    No runtime value ever has this type; a call of a void function
-    produces no result."""
-
-
-@dataclass(frozen=True)
 class FormalArg:
     name: str
     type: Type
@@ -89,6 +82,12 @@ class StructType(Type):
     struct follows the same order).  ``spy_type`` is a back reference to
     the spy-side descriptor, which carries the field names, the method
     table and the Python-side ctypes class.
+
+    ``ctype`` is the ctypes class mirroring the LLVM layout of the
+    struct (a plain ``ctypes.Structure`` subclass built from the MIR
+    fields, zero-sized spy fields excluded - they occupy no storage);
+    it is materialized on demand by ``lower`` when a value of the type
+    crosses the Python boundary, and cached here once built.
     """
 
     def __init__(
@@ -98,9 +97,7 @@ class StructType(Type):
     ) -> None:
         self.spy_type = spy_type
         self.fields = fields
-        # the ctypes Structure subclass mirroring the struct layout
-        # (the Python class of the instances, ``spy_type._py_cls``)
-        self.ctype: Any = None
+        self.ctype: Any = None  # lazily built from the MIR fields by ``lower``
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -111,7 +108,7 @@ class StructType(Type):
 
 @dataclass(frozen=True)
 class PointerType(Type):
-    elem: Type
+    elem: Type | None
     is_const: bool = False
 
 @dataclass(frozen=True)
@@ -120,7 +117,7 @@ class FunctionType(Type):
     pointer)."""
 
     args: tuple[Type, ...]
-    return_type: Type
+    return_type: Type | None
 
 
 def type_str(type: Type) -> str:
@@ -135,14 +132,12 @@ def type_str(type: Type) -> str:
             return ('i' if type.signed else 'u') + str(type.bits)
         case FloatType():
             return 'f' + str(type.bits)
-        case VoidType():
-            return 'void'
         case PointerType(elem):
-            return '*' + type_str(elem)
+            return '*' + (type_str(elem) if elem is not None else 'void')
         case StructType():
             return type.spy_type.name
         case FunctionType(args, ret):
-            return f'fn({', '.join(type_str(a) for a in args)}) -> {type_str(ret)}'
+            return f'fn({", ".join(type_str(a) for a in args)}) -> {type_str(ret) if ret is not None else "void"}'
         case _:
             return str(type)
 
@@ -307,13 +302,15 @@ class Cmp(Inst):
 
 @dataclass(eq=False)
 class Call(Inst):
-    """A call of a function value returning a value of type ``type``.
-    The callee is either a :class:`Function` (compiled in the same LLVM
-    module) or a :class:`Symbol` (compiled in an earlier module)."""
+    """A call of a function value returning a value of type ``type``
+    (``None`` for a call of a void function, which produces no
+    result).  The callee is either a :class:`Function` (compiled in the
+    same LLVM module) or a :class:`Symbol` (compiled in an earlier
+    module)."""
 
     callee: Value
     args: tuple[Value, ...]
-    type: Type
+    type: Type | None
 
 
 @dataclass(eq=False)
@@ -397,11 +394,13 @@ class Function(Value):
     The signature the object carries is the *lowered* (MIR) form: a
     function whose return type is returned through a result pointer (see
     ``type.returns_via_result_ptr``) has its trailing result pointer
-    formal appended to ``args`` and a ``void`` ``ret_type`` - the
+    formal appended to ``args`` and a ``None`` (void) ``ret_type`` - the
     original return type is then kept in ``result_type`` - while a
-    direct-return function returns its value type.  ``interp`` performs
-    this lowering when it decides the return type; ``args``/``ret_type``
-    are the python formals and the logical return type before that."""
+    direct-return function returns its value type (a function returning
+    a zero-sized type returns void: ``ret_type`` is ``None``).  ``interp``
+    performs this lowering when it decides the return type;
+    ``args``/``ret_type`` are the python formals and the logical return
+    type before that."""
 
     name: str
     args: tuple[FormalArg, ...]
@@ -409,15 +408,16 @@ class Function(Value):
     insts: list[Inst]
     # the return type of a function that delivers its result through a
     # result pointer (``type.returns_via_result_ptr``): ``ret_type`` is
-    # then ``void`` and ``args`` carries the trailing result pointer
-    # formal; None for a direct-return function
+    # then ``None`` (void) and ``args`` carries the trailing result
+    # pointer formal; None for a direct-return function
     result_type: Type | None = None
 
     @property
     def logical_ret(self) -> Type | None:
         """The logical return type of the function: the type its callers
         see - ``result_type`` when the result is written through a result
-        pointer, ``ret_type`` otherwise."""
+        pointer, ``ret_type`` otherwise (``None`` - void - for a
+        function returning no value)."""
         return self.result_type if self.result_type is not None else self.ret_type
 
     @property
@@ -427,7 +427,6 @@ class Function(Value):
         always the *lowered* form, so this logical view is only used by
         the host."""
         ret = self.logical_ret
-        assert ret is not None, 'the function is still being typed'
         args = self.args
         if self.result_type is not None:
             # drop the lowered trailing result pointer formal

@@ -45,8 +45,8 @@ class Type(Value):
         zero-sized), otherwise the one compile-time value every value of
         the type equals - ``Void()`` for the void type, ``Int(0, T)`` for
         a zero-bit integer, an ``AggregateValue`` for a struct whose
-        fields are all ZSTs.  A ZST has no runtime representation and
-        lowers to ``mir.VoidType``."""
+        fields are all ZSTs.  A ZST has no runtime representation: its
+        ``mir`` mirror is ``None`` (``to_mir_type`` returns ``None``)."""
         return None
 
 @dataclass(frozen=True)
@@ -73,8 +73,9 @@ class VoidType(Type):
     :class:`Void` (``sval.Void()``).  It is the spy type of ``None`` -
     the return type of a function that returns no value (declared as
     ``-> None``, or inferred for a body without value returns) - and it
-    has no runtime representation: it lowers to ``mir.VoidType`` and no
-    load/store is ever emitted for it (see :func:`is_zst`)."""
+    has no runtime representation: its ``mir`` mirror is ``None``
+    (``to_mir_type`` returns ``None``) and no load/store is ever
+    emitted for it."""
 
     @override
     def get_type(self) -> Type:
@@ -192,7 +193,7 @@ class FunctionReturnInfo:
 @dataclass(frozen=True)
 class FunctionValueReturnInfo(FunctionReturnInfo):
     """Return by value: No result location pointer, mir function returns `mir_type`."""
-    mir_type: mir.Type
+    mir_type: mir.Type | None
 
 @dataclass(frozen=True)
 class FunctionRetLocReturnInfo(FunctionReturnInfo):
@@ -252,9 +253,13 @@ class StructType(Type):
         # the Python class of the struct instances (a ctypes.Structure
         # subclass mirroring the LLVM layout); installed by the host
         self._py_cls: Any = None
-        # the MIR mirror of the type, created lazily when a function
-        # body needs it (see ``interp.to_mir_type``)
-        self._mir: mir.Type | None = None
+        # the MIR mirror of the type, created lazily when the lowering
+        # of a function body needs it (see ``to_mir_type``); None until
+        # then
+        self._mir: mir.StructType | None = None
+        # the mirror position of every field, in declaration order (see
+        # ``get_field_mir_indices``), computed together with the mirror
+        self._field_mir_indices: tuple[int | None, ...] | None = None
 
     def add_field(self, name: str, type: Type) -> None:
         assert all(f.name != name for f in self._fields)
@@ -319,6 +324,46 @@ class StructType(Type):
             values.append(val)
         return AggregateValue(tuple(values), self)
 
+    def _calculate_mir(self) -> None:
+        """Build (once) the MIR mirror of the struct together with the
+        position map of its fields: the fields whose spy type has no
+        runtime representation (``to_mir_type`` is ``None`` - a
+        zero-sized type) occupy no storage and are dropped from the
+        mirror, so a field's mirror position differs from its
+        declaration index, and a zero-sized field itself has no
+        position at all (its map entry is ``None``)."""
+        if self._mir is None:
+            assert self._field_mir_indices is None
+            fields: list[mir.FormalArg] = []
+            field_mir_indices: list[int | None] = []
+            for field in self._fields:
+                field_type = to_mir_type(field.type)
+                if field_type is None:
+                    field_mir_indices.append(None)
+                else:
+                    field_mir_indices.append(len(fields))
+                    fields.append(mir.FormalArg(field.name, field_type))
+            self._mir = mir.StructType(self, tuple(fields))
+            self._field_mir_indices = tuple(field_mir_indices)
+
+    def get_mir_type(self) -> mir.StructType:
+        """The (cached) MIR mirror of the struct: the one
+        :class:`mir.StructType` object every value of the struct
+        mirrors to (created lazily, shared by all users), with the
+        zero-sized fields dropped from the LLVM layout."""
+        self._calculate_mir()
+        assert self._mir is not None
+        return self._mir
+
+    def get_field_mir_indices(self) -> tuple[int | None, ...]:
+        """The mirror position of every field, in declaration order: the
+        i-th entry is the position of the i-th field in the mirror
+        returned by :meth:`get_mir_type` - zero-sized fields occupy no
+        position and map to ``None``."""
+        self._calculate_mir()
+        assert self._field_mir_indices is not None
+        return self._field_mir_indices
+
     def __eq__(self, value: object, /) -> bool:
         return self is value
 
@@ -370,42 +415,6 @@ def type_str(type: Type) -> str:
         case _:
             return str(type)
 
-
-def is_zst(type: Type) -> bool:
-    """Whether ``type`` is a zero-sized type (ZST, "unit type"): the unit
-    type itself (:class:`VoidType`), a zero-bit integer, a struct whose
-    fields are all ZSTs, ...  A ZST has no runtime representation: every
-    value of it is its canonical *unit value* (see
-    :meth:`Type.get_unit_value`), and it lowers to ``mir.VoidType``."""
-    return type.get_unit_value() is not None
-
-
-def is_zst_value(value: object) -> bool:
-    """Whether ``value`` is the unit value of a zero-sized type (a
-    ``sval.Value`` whose type is a ZST: ``Void()``, ``Int(0, T)`` with a
-    zero-bit ``T``, an ``AggregateValue`` of a ZST struct, ...)."""
-    if isinstance(value, Value):
-        return is_zst(value.get_type())
-    return False
-
-
-def struct_mir_index(type: StructType, spy_index: int) -> int | None:
-    """The position of the ``spy_index``-th spy field (declaration order)
-    in the MIR mirror of the struct - ZST fields are dropped from the
-    mirror (see :func:`struct_mir_type`), so the position differs from
-    the declaration index - or ``None`` when the field itself is a ZST
-    (it has no position in the mirror)."""
-    mir_index = 0
-    for i, field in enumerate(type.fields):
-        if i == spy_index:
-            return None if is_zst(field.type) else mir_index
-        if not is_zst(field.type):
-            mir_index += 1
-    raise CompileError(
-        f'field index {spy_index} is out of range for struct {type.name}'
-    )
-
-
 # ---------------------------------------------------------------------------
 # the return convention of a type: whether a function returning it returns a
 # value, or writes the result into a caller-provided result location
@@ -420,21 +429,22 @@ _AGGREGATE_VALUE_RETURN_LIMIT = 16
 def _alignment_of(type: Type) -> int:
     """The natural alignment of a type, in bytes (the layout rules of
     the ctypes instances - and of the LLVM structs they mirror - for the
-    types that may occur in a struct).  ZSTs occupy no storage and are
-    skipped inside aggregates."""
-    if is_zst(type):
-        # a zero-sized type has no alignment: it occupies no storage
-        return 0
+    types that may occur in a struct).  Zero-sized (ZST) types occupy no
+    storage and are skipped inside aggregates."""
     match type:
         case BoolType():
             return 1
         case IntType():
-            return type.bits // 8
+            return type.bits // 8 if type.bits != 0 else 1
         case FloatType():
             return type.bits // 8
         case StructType():
             return max(
-                (_alignment_of(f.type) for f in type.fields if not is_zst(f.type)),
+                (
+                    _alignment_of(f.type)
+                    for f in type.fields
+                    if f.type.get_unit_value() is None
+                ),
                 default=1,
             )
         case _:
@@ -446,19 +456,18 @@ def _size_of(type: Type) -> int:
     natural layout the ctypes instances - and the LLVM structs they
     mirror - use).  A ZST is zero-sized; ZST fields occupy no storage
     inside an aggregate."""
-    if is_zst(type):
-        return 0
     match type:
         case BoolType():
             return 1
         case IntType():
-            return type.bits // 8
+            return type.bits // 8 if type.bits != 0 else 0
         case FloatType():
             return type.bits // 8
         case StructType():
             offset = 0
             for field in type.fields:
-                if is_zst(field.type):
+                if field.type.get_unit_value() is not None:
+                    # a zero-sized field occupies no storage
                     continue
                 align = _alignment_of(field.type)
                 offset = (offset + align - 1) // align * align
@@ -490,34 +499,51 @@ def returns_via_result_ptr(type: Type) -> bool:
             return False
 
 
-def function_call_info(type: FunctionType) -> FunctionCallInfo:
+def function_call_info(type: FunctionType) -> tuple[FunctionCallInfo, mir.FunctionType]:
     """The lowering plan of one call of a function of this signature
     into MIR: how the by-value arguments map onto the positions of the
     lowered MIR argument list, and how the result is returned.  This is
     the single place the lowered form of a call is derived from the
     *function type* (so a future call through a function pointer lowers
-    identically): every argument keeps its position, a zero-sized (ZST)
-    parameter occupies no position and is not passed (it has no runtime
-    representation; the callee binds its own unit value), and a return
-    type delivered through a result location (see
+    identically): every argument keeps its position, a parameter whose
+    type has no runtime representation (``to_mir_type`` is ``None`` - a
+    zero-sized type) occupies no position and is not passed (it has no
+    runtime representation; the callee binds its own unit value), and a
+    return type delivered through a result location (see
     :func:`returns_via_result_ptr`) appends the hidden result pointer as
-    the trailing MIR argument."""
+    the trailing MIR argument.
+
+    Besides the call plan, the *lowered* MIR signature of the function
+    is returned: the :class:`mir.FunctionType` the lowered argument
+    list and return type form (the form a :class:`mir.Symbol` or
+    function value of the signature carries)."""
     args_map: list[FunctionCallArgInfo | None] = []
-    lowered = 0
+    mir_args: list[mir.Type] = []
     for arg in type.args:
-        if is_zst(arg.type):
+        mir_type = to_mir_type(arg.type)
+        if mir_type is None:
             args_map.append(None)
         else:
-            args_map.append(FunctionCallArgInfo(lowered))
-            lowered += 1
+            args_map.append(FunctionCallArgInfo(len(mir_args)))
+            mir_args.append(mir_type)
     if returns_via_result_ptr(type.return_type):
+        # the result is written into a caller-provided location whose
+        # address is appended as the trailing MIR argument; the lowered
+        # function returns void
+        result_type = to_mir_type(type.return_type)
+        assert result_type is not None
         return FunctionCallInfo(
-            lowered + 1, tuple(args_map), FunctionRetLocReturnInfo(arg_index=lowered)
-        )
-    return FunctionCallInfo(
-        lowered,
-        tuple(args_map),
-        FunctionValueReturnInfo(mir_type=to_mir_type(type.return_type)),
+            len(mir_args) + 1,
+            tuple(args_map),
+            FunctionRetLocReturnInfo(arg_index=len(mir_args)),
+        ), mir.FunctionType(tuple(mir_args) + (mir.PointerType(result_type),), None)
+    return (
+        FunctionCallInfo(
+            len(mir_args),
+            tuple(args_map),
+            FunctionValueReturnInfo(mir_type=to_mir_type(type.return_type)),
+        ),
+        mir.FunctionType(tuple(mir_args), to_mir_type(type.return_type)),
     )
 
 
@@ -528,52 +554,43 @@ def function_call_info(type: FunctionType) -> FunctionCallInfo:
 # ---------------------------------------------------------------------------
 
 
-def to_mir_type(type: Type) -> mir.Type:
+def to_mir_type(type: Type) -> mir.Type | None:
     """The MIR mirror of a spy type: the static type the runtime register
     of a value of ``type`` has.  The mapping is one-to-one over the types
     that can cross into runtime code.  A zero-sized type has no runtime
-    representation and mirrors to ``mir.VoidType`` (a function whose
-    return type is a ZST returns void); a spy struct type mirrors to one
-    :class:`mir.StructType` object (created lazily and cached on the
-    descriptor), so that all values of one struct share one identity."""
-    if is_zst(type):
-        return mir.VoidType()
+    representation and mirrors to ``None`` (the MIR's "void": a function
+    whose return type is a ZST returns void); a spy struct type mirrors
+    to one :class:`mir.StructType` object (created lazily and cached on
+    the descriptor), so that all values of one struct share one
+    identity.  Types with no MIR mirror at all (``TypeType``,
+    ``AnyFunction``, ...) are a compile error."""
     match type:
         case BoolType():
             return mir.BoolType()
         case IntType():
-            return mir.IntType(type.bits, type.signed)
+            return None if type.bits == 0 else mir.IntType(type.bits, type.signed)
         case FloatType():
             return mir.FloatType(type.bits)
+        case VoidType():
+            return None
         case StructType():
-            return struct_mir_type(type)
-        case PointerType(elem, _):
-            # const-ness is not tracked in the MIR
-            return mir.PointerType(to_mir_type(elem))
-        case FunctionType(args, ret):
-            return mir.FunctionType(tuple(to_mir_type(a.type) for a in args), to_mir_type(ret))
+            # a struct whose fields are all zero-sized has no runtime
+            # representation of its own (every value of it is its
+            # canonical unit value): it mirrors to void
+            if type.get_unit_value() is not None:
+                return None
+            return type.get_mir_type()
+        case PointerType():
+            return mir.PointerType(to_mir_type(type.elem), type.is_const)
+        case FunctionType():
+            args: list[mir.Type] = []
+            for arg in type.args:
+                mir_type = to_mir_type(arg.type)
+                if mir_type is not None:
+                    args.append(mir_type)
+            return mir.FunctionType(tuple(args), to_mir_type(type.return_type))
         case _:
             raise CompileError(f"spy type {type!r} has no MIR representation")
-
-
-def struct_mir_type(type: StructType) -> mir.Type:
-    """The (cached) MIR mirror of one spy struct type: fields in
-    declaration order, mirroring the LLVM layout of the struct.  ZST
-    fields occupy no storage and are dropped from the mirror (their
-    declaration positions are mapped to the mirror by
-    :func:`struct_mir_index`)."""
-    ret = type._mir
-    if ret is not None:
-        return ret
-    fields: list[mir.FormalArg] = []
-    for field in type.fields:
-        if is_zst(field.type):
-            continue
-        fields.append(mir.FormalArg(field.name, to_mir_type(field.type)))
-    ret = mir.StructType(type, tuple(fields))
-    ret.ctype = type._py_cls
-    type._mir = ret
-    return ret
 
 # ---------------------------------------------------------------------------
 # mapping Python values to spy types

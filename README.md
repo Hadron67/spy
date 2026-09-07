@@ -55,7 +55,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 
 类型注解同时也是**编译期值**：`spy.typeof(x)` 返回 `x` 的静态类型，可以与类型值比较做编译期分发。
 
-**单位类型（ZST）**：`-> None` 的 void 类型 `VoidType` 是一个**零大小类型**（zero-sized type，ZST）。ZST 没有运行时表示——任何 ZST 都 lower 成 `mir.VoidType`（函数返回类型是 ZST 就返回 void），ZST 的 slot 不落内存、不产生 load/store，结构体里的 ZST 字段不占布局、不会进入 MIR 结构体（零位整型、字段全为 ZST 或空的结构体也属于 ZST）。**ZST 函数参数同样跳过**：不进入 MIR 签名、调用时不传参（方法按值绑定的 `self` 若是 ZST 结构体也一样跳过），函数体内该参数读到的是类型的单位值。在编译期，"无值"用其单位值 `sval.Void()` 表示，取代原先的 `None` 哨兵；读取 ZST 字段直接得到该类型的单位值。
+**单位类型（ZST）**：`-> None` 的 void 类型 `VoidType` 是一个**零大小类型**（zero-sized type，ZST）。ZST 没有运行时表示——`to_mir_type` 对任何 ZST 都返回 `None`（MIR 里不存在 void 类型，函数返回类型是 ZST 就返回 void，即 `None`）——ZST 的 slot 不落内存、不产生 load/store，结构体里的 ZST 字段不占布局、不会进入 MIR 结构体（零位整型、字段全为 ZST 或空的结构体也属于 ZST）。**ZST 函数参数同样跳过**：不进入 MIR 签名、调用时不传参（方法按值绑定的 `self` 若是 ZST 结构体也一样跳过），函数体内该参数读到的是类型的单位值。在编译期，"无值"用其单位值 `sval.Void()` 表示，取代原先的 `None` 哨兵；读取 ZST 字段直接得到该类型的单位值。
 
 泛型：函数可以用 PEP 695 的 `[T]` 语法（需要 Python 3.13+）。在 `jit` 模式下参数注解不影响特化的选取（由实参 marshaled 出的类型决定），但注解为同一个 `T` 的参数必须统一成同一类型；**声明了返回注解时，它决定该特化的返回类型**（递归函数必须有，见下）。
 

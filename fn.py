@@ -48,17 +48,17 @@ class NativeFn:
     ``arg_types``/``ret_type`` are the *lowered* signature (see
     ``mir.returns_via_result_ptr``): a function that returns through a
     result pointer carries its trailing result pointer formal in
-    ``arg_types``, a void ``ret_type`` and its logical return type in
-    ``result_type``.  The Python-facing ``_entry`` is pointer-ABI form
-    (see ``lower.compile_module``)."""
+    ``arg_types``, a ``None`` (void) ``ret_type`` and its logical return
+    type in ``result_type``.  The Python-facing ``_entry`` is
+    pointer-ABI form (see ``lower.compile_module``)."""
 
     name: str
     arg_types: tuple[mir.Type, ...]
-    ret_type: mir.Type
+    ret_type: mir.Type | None
     lines: list[str] = field(default_factory=list)
     # the return type of a result-pointer function (``ret_type`` is then
-    # void and ``arg_types`` carries the trailing result pointer formal);
-    # None for a direct-return function
+    # ``None`` and ``arg_types`` carries the trailing result pointer
+    # formal); None for a direct-return function
     result_type: mir.Type | None = None
     _engine: object = None  # type: ignore[assignment]
     _addr: int = 0
@@ -69,7 +69,10 @@ class NativeFn:
         if isinstance(logical, mir.StructType):
             # the Python-facing entry writes the result into an out buffer
             # (see ``lower.compile_module``): allocate the instance, pass
-            # its address as the trailing argument and return it
+            # its address as the trailing argument and return it.  The
+            # class of the buffer is the ctypes view of the struct's MIR
+            # layout (``lower.struct_ctype``), materialized when the
+            # function was compiled
             out = logical.ctype()
             self._entry(*values, ctypes.addressof(out))
             return out
@@ -87,11 +90,13 @@ class NativeFn:
 class LazyJitFunctionInstance:
     """The compiled artifact of one ``@jit`` specialization: its native
     function (what a Python-side call invokes, see :class:`NativeFn`)
-    and the call lowering plan a spy function body follows when it
-    calls the specialization (see ``type.function_call_info``)."""
+    and the lowering result its spy function type yields - the call
+    lowering plan a spy function body follows when it calls the
+    specialization, together with its lowered MIR signature (see
+    ``type.function_call_info``)."""
 
     native_fn: NativeFn
-    call_info: FunctionCallInfo
+    call_info: tuple[FunctionCallInfo, mir.FunctionType]
 
 
 class LazyJitFunction(Value):

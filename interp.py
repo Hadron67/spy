@@ -352,6 +352,28 @@ def _unsupported_type_error(op: str, type: sval.Type | None) -> CompileError:
 
 
 
+def _is_unit_value(value: sval.AnyValue) -> bool:
+    """Whether a compile-time object is the unit value of a zero-sized
+    type - a value with no runtime representation (``sval.Void()``, a
+    zero-bit ``sval.Int``, the ``AggregateValue`` of a zero-sized
+    struct, ...).  Python scalars and compile-time-only objects (type
+    descriptors, functions) are not."""
+    if not isinstance(value, sval.Value):
+        return False
+    return value.get_type().get_unit_value() is not None
+
+
+def _mirror_of(type: sval.Type) -> mir.Type:
+    """The MIR mirror of a spy type that is guaranteed to have a runtime
+    representation - the operand of a typed instruction (a load, a
+    conversion, an arithmetic operation, ... never involves a
+    zero-sized value).  ``sval.to_mir_type`` returns ``None`` exactly
+    for the zero-sized types."""
+    ret = sval.to_mir_type(type)
+    assert ret is not None
+    return ret
+
+
 def _to_runtime(ev: InterpVal, target: sval.Type | None) -> tuple[mir.Value, sval.Type]:
     """Materialize a value as a typed runtime value: runtime values must
     already have the target type, compile-time values adopt it (or,
@@ -366,7 +388,7 @@ def _to_runtime(ev: InterpVal, target: sval.Type | None) -> tuple[mir.Value, sva
             )
         return value, ev.type
     if isinstance(ev, ComptimeVal):
-        if sval.is_zst_value(ev.obj):
+        if _is_unit_value(ev.obj):
             raise CompileError(
                 'a zero-sized (void) value has no runtime representation'
             )
@@ -413,7 +435,7 @@ def _call_arg_values(
     materialized to the value of its formal type (defaults included)."""
     values: list[mir.Value | None] = []
     for i, param in enumerate(fn_ir.params):
-        if sval.is_zst(formal[i]):
+        if sval.to_mir_type(formal[i]) is None:
             values.append(None)
             continue
         if i < len(evals):
@@ -449,7 +471,7 @@ def _bind_frame_args(
     out: list[InterpVal] = []
     for i, param in enumerate(fn_ir.params):
         t = formal[i]
-        if sval.is_zst(t):
+        if sval.to_mir_type(t) is None:
             unit = t.get_unit_value()
             assert unit is not None
             out.append(ComptimeVal(unit))
@@ -679,12 +701,13 @@ decision).  The return convention of the function is decided here
         lowered = 0
         arg_evals: list[InterpVal] = []
         for i, t in enumerate(arg_types):
-            if sval.is_zst(t):
+            mir_type = sval.to_mir_type(t)
+            if mir_type is None:
                 unit = t.get_unit_value()
                 assert unit is not None
                 arg_evals.append(ComptimeVal(unit))
                 continue
-            param = mir.Param(lowered, sval.to_mir_type(t), fn_ir.params[i].name)
+            param = mir.Param(lowered, mir_type, fn_ir.params[i].name)
             arg_evals.append(RuntimeVal(param, t))
             lowered += 1
         frame.arg_values = tuple(arg_evals)
@@ -730,7 +753,7 @@ decision).  The return convention of the function is decided here
             # a result-pointer function: its MIR signature was lowered to
             # a trailing result pointer formal and a void return when the
             # mode was bound (see ``_bind_result_ptr``)
-            fn.ret_type = mir.VoidType()
+            fn.ret_type = None
         else:
             fn.ret_type = sval.to_mir_type(ret_type)
         return ret_type
@@ -802,11 +825,12 @@ decision).  The return convention of the function is decided here
                 'cannot return a value from a void function (its return '
                 'type is None)'
             )
-        if isinstance(ev, ComptimeVal) and sval.is_zst_value(ev.obj) and target is None:
+        if isinstance(ev, ComptimeVal) and _is_unit_value(ev.obj):
             # the value of a void expression (e.g. a call of a void
-            # function) in return position: the function is void
-            return
-        if isinstance(ev, ComptimeVal) and sval.is_zst_value(ev.obj):
+            # function) in return position
+            if target is None:
+                # ... and no return type is declared: the function is void
+                return
             raise CompileError(
                 'cannot return a void (zero-sized) value: functions must '
                 'return a value'
@@ -894,7 +918,7 @@ decision).  The return convention of the function is decided here
             # the value was written in place (a constructor): load it
             # back to return it
             assert retloc.type is not None
-            value = self._emit(mir.Load(retloc.ptr, sval.to_mir_type(retloc.type)))
+            value = self._emit(mir.Load(retloc.ptr, _mirror_of(retloc.type)))
             retloc.ptr = None
             retloc.type = None
             self._emit(mir.Ret(value))
@@ -976,7 +1000,7 @@ decision).  The return convention of the function is decided here
                         # load it back to yield it
                         assert retloc.type is not None
                         value: InterpVal | None = RuntimeVal(
-                            self._emit(mir.Load(retloc.ptr, sval.to_mir_type(retloc.type))),
+                            self._emit(mir.Load(retloc.ptr, _mirror_of(retloc.type))),
                             retloc.type,
                         )
                         retloc.ptr = None
@@ -1028,7 +1052,7 @@ decision).  The return convention of the function is decided here
             case hir.CallMethodInplace():
                 self._exec_call_method(inst)
             case hir.FieldAddr():
-                regs[inst] = self._exec_field_addr(self._operand(inst.base), inst.name)
+                regs[inst] = self._field_addr(self._operand(inst.base), inst.name)
             case _:
                 raise CompileError(f"unsupported instruction {type(inst).__name__}")
 
@@ -1271,7 +1295,7 @@ decision).  The return convention of the function is decided here
         resume = frame.resume
         assert resume is not None
         inst, is_ctor = resume
-        if frame.ret_type is not None and not sval.is_zst(frame.ret_type):
+        if frame.ret_type is not None and sval.to_mir_type(frame.ret_type) is not None:
             # every runtime path that returned stored its value into the
             # shared result location: only the caller's walk resumes
             return
@@ -1331,16 +1355,14 @@ decision).  The return convention of the function is decided here
         match ev:
             case RuntimeVal(_, type):
                 t = type
-                unit = sval.is_zst(t)
+                unit = sval.to_mir_type(t) is None
             case ComptimeVal(obj):
-                if sval.is_zst_value(obj):
+                t = sval.type_of(obj)
+                if t is not None and _is_unit_value(obj):
                     # the unit value of a zero-sized type (the void
                     # value of a bare ``return``, ...): no memory
-                    t = sval.type_of(obj)
-                    assert t is not None
                     unit = True
                 else:
-                    t = sval.type_of(obj)
                     if t is None or not isinstance(
                         t, (sval.BoolType, sval.IntType, sval.FloatType)
                     ):
@@ -1497,14 +1519,14 @@ decision).  The return convention of the function is decided here
                 return ptr.value
             assert ptr.type is not None
             return RuntimeVal(
-                self._emit(mir.Load(ptr.ptr, sval.to_mir_type(ptr.type))), ptr.type
+                self._emit(mir.Load(ptr.ptr, _mirror_of(ptr.type))), ptr.type
             )
         if isinstance(ptr, RuntimeVal):
             ptype = ptr.type
             if not isinstance(ptype, sval.PointerType):
                 raise CompileError(f"cannot load from a {sval.type_str(ptype)} value")
             return RuntimeVal(
-                self._emit(mir.Load(ptr.value, sval.to_mir_type(ptype.elem))), ptype.elem
+                self._emit(mir.Load(ptr.value, _mirror_of(ptype.elem))), ptype.elem
             )
         raise CompileError('cannot load from a compile-time pointer')
 
@@ -1523,7 +1545,7 @@ decision).  The return convention of the function is decided here
                 ptr.value = value
             return
         if isinstance(ptr, PendingSlot):
-            if isinstance(value, ComptimeVal) and sval.is_zst_value(value.obj):
+            if isinstance(value, ComptimeVal) and _is_unit_value(value.obj):
                 # a store of a zero-sized (unit) value: it occupies no
                 # storage - the slot records it (its loads hand the value
                 # out directly) and nothing is emitted: no alloca, no
@@ -1539,7 +1561,7 @@ decision).  The return convention of the function is decided here
                     )
                 if ptr.value is not None and not (
                     isinstance(ptr.value, ComptimeVal)
-                    and sval.is_zst_value(ptr.value.obj)
+                    and _is_unit_value(ptr.value.obj)
                 ):
                     # the slot only recorded an RLS result with a runtime
                     # representation: a unit value cannot overwrite it
@@ -1553,7 +1575,7 @@ decision).  The return convention of the function is decided here
                 ptr.value = value
                 return
             if ptr.ptr is None and ptr.value is not None:
-                if isinstance(ptr.value, ComptimeVal) and sval.is_zst_value(
+                if isinstance(ptr.value, ComptimeVal) and _is_unit_value(
                     ptr.value.obj
                 ):
                     # the slot only ever held a zero-sized value: a value
@@ -1641,7 +1663,7 @@ decision).  The return convention of the function is decided here
             # pointer local, ...): load the pointer stored in it and
             # follow it
             assert ev.ptr is not None
-            ev = RuntimeVal(self._emit(mir.Load(ev.ptr, sval.to_mir_type(t))), t)
+            ev = RuntimeVal(self._emit(mir.Load(ev.ptr, _mirror_of(t))), t)
         if not isinstance(ev, RuntimeVal):
             raise CompileError('cannot access the fields of this value')
         value = ev.value
@@ -1656,7 +1678,7 @@ decision).  The return convention of the function is decided here
             # the base is a pointer to a pointer to a struct (the address
             # of a pointer-valued field or variable): load the pointer
             # stored there before going on
-            value = self._emit(mir.Load(value, sval.to_mir_type(elem)))
+            value = self._emit(mir.Load(value, _mirror_of(elem)))
             elem = elem.elem
         if not isinstance(elem, sval.StructType):
             raise CompileError(
@@ -1665,7 +1687,7 @@ decision).  The return convention of the function is decided here
             )
         return value, elem
 
-    def _exec_field_addr(self, ptr: InterpVal, name: str) -> InterpVal:
+    def _field_addr(self, ptr: InterpVal, name: str) -> InterpVal:
         """One step of an attribute chain on a struct value: the address
         of the field ``name`` of the struct the base ``ptr`` denotes
         (the base's pointer layers are auto-dereferenced here).
@@ -1678,8 +1700,9 @@ decision).  The return convention of the function is decided here
         slot.
 
         A zero-sized (ZST) field has no position in the struct layout
-        (see ``sval.struct_mir_type``): its address is the indeterminate
-        value (``sval.Undefined``)."""
+        (it is dropped from the MIR mirror, see ``sval.StructType.
+        get_field_mir_indices``): its address is the indeterminate value
+        (``sval.Undefined``)."""
         ptr = self._auto_deref(_normalize(ptr))
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
@@ -1693,7 +1716,7 @@ decision).  The return convention of the function is decided here
                 f"type {sval.type_str(container_type)} has no field named '{name}'"
             )
         field_type = container_type.fields[index].type
-        mir_index = sval.struct_mir_index(container_type, index)
+        mir_index = container_type.get_field_mir_indices()[index]
         if mir_index is None:
             return ComptimeVal(sval.Undefined(sval.PointerType(field_type, type.is_const)))
 
@@ -1751,13 +1774,13 @@ decision).  The return convention of the function is decided here
                 kind = 'sext' if from_type.signed else 'zext'
             else:
                 kind = 'trunc'
-            return self._emit(mir.Convert(kind, value, sval.to_mir_type(to_type)))
+            return self._emit(mir.Convert(kind, value, _mirror_of(to_type)))
         if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.FloatType):
             kind = 'sitofp' if from_type.signed else 'uitofp'
-            return self._emit(mir.Convert(kind, value, sval.to_mir_type(to_type)))
+            return self._emit(mir.Convert(kind, value, _mirror_of(to_type)))
         if isinstance(from_type, sval.FloatType) and isinstance(to_type, sval.FloatType):
             kind = 'fpext' if from_type.bits < to_type.bits else 'fptrunc'
-            return self._emit(mir.Convert(kind, value, sval.to_mir_type(to_type)))
+            return self._emit(mir.Convert(kind, value, _mirror_of(to_type)))
         raise CompileError(
             f"cannot convert a {sval.type_str(from_type)} value to {sval.type_str(to_type)}"
         )
@@ -1796,7 +1819,7 @@ decision).  The return convention of the function is decided here
         lv = self._coerce(lhs, type)
         rv = self._coerce(rhs, type)
         signed = isinstance(type, sval.IntType) and type.signed
-        value = self._emit(mir.Arith(_ARITH_OPS[op], signed, lv, rv, sval.to_mir_type(type)))
+        value = self._emit(mir.Arith(_ARITH_OPS[op], signed, lv, rv, _mirror_of(type)))
         return RuntimeVal(value, type)
 
     def _eval_cmp(self, inst: hir.Compare) -> InterpVal:
@@ -1850,19 +1873,19 @@ decision).  The return convention of the function is decided here
                 raise CompileError(f"cannot apply 'not' to a {sval.type_str(type)} value")
             one = mir.BoolValue(True)
             return RuntimeVal(
-                self._emit(mir.Arith('xor', False, value, one, sval.to_mir_type(type))),
+                self._emit(mir.Arith('xor', False, value, one, _mirror_of(type))),
                 sval.BoolType(),
             )
         if op == 'neg':
             if isinstance(type, sval.FloatType):
                 zero = mir.FloatValue(0.0, type.bits)
                 return RuntimeVal(
-                    self._emit(mir.Arith('sub', False, zero, value, sval.to_mir_type(type))), type
+                    self._emit(mir.Arith('sub', False, zero, value, _mirror_of(type))), type
                 )
             if isinstance(type, sval.IntType):
                 zero = mir.IntValue(0, type.bits, type.signed)
                 return RuntimeVal(
-                    self._emit(mir.Arith('sub', False, zero, value, sval.to_mir_type(type))), type
+                    self._emit(mir.Arith('sub', False, zero, value, _mirror_of(type))), type
                 )
             raise CompileError(f"cannot negate a {sval.type_str(type)} value")
         raise CompileError(f"unsupported unary operator '{op}'")
@@ -2024,20 +2047,23 @@ decision).  The return convention of the function is decided here
         slot that already holds one is reused), or the result pointer of
         a result-pointer function.  The type is an aggregate (a struct
         today, arrays and others later); scalars never materialize."""
-        if sval.is_zst(type):
-            # a zero-sized type has no memory (its slots never fall, no
-            # loads/stores are emitted for them): nothing can address it
-            raise CompileError(
-                f'cannot give the zero-sized type {sval.type_str(type)} a memory location'
-            )
         if isinstance(loc, PendingSlot):
             if loc.ptr is None:
                 if loc.value is not None:
                     # the slot only recorded a scalar call result that was
                     # never materialized: it is discarded by this assignment
                     loc.value = None
-                loc.ptr = self._emit(mir.Alloca(mir.PointerType(sval.to_mir_type(type))))
                 loc.type = type
+                mir_type = sval.to_mir_type(type)
+                if mir_type is None:
+                    # a zero-sized type has no memory (its slots never
+                    # fall, no loads/stores are emitted for them): nothing
+                    # can address it
+                    raise CompileError(
+                        f'cannot give the zero-sized type {sval.type_str(type)} '
+                        'a memory location'
+                    )
+                loc.ptr = self._emit(mir.Alloca(mir.PointerType(mir_type)))
             elif loc.type is None or loc.type != type:
                 raise CompileError(
                     f'cannot write a {sval.type_str(type)} value into a slot that '
@@ -2056,7 +2082,13 @@ decision).  The return convention of the function is decided here
                     return loc.ptr
                 # a direct-return function (or an inlined body) returning
                 # a value written in place: give the location memory
-                loc.ptr = self._emit(mir.Alloca(mir.PointerType(sval.to_mir_type(type))))
+                mir_type = sval.to_mir_type(type)
+                if mir_type is None:
+                    raise CompileError(
+                        f'cannot give the zero-sized type {sval.type_str(type)} '
+                        'a memory location'
+                    )
+                loc.ptr = self._emit(mir.Alloca(mir.PointerType(mir_type)))
                 loc.type = type
                 loc.value = None
             elif loc.type is None or loc.type != type:
@@ -2123,8 +2155,7 @@ decision).  The return convention of the function is decided here
                 f"constructor {desc.name} takes {len(fields)} arguments "
                 f"(one per field), got {len(inst.args)}"
             )
-        for i, f in enumerate(fields):
-            mir_index = sval.struct_mir_index(desc, i)
+        for i, (f, mir_index) in enumerate(zip(fields, desc.get_field_mir_indices())):
             if mir_index is None:
                 # a zero-sized field: it has no storage to write
                 continue
@@ -2189,7 +2220,7 @@ decision).  The return convention of the function is decided here
         the struct itself) it is the struct loaded from its address, by
         pointer it is the address itself."""
         if type == struct:
-            value = self._emit(mir.Load(addr, sval.struct_mir_type(struct)))
+            value = self._emit(mir.Load(addr, struct.get_mir_type()))
             return RuntimeVal(value, struct)
         assert isinstance(type, sval.PointerType) and type.elem == struct
         return RuntimeVal(addr, type)
@@ -2262,11 +2293,14 @@ decision).  The return convention of the function is decided here
             assert arg is not None
         args = cast(tuple[mir.Value, ...], tuple(placed))
         if isinstance(info.return_info, sval.FunctionRetLocReturnInfo):
-            self._emit(mir.Call(callee, args, mir.VoidType()))
+            # the callee writes the result into the result location,
+            # whose address was placed as the trailing MIR argument: the
+            # call itself returns void (produces no value)
+            self._emit(mir.Call(callee, args, None))
             return InPlaceResult()
         assert isinstance(info.return_info, sval.FunctionValueReturnInfo)
         value = self._emit(mir.Call(callee, args, info.return_info.mir_type))
-        if sval.is_zst(ret_type):
+        if sval.to_mir_type(ret_type) is None:
             # a call whose result type is a zero-sized type (the void
             # type, a zero-bit integer, ...) produces no runtime value:
             # its compile-time value is the canonical unit value of the

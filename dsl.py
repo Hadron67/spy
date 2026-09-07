@@ -33,7 +33,7 @@ from .builtins import AsValue
 from .errors import CompileError, SpyError, TypeMismatchError
 from .fn import FunctionEntry, FunctionValue, LazyJitFunction, LazyJitFunctionInstance
 from .interp import FunctionResolver, HirRunner
-from .lower import NativeFn, compile_module
+from .lower import NativeFn, compile_module, zst_python_value
 from .sval import (
     BoolType,
     FloatType,
@@ -41,11 +41,11 @@ from .sval import (
     FunctionCallInfo,
     IntType,
     PointerType,
+    StructField,
     Type,
     Value,
     function_call_info,
     int_range,
-    is_zst,
     to_mir_type,
     type_of,
     type_str,
@@ -418,13 +418,26 @@ def _recursion_ret_type_error(entry: FunctionEntry, arg_types: tuple[Type, ...])
 def _build_instance_class(cls: type, desc: sval.StructType) -> type:
     """The Python class of the struct instances: a ctypes.Structure
     subclass whose memory follows the LLVM layout of the struct (the
-    same layout the native code compiles against)."""
-    fields = [(f.name, ctypes_of(f.type)) for f in desc.fields]
-    py_cls = type(
-        cls.__name__,
-        (StructInstance,),
-        {'_fields_': fields, '__module__': cls.__module__, '__doc__': cls.__doc__},
-    )
+    same layout the native code compiles against).
+
+    A zero-sized field has no runtime representation and occupies no
+    storage in the layout (like in the MIR mirror of the struct): it is
+    left out of ``_fields_`` and exposed instead as a read-only view
+    that returns the field's unit value (in its Python form, see
+    ``lower.zst_python_value``) without touching memory."""
+    fields: list[tuple[str, type]] = []
+    attrs: dict[str, object] = {}
+    for f in desc.fields:
+        if f.type.get_unit_value() is not None:
+            attrs[f.name] = property(
+                lambda self, ft=f.type: zst_python_value(ft)
+            )
+        else:
+            fields.append((f.name, ctypes_of(f.type)))
+    attrs['_fields_'] = fields
+    attrs['__module__'] = cls.__module__
+    attrs['__doc__'] = cls.__doc__
+    py_cls = type(cls.__name__, (StructInstance,), attrs)
     py_cls.__spy_struct_type__ = desc  # type: ignore[attr-defined]
     return py_cls
 
@@ -442,7 +455,10 @@ def _write_fields(
 ) -> None:
     """Write Python arguments into the fields of a fresh struct
     instance (in declaration order; keyword arguments by field
-    name)."""
+    name).  A zero-sized field takes its canonical unit value (in its
+    Python form - ``None`` for a void field, see
+    ``lower.zst_python_value``) and has no storage to write into: its
+    argument is checked and consumed without touching the instance."""
     fields = desc.fields
     bound: list[Any] = []
     names = [f.name for f in fields]
@@ -463,12 +479,45 @@ def _write_fields(
         missing = [n for n in names if n not in [b[0].name for b in bound]]
         raise TypeError(f"{desc.name}() missing required argument '{missing[0]}'")
     for field, value in bound:
+        if field.type.get_unit_value() is not None:
+            # a zero-sized field: its argument must be the canonical unit
+            # value (in its Python form), and nothing is stored - the
+            # field occupies no memory
+            _check_zst_field_arg(desc, field, value)
+            continue
         converted = _coerce_py(value, field.type, f"field '{field.name}' of {desc.name}")
         if isinstance(field.type, sval.StructType):
             # copy the memory of the nested struct into the field
             _copy_memory(instance, field.name, converted)
         else:
             setattr(instance, field.name, converted)
+
+
+def _check_zst_field_arg(desc: sval.StructType, field: StructField, value: object) -> None:
+    """The argument of a zero-sized field of a struct constructor is its
+    canonical unit value in Python form - ``None`` for a void field, ``0``
+    for a zero-bit integer, an (empty) instance of the struct's Python
+    class for a zero-sized struct field (see ``lower.zst_python_value``).
+    A zero-sized field occupies no storage: its argument is only checked
+    here, never written."""
+    type = field.type
+    if isinstance(type, sval.VoidType):
+        ok = value is None
+    elif isinstance(type, sval.IntType):
+        ok = not isinstance(value, bool) and value == 0
+    else:
+        assert isinstance(type, sval.StructType)
+        ok = type._py_cls is not None and isinstance(value, type._py_cls)
+    if not ok:
+        what = (
+            'its unit value (an empty instance of the struct)'
+            if isinstance(type, sval.StructType)
+            else f'its unit value ({zst_python_value(type)!r})'
+        )
+        raise TypeMismatchError(
+            f"the '{field.name}' field of {desc.name} is a zero-sized "
+            f'(void) field and must be {what}'
+        )
 
 class JitContext(FunctionResolver):
     """A cache of compiled spy functions; functions decorated by the
@@ -669,7 +718,7 @@ class JitContext(FunctionResolver):
         # typed from the arguments, none of which can marshal to a
         # zero-sized type
         if isinstance(entry, FunctionValue):
-            is_zst_param = tuple(is_zst(a.type) for a in entry.args)
+            is_zst_param = tuple(to_mir_type(a.type) is None for a in entry.args)
             assert len(is_zst_param) == len(params)
         else:
             is_zst_param = (False,) * len(params)
@@ -703,7 +752,7 @@ class JitContext(FunctionResolver):
             formal, _ = astgen.solve_call_types(fn_ir, 'jit', tuple(provided))
 
         marshaled: list[Any] = []
-        if not is_zst(self_type):
+        if to_mir_type(self_type) is not None:
             marshaled.append(_marshal(name, 'self', instance, self_type))
         for i, param in enumerate(rest):
             if param.name in present:
@@ -742,7 +791,7 @@ class JitContext(FunctionResolver):
         name = entry.fn.__name__
         params = fn_ir.params
         if isinstance(entry, FunctionValue):
-            is_zst_param = tuple(is_zst(a.type) for a in entry.args)
+            is_zst_param = tuple(to_mir_type(a.type) is None for a in entry.args)
             assert len(is_zst_param) == len(params)
         else:
             # a jit signature is typed from the provided arguments; a
@@ -898,9 +947,9 @@ class JitContext(FunctionResolver):
         else:
             ret_hint = astgen.solve_call_types(fn_ir, 'jit', arg_types)[1]
         args = tuple(
-            mir.FormalArg(fn_ir.params[i].name, to_mir_type(arg_types[i]))
-            for i in range(len(arg_types))
-            if not is_zst(arg_types[i])
+            mir.FormalArg(fn_ir.params[i].name, mir_type)
+            for i, mir_type in enumerate(to_mir_type(t) for t in arg_types)
+            if mir_type is not None
         )
         fn = mir.Function(
             symbol_of(entry.name_base, arg_types),
@@ -1009,26 +1058,30 @@ class JitContext(FunctionResolver):
         ``mir.Call`` by following the plan."""
         native = _native_spec(entry, arg_types)
         if native is not None:
-            # native function exists: external symbol call
-            fn_type = mir.FunctionType(native.arg_types, native.ret_type)
-            callee: mir.Value = mir.Symbol(native.name, fn_type)
+            # native function exists: external symbol call whose lowered
+            # signature is the one derived from the spy function type
+            # (see ``type.function_call_info``)
             ret = self._logical_spy_ret(entry, arg_types)
             if isinstance(entry, FunctionValue):
                 # an aot function has one specialization; its logical
                 # return type is the declared one, or the type inferred
                 # from the body of a method without a return annotation
                 # (see ``_logical_spy_ret``)
-                info = function_call_info(_spec_function_type(entry, arg_types, ret))
+                info, fn_type = function_call_info(
+                    _spec_function_type(entry, arg_types, ret)
+                )
             else:
-                # a jit specialization recorded its plan when it was
-                # registered (see ``_compile_module``)
+                # a jit specialization recorded its lowering result (the
+                # plan and the lowered signature) when it was registered
+                # (see ``_compile_module``)
                 instance = entry.specs.get(arg_types)
                 assert instance is not None, 'internal error: unregistered jit spec'
-                info = instance.call_info
+                info, fn_type = instance.call_info
+            callee: mir.Value = mir.Symbol(native.name, fn_type)
             return callee, ret, info
         fn = self._compile_mir(entry, arg_types)
         ret = self._logical_spy_ret(entry, arg_types)
-        info = function_call_info(_spec_function_type(entry, arg_types, ret))
+        info, _ = function_call_info(_spec_function_type(entry, arg_types, ret))
         return fn, ret, info
 
     @override
