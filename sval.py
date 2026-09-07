@@ -144,6 +144,14 @@ class PointerType(Type):
 
 
 @dataclass(frozen=True)
+class Undefined(Value):
+    type: Type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+@dataclass(frozen=True)
 class FormalArg:
     name: str
     type: Type

@@ -491,9 +491,15 @@ def _materialize_arg(ev: InterpVal, target: sval.Type, what: str) -> mir.Value:
             raise CompileError(f'cannot pass this value as {what}')
 
 
+def _normalize(ev: InterpVal) -> InterpVal:
+    if isinstance(ev, PendingSlot) and ev.ptr is not None and ev.type is not None:
+        return RuntimeVal(ev.ptr, sval.PointerType(ev.type, is_const=False))
+    else:
+        return ev
+
 def _type_of(ev: InterpVal) -> sval.Type | None:
     """The spy type of the value ``ev`` denotes, or None when it has
-    no spy representation (an un-typable compile-time object)."""
+    no spy representation (an un-typable compile-time object). Normalized values only"""
     match ev:
         case RuntimeVal(_, type):
             return type
@@ -1022,7 +1028,7 @@ decision).  The return convention of the function is decided here
             case hir.CallMethodInplace():
                 self._exec_call_method(inst)
             case hir.FieldAddr():
-                regs[inst] = self._exec_field_addr(inst)
+                regs[inst] = self._exec_field_addr(self._operand(inst.base), inst.name)
             case _:
                 raise CompileError(f"unsupported instruction {type(inst).__name__}")
 
@@ -1659,28 +1665,45 @@ decision).  The return convention of the function is decided here
             )
         return value, elem
 
-    def _exec_field_addr(self, inst: hir.FieldAddr) -> InterpVal:
+    def _exec_field_addr(self, ptr: InterpVal, name: str) -> InterpVal:
         """One step of an attribute chain on a struct value: the address
-        of the field ``inst.name`` of the struct ``inst.base`` denotes
-        (the base's pointer layers are auto-dereferenced here, see
-        ``_struct_addr_of``).
+        of the field ``name`` of the struct the base ``ptr`` denotes
+        (the base's pointer layers are auto-dereferenced here).
+
+        A storage base is normalized first: the slot of a struct
+        variable (or by-value parameter) holds the struct value itself,
+        and the slot of a pointer - a ``ptr_self`` ``self``, a pointer
+        variable - holds the address of the struct; the field lives in
+        the struct at the slot, or at the pointer loaded out of the
+        slot.
 
         A zero-sized (ZST) field has no position in the struct layout
-        (see ``sval.struct_mir_type``): its address cannot be taken.  A
-        read of it (the matching ``Load``) hands out the field type's
-        canonical unit value (``get_unit_value``) instead, without
-        emitting anything - a ZST field's value is statically its unit
-        value."""
-        ptr, type = self._struct_addr_of(self._operand(inst.base))
-        index = _field_index(type, inst.name)
-        field_type = type.fields[index].type
-        mir_index = sval.struct_mir_index(type, index)
+        (see ``sval.struct_mir_type``): its address is the indeterminate
+        value (``sval.Undefined``)."""
+        ptr = self._auto_deref(_normalize(ptr))
+        type = _type_of(ptr)
+        if type is None or not isinstance(type, sval.PointerType):
+            raise CompileError(f"cannot take field address of {ptr}")
+        container_type = type.elem
+        if not isinstance(container_type, sval.StructType):
+            raise CompileError(f"cannot take field address of {ptr}")
+        index = container_type.field_index(name)
+        if index is None:
+            raise CompileError(
+                f"type {sval.type_str(container_type)} has no field named '{name}'"
+            )
+        field_type = container_type.fields[index].type
+        mir_index = sval.struct_mir_index(container_type, index)
         if mir_index is None:
-            unit = field_type.get_unit_value()
-            assert unit is not None
-            return PendingSlot(type=field_type, value=ComptimeVal(unit))
-        value = self._emit(mir.Gep(ptr, mir_index))
-        return RuntimeVal(value, sval.PointerType(field_type, is_const=False))
+            return ComptimeVal(sval.Undefined(sval.PointerType(field_type, type.is_const)))
+
+        match ptr:
+            case ComptimeVal() | ComptimeRefVal():
+                raise NotImplementedError("TODO")
+            case RuntimeVal():
+                return RuntimeVal(self._emit(mir.Gep(ptr.value, mir_index)), sval.PointerType(field_type, type.is_const))
+            case _:
+                raise CompileError(f"cannot take field address of {ptr}")
 
     def _emit(self, inst: mir.Inst) -> mir.Value:
         """Append one instruction to the flat body of the function
