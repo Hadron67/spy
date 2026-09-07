@@ -1,14 +1,17 @@
-"""Lowering of Python source to the untyped HIR (``hir``), plus the shared
-signature analysis used both by the call boundary (``dsl``) and by
-compile-time calls inside a function body (``interp``).
+"""Lowering of Python source to the untyped HIR (``hir``).
 
 ``parse_function`` turns the source of a Python function into a
-:class:`FunctionIR`: the declared type parameters (PEP 695 ``[T]``
-syntax), the formal parameters and the translated body.  The parameter
-annotations, default values and return annotation are read off the
-function object itself (``fn.__annotations__``/``fn.__defaults__``/...),
-where Python has already evaluated them at definition time, so the
-source expressions are never re-evaluated.
+:class:`FunctionIR`: its signature - the declared generic type
+parameters (PEP 695 ``[T]``), the formal parameters and the return
+annotation - and the translated body.  The parameter annotations,
+default values and return annotation are read off the function object
+itself (``fn.__annotations__``/``fn.__defaults__``/...), where Python
+has already evaluated them at definition time, so the source
+expressions are never re-evaluated; like every compile-time object they
+are stored in the spy domain (``sval.as_value``, with the declared
+type parameters converted to ``sval.TypeVar``s).  The signature analysis
+itself - typing one call from its arguments - lives with
+:class:`Signature`/:class:`FunctionIR` in ``fn``, not here.
 
 Like ``symlat.jit.llvm`` the body is one *linear* list of instructions;
 expression evaluation appends temporary instructions to the list and
@@ -43,31 +46,30 @@ spy function - and which function value it stands for - is decided by
 the interpreter when a call runs: a function body may be parsed before
 its callees, or even itself (an aot function parses its own body while
 it is being registered), are registered.
-
-``solve_call_types`` computes the concrete spy types of all formal
-parameters of one call - and, together with them, the return type the
-callee's annotation declares for it:
-
-* in *jit* mode every provided argument contributes the type it marshals
-  to, and parameters annotated with the same type parameter ``T`` must
-  all marshal to the same type (``T`` is unified); the declared return
-  type is the return annotation when it is a concrete spy type, or the
-  bound type when the return annotation names a type parameter;
-* in *aot* mode the parameter types are simply the (concrete,
-  non-generic) annotations, and the declared return type is the
-  mandatory return annotation.
 """
 
 import ast
 import inspect
 import textwrap
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
+
+from spy.util import IndexedMap
 
 from . import hir
-from .errors import CompileError, TypeMismatchError
-from .fn import FunctionIR, ParamDef
-from .sval import Type, VoidType, type_of, type_str
+from .errors import CompileError
+from .fn import FunctionIR, ParamDef, Signature
+from .sval import (
+    AnyValue,
+    Type,
+    Value,
+    Void,
+    VoidType,
+    as_value,
+)
+from .sval import (
+    TypeVar as SpyTypeVar,
+)
 
 _BIN_OPS = {
     ast.Add: '+',
@@ -466,8 +468,15 @@ class _Builder:
                 )
 
 
-def parse_function(fn: Callable) -> FunctionIR:
-    """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`."""
+def parse_function(fn: Callable, mode: str = 'jit') -> FunctionIR:
+    """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
+
+    ``mode`` is how the function will be compiled and typed when it is
+    called (see ``FunctionIR.mode``): ``'jit'`` (the marshaled argument
+    types solve each specialization) or ``'aot'`` (the concrete
+    annotations fix its single signature).  A plain function that is
+    only ever inlined is parsed in ``'jit'`` mode.
+    """
     try:
         source = inspect.getsource(fn)
     except OSError as e:
@@ -518,30 +527,71 @@ def parse_function(fn: Callable) -> FunctionIR:
     # ``fn.__type_params__`` exposes the declared PEP 695 type parameters
     # (Python 3.13+); the AST ``[T]`` syntax may parse on 3.12, but the
     # annotation values of a generic function are only accessible there
-    # through ``__type_params__``.
+    # through ``__type_params__``.  Each PEP 695 type parameter object is
+    # converted into a spy-domain ``sval.TypeVar`` of its own, which the
+    # annotations that name the parameter refer to by identity (see
+    # ``sval.as_value``).
     declared_type_params = getattr(fn, '__type_params__', ())
     if len(node.type_params) > 0 and len(declared_type_params) == 0:
         raise CompileError(
             f"generic spy functions require Python 3.13 or newer (function {node.name})"
         )
-    type_params: list[TypeVar] = []
+    generic_args = IndexedMap[str, SpyTypeVar]()
+    type_vars: dict[TypeVar, Value] = {}
     for type_param in declared_type_params:
-        if isinstance(type_param, TypeVar):
-            type_params.append(type_param)
-        else:
+        if not isinstance(type_param, TypeVar):
             raise CompileError(
                 f"unsupported type parameter {type_param!r} in function {node.name}"
             )
+        spy = SpyTypeVar(type_param.__name__)
+        generic_args.add(type_param.__name__, spy)
+        type_vars[type_param] = spy
 
+    def convert(annotation: Any, what: str) -> AnyValue | None:
+        """The spy-domain value of one evaluated annotation or default
+        (see ``sval.as_value``); ``None`` (no annotation written, no
+        default) stays ``None``."""
+        if annotation is None:
+            return None
+        try:
+            return as_value(annotation, type_vars)
+        except Exception as e:
+            raise CompileError(
+                f"cannot use {annotation!r} as {what} of function {node.name}: {e}"
+            ) from e
+
+    def annotation_of(annotation: Any) -> Type | None:
+        # an annotation is a spy type or a type parameter in practice; a
+        # value that is neither is kept as-is and rejected by the aot
+        # discipline (``FunctionIR.aot_param_type``) when the function
+        # is used
+        return cast(Type | None, convert(annotation, 'the annotation'))
+
+    def default_of(value: Any) -> AnyValue | None:
+        # a default value of ``None`` is the unit value of the void type
+        # (see ``sval.as_value``): ``default_value`` being ``None`` means
+        # the parameter has no default
+        if value is None:
+            return Void()
+        return convert(value, 'a default value')
+
+    # the signature: the formal parameters, by declaration position
     all_args = list(node.args.args)
     offset = len(all_args) - len(defaults)
-    params: list[ParamDef] = []
+    positional = IndexedMap[int, ParamDef]()
     for i, arg in enumerate(all_args):
         has_default = i >= offset
-        default_value = defaults[i - offset] if has_default else None
-        params.append(ParamDef(arg.arg, annotations.get(arg.arg), has_default, default_value))
+        default_value = default_of(defaults[i - offset]) if has_default else None
+        positional.add(
+            i, ParamDef(arg.arg, annotation_of(annotations.get(arg.arg)), default_value)
+        )
+    # spy function definitions reject *args/**kwargs (above), so the
+    # ``*args``/``**kwargs`` parameters are always absent for now
+    signature = Signature(
+        generic_args, positional, None, None, annotation_of(ret_annotation)
+    )
 
-    ir = FunctionIR(fn, node.name, tuple(type_params), tuple(params), ret_annotation, ())
+    ir = FunctionIR(fn, node.name, mode, signature, ())
     ir.ret_loc = hir.ResultLoc()
 
     # prologue: every parameter is addressable, so allocate one slot per
@@ -550,6 +600,7 @@ def parse_function(fn: Callable) -> FunctionIR:
     # parameter slots, so an assignment to a parameter name at the top
     # level stores into the parameter slot.  The interpreter types an
     # Alloca when its first store runs.
+    params = positional.values()
     scope = _Scope(None)
     prologue: list[hir.Inst] = []
     for i, param in enumerate(params):
@@ -563,152 +614,3 @@ def parse_function(fn: Callable) -> FunctionIR:
         builder._gen_stmt(stmt)
     ir.body = tuple(prologue + builder.insts)
     return ir
-
-
-# ---------------------------------------------------------------------------
-# signature analysis
-# ---------------------------------------------------------------------------
-
-
-def _type_param_of(fn_ir: FunctionIR, param: ParamDef) -> str | None:
-    """If the parameter annotation names a type parameter, return its name."""
-    ann = param.annotation
-    if ann is None:
-        return None
-    for type_param in fn_ir.type_params:
-        if ann is type_param:
-            return type_param.__name__
-    return None
-
-
-def annotation_type(fn_ir: FunctionIR, param: ParamDef) -> Type:
-    """The (concrete) spy type of the annotation of an aot parameter."""
-    if param.annotation is None:
-        raise TypeMismatchError(
-            f"parameter '{param.name}' of function {fn_ir.name} requires a type annotation"
-        )
-    tp = _type_param_of(fn_ir, param)
-    if tp is not None:
-        raise TypeMismatchError(
-            f"type parameter {tp} is not allowed in aot function {fn_ir.name}"
-        )
-    if not isinstance(param.annotation, Type):
-        raise TypeMismatchError(
-            f"annotation of parameter '{param.name}' of function {fn_ir.name} "
-            f"is not a spy type: {param.annotation!r}"
-        )
-    return param.annotation
-
-
-def return_annotation_type(fn_ir: FunctionIR) -> Type:
-    """The spy type of the return annotation of an aot function."""
-    ret_ann = fn_ir.ret_annotation
-    if ret_ann is None:
-        raise TypeMismatchError(f"function {fn_ir.name} requires a return type annotation")
-    if not isinstance(ret_ann, Type):
-        raise TypeMismatchError(
-            f"return annotation of function {fn_ir.name} is not a spy type: {ret_ann!r}"
-        )
-    return ret_ann
-
-
-def _param_missing_error(fn_ir: FunctionIR, param: ParamDef) -> TypeMismatchError:
-    if param.has_default:
-        raise TypeMismatchError(
-            f"cannot determine the type of the default value of parameter "
-            f"'{param.name}' of function {fn_ir.name}"
-        )
-    raise TypeMismatchError(f"missing argument '{param.name}' of function {fn_ir.name}")
-
-
-def solve_call_types(
-    fn_ir: FunctionIR, mode: str, provided: tuple[Type | None, ...]
-) -> tuple[tuple[Type, ...], Type | None]:
-    """Compute the concrete spy type of every formal parameter of a
-    call, and the return type its annotation declares for the call
-    (``None`` when none is declared and the body infers it).
-
-    ``provided`` holds the marshaled type of every provided argument, in
-    parameter order, and ``None`` for parameters whose default value
-    applies.
-
-    In *jit* mode every provided argument contributes the type it
-    marshals to, and parameters annotated with the same type parameter
-    ``T`` must all marshal to the same type (``T`` is unified); the
-    declared return type is the return annotation when it is a concrete
-    spy type, or the bound type of a return annotation naming a type
-    parameter.  In *aot* mode the parameter types are simply the
-    (concrete, non-generic) annotations and the return type is the
-    mandatory return annotation.
-    """
-    assert len(provided) == len(fn_ir.params), 'argument count mismatch'
-    if mode == 'aot':
-        # an aot signature is fixed by the annotations alone (type
-        # parameters are not allowed); the return annotation is
-        # mandatory - ``return_annotation_type`` raises without one
-        return (
-            tuple(annotation_type(fn_ir, p) for p in fn_ir.params),
-            return_annotation_type(fn_ir),
-        )
-
-    if mode != 'jit':
-        raise ValueError(f"unknown call mode {mode!r}")
-
-    # unify the type parameters over the provided arguments
-    bound: dict[str, Type] = {}
-    for param, cand in zip(fn_ir.params, provided):
-        if cand is None:
-            continue
-        tp = _type_param_of(fn_ir, param)
-        if tp is None:
-            continue
-        if tp in bound:
-            if bound[tp] != cand:
-                raise TypeMismatchError(
-                    f"type parameter {tp} of function {fn_ir.name} got conflicting types "
-                    f"{type_str(bound[tp])} and {type_str(cand)}"
-                )
-        else:
-            bound[tp] = cand
-
-    param_types: list[Type] = []
-    for param, cand in zip(fn_ir.params, provided):
-        tp = _type_param_of(fn_ir, param)
-        if tp is not None:
-            if cand is not None:
-                assert tp in bound and bound[tp] == cand
-                param_types.append(cand)
-            elif tp in bound:
-                param_types.append(bound[tp])
-            elif param.has_default:
-                t = type_of(param.default_value)
-                if t is None:
-                    raise _param_missing_error(fn_ir, param)
-                param_types.append(t)
-            else:
-                raise _param_missing_error(fn_ir, param)
-        else:
-            if cand is not None:
-                param_types.append(cand)
-            elif param.has_default:
-                t = type_of(param.default_value)
-                if t is None:
-                    raise _param_missing_error(fn_ir, param)
-                param_types.append(t)
-            else:
-                raise _param_missing_error(fn_ir, param)
-
-    declared_ret: Type | None = None
-    ret_ann = fn_ir.ret_annotation
-    if ret_ann is not None:
-        type_param = next((tp for tp in fn_ir.type_params if ret_ann is tp), None)
-        if type_param is not None:
-            # a return type naming a type parameter is bound by the
-            # argument types of the parameters annotated with it
-            for i, param in enumerate(fn_ir.params):
-                if param.annotation is type_param:
-                    declared_ret = param_types[i]
-                    break
-        elif isinstance(ret_ann, Type):
-            declared_ret = ret_ann
-    return tuple(param_types), declared_ret

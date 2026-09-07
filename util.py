@@ -308,3 +308,6 @@ class IndexedMap[K, V]:
 
     def get_by_key(self, key: K) -> V:
         return self._by_id[self._by_key[key]]
+
+    def values(self):
+        return self._by_id

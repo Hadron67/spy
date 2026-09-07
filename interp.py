@@ -434,7 +434,8 @@ def _call_arg_values(
     callee binds its own unit value); every other parameter is
     materialized to the value of its formal type (defaults included)."""
     values: list[mir.Value | None] = []
-    for i, param in enumerate(fn_ir.params):
+    params = fn_ir.signature.positional.values()
+    for i, param in enumerate(params):
         if sval.to_mir_type(formal[i]) is None:
             values.append(None)
             continue
@@ -453,7 +454,7 @@ def _call_arg_values(
             else:
                 raise CompileError('cannot pass this value as an argument')
         else:
-            assert param.has_default
+            assert param.default_value is not None
             values.append(_const_of_py(param.default_value, formal[i]))
     return tuple(values)
 
@@ -469,7 +470,8 @@ def _bind_frame_args(
     parameter of a zero-sized type binds its type's unit value (nothing
     is passed for it), every other parameter its materialized value."""
     out: list[InterpVal] = []
-    for i, param in enumerate(fn_ir.params):
+    params = fn_ir.signature.positional.values()
+    for i, param in enumerate(params):
         t = formal[i]
         if sval.to_mir_type(t) is None:
             unit = t.get_unit_value()
@@ -491,7 +493,7 @@ def _bind_frame_args(
             else:
                 raise CompileError('cannot pass this value as an argument')
         else:
-            assert param.has_default
+            assert param.default_value is not None
             out.append(RuntimeVal(_const_of_py(param.default_value, t), t))
     return tuple(out)
 
@@ -700,6 +702,7 @@ decision).  The return convention of the function is decided here
         # parameter is the next argument of the lowered signature.
         lowered = 0
         arg_evals: list[InterpVal] = []
+        params = fn_ir.signature.positional.values()
         for i, t in enumerate(arg_types):
             mir_type = sval.to_mir_type(t)
             if mir_type is None:
@@ -707,7 +710,7 @@ decision).  The return convention of the function is decided here
                 assert unit is not None
                 arg_evals.append(ComptimeVal(unit))
                 continue
-            param = mir.Param(lowered, mir_type, fn_ir.params[i].name)
+            param = mir.Param(lowered, mir_type, params[i].name)
             arg_evals.append(RuntimeVal(param, t))
             lowered += 1
         frame.arg_values = tuple(arg_evals)
@@ -2167,6 +2170,28 @@ decision).  The return convention of the function is decided here
             self._emit(mir.Store(field_ptr, value))
         return InPlaceResult()
 
+    def _resolve_method(self, type: sval.Type, method_name: str):
+        match type:
+            case sval.StructType():
+                if method_name in type.methods:
+                    return self._resolver.resolve_global(type.methods[method_name])
+                return None
+            case _:
+                return None
+
+    def _exec_call_method2(self, ptr: InterpVal, method_name: str, args: tuple[InterpVal, ...], ret: InterpVal) -> None:
+        # A new, simpler, WIP implementation, DO NOT TOUCH YET
+        ptr = self._auto_deref(_normalize(ptr))
+        type = _type_of(ptr)
+        if type is None or not isinstance(type, sval.PointerType):
+            raise CompileError(f'cannot call a method on a {type} value')
+
+        method = self._resolve_method(type, method_name)
+        if method is None:
+            raise CompileError(f'type {type} has no method named {method_name}')
+
+        raise NotImplementedError
+
     def _exec_call_method(self, inst: hir.CallMethodInplace) -> None:
         """A method call ``x.h(...)``: a method is an ordinary function
         whose first parameter is the struct type of ``x`` (by value) or a
@@ -2253,7 +2278,7 @@ decision).  The return convention of the function is decided here
                 )
             values = _call_arg_values(fn_ir, evals, formal)
         else:
-            formal = self._solve_types(fn_ir, evals, 'jit')
+            formal = self._solve_types(fn_ir, evals)
             values = _call_arg_values(fn_ir, evals, formal)
         callee, ret_type, info = self._resolver.resolve_call(entry, formal)
         return self._emit_native_call(callee, inst, ret_type, info, values)
@@ -2354,7 +2379,7 @@ decision).  The return convention of the function is decided here
                 'finish at compile time must be declared as a spy function '
                 '(@jit/@aot) instead'
             )
-        formal = self._solve_types(fn_ir, evals, 'jit')
+        formal = self._solve_types(fn_ir, evals)
         # the call's result location, resolved in the caller (whose frame
         # is still current here): a constructor writes in place and never
         # hands a value back, so it has no result to deliver
@@ -2368,17 +2393,18 @@ decision).  The return convention of the function is decided here
         self._emit(mir.Block())
 
     def _solve_types(
-        self, fn_ir: astgen.FunctionIR, evals: list[InterpVal], mode: str
+        self, fn_ir: astgen.FunctionIR, evals: list[InterpVal]
     ) -> tuple[sval.Type, ...]:
         """The concrete spy types of all formal parameters of one call,
         solved from the provided arguments (defaults included), plus the
-        argument count check."""
-        if len(evals) > len(fn_ir.params):
+        argument count check (see ``Signature.solve_param_types``)."""
+        n = len(fn_ir.signature.positional.values())
+        if len(evals) > n:
             raise CompileError(
-                f"function {fn_ir.name} takes {len(fn_ir.params)} arguments, "
+                f"function {fn_ir.name} takes {n} arguments, "
                 f"got {len(evals)}"
             )
-        provided: list[sval.Type | None] = [None] * len(fn_ir.params)
+        provided: list[sval.Type | None] = [None] * n
         for i, ev in enumerate(evals):
             match ev:
                 case ComptimeVal(obj):
@@ -2394,7 +2420,6 @@ decision).  The return convention of the function is decided here
                 )
             provided[i] = t
         try:
-            param_types, _ = astgen.solve_call_types(fn_ir, mode, tuple(provided))
-            return param_types
+            return fn_ir.signature.solve_param_types(tuple(provided))
         except TypeMismatchError as e:
             raise CompileError(str(e)) from e

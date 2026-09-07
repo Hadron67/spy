@@ -8,7 +8,7 @@
 Python 源码 ──astgen──▶ 无类型 HIR ──interp──▶ 有类型 MIR ──lower──▶ LLVM IR/机器码
 ```
 
-- `astgen`：用 `inspect.getsource` 取得函数源码，翻译成线性的无类型指令流（HIR），同时做签名分析；
+- `astgen`：用 `inspect.getsource` 取得函数源码，翻译成线性的无类型指令流（HIR），并把函数签名（形参/默认值/泛型参数/返回注解）转成 spy 域的 `fn.Signature`；
 - `interp`：在**编译期**以具体的参数类型逐条"运行"HIR——纯编译期操作直接在 Python 中求值，需要落到运行时的操作才发出带类型的 MIR 指令（此时控制流是结构化区域树，见下文）；
 - `lower`：把 MIR 机械地映射到 LLVM IR，用 llvmlite（MCJIT）编译成原生代码。
 
@@ -149,13 +149,13 @@ assert bar.foo.a == 35
 | 文件 | 作用 |
 |---|---|
 | `dsl.py` | `JitContext`、`jit`/`aot`/`struct` 装饰器、注册与模块编译调度、外部符号链接、结构体实例（ctypes）的构造与封送 |
-| `astgen.py` | 源码 → 无类型 HIR；签名分析（`solve_call_types`） |
+| `astgen.py` | 源码 → 无类型 HIR；把函数签名（注解/默认值/泛型参数）转成 spy 域的 `fn.Signature` |
 | `hir.py` | 无类型 HIR 指令定义 |
 | `interp.py` | 编译期运行 HIR → 有类型 MIR（comptime 语义所在）；结构体的字段寻址、方法分发与构造 |
 | `mir.py` | MIR 类型（含结构体类型）、指令与区域树定义 |
 | `lower.py` | MIR → LLVM IR → 机器码（MCJIT）；结构体按值传参 |
-| `fn.py` | 函数值/注册条目：`LazyJitFunction`（jit）、`FunctionValue`（aot） |
-| `type.py` | spy 类型系统（含结构体类型）与 Python 值 → 类型的映射 |
+| `fn.py` | 函数签名（`Signature`：形参绑定、类型参数求解、返回类型推导）与函数值/注册条目：`LazyJitFunction`（jit）、`FunctionValue`（aot） |
+| `sval.py` | spy 类型系统（含结构体类型）、Python 值 → spy 域的映射（`as_value`）与类型参数约束求解（`TypeVarSolver`） |
 | `errors.py` | `CompileError`、`TypeMismatchError`（`TypeMismatchError` 同时是 `TypeError` 子类） |
 
 ## 尚未实现 / 已知限制

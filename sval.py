@@ -16,12 +16,13 @@ are equal), which is what makes the compile-time comparisons in
 ``spy.typeof(a) == spy.u64`` work.
 """
 
+import typing
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, override
 
 from . import mir
-from .errors import CompileError, SpyError
+from .errors import CompileError, SpyError, TypeMismatchError
 
 INT_DEFAULT_BITS = 32
 """A plain Python ``int`` argument is mapped to this signedness/width by
@@ -55,6 +56,20 @@ class TypeType(Type):
     @override
     def get_type(self) -> Type:
         return TypeType(self.level + 1)
+
+
+class TypeVar(Type):
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    @override
+    def __eq__(self, value: object, /) -> bool:
+        return self is value
+
+    @override
+    def __hash__(self) -> int:
+        return object.__hash__(self)
+
 
 TYPE_TYPE = TypeType(0)
 
@@ -406,6 +421,8 @@ def type_str(type: Type) -> str:
             return '*' + ('const ' if is_const else '') + type_str(elem)
         case FunctionType(args, ret):
             return f'fn({', '.join(type_str(a.type) for a in args)}) -> {type_str(ret)}'
+        case TypeVar():
+            return type.name
         case AnyFunction():
             return 'any fn'
         case VoidType():
@@ -645,7 +662,7 @@ def value_repr(value: object) -> str:
                 return f'a {descriptor.name} struct'
             return repr(value)
 
-def as_value(value: Any) -> AnyValue:
+def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
     scalars and ``sval.Value`` objects pass through, and ``None`` is the
     unit value of the zero-sized void type (``Void()``).  Class objects
@@ -664,6 +681,10 @@ def as_value(value: Any) -> AnyValue:
         return PointerType(IntType(8, False), is_const=True)
     if value is bool:
         return BoolType()
+    if isinstance(value, typing.TypeVar):
+        if type_vars is None:
+            raise TypeError(f'cannot convert {value} to a value')
+        return type_vars[value]
 
     raise TypeError(f'cannot convert {value} to a value')
 
@@ -671,3 +692,198 @@ def negate(value: AnyValue) -> AnyValue | None:
     if isinstance(value, (int, float)):
         return -value
     return None
+
+
+def _subtype_conflict(lhs: Value, rhs: Value) -> TypeMismatchError:
+    return TypeMismatchError(
+        f'conflicting types {_type_or_repr(lhs)} and {_type_or_repr(rhs)}'
+    )
+
+
+def _type_or_repr(value: Value) -> str:
+    if isinstance(value, Type):
+        return type_str(value)
+    return repr(value)
+
+
+@dataclass(frozen=True)
+class _Constraint:
+    lhs: Value
+    rhs: Value
+    is_subtype: bool = False  # True when lhs is a subtype of rhs
+
+class _SolvedTypeVar:
+    """The solver state of one type parameter.
+
+    A parameter is either *solved* - bound to a value (``_value``), with
+    no subtype bounds recorded - or *bounded*: declared a subtype of
+    every value in ``_subtypes`` (its upper bounds), without a solution
+    yet.  Solving the equality constraints of a bounded parameter binds
+    it to a value that must satisfy every recorded bound."""
+
+    def __init__(self) -> None:
+        self._value: Value | None = None  # non-None: this type var is solved to this value, in this case _subtypes is None
+        self._subtypes: set[Value] | None = None  # non-None: this type var is a subtype of all values in the set, in this case _value is None
+
+    def _add_bound(self, value: Value) -> None:
+        if self._subtypes is None:
+            self._subtypes = set()
+        self._subtypes.add(value)
+
+class TypeVarSolver:
+    """A constraint solver over spy values, used to resolve the type
+    parameters of a generic function to the concrete spy types a call
+    determines.
+
+    ``add_constraint`` collects one constraint - an *equality*
+    (``lhs == rhs``, the default) or a *subtyping* (``lhs <: rhs``,
+    ``is_subtype=True``) - and ``finish`` solves them, binding every
+    constrained type parameter to a value.  Spy types have no
+    structural subtyping (one concrete spy type is a subtype of another
+    only when they are equal), so a subtype constraint is satisfiable
+    exactly when an equality one is; the solver still tracks the bounds
+    of a parameter separately so that ``finish`` can bind a parameter
+    that only ever appears on the left of subtype constraints.  When a
+    constraint cannot be satisfied, ``finish`` raises
+    :class:`TypeMismatchError`.
+    """
+
+    def __init__(self) -> None:
+        self._type_var_values: dict[TypeVar, _SolvedTypeVar] = {}
+        self._constraints: list[_Constraint] = []
+
+    def _solved(self, tv: TypeVar) -> _SolvedTypeVar:
+        stv = self._type_var_values.get(tv)
+        if stv is None:
+            stv = _SolvedTypeVar()
+            self._type_var_values[tv] = stv
+        return stv
+
+    def _whnf_one(self, value: Value) -> Value:
+        if isinstance(value, TypeVar) and value in self._type_var_values:
+            val = self._type_var_values[value]._value
+            if val is not None:
+                return val
+        return value
+
+    def _whnf(self, value: Value) -> Value:
+        next = self._whnf_one(value)
+        while next != value:
+            value = next
+            next = self._whnf_one(value)
+        return value
+
+    def add_constraint(self, lhs: Value, rhs: Value, is_subtype: bool = False) -> None:
+        self._constraints.append(_Constraint(lhs, rhs, is_subtype))
+
+    def finish(self) -> None:
+        """Solve the pending constraints, binding the type parameters to
+        their solutions.  Raises :class:`TypeMismatchError` when a
+        constraint cannot be satisfied."""
+        pending = self._constraints
+        self._constraints = []
+        # equality constraints are solved eagerly; a constraint that
+        # cannot be decided in one pass (its type parameter only carries
+        # a subtype bound that is not resolved yet) is retried after the
+        # rest of the pass has made its progress
+        while len(pending) > 0:
+            leftover: list[_Constraint] = []
+            progress = False
+            for constraint in pending:
+                if self._solve_one(constraint):
+                    progress = True
+                else:
+                    leftover.append(constraint)
+            if not progress:
+                raise TypeMismatchError(
+                    'cannot solve the remaining type constraints'
+                )
+            pending = leftover
+        # bind the type parameters that only subtype constraints
+        # constrain (their bounds are recorded on the parameter; a
+        # bound that is itself a type parameter is followed to its own
+        # solution)
+        while True:
+            progress = False
+            for tv, stv in self._type_var_values.items():
+                if stv._value is not None or stv._subtypes is None:
+                    continue
+                bounds = {self._whnf(b) for b in stv._subtypes}
+                if len(bounds) > 1:
+                    raise _subtype_conflict(*(tuple(bounds)[:2]))
+                val = next(iter(bounds))
+                if isinstance(val, TypeVar) and self._solved(val)._value is None:
+                    # the sole bound is itself unsolved: it is resolved
+                    # in a later pass of this loop
+                    continue
+                stv._value = val
+                progress = True
+            if not progress:
+                # every remaining bounded parameter has an unsolved
+                # bound, so no value can be assigned
+                for tv, stv in self._type_var_values.items():
+                    if stv._value is None and stv._subtypes is not None:
+                        raise _subtype_conflict(tv, next(iter(stv._subtypes)))
+                return
+
+    def get_solved(self) -> dict[TypeVar, Value]:
+        return {
+            k: self._whnf(v._value)  # type: ignore[arg-type]
+            for k, v in self._type_var_values.items()
+            if v._value is not None
+        }
+
+    def _solve_one(self, constraint: _Constraint) -> bool:
+        """Solve one constraint. Returns True when the constraint is
+        fully handled, False when it cannot be decided yet (its type
+        parameter only carries a subtype bound that is not resolved) and
+        the caller must retry it."""
+        lhs = self._whnf(constraint.lhs)
+        rhs = self._whnf(constraint.rhs)
+        if lhs == rhs:
+            return True
+        if constraint.is_subtype:
+            # a subtype constraint involving a type parameter records
+            # the other side as a bound of the parameter; between two
+            # resolved values it can only hold when they are equal
+            if isinstance(lhs, TypeVar):
+                self._solved(lhs)._add_bound(rhs)
+                return True
+            if isinstance(rhs, TypeVar):
+                # ``lhs <: T``: under the trivial subtype relation this
+                # constrains T to lhs, which the bound records
+                self._solved(rhs)._add_bound(lhs)
+                return True
+            raise _subtype_conflict(lhs, rhs)
+        # an equality constraint: bring the type parameter (if any) to
+        # the left hand side
+        if isinstance(rhs, TypeVar) and not isinstance(lhs, TypeVar):
+            t = lhs
+            lhs = rhs
+            rhs = t
+        if not isinstance(lhs, TypeVar):
+            # neither side is a type parameter: two distinct resolved
+            # values can never become equal
+            raise _subtype_conflict(lhs, rhs)
+        stv = self._solved(lhs)
+        # the solution must satisfy the subtype bounds recorded on the
+        # parameter
+        if stv._subtypes is not None:
+            for bound in stv._subtypes:
+                b = self._whnf(bound)
+                if isinstance(b, TypeVar) and not isinstance(rhs, TypeVar):
+                    # the bound is an unsolved type parameter: whether
+                    # rhs satisfies it is only known once it resolves
+                    return False
+                if b != rhs:
+                    raise _subtype_conflict(rhs, b)
+        if isinstance(rhs, TypeVar):
+            # an equality between two type parameters: solving the lhs
+            # to the rhs chains the two; when the rhs carries a subtype
+            # bound, the equality is only decidable once it resolves
+            if self._solved(rhs)._subtypes is not None:
+                return False
+            stv._value = rhs
+            return True
+        stv._value = rhs
+        return True

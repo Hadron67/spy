@@ -214,6 +214,18 @@ def _marshal(fn_name: str, param_name: str, value: object, target: Type) -> obje
     return _coerce_py(value, target, what)
 
 
+def _python_default_value(value: sval.AnyValue) -> Any:
+    """Convert one *spy-domain* default value (see ``Signature``) back
+    to the Python value the call boundary marshals.  Spy-domain and
+    Python scalars coincide, except for a plain ``None`` default, whose
+    spy-domain form is the unit value of the void type
+    (``sval.Void()``): its Python form is ``None`` (the void value of a
+    zero-sized parameter)."""
+    if isinstance(value, sval.Void):
+        return None
+    return value
+
+
 def _bound_method(handle: Any) -> Any:
     """The Python method of a struct instance: ``bar.hkm()`` binds the
     instance as the first argument of the method's registration
@@ -305,13 +317,17 @@ class _RegisteredFunction:
         entry = self._entry
         if entry is not None:
             return entry
-        fn_ir = astgen.parse_function(self._fn)
+        fn_ir = astgen.parse_function(self._fn, self._kind)
         if self._kind == 'aot':
             if self._method is None:
-                # resolve the fixed signature from the annotations
-                params = fn_ir.params
-                formal, ret = astgen.solve_call_types(fn_ir, 'aot', (None,) * len(params))
-                args = tuple(FormalArg(params[i].name, formal[i]) for i in range(len(params)))
+                # the fixed signature is the (concrete, complete)
+                # annotations: every parameter must be annotated with a
+                # concrete spy type, the return type must be declared
+                args = tuple(
+                    FormalArg(p.name, fn_ir.aot_param_type(p))
+                    for p in fn_ir.signature.positional.values()
+                )
+                ret = fn_ir.aot_return_type()
             else:
                 args, ret = self._method_args(fn_ir)
             entry = FunctionValue(self._fn, fn_ir, args, ret)
@@ -333,7 +349,7 @@ class _RegisteredFunction:
         aot parameter; the return type is the declared one, or None when
         it is inferred from the body (a method may return nothing)."""
         assert self._method is not None
-        params = fn_ir.params
+        params = fn_ir.signature.positional.values()
         if len(params) == 0:
             raise CompileError(
                 f'method {self._fn.__name__} of {self._method.name} must take '
@@ -344,13 +360,13 @@ class _RegisteredFunction:
             self_type = PointerType(self._method)
         args = [FormalArg(params[0].name, self_type)]
         for param in params[1:]:
-            args.append(FormalArg(param.name, astgen.annotation_type(fn_ir, param)))
-        if fn_ir.ret_annotation is not None:
-            ret = astgen.return_annotation_type(fn_ir)
-        else:
+            args.append(FormalArg(param.name, fn_ir.aot_param_type(param)))
+        if fn_ir.signature.ret_type is None:
             # no return annotation: the return type is inferred from the
             # body (a body that never returns a value is a void method)
             ret = None
+        else:
+            ret = fn_ir.aot_return_type()
         return tuple(args), ret
 
     @property
@@ -383,7 +399,7 @@ def _spec_function_type(
     argument types bound to the names of its parameters, and its
     logical return type.  The call lowering plan of the specialization
     is derived from this type (see ``type.function_call_info``)."""
-    params = entry.hir.params
+    params = entry.hir.signature.positional.values()
     return sval.FunctionType(
         tuple(FormalArg(params[i].name, arg_types[i]) for i in range(len(arg_types))),
         ret,
@@ -394,24 +410,23 @@ def _recursion_ret_type_error(entry: FunctionEntry, arg_types: tuple[Type, ...])
     """Explain why the return type of a recursive specialization
     cannot be determined from its annotations."""
     fn_ir = entry.hir
-    ret_ann = fn_ir.ret_annotation
+    ret = fn_ir.signature.ret_type
     name = entry.fn.__name__
-    if ret_ann is None:
+    if ret is None:
         return (
             f"recursive function {name} requires a return type annotation: "
             'the return type of a recursive call must be known while '
             'the body is being compiled'
         )
-    for type_param in fn_ir.type_params:
-        if ret_ann is type_param:
-            return (
-                f"cannot determine the return type of the recursive function {name}: "
-                f"type parameter {type_param.__name__} appears only in the return "
-                'annotation, not on any parameter'
-            )
+    if isinstance(ret, sval.TypeVar):
+        return (
+            f"cannot determine the return type of the recursive function {name}: "
+            f"type parameter {ret.name} appears only in the return "
+            'annotation, not on any parameter'
+        )
     return (
         f"cannot determine the return type of the recursive function {name}: "
-        f'the return annotation {ret_ann!r} is not a spy type'
+        f'the return annotation {ret!r} is not a spy type'
     )
 
 
@@ -707,61 +722,44 @@ class JitContext(FunctionResolver):
         name = entry.fn.__name__
         assert handle._method is not None
         desc = handle._method
-        params = fn_ir.params
+        signature = fn_ir.signature
+        params = signature.positional.values()
         if len(params) == 0:
             raise TypeError(f'{name}() is missing its self parameter')
         self_type: Type = PointerType(desc) if handle._ptr_self else desc
-
-        rest = params[1:]
+        # bind the arguments to the formals (``Signature.bind_args``
+        # validates the argument count and names and inserts the default
+        # values); ``self`` is the leading argument - the instance
+        bound, _, _ = signature.bind_args(
+            (instance,) + args, kwargs, _python_default_value
+        )
         # an aot signature carries its fixed types (a zero-sized ``self``
         # or parameter is known there); a jit method's parameters are
         # typed from the arguments, none of which can marshal to a
         # zero-sized type
         if isinstance(entry, FunctionValue):
-            is_zst_param = tuple(to_mir_type(a.type) is None for a in entry.args)
-            assert len(is_zst_param) == len(params)
-        else:
-            is_zst_param = (False,) * len(params)
-        rest_names = [p.name for p in rest]
-        if len(args) > len(rest):
-            raise TypeError(
-                f'{name}() takes {len(rest)} positional arguments but {len(args)} were given'
-            )
-        present: dict[str, Any] = {}
-        for i, value in enumerate(args):
-            present[rest_names[i]] = value
-        for key, value in kwargs.items():
-            if key not in rest_names:
-                raise TypeError(f"{name}() got an unexpected keyword argument '{key}'")
-            if key in present:
-                raise TypeError(f"{name}() got multiple values for argument '{key}'")
-            present[key] = value
-
-        if isinstance(entry, FunctionValue):
             formal = tuple(a.type for a in entry.args)
+            assert len(formal) == len(params)
+            is_zst_param = tuple(to_mir_type(t) is None for t in formal)
         else:
             # a jit method: solve the formal types from the marshaled
             # arguments; ``self`` is pinned to its pointer/value type
-            provided: list[Type | None] = [self_type]
-            for i, param in enumerate(rest):
-                provided.append(
-                    _candidate_type(name, param.name, present[param.name])
-                    if param.name in present
-                    else None
-                )
-            formal, _ = astgen.solve_call_types(fn_ir, 'jit', tuple(provided))
+            provided: list[Type | None] = [None] * len(params)
+            provided[0] = self_type
+            for i, param in enumerate(params[1:], start=1):
+                # the parameter is provided positionally (after the
+                # leading ``self``) or by name
+                if i < len(args) + 1 or param.name in kwargs:
+                    provided[i] = _candidate_type(name, param.name, bound[i])
+            formal = signature.solve_param_types(tuple(provided))
+            is_zst_param = (False,) * len(params)
 
         marshaled: list[Any] = []
-        if to_mir_type(self_type) is not None:
-            marshaled.append(_marshal(name, 'self', instance, self_type))
-        for i, param in enumerate(rest):
-            if param.name in present:
-                value = present[param.name]
-            else:
-                if not param.has_default:
-                    raise TypeError(f"{name}() missing required argument '{param.name}'")
-                value = param.default_value
-            if is_zst_param[i + 1]:
+        if to_mir_type(formal[0]) is not None:
+            marshaled.append(_marshal(name, 'self', bound[0], formal[0]))
+        for i, param in enumerate(params[1:], start=1):
+            value = bound[i]
+            if is_zst_param[i]:
                 # a zero-sized parameter has no runtime representation:
                 # its logical value (the void value, ``None``) is
                 # consumed but not passed to the native function
@@ -771,7 +769,7 @@ class JitContext(FunctionResolver):
                         f'(void) parameter and must be None'
                     )
                 continue
-            marshaled.append(_marshal(name, param.name, value, formal[i + 1]))
+            marshaled.append(_marshal(name, param.name, value, formal[i]))
         spec = self.ensure_spec(entry, formal)
         return spec.call(*marshaled)
 
@@ -789,48 +787,35 @@ class JitContext(FunctionResolver):
         it."""
         fn_ir = entry.hir
         name = entry.fn.__name__
-        params = fn_ir.params
+        signature = fn_ir.signature
+        params = signature.positional.values()
+        n = len(params)
+        # bind the arguments to the formals (``Signature.bind_args``
+        # validates the argument count and names and inserts the default
+        # values); the argument payload is the Python value each
+        # argument marshals from
+        bound, _, _ = signature.bind_args(args, kwargs, _python_default_value)
         if isinstance(entry, FunctionValue):
-            is_zst_param = tuple(to_mir_type(a.type) is None for a in entry.args)
-            assert len(is_zst_param) == len(params)
+            # an aot signature is fixed by the annotations: the entry
+            # carries its formal types (zero-sized ones included)
+            formal = tuple(a.type for a in entry.args)
+            assert len(formal) == n
+            is_zst_param = tuple(to_mir_type(t) is None for t in formal)
         else:
-            # a jit signature is typed from the provided arguments; a
-            # Python value never marshals to a zero-sized type
-            is_zst_param = (False,) * len(params)
-        param_names = [p.name for p in params]
-
-        if len(args) > len(params):
-            raise TypeError(
-                f"{name}() takes {len(params)} positional arguments but {len(args)} were given"
-            )
-        present: dict[str, Any] = {}
-        for i, value in enumerate(args):
-            present[param_names[i]] = value
-        for key, value in kwargs.items():
-            if key not in param_names:
-                raise TypeError(f"{name}() got an unexpected keyword argument '{key}'")
-            if key in present:
-                raise TypeError(f"{name}() got multiple values for argument '{key}'")
-            present[key] = value
-
-        provided: list[Type | None] = [None] * len(params)
-        for i, param in enumerate(params):
-            if is_zst_param[i]:
-                # its type is fixed by the (aot) signature: the argument
-                # is the void value and contributes no type
-                continue
-            if param.name in present:
-                provided[i] = _candidate_type(name, param.name, present[param.name])
-        formal, _ = astgen.solve_call_types(fn_ir, entry.kind, tuple(provided))
+            # a jit signature is typed from the marshaled types of the
+            # provided arguments; a Python value never marshals to a
+            # zero-sized type
+            provided: list[Type | None] = [None] * n
+            for i, param in enumerate(params):
+                # the parameter is provided positionally or by name
+                if i < len(args) or param.name in kwargs:
+                    provided[i] = _candidate_type(name, param.name, bound[i])
+            formal = signature.solve_param_types(tuple(provided))
+            is_zst_param = (False,) * n
 
         marshaled: list[Any] = []
         for i, param in enumerate(params):
-            if param.name in present:
-                value = present[param.name]
-            else:
-                if not param.has_default:
-                    raise TypeError(f"{name}() missing required argument '{param.name}'")
-                value = param.default_value
+            value = bound[i]
             if is_zst_param[i]:
                 # a zero-sized parameter has no runtime representation:
                 # its logical value (the void value, ``None``) is
@@ -933,7 +918,7 @@ class JitContext(FunctionResolver):
             return fn
 
         fn_ir = entry.hir
-        assert len(arg_types) == len(fn_ir.params)
+        assert len(arg_types) == len(fn_ir.signature.positional.values())
         # a declared return type - concrete, or naming a type parameter
         # bound by the parameters - fixes the return type of the
         # specialization (a recursive function needs it: its calls are
@@ -941,13 +926,14 @@ class JitContext(FunctionResolver):
         # return type is inferred from the return sites.  An aot
         # function carries its (fixed) return type on its entry; a jit
         # function declares one by its return annotation (see
-        # ``astgen.solve_call_types``)
+        # ``Signature.solve_return_type``)
         if isinstance(entry, FunctionValue):
             ret_hint = entry.ret
         else:
-            ret_hint = astgen.solve_call_types(fn_ir, 'jit', arg_types)[1]
+            ret_hint = fn_ir.signature.solve_return_type(arg_types)
+        params = fn_ir.signature.positional.values()
         args = tuple(
-            mir.FormalArg(fn_ir.params[i].name, mir_type)
+            mir.FormalArg(params[i].name, mir_type)
             for i, mir_type in enumerate(to_mir_type(t) for t in arg_types)
             if mir_type is not None
         )
@@ -1034,7 +1020,7 @@ class JitContext(FunctionResolver):
         if isinstance(entry, FunctionValue):
             declared = entry.ret
         else:
-            declared = astgen.solve_call_types(entry.hir, 'jit', arg_types)[1]
+            declared = entry.hir.signature.solve_return_type(arg_types)
         if declared is None:
             raise CompileError(_recursion_ret_type_error(entry, arg_types))
         return declared
