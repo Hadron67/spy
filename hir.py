@@ -12,7 +12,9 @@ Calls follow *result location semantics* (RLS): a call writes its
 result into the slot of its ``ret`` operand (:class:`CallInplace`) and
 produces no register of its own.  A caller that needs the value
 allocates a slot and loads it back; the interpreter keeps scalar and
-compile-time results in the slot without giving it real memory.  The
+compile-time results of native calls in the slot without giving it real
+memory (an inlined callee's result is the exception: it is stored into
+the slot on every returning path, see ``interp``).  The
 return of a function is governed by the same semantics: its body ends
 with a write into the function's result location (:class:`ResultLoc`)
 followed by a value-less :class:`Ret` terminator; the interpreter turns
@@ -131,7 +133,9 @@ class Alloca(Inst):
     """Reserve an addressable slot for one value.  The slot is untyped
     until it is used: the first ``Store`` that targets it types and
     allocates it, while a ``CallInplace`` result (RLS) is only recorded
-    in it - scalar and compile-time results are never given real memory.
+    in it - scalar and compile-time results of native calls are never
+    given real memory, but an inlined callee's result is stored into it
+    (see ``interp``).
     Function bodies start with one Alloca/Store pair per parameter."""
 
 

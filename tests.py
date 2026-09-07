@@ -675,6 +675,24 @@ class SpyExampleTest(TestCase):
         blocks = sum(1 for inst in insts if isinstance(inst, mir.Block))
         self.assertEqual(blocks, 2)
 
+    def test_single_path_inline_results_use_no_slots(self) -> None:
+        # an inlined body always returns through the memory of the
+        # call's result location; the store/load round trip of a
+        # straight-line body is folded away by ``opt`` (the single
+        # stored value replaces the load), so the typed MIR of a
+        # straight-line caller keeps no slot at all
+        self.nested_inline(1)
+        insts = self.nested_inline._entry.mir_cache[(i32,)].insts
+        self.assertEqual(
+            sum(1 for inst in insts if isinstance(inst, mir.Alloca)), 0, insts
+        )
+        # a result that genuinely joins runtime paths keeps its memory
+        self.use_sign_local(1)
+        insts = self.use_sign_local._entry.mir_cache[(i32,)].insts
+        self.assertGreater(
+            sum(1 for inst in insts if isinstance(inst, mir.Alloca)), 0, insts
+        )
+
     # -- runtime ``if`` inside inlined bodies --------------------------------
 
     def test_inline_runtime_if_local_result(self) -> None:
@@ -749,11 +767,13 @@ class SpyExampleTest(TestCase):
 
     def test_inline_runtime_if_mixed_value_and_void(self) -> None:
         # one runtime path of the inlined body returns a value, another
-        # is void: rejected when the body's typing completes
+        # is void (a bare ``return`` returns the void value): a return
+        # type conflict, rejected at the offending site
         with self.assertRaises(CompileError) as ctx:
             self._bad_mixed()(1)
         message = str(ctx.exception)
-        self.assertIn('returns a value on some paths', message)
+        self.assertIn('conflicting types', message)
+        self.assertIn('void', message)
         self.assertIn('bad_mixed', message)
 
     def _bad_mixed(self):
@@ -769,6 +789,28 @@ class SpyExampleTest(TestCase):
             return bad_mixed(n)
 
         return use
+
+    def test_inline_comptime_value_return_is_rejected(self) -> None:
+        # a return of an inlined body crosses into the runtime code of
+        # the caller, so a compile-time-only value (a type descriptor
+        # from ``spy.typeof``) can no longer be returned from an inlined
+        # helper
+        cache = JitContext()
+
+        def helper(x):
+            return spy_typeof(x)
+
+        @cache.jit()
+        def use(n):
+            if helper(n) == i32:
+                return 1
+            return 2
+
+        with self.assertRaises(CompileError) as ctx:
+            use(1)
+        message = str(ctx.exception)
+        self.assertIn('cannot return', message)
+        self.assertIn('helper', message)
 
     # -- recursion -----------------------------------------------------------
 

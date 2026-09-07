@@ -42,12 +42,14 @@ Calls are dispatched at compile time:
 
 An inlined body is delimited in the emitted MIR by a ``Block``/``End``
 pair, and it may contain runtime ``if`` branches like the function
-proper: once a runtime branch opens inside an inlined body (see
-``Frame.multi_path``), every return of the body stores its value into
-the call's result location on its own runtime path and leaves the body
-with a ``Break`` out of its ``Block`` - the result location's memory is
-the join of the paths (its alloca is hoisted by ``lower`` so every
-path shares one address).
+proper.  Every return of the body stores its value into the call's
+result location on its own runtime path, whatever the path is, and a
+return inside a runtime branch leaves the body with a ``Break`` out of
+its ``Block`` - the result location's memory is the join of the paths
+(its alloca is hoisted by ``lower`` so every path shares one address).
+A body whose paths all deliver one value stores only once, right
+before its ``End``; a single-path body's store/load round trip is
+cleaned up afterwards by ``opt``.
 
 Both kinds of function calls push a *frame* holding the by-value
 arguments (resolved by ``hir.Arg`` leaves); the addressable parameter
@@ -123,12 +125,14 @@ class PendingSlot(InterpVal):
     """The value of an executed ``hir.Alloca``: an addressable slot whose
     concrete type is fixed by its first store (the interpreter emits the
     typed MIR alloca at that moment).  A slot that receives the result of
-    a call (RLS) first only *records* the value: scalar and compile-time
-    results are never given real memory - the matching ``Load`` hands the
-    recorded value out directly - and memory is allocated only when the
-    slot really must hold its value at a fixed address (a later plain
-    ``Store``, or a struct result, which the callee writes into the slot
-    in place)."""
+    a *native* call (RLS) first only *records* the value: scalar and
+    compile-time results are never given real memory - the matching
+    ``Load`` hands the recorded value out directly - and memory is
+    allocated only when the slot really must hold its value at a fixed
+    address (a later plain ``Store``, a struct result, which the callee
+    writes into the slot in place, or the result of an *inlined* call,
+    whose per-path delivery stores into the slot immediately, see
+    ``_deliver_inline_result``)."""
 
     # the spy type of the slot content (the type the slot is typed with
     # by its first store, in ``type.py``)
@@ -232,22 +236,19 @@ class Frame:
         # result an ``InPlaceResult`` rather than the value the body yielded)
         self.resume: tuple[hir.CallInplace | hir.CallMethodInplace, bool] | None = None
         self.regs: dict[hir.Inst, InterpVal] = {}
-        # the location the call's result goes to, resolved from the pending
-        # call in the caller (see ``_start_inline``); the target of the
-        # per-path stores of an inlined body that delivers its result from
-        # several runtime paths (``multi_path``)
+        # the location the call's result goes to, resolved from the
+        # pending call in the caller (see ``_start_inline``): the target
+        # of the per-path stores of the returns of the inlined body -
+        # every return delivers its value through this shared memory
         self.result_loc: InterpVal | None = None
-        # True once a runtime ``if`` has been typed inside this body: from
-        # then on the body may deliver its result from several runtime
-        # paths, and every return site stores its value into the call's
-        # result location (``result_loc``) on its own path instead of the
-        # single hand-off of a single-path inline
-        self.multi_path: bool = False
-        # the number of return sites typed while ``multi_path`` that
-        # carried a value / were void (used to reject a body that returns
-        # a value on some paths but not on others)
-        self.val_rets: int = 0
-        self.void_rets: int = 0
+        # the spy type of the values the body returned on the paths
+        # typed so far, or None before its first return site: the
+        # cross-path return-type bookkeeping of the body - a bare
+        # ``return`` returns the unit value of the void type, and a body
+        # whose return sites disagree on the type (a value on some
+        # paths but void on others, ...) is rejected at the offending
+        # site (see ``_deliver_inline_result``)
+        self.ret_type: sval.Type | None = None
 
 
 class Flow(IntEnum):
@@ -831,8 +832,8 @@ decision).  The return convention of the function is decided here
         # a direct-return function: the value of the path is recorded and
         # the terminating ``Ret`` returns it - or, with ``memory``,
         # stored into the result location's memory (which the ``Ret``
-        # loads back), so that every runtime path of a multi-path
-        # inlined body leaves its own value there
+        # loads back), so that every returning path of an inlined body
+        # leaves its own value there
         assert self._result_mode == ResultMode.VALUE
         if memory:
             if retloc.ptr is None:
@@ -977,32 +978,19 @@ decision).  The return convention of the function is decided here
                     else:
                         value = retloc.value
                         retloc.value = None
-                    if frame.multi_path:
-                        # a body that delivers its result from several
-                        # runtime paths: the value is stored into the
-                        # call's result location on this path (see
-                        # ``_deliver_inline_result``), and a return
-                        # inside a runtime branch leaves the body with a
-                        # ``Break`` (the falling paths continue, the
-                        # other paths jump to the caller continuation).  A
-                        # constructor's ``__init__`` has no result location
-                        # (it writes the struct in place): its returns are
-                        # void, like a single-path ``__init__``
-                        void = (
-                            value is None
-                            or isinstance(value, ComptimeVal)
-                            and sval.is_zst_value(value.obj)
-                            or frame.result_loc is None
-                        )
-                        if void:
-                            frame.void_rets += 1
-                        else:
-                            assert value is not None
-                            frame.val_rets += 1
-                            self._deliver_inline_result(frame, value)
-                        level = self._break_level(frame)
-                        if level > 0:
-                            self._emit(mir.Break(level))
+                    # deliver the value to the call's result location on
+                    # this path; a constructor's ``__init__`` writes its
+                    # struct in place and has no result to deliver (see
+                    # ``_deliver_inline_result``)
+                    if frame.result_loc is not None:
+                        self._deliver_inline_result(frame, value)
+                    level = self._break_level(frame)
+                    if level > 0:
+                        # a return inside a runtime branch leaves the
+                        # body with a ``Break``: the other paths continue,
+                        # the returning path jumps to the caller
+                        # continuation
+                        self._emit(mir.Break(level))
                     self._cut(value if value is not None else ComptimeVal(sval.Void()))
                 else:
                     # a path of the function proper ends: emit its return
@@ -1120,16 +1108,13 @@ decision).  The return convention of the function is decided here
         ``End`` (both branches may fall through: the MIR's falling
         branches join there, see ``_rt_else_fell``).
 
-        Inside an inlined body the ``if`` makes the body multi-path (see
-        ``Frame.multi_path``): the body may now deliver its result from
-        several runtime paths, so its returns store into the call's
-        result location on their own paths and leave the body with a
-        ``mir.Break`` (see the ``hir.Ret`` handling)."""
+        Inside an inlined body every return already stores its value
+        into the call's result location on its own path (see the
+        ``hir.Ret`` handling); a return inside a runtime branch
+        additionally leaves the body with a ``mir.Break``."""
         if not isinstance(cond, RuntimeVal) or cond.type != sval.BoolType():
             raise CompileError('runtime if conditions must be boolean values')
         frame = self._frames[-1]
-        if not self._in_function_proper():
-            frame.multi_path = True
         self._emit(mir.If(cond.value))
         frame.block_stack.append(BlockFrame(entry))
 
@@ -1238,28 +1223,28 @@ decision).  The return convention of the function is decided here
         its end (``returns`` False, a void body) or cut by a ``return``
         (``returns`` True).  The run of the function proper ends the
         machine (its outcome is recorded in ``self._flow``); an inlined
-        callee is popped and its value resumes the pending call of the
+        callee is popped and its run resumes the pending call of the
         caller (see ``_resume_call``).  The ``End`` of the block that
         delimits the inlined body (opened at its start, see
         ``_start_inline``) is emitted here, closing the body's emitted
         code before the caller's continuation is emitted by the resume.
 
-        An inlined body that delivers its result from several runtime
-        paths (``Frame.multi_path``) must return a value on every path:
-        a body that returns a value on some paths but is void - a bare
-        ``return`` or a fall-off its end - on others is rejected here,
-        where the typing of the body is complete."""
+        A path that falls off the end of the body returns the void value
+        on that path; when the body returned a sized value on other
+        paths, the falling path would leave the shared result memory
+        unwritten - a return-type conflict (a fall-off returns
+        ``sval.Void``), which is rejected here, where the typing of the
+        body is complete."""
         if len(self._frames) == 1:
             self._flow = Flow.RET if returns else Flow.FALL
             return
         self._emit(mir.End())
         frame = self._frames.pop()
-        if frame.multi_path and frame.val_rets > 0 and (
-            not returns or frame.void_rets > 0
-        ):
+        if not returns and frame.ret_type is not None and frame.ret_type != sval.VoidType():
             raise CompileError(
-                f"function {frame.fn_ir.name} returns a value on some paths but "
-                'returns without a value (or falls off its end) on others'
+                f"function {frame.fn_ir.name} returns values of conflicting types "
+                f"{sval.type_str(frame.ret_type)} and void: it falls off its end "
+                '(without a return) on some path'
             )
         if returns:
             assert value is not None
@@ -1270,19 +1255,19 @@ decision).  The return convention of the function is decided here
 
     def _resume_call(self, frame: Frame, value: InterpVal) -> None:
         """The run of an inlined callee ended: resume the call of the
-        caller that suspended on it - the call's result is handed to its
-        result location (``_store_result``), and the walk of the caller
-        continues with the instructions after the call.  A callee that
-        delivered its result from several runtime paths already stored
-        it into the result location on each path (see
-        ``_deliver_inline_result``): only the caller's walk resumes."""
+        caller that suspended on it.  A body that returned sized values
+        already stored each of them into the shared result location on
+        its own path (see ``_deliver_inline_result``): only the caller's
+        walk resumes, and its continuation reads the result from memory.
+        A body that never returned a sized value - a void body, or a
+        constructor, whose ``__init__`` wrote the struct in place - is
+        handed over like a compile-time value (``_store_result``)."""
         resume = frame.resume
         assert resume is not None
         inst, is_ctor = resume
-        if frame.multi_path and frame.val_rets > 0 and not is_ctor:
-            # every runtime path that returns stored its value into the
-            # shared result location; a void body (``val_rets`` 0) still
-            # hands its ``None`` over like a single-path one
+        if frame.ret_type is not None and not sval.is_zst(frame.ret_type):
+            # every runtime path that returned stored its value into the
+            # shared result location: only the caller's walk resumes
             return
         # a constructor's ``__init__`` wrote the struct into the result
         # location itself: the call result is the in-place marker, not
@@ -1304,14 +1289,24 @@ decision).  The return convention of the function is decided here
                 open_ifs += 1
         return open_ifs + 1 if open_ifs > 0 else 0
 
-    def _deliver_inline_result(self, frame: Frame, ev: InterpVal) -> None:
-        """Hand the value of one return site of an inlined body that
-        delivers its result from several runtime paths (see
-        ``Frame.multi_path``) to the location the call's result goes to
-        (``frame.result_loc``): the value is stored into the location's
-        memory on this path.
+    def _deliver_inline_result(self, frame: Frame, value: InterpVal | None) -> None:
+        """Deliver the value of one return site of an inlined body to
+        the location the call's result goes to (``frame.result_loc``):
+        every return of the body - a single-path body included - stores
+        its value into the location's memory on its own path, which is
+        how the value crosses into the code of the caller that follows
+        the inlined body.
 
-        The memory is created here, at the first return site, typed by
+        A bare ``return`` returns the void value (``sval.Void``), the
+        unit value of the void type.  A zero-sized value has no memory,
+        so it is never stored: it only fixes the *type* the body returns
+        on this path.  The spy type of the value must agree across the
+        paths (``frame.ret_type``): a body that returns a value on some
+        paths but is void on others - a return type conflict, ``void``
+        being a type like any other - is rejected here, at the offending
+        site.
+
+        The memory is created at the first sized return site, typed by
         its value - the interpreter emits the alloca at the site, but
         ``lower`` hoists every alloca into the function's entry block,
         so the stores of all paths (and the reads of the caller's
@@ -1321,19 +1316,64 @@ decision).  The return convention of the function is decided here
         proper goes through ``_write_result``, whose return-type checks
         apply on each path; the result location of an enclosing inlined
         body (a ``return``-position call inside another inlined body)
-        and a plain slot are typed by their first store here."""
+        and a plain slot are typed by their first store here.  A
+        constructor's ``__init__`` writes its struct in place and has no
+        result location (``frame.result_loc`` is None): its returns are
+        not delivered at all (the ``hir.Ret`` handling skips this
+        method)."""
+        ev = value if value is not None else ComptimeVal(sval.Void())
+        match ev:
+            case RuntimeVal(_, type):
+                t = type
+                unit = sval.is_zst(t)
+            case ComptimeVal(obj):
+                if sval.is_zst_value(obj):
+                    # the unit value of a zero-sized type (the void
+                    # value of a bare ``return``, ...): no memory
+                    t = sval.type_of(obj)
+                    assert t is not None
+                    unit = True
+                else:
+                    t = sval.type_of(obj)
+                    if t is None or not isinstance(
+                        t, (sval.BoolType, sval.IntType, sval.FloatType)
+                    ):
+                        raise CompileError(
+                            f"cannot return the compile-time value {_describe(ev)} "
+                            f"from function {frame.fn_ir.name}: a return that "
+                            'crosses into the runtime code of the caller must be a '
+                            'spy value with a runtime representation'
+                        )
+                    unit = False
+            case _:
+                raise CompileError(
+                    f"cannot return {_describe(ev)} from function "
+                    f'{frame.fn_ir.name}'
+                )
+        prev = frame.ret_type
+        if prev is not None and prev != t:
+            raise CompileError(
+                f"function {frame.fn_ir.name} returns values of conflicting types "
+                f"{sval.type_str(prev)} and {sval.type_str(t)}"
+            )
+        frame.ret_type = t
+        if unit:
+            # a zero-sized value occupies no storage: nothing is stored
+            # on this path, only the return type is recorded
+            return
         loc = frame.result_loc
+        assert loc is not None
         if isinstance(loc, PendingSlot):
             if loc.ptr is None:
-                value, t = _to_runtime(ev, None)
+                runtime, t = _to_runtime(ev, None)
                 loc.ptr = self._emit(mir.Alloca(mir.PointerType(sval.to_mir_type(t))))
                 loc.type = t
                 loc.value = None
-                self._emit(mir.Store(loc.ptr, value))
+                self._emit(mir.Store(loc.ptr, runtime))
             else:
                 assert loc.type is not None
-                value = _to_slot(ev, loc.type)
-                self._emit(mir.Store(loc.ptr, value))
+                runtime = _to_slot(ev, loc.type)
+                self._emit(mir.Store(loc.ptr, runtime))
             return
         if isinstance(loc, RetLocVal):
             if self._frames[0].ret_loc[1] is loc:
@@ -1347,17 +1387,17 @@ decision).  The return convention of the function is decided here
                 # body's own return loads the stored value back and
                 # yields it when its run ends
                 if loc.ptr is None:
-                    value, t = _to_runtime(ev, None)
+                    runtime, t = _to_runtime(ev, None)
                     loc.ptr = self._emit(
                         mir.Alloca(mir.PointerType(sval.to_mir_type(t)))
                     )
                     loc.type = t
                     loc.value = None
-                    self._emit(mir.Store(loc.ptr, value))
+                    self._emit(mir.Store(loc.ptr, runtime))
                 else:
                     assert loc.type is not None
-                    value = _to_slot(ev, loc.type)
-                    self._emit(mir.Store(loc.ptr, value))
+                    runtime = _to_slot(ev, loc.type)
+                    self._emit(mir.Store(loc.ptr, runtime))
             return
         if isinstance(loc, RuntimeVal):
             ptype = loc.type
@@ -1366,8 +1406,8 @@ decision).  The return convention of the function is decided here
                     f"cannot write the inlined result through a "
                     f"{sval.type_str(ptype)} value"
                 )
-            value = _to_slot(ev, ptype.elem)
-            self._emit(mir.Store(loc.value, value))
+            runtime = _to_slot(ev, ptype.elem)
+            self._emit(mir.Store(loc.value, runtime))
             return
         raise CompileError(
             'cannot deliver the inlined result to this location'
@@ -2236,9 +2276,8 @@ decision).  The return convention of the function is decided here
 
         The frame also records the location the call's result goes to
         (``Frame.result_loc``), resolved from the pending call in the
-        caller: the target of the per-path stores of a body that
-        delivers its result from several runtime paths (see
-        ``_deliver_inline_result``)."""
+        caller: the target of the per-path stores of the body's returns
+        (see ``_deliver_inline_result``)."""
         fn_ir = self._resolver.hir_of_plain_fn(fn)
         # The frames above the function proper are exactly the inlined
         # bodies under execution, each carrying its own ``fn_ir`` (see

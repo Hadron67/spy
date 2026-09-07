@@ -28,7 +28,7 @@ from typing import Any, dataclass_transform
 
 from typing_extensions import override
 
-from . import astgen, mir, sval
+from . import astgen, mir, opt, sval
 from .builtins import AsValue
 from .errors import CompileError, SpyError, TypeMismatchError
 from .fn import FunctionEntry, FunctionValue, LazyJitFunction, LazyJitFunctionInstance
@@ -922,6 +922,10 @@ class JitContext(FunctionResolver):
         try:
             runner = HirRunner(self)
             ret = runner.run_function(fn, fn_ir, arg_types, ret_hint)
+            # the interpreter delivers every inlined result through a
+            # slot: clean up the single-path store/load round trips
+            # (see ``opt``)
+            opt.simplify(fn)
             # the logical spy return type of the specialization (see
             # ``run_function``), kept with its MIR so that callers of a
             # later build can re-derive its function type without reading
