@@ -40,7 +40,7 @@ class FunctionResolver:
         raise NotImplementedError
 
     @abstractmethod
-    def resolve_global(self, value: Any) -> sval.Value | None:
+    def resolve_global(self, value: Any) -> sval.AnyValue:
         """The spy value a global object referenced inside a function
         body resolves to.  A function registered in this host - reached
         as the raw function object or through the callable view its

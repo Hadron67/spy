@@ -58,7 +58,7 @@ from spy.util import IndexedMap
 
 from . import hir
 from .errors import CompileError
-from .fn import FunctionIR, ParamDef, Signature
+from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
     Type,
@@ -108,9 +108,9 @@ class _Scope:
 
     def __init__(self, parent: '_Scope | None') -> None:
         self.parent = parent
-        self.bindings: dict[str, hir.Inst] = {}
+        self.bindings: dict[str, hir.Value] = {}
 
-    def lookup(self, name: str) -> hir.Inst | None:
+    def lookup(self, name: str) -> hir.Value | None:
         """The Alloca of the nearest binding of ``name``, or None when
         the name is not bound in this or any enclosing block."""
         scope = self
@@ -228,8 +228,8 @@ class _Builder:
             raise CompileError(f"only '+=' is supported yet in spy function {fn_name}")
 
         lhs = self._gen_ref(node.target)
-        rhs = self._gen_value(node.value)
-        self.add(hir.Store(lhs, self.add(hir.Binary('+', self.add(hir.Load(lhs)), rhs))))
+        rhs = self._gen_arg(node.value)
+        self.add(hir.Binary('+', ArgEntry(lhs, True), rhs, lhs))
 
     # -- expressions ----------------------------------------------------------
 
@@ -353,12 +353,43 @@ class _Builder:
                         f"(function {fn_name})"
                     )
                 self._gen_call(node, result_loc)
+            case ast.UnaryOp():
+                op = _UNARY_OPS.get(type(node.op))
+                if op is None:
+                    raise CompileError(
+                        f"unsupported unary operator {type(node.op).__name__} in spy function {fn_name}"
+                    )
+                self.add(hir.Unary(op, self._gen_arg(node.operand), result_loc))
+            case ast.BinOp():
+                op = _BIN_OPS.get(type(node.op))
+                if op is None:
+                    raise CompileError(
+                        f"unsupported binary operator {type(node.op).__name__} in spy function {fn_name}"
+                    )
+                lhs = self._gen_arg(node.left)
+                rhs = self._gen_arg(node.right)
+                self.add(hir.Binary(op, lhs, rhs, result_loc))
             case _:
                 # every other expression computes a value first; only the
                 # call (and, later, the ``if`` expression) can write
                 # through a result location without materializing a value
                 value = self._gen_value(node)
                 self.add(hir.Store(result_loc, value))
+
+    def _gen_arg(self, node: ast.expr):
+        match node:
+            case ast.Name() | ast.Call() | ast.Attribute():
+                return ArgEntry(self._gen_ref(node), True)
+            case _:
+                return ArgEntry(self._gen_value(node), False)
+
+    def _gen_arglist(self, args: list[ast.expr], keywords: list[ast.keyword]) -> RawArgList[ArgEntry[hir.Value]]:
+        positional = tuple(self._gen_arg(a) for a in args)
+        kwargs: dict[str, ArgEntry[hir.Value]] = {}
+        for kw in keywords:
+            if kw.arg is not None:
+                kwargs[kw.arg] = self._gen_arg(kw.value)
+        return RawArgList(positional, frozenset(kwargs.items()))
 
     def _gen_call(self, node: ast.Call, result_loc: hir.Value) -> None:
         """One call whose result is written into ``result_loc``: a method
@@ -370,14 +401,12 @@ class _Builder:
             # parameter are resolved by the interpreter from the static
             # type of the base; only the base's address is carried here
             base = self._gen_ref(node.func.value)
-            args = tuple(self._gen_value(a) for a in node.args)
-            self.add(hir.CallMethodInplace(base, node.func.attr, args, result_loc))
+            self.add(hir.CallMethodInplace(base, node.func.attr, self._gen_arglist(node.args, node.keywords), result_loc))
             return
         # the callee must be addressable (a reference), the arguments are
         # by-value values
         callee = self._gen_ref(node.func)
-        args = tuple(self._gen_value(a) for a in node.args)
-        self.add(hir.CallInplace(callee, args, result_loc))
+        self.add(hir.CallInplace(callee, self._gen_arglist(node.args, node.keywords), result_loc))
 
     def _gen_name(self, name: str, is_ref: bool) -> hir.Value:
         """One reference to the name ``name``.  A variable (a parameter
@@ -414,33 +443,9 @@ class _Builder:
                 raise CompileError(f"unsupported constant {node.value!r} in spy function {fn_name}")
             case ast.Name():
                 return self._gen_name(node.id, False)
-            case ast.BinOp():
-                op = _BIN_OPS.get(type(node.op))
-                if op is None:
-                    raise CompileError(
-                        f"unsupported binary operator {type(node.op).__name__} in spy function {fn_name}"
-                    )
-                lhs = self._gen_value(node.left)
-                rhs = self._gen_value(node.right)
-                return self.add(hir.Binary(op, lhs, rhs))
             case ast.BoolOp():
-                op = _BOOL_OPS.get(type(node.op))
-                if op is None:
-                    raise CompileError(f"unsupported boolean operator in spy function {fn_name}")
-                values = [self._gen_value(v) for v in node.values]
-                result: hir.Value = values[0]
-                for v in values[1:]:
-                    result = self.add(hir.BoolOp(op, result, v))
-                return result
-            case ast.UnaryOp():
-                if isinstance(node.op, ast.UAdd):
-                    return self._gen_value(node.operand)
-                op = _UNARY_OPS.get(type(node.op))
-                if op is None:
-                    raise CompileError(
-                        f"unsupported unary operator {type(node.op).__name__} in spy function {fn_name}"
-                    )
-                return self.add(hir.Unary(op, self._gen_value(node.operand)))
+                # do not implement this yet
+                raise NotImplementedError
             case ast.Compare():
                 if len(node.ops) != 1 or len(node.comparators) != 1:
                     raise CompileError(
@@ -451,11 +456,11 @@ class _Builder:
                     raise CompileError(
                         f"unsupported comparison {type(node.ops[0]).__name__} in spy function {fn_name}"
                     )
-                lhs = self._gen_value(node.left)
-                rhs = self._gen_value(node.comparators[0])
+                lhs = self._gen_arg(node.left)
+                rhs = self._gen_arg(node.comparators[0])
                 return self.add(hir.Compare(op, lhs, rhs))
-            case ast.Call():
-                loc = self.add(hir.Alloca())
+            case ast.Call() | ast.BinOp() | ast.UnaryOp():
+                loc = self.add(hir.Alloca(True))
                 self._gen_result_loc(node, loc)
                 return self._make_load(loc)
             case ast.Attribute():
@@ -534,7 +539,7 @@ def parse_function(fn: Callable, mode: str = 'jit', self_type: Type | None = Non
         raise CompileError(
             f"generic spy functions require Python 3.13 or newer (function {node.name})"
         )
-    generic_args = IndexedMap[str, SpyTypeVar]()
+    generic_args: list[SpyTypeVar] = []
     type_vars: dict[TypeVar, Value] = {}
     for type_param in declared_type_params:
         if not isinstance(type_param, TypeVar):
@@ -542,7 +547,7 @@ def parse_function(fn: Callable, mode: str = 'jit', self_type: Type | None = Non
                 f"unsupported type parameter {type_param!r} in function {node.name}"
             )
         spy = SpyTypeVar(type_param.__name__)
-        generic_args.add(type_param.__name__, spy)
+        generic_args.append(spy)
         type_vars[type_param] = spy
 
     def convert(annotation: Any, what: str) -> AnyValue | None:
@@ -576,7 +581,7 @@ def parse_function(fn: Callable, mode: str = 'jit', self_type: Type | None = Non
     # the signature: the formal parameters, by declaration position
     all_args = list(node.args.args)
     offset = len(all_args) - len(defaults)
-    positional = IndexedMap[int, ParamDef]()
+    positional = IndexedMap[str, SignatureFormalArg]()
     for i, arg in enumerate(all_args):
         has_default = i >= offset
         default_value = default_of(defaults[i - offset]) if has_default else None
@@ -584,34 +589,26 @@ def parse_function(fn: Callable, mode: str = 'jit', self_type: Type | None = Non
         if i == 0 and self_type is not None:
             arg_type = self_type
         positional.add(
-            i, ParamDef(arg.arg, arg_type, default_value)
+            arg.arg, SignatureFormalArg(arg_type, False, False, default_value)
         )
+
+    # TODO: implement varargs and kwargs here
 
     # spy function definitions reject *args/**kwargs (above), so the
     # ``*args``/``**kwargs`` parameters are always absent for now
     signature = Signature(
-        generic_args, positional, None, None, annotation_of(ret_annotation)
+        tuple(generic_args), positional, None, None, annotation_of(ret_annotation), None,
     )
 
     ir = FunctionIR(node.name, signature, ())
 
-    # prologue: every parameter is addressable, so allocate one slot per
-    # parameter and store its by-value argument into it.  The function
-    # body is the outermost block: its scope is pre-populated with the
-    # parameter slots, so an assignment to a parameter name at the top
-    # level stores into the parameter slot.  The interpreter types an
-    # Alloca when its first store runs.
-    params = positional.values()
+    # At HIR level, parameters are passed by ref (pointer)
     scope = _Scope(None)
-    prologue: list[hir.Inst] = []
-    for i, param in enumerate(params):
-        alloca = hir.Alloca()
-        prologue.append(alloca)
-        prologue.append(hir.Store(alloca, hir.Arg(i)))
-        scope.bindings[param.name] = alloca
+    for i, name in enumerate(positional.keys):
+        scope.bindings[name] = hir.Arg(i)
 
     builder = _Builder(fn, ir, scope)
     for stmt in node.body:
         builder._gen_stmt(stmt)
-    ir.body = tuple(prologue + builder.insts)
+    ir.body = tuple(builder.insts)
     return ir

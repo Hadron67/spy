@@ -19,7 +19,9 @@ are equal), which is what makes the compile-time comparisons in
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, override
+from typing import Any, final, override
+
+from spy.fn import RawArgList
 
 from . import mir
 from .errors import CompileError, SpyError, TypeMismatchError
@@ -40,7 +42,7 @@ class Value:
 AnyValue = Value | int | float | str | bool
 
 class Type(Value):
-    def get_unit_value(self) -> Value | None:
+    def get_unit_value(self) -> AnyValue | None:
         """The canonical *unit value* of a zero-sized type (ZST): ``None``
         when the type has a runtime representation (it is not
         zero-sized), otherwise the one compile-time value every value of
@@ -50,12 +52,24 @@ class Type(Value):
         ``mir`` mirror is ``None`` (``to_mir_type`` returns ``None``)."""
         return None
 
+    def is_subtype_of(self, other: 'Type') -> bool:
+        return isinstance(other, self.__class__)
+
+    def resolve_peer_type(self, other: 'Type') -> 'Type | None':
+        return other if self.is_subtype_of(other) else None
+
 @dataclass(frozen=True)
 class TypeType(Type):
     level: int
     @override
     def get_type(self) -> Type:
         return TypeType(self.level + 1)
+
+    @override
+    def is_subtype_of(self, other: 'Type') -> bool:
+        type = other.get_type()
+        assert isinstance(type, TypeType)
+        return self.level <= type.level
 
 
 class TypeVar(Type):
@@ -81,6 +95,14 @@ class BoolType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
+@dataclass(frozen=True)
+class EmptyType(Type):
+    def get_type(self) -> 'Type':
+        return TYPE_TYPE
+
+    @override
+    def resolve_peer_type(self, other: 'Type') -> 'Type | None':
+        return other
 
 @dataclass(frozen=True)
 class VoidType(Type):
@@ -100,7 +122,6 @@ class VoidType(Type):
     def get_unit_value(self) -> Value | None:
         return Void()
 
-
 class Void(Value):
     """The unique *value* of the unit type :class:`VoidType` (which is a
     zero-sized type): the compile-time object that denotes "no value" -
@@ -111,13 +132,21 @@ class Void(Value):
     def get_type(self) -> Type:
         return VoidType()
 
+@dataclass
+class ConstRef(Value):
+    value: AnyValue
+
+    @override
+    def get_type(self) -> Type:
+        return PointerType(type_of(self.value), is_const=True)
+
 class BuiltinFn(Value):
     @override
     def get_type(self) -> 'Type':
         return AnyFunction()
 
 @dataclass
-class ComptimeIntType(Type):
+class AnyIntType(Type):
     def get_type(self) -> 'Type':
         return TYPE_TYPE
 
@@ -134,6 +163,36 @@ class IntType(Type):
     def get_unit_value(self) -> Value | None:
         if self.bits == 0:
             return Int(0, self)
+        return None
+
+    @override
+    def is_subtype_of(self, other: 'Type') -> bool:
+        if isinstance(other, AnyIntType):
+            return True
+        if not isinstance(other, IntType):
+            return False
+        self_range = int_range(self)
+        other_range = int_range(other)
+        return self_range[0] >= other_range[0] and self_range[1] <= other_range[1]
+
+    def peer_type_with_value(self, value: int):
+        lower, upper = int_range(self)
+        lower = min(lower, value)
+        upper = max(upper, value)
+        return min_int_type(lower, upper)
+
+    def resolve_peer_type(self, other: 'Type') -> 'Type | None':
+        match other:
+            case IntType():
+                self_range = int_range(self)
+                other_range = int_range(other)
+                return min_int_type(min(self_range[0], other_range[0]), max(self_range[1], other_range[1]))
+            case ValueType():
+                match other.value:
+                    case int():
+                        return self.peer_type_with_value(other.value)
+                    case Int():
+                        return self.peer_type_with_value(other.value.value)
         return None
 
 @dataclass(frozen=True)
@@ -155,6 +214,11 @@ class FloatType(Type):
     @override
     def get_type(self) -> Type:
         return TYPE_TYPE
+
+    def is_subtype_of(self, other: 'Type') -> bool:
+        if not isinstance(other, FloatType):
+            return False
+        return self.bits <= other.bits
 
 @dataclass(frozen=True)
 class Float(Type):
@@ -185,6 +249,29 @@ class Undefined(Value):
     @override
     def get_type(self) -> Type:
         return self.type
+
+@dataclass(frozen=True)
+class ValueType(Type):
+    value: AnyValue
+
+    @staticmethod
+    def create(value: AnyValue):
+        type = type_of(value)
+        return ValueType(value) if type.get_unit_value() is None else type
+
+    @override
+    def get_type(self) -> Type:
+        return type_of(self.value).get_type()
+
+    @override
+    def get_unit_value(self) -> AnyValue | None:
+        return self.value
+
+    @override
+    def resolve_peer_type(self, other: 'Type') -> 'Type | None':
+        if isinstance(other, ValueType):
+            return self if self.value == other.value else None
+        return other.resolve_peer_type(self)
 
 @dataclass(frozen=True)
 class FormalArg:
@@ -224,7 +311,7 @@ class StructField:
 
 @dataclass(frozen=True)
 class AggregateValue(Value):
-    values: tuple[Value, ...]
+    values: tuple[AnyValue, ...]
     type: Type
 
     @override
@@ -276,7 +363,7 @@ class StructType(Type):
         assert all(f.name != name for f in self._fields)
         self._fields.append(StructField(name, type))
 
-    def bind_default_ctor_args[T](self, positional: tuple[T, ...], named: dict[str, T]) -> tuple[T, ...]:
+    def bind_default_ctor_args[T](self, args: RawArgList[T]) -> tuple[T, ...]:
         ret: list[T | None] = []
         # TODO
         raise NotImplementedError
@@ -331,8 +418,8 @@ class StructType(Type):
         return TypeType(level)
 
     @override
-    def get_unit_value(self) -> Value | None:
-        values: list[Value] = []
+    def get_unit_value(self) -> AnyValue | None:
+        values: list[AnyValue] = []
         for field in self._fields:
             val = field.type.get_unit_value()
             if val is None:
@@ -410,6 +497,10 @@ def int_range(type: IntType) -> tuple[int, int]:
         return (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
     return (0, 2 ** type.bits - 1)
 
+def min_int_type(lower: int, upper: int) -> IntType:
+    bits = (lower - 1).bit_length() + 1
+    bits_upper = (upper - 1).bit_length() + 1
+    return IntType(max(bits, bits_upper), lower < 0)
 
 def type_str(type: Type) -> str:
     """A short, printable name of a type (used in error messages and in the
@@ -520,54 +611,6 @@ def returns_via_result_ptr(type: Type) -> bool:
             return False
 
 
-def function_call_info(type: FunctionType) -> tuple[FunctionCallInfo, mir.FunctionType]:
-    """The lowering plan of one call of a function of this signature
-    into MIR: how the by-value arguments map onto the positions of the
-    lowered MIR argument list, and how the result is returned.  This is
-    the single place the lowered form of a call is derived from the
-    *function type* (so a future call through a function pointer lowers
-    identically): every argument keeps its position, a parameter whose
-    type has no runtime representation (``to_mir_type`` is ``None`` - a
-    zero-sized type) occupies no position and is not passed (it has no
-    runtime representation; the callee binds its own unit value), and a
-    return type delivered through a result location (see
-    :func:`returns_via_result_ptr`) appends the hidden result pointer as
-    the trailing MIR argument.
-
-    Besides the call plan, the *lowered* MIR signature of the function
-    is returned: the :class:`mir.FunctionType` the lowered argument
-    list and return type form (the form a :class:`mir.Symbol` or
-    function value of the signature carries)."""
-    args_map: list[FunctionCallArgInfo | None] = []
-    mir_args: list[mir.Type] = []
-    for arg in type.args:
-        mir_type = to_mir_type(arg.type)
-        if isinstance(mir_type, mir.VoidType):
-            args_map.append(None)
-        else:
-            args_map.append(FunctionCallArgInfo(len(mir_args)))
-            mir_args.append(mir_type)
-    if returns_via_result_ptr(type.return_type):
-        # the result is written into a caller-provided location whose
-        # address is appended as the trailing MIR argument; the lowered
-        # function returns void
-        result_type = to_mir_type(type.return_type)
-        assert not isinstance(result_type, mir.VoidType)
-        return FunctionCallInfo(
-            len(mir_args) + 1,
-            tuple(args_map),
-            FunctionRetLocReturnInfo(arg_index=len(mir_args)),
-        ), mir.FunctionType(tuple(mir_args) + (mir.PointerType(result_type),), mir.VOID)
-    return (
-        FunctionCallInfo(
-            len(mir_args),
-            tuple(args_map),
-            FunctionValueReturnInfo(mir_type=to_mir_type(type.return_type)),
-        ),
-        mir.FunctionType(tuple(mir_args), to_mir_type(type.return_type)),
-    )
-
-
 # ---------------------------------------------------------------------------
 # mirroring spy types into MIR types: the only place MIR types are produced
 # from spy types (valid spy types always mirror to valid MIR - ``lower`` maps
@@ -613,7 +656,7 @@ def to_mir_type(type: Type) -> mir.MayBeVoidType:
 # ---------------------------------------------------------------------------
 
 
-def type_of(value: Any) -> Type | None:
+def type_of(value: AnyValue) -> Type:
     """The spy type a Python *value* is marshaled to at the call boundary.
 
     ``None`` is returned for values that have no spy representation (e.g.
@@ -626,21 +669,13 @@ def type_of(value: Any) -> Type | None:
         case bool():
             return BoolType()
         case int():
-            return ComptimeIntType()
+            return AnyIntType()
         case float():
             return FloatType(64)
         case str():
             # strings are compiled as arrays of u8; until arrays get their
             # own type they are represented by a const pointer to u8
             return PointerType(IntType(8, False), is_const=True)
-        case _:
-            # a struct instance knows its spy struct type: its Python
-            # class (built by the host) carries a back reference
-            cls = type(value)
-            descriptor = getattr(cls, '__spy_struct_type__', None)
-            if descriptor is not None:
-                return descriptor
-            return None
 
 
 def value_repr(value: object) -> str:
@@ -722,7 +757,7 @@ class _SolvedTypeVar:
 
     def __init__(self) -> None:
         self._value: Value | None = None  # non-None: this type var is solved to this value, in this case _subtypes is None
-        self._subtypes: set[Value] | None = None  # non-None: this type var is a subtype of all values in the set, in this case _value is None
+        self._subtypes: set[Value] | None = None  # non-None: all values in this set are subtypes of this type var, in this case _value is None
 
     def _add_bound(self, value: Value) -> None:
         if self._subtypes is None:
@@ -749,7 +784,7 @@ class TypeVarSolver:
 
     def __init__(self) -> None:
         self._type_var_values: dict[TypeVar, _SolvedTypeVar] = {}
-        self._constraints: list[_Constraint] = []
+        self._unsatisfied: list[_Constraint] = []
 
     def _solved(self, tv: TypeVar) -> _SolvedTypeVar:
         stv = self._type_var_values.get(tv)
@@ -758,134 +793,72 @@ class TypeVarSolver:
             self._type_var_values[tv] = stv
         return stv
 
-    def _whnf_one(self, value: Value) -> Value:
-        if isinstance(value, TypeVar) and value in self._type_var_values:
-            val = self._type_var_values[value]._value
-            if val is not None:
-                return val
-        return value
+    def _add_unsatisfied(self, lhs: Value, rhs: Value, is_subtype: bool = False) -> None:
+        self._unsatisfied.append(_Constraint(lhs, rhs, is_subtype))
 
-    def _whnf(self, value: Value) -> Value:
-        next = self._whnf_one(value)
-        while next != value:
-            value = next
-            next = self._whnf_one(value)
-        return value
+    def _solve_type_var_bound(self, v: TypeVar, bound: Value, is_subtype: bool) -> None:
+        solved = self._solved(v)
+        if is_subtype:
+            assert solved._value is None
+            if solved._subtypes is None:
+                solved._subtypes = set()
+            solved._subtypes.add(bound)
+        else:
+            if solved._subtypes is not None:
+                for st in solved._subtypes:
+                    assert isinstance(st, Type) and isinstance(bound, Type)
+                    if not st.is_subtype_of(bound):
+                        self._add_unsatisfied(st, bound, True)
+                solved._subtypes = None
+            solved._value = bound
 
-    def add_constraint(self, lhs: Value, rhs: Value, is_subtype: bool = False) -> None:
-        self._constraints.append(_Constraint(lhs, rhs, is_subtype))
+    def add_constraint(self, lhs: Value, rhs: Value, is_subtype: bool = False):
+        todo = [(lhs, rhs, is_subtype)]
+        while todo:
+            lhs, rhs, is_subtype = todo.pop()
+            if lhs == rhs:
+                continue
+            if is_subtype:
+                # in the case we concern, TypeVar cannot appear on the left side of a subtype constraint
+                assert not isinstance(lhs, TypeVar)
+                if isinstance(rhs, TypeVar):
+                    self._solve_type_var_bound(rhs, lhs, True)
+                if isinstance(lhs, TypeVar) and isinstance(rhs, TypeVar) and not lhs.is_subtype_of(rhs):
+                    self._add_unsatisfied(lhs, rhs, is_subtype)
+                self._add_unsatisfied(lhs, rhs, is_subtype)
+            else:
+                if isinstance(rhs, TypeVar) and not isinstance(lhs, TypeVar):
+                    t = lhs
+                    lhs = rhs
+                    rhs = t
 
-    def finish(self) -> None:
-        """Solve the pending constraints, binding the type parameters to
-        their solutions.  Raises :class:`TypeMismatchError` when a
-        constraint cannot be satisfied."""
-        pending = self._constraints
-        self._constraints = []
-        # equality constraints are solved eagerly; a constraint that
-        # cannot be decided in one pass (its type parameter only carries
-        # a subtype bound that is not resolved yet) is retried after the
-        # rest of the pass has made its progress
-        while len(pending) > 0:
-            leftover: list[_Constraint] = []
-            progress = False
-            for constraint in pending:
-                if self._solve_one(constraint):
-                    progress = True
-                else:
-                    leftover.append(constraint)
-            if not progress:
-                raise TypeMismatchError(
-                    'cannot solve the remaining type constraints'
-                )
-            pending = leftover
-        # bind the type parameters that only subtype constraints
-        # constrain (their bounds are recorded on the parameter; a
-        # bound that is itself a type parameter is followed to its own
-        # solution)
-        while True:
-            progress = False
-            for tv, stv in self._type_var_values.items():
-                if stv._value is not None or stv._subtypes is None:
-                    continue
-                bounds = {self._whnf(b) for b in stv._subtypes}
-                if len(bounds) > 1:
-                    raise _subtype_conflict(*(tuple(bounds)[:2]))
-                val = next(iter(bounds))
-                if isinstance(val, TypeVar) and self._solved(val)._value is None:
-                    # the sole bound is itself unsolved: it is resolved
-                    # in a later pass of this loop
-                    continue
-                stv._value = val
-                progress = True
-            if not progress:
-                # every remaining bounded parameter has an unsolved
-                # bound, so no value can be assigned
-                for tv, stv in self._type_var_values.items():
-                    if stv._value is None and stv._subtypes is not None:
-                        raise _subtype_conflict(tv, next(iter(stv._subtypes)))
-                return
+                if isinstance(lhs, TypeVar):
+                    self._solve_type_var_bound(lhs, rhs, False)
+
+                # TODO: more cases after generics are added
+
+                if lhs != rhs:
+                    self._add_unsatisfied(lhs, rhs, is_subtype)
+
+    def finish(self):
+        for type_var, sv in self._type_var_values.items():
+            if sv._value is None and sv._subtypes is not None:
+                type = EmptyType()
+                for st in sv._subtypes:
+                    assert isinstance(st, Type)
+                    pt = type.resolve_peer_type(st)
+                    if pt is None:
+                        self._add_unsatisfied(type_var, st, True)
+                        continue
+                    type = pt
+                sv._value = type
 
     def get_solved(self) -> dict[TypeVar, Value]:
         return {
-            k: self._whnf(v._value)
+            k: v._value
             for k, v in self._type_var_values.items()
             if v._value is not None
         }
-
-    def _solve_one(self, constraint: _Constraint) -> bool:
-        """Solve one constraint. Returns True when the constraint is
-        fully handled, False when it cannot be decided yet (its type
-        parameter only carries a subtype bound that is not resolved) and
-        the caller must retry it."""
-        lhs = self._whnf(constraint.lhs)
-        rhs = self._whnf(constraint.rhs)
-        if lhs == rhs:
-            return True
-        if constraint.is_subtype:
-            # a subtype constraint involving a type parameter records
-            # the other side as a bound of the parameter; between two
-            # resolved values it can only hold when they are equal
-            if isinstance(lhs, TypeVar):
-                self._solved(lhs)._add_bound(rhs)
-                return True
-            if isinstance(rhs, TypeVar):
-                # ``lhs <: T``: under the trivial subtype relation this
-                # constrains T to lhs, which the bound records
-                self._solved(rhs)._add_bound(lhs)
-                return True
-            raise _subtype_conflict(lhs, rhs)
-        # an equality constraint: bring the type parameter (if any) to
-        # the left hand side
-        if isinstance(rhs, TypeVar) and not isinstance(lhs, TypeVar):
-            t = lhs
-            lhs = rhs
-            rhs = t
-        if not isinstance(lhs, TypeVar):
-            # neither side is a type parameter: two distinct resolved
-            # values can never become equal
-            raise _subtype_conflict(lhs, rhs)
-        stv = self._solved(lhs)
-        # the solution must satisfy the subtype bounds recorded on the
-        # parameter
-        if stv._subtypes is not None:
-            for bound in stv._subtypes:
-                b = self._whnf(bound)
-                if isinstance(b, TypeVar) and not isinstance(rhs, TypeVar):
-                    # the bound is an unsolved type parameter: whether
-                    # rhs satisfies it is only known once it resolves
-                    return False
-                if b != rhs:
-                    raise _subtype_conflict(rhs, b)
-        if isinstance(rhs, TypeVar):
-            # an equality between two type parameters: solving the lhs
-            # to the rhs chains the two; when the rhs carries a subtype
-            # bound, the equality is only decidable once it resolves
-            if self._solved(rhs)._subtypes is not None:
-                return False
-            stv._value = rhs
-            return True
-        stv._value = rhs
-        return True
 
 def replace_type_var(value: Value, reps: dict[TypeVar, Value]) -> Value:
     match value:
@@ -893,3 +866,15 @@ def replace_type_var(value: Value, reps: dict[TypeVar, Value]) -> Value:
             return reps.get(value, value)
         case _:
             return value
+
+def replace_type_vars_type(type: Type, reps: dict[TypeVar, Value]) -> Type:
+    ret = replace_type_var(type, reps)
+    assert isinstance(ret, Type)
+    return ret
+
+def is_comptime_only_type(type: Type) -> bool:
+    match type:
+        case AnyIntType() | TypeType():
+            return True
+        case _:
+            return False

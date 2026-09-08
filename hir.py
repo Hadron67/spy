@@ -71,6 +71,8 @@ instructions (loops, ...) will use the same marker representation.
 from dataclasses import dataclass
 from typing import Any
 
+from spy.fn import ArgEntry, RawArgList
+
 
 class Value:
     pass
@@ -172,7 +174,7 @@ class CallMethodInplace(Inst):
 
     base: Value
     name: str
-    args: tuple[Value, ...]
+    args: RawArgList[ArgEntry[Value]]
     ret: Value
 
 
@@ -186,7 +188,7 @@ class CallInplace(Inst):
     that needs the value loads it back from ``ret``."""
 
     callee: Value
-    args: tuple[Value, ...]
+    args: RawArgList[ArgEntry[Value]]
     ret: Value
 
 
@@ -195,17 +197,17 @@ class Binary(Inst):
     """Arithmetic: '+', '-', '*', '/', '//', '%', '**'."""
 
     op: str
-    lhs: Value
-    rhs: Value
-
+    lhs: ArgEntry[Value]
+    rhs: ArgEntry[Value]
+    ret: Value
 
 @dataclass(eq=False)
 class Compare(Inst):
     """Comparison: '==', '!=', '<', '<=', '>', '>='."""
 
     op: str
-    lhs: Value
-    rhs: Value
+    lhs: ArgEntry[Value]
+    rhs: ArgEntry[Value]
 
 
 @dataclass(eq=False)
@@ -215,8 +217,8 @@ class BoolOp(Inst):
     runs, so both sides of a compile-time ``and`` are always computed."""
 
     op: str
-    lhs: Value
-    rhs: Value
+    lhs: ArgEntry[Value]
+    rhs: ArgEntry[Value]
 
 
 @dataclass(eq=False)
@@ -224,8 +226,8 @@ class Unary(Inst):
     """Unary operator: 'not', 'neg' (unary minus)."""
 
     op: str
-    operand: Value
-
+    operand: ArgEntry[Value]
+    ret: Value
 
 @dataclass(eq=False)
 class Ret(Inst):

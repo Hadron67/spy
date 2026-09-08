@@ -1,9 +1,7 @@
 import ctypes
-from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from types import FunctionType as PyFunctionType
-from typing import Any, TypeAlias, override
+from typing import Any, override
 
 from spy.util import IndexedMap
 
@@ -18,25 +16,112 @@ from .sval import (
     TypeVar,
     TypeVarSolver,
     Value,
-    returns_via_result_ptr,
-    to_mir_type,
 )
 
 
 @dataclass(frozen=True)
-class ParamDef:
-    name: str
+class SignatureFormalArg:
     # The evaluated annotation of the parameter, in the spy domain (see
     # ``Signature``): a concrete spy type, a generic type parameter of
     # the signature (a ``TypeVar`` of ``Signature.generic_args``), or
     # None when the parameter is unannotated.
     type: Type | None
+    is_comptime: bool
+    # whether pass this parameter by reference (i.e. as a constant pointer)
+    by_ref: bool
     # The evaluated default value of the parameter, in the spy domain
     # (see ``Signature``); None when the parameter has no default.
     default_value: AnyValue | None
 
+    def map_type(self, f: Callable[[Type], Type]) -> 'SignatureFormalArg':
+        return SignatureFormalArg(
+            None if self.type is None else f(self.type),
+            self.is_comptime,
+            self.by_ref,
+            self.default_value,
+        )
 
 @dataclass(frozen=True)
+class ArgEntry[T]:
+    value: T
+    is_ref: bool
+
+
+@dataclass(frozen=True)
+class RawArgList[T]:
+    positional: tuple[T, ...]
+    kwargs: frozenset[tuple[str, T]]
+
+    def map[K](self, f: Callable[[T], K]) -> 'RawArgList[K]':
+        return RawArgList(
+            tuple(f(p) for p in self.positional),
+            frozenset((k, f(v)) for k, v in self.kwargs),
+        )
+
+@dataclass(frozen=True)
+class ArgList[T]:
+    positional: tuple[T, ...]
+    varargs: tuple[T, ...]
+    kwargs: frozenset[tuple[str, T]]
+
+    def map[K](self, f: Callable[[T], K]) -> 'ArgList[K]':
+        return ArgList(
+            tuple(f(p) for p in self.positional),
+            tuple(f(v) for v in self.varargs),
+            frozenset((k, f(v)) for k, v in self.kwargs),
+        )
+
+class SpecializedFormalArg:
+    pass
+
+@dataclass(frozen=True)
+class SpecializedRuntimeArg(SpecializedFormalArg):
+    type: Type
+    is_ref: bool
+
+    def __str__(self) -> str:
+        return f"<{'&' if self.is_ref else ''}{self.type}>"
+
+@dataclass(frozen=True)
+class SpecializedComptimeArg(SpecializedFormalArg):
+    value: AnyValue
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+@dataclass(frozen=True)
+class SpecializedSignature:
+    generic_args: tuple[Value, ...]
+    positional: tuple[tuple[str, SpecializedFormalArg]]
+    varargs: tuple[SpecializedFormalArg, ...] | None
+    kwargs: frozenset[tuple[str, SpecializedFormalArg]] | None
+    ret_by_ref: bool | None
+    ret_type: Type | None
+
+    def __str__(self) -> str:
+        """Note: return type not included"""
+        generic = ", ".join(str(a) for a in self.generic_args)
+        parts: list[str] = []
+        parts.extend(str(a[1] for a in self.positional))
+        if self.varargs is not None:
+            s = ", ".join(str(a) for a in self.varargs)
+            parts.append(f"*({s})")
+        if self.kwargs is not None:
+            s = ", ".join(str(a) for a in self.kwargs)
+            parts.append(f"**{{{s}}}")
+        return f"[{generic}]({', '.join(parts)})"
+
+    def with_ret_type(self, ret_type: Type, ret_by_ret: bool) -> 'SpecializedSignature':
+        return SpecializedSignature(
+            generic_args=self.generic_args,
+            positional=self.positional,
+            varargs=self.varargs,
+            kwargs=self.kwargs,
+            ret_type=ret_type,
+            ret_by_ref=ret_by_ret,
+        )
+
+@dataclass
 class Signature:
     """The complete signature of a spy function, read off its Python
     definition: the declared generic type parameters (PEP 695 ``[T]``,
@@ -52,26 +137,26 @@ class Signature:
 
     # the declared generic type parameters, by name: ``[T]`` declares
     # one entry ``T -> TypeVar('T')``
-    generic_args: IndexedMap[str, TypeVar]
+    generic_args: tuple[TypeVar, ...]
     # the formal parameters, by declaration position
-    positional: IndexedMap[int, ParamDef]
+    positional: IndexedMap[str, SignatureFormalArg]
     # the ``*args``/``**kwargs`` parameters (always None for now: spy
     # function definitions do not accept them yet, but the signature
     # model - and ``bind_args`` - already does)
-    varargs: ParamDef | None
-    kwargs: ParamDef | None
+    varargs: SignatureFormalArg | None
+    kwargs: SignatureFormalArg | None
     # the evaluated return annotation, in the spy domain (a concrete spy
     # type, a type parameter, or the void type for an explicit
     # ``-> None``); None when no return annotation is written and the
     # return type is inferred from the body
     ret_type: Type | None
+    ret_by_ref: bool | None
 
-    def bind_args[T](
+    def bind_arg_pos[T](
         self,
-        positional: tuple[T, ...],
-        kwargs: dict[str, T],
+        args: RawArgList[T],
         default_converter: Callable[[AnyValue], T],
-    ) -> tuple[tuple[T, ...], tuple[T, ...], dict[str, T]]:
+    ) -> ArgList[T]:
         """Bind the arguments of one call to the function's formal
         parameters.  Returns ``(positional, varargs, kwargs)`` where
 
@@ -89,9 +174,10 @@ class Signature:
         Binding errors - too many positional arguments, an unknown or
         duplicate keyword argument, a missing required argument - are
         raised as :class:`TypeError`."""
-        pos_params = self.positional.values()
-        n = len(pos_params)
-        param_index = {p.name: i for i, p in enumerate(pos_params)}
+        n = len(self.positional.by_id)
+        positional = args.positional
+        kwargs = args.kwargs
+
         values: dict[int, T] = {}
         varargs_out: list[T] = []
         # the positional arguments bind the leading parameters in order;
@@ -107,8 +193,8 @@ class Signature:
                 )
         # the keyword arguments bind the remaining parameters by name
         kwargs_out: dict[str, T] = {}
-        for key, value in kwargs.items():
-            idx = param_index.get(key)
+        for key, value in kwargs:
+            idx = self.positional.by_key.get(key)
             if idx is not None:
                 if idx in values:
                     raise TypeError(f"got multiple values for argument '{key}'")
@@ -119,19 +205,19 @@ class Signature:
                 raise TypeError(f"got an unexpected keyword argument '{key}'")
         # the parameters the call leaves out take their default values
         bound: list[T] = []
-        for i, param in enumerate(pos_params):
+        for i, (name, param) in enumerate(self.positional.items()):
             if i in values:
                 bound.append(values[i])
             else:
                 default = param.default_value
                 if default is None:
-                    raise TypeError(f"missing required argument '{param.name}'")
+                    raise TypeError(f"missing required argument '{name}'")
                 bound.append(default_converter(default))
-        return tuple(bound), tuple(varargs_out), kwargs_out
+        return ArgList(tuple(bound), tuple(varargs_out), frozenset(kwargs_out.items()))
 
     def solve_param_types(
-        self, provided: tuple[Type | None, ...]
-    ) -> tuple[Type, ...]:
+        self, provided: ArgList[Type | None]
+    ) -> tuple[Value, ...]:
         """The concrete spy type of every formal parameter of one call,
         given ``provided``: the marshaled type of each argument the call
         provides, and ``None`` for a parameter whose default value
@@ -145,60 +231,33 @@ class Signature:
         parameter unifies.  A parameter that no argument covers takes
         the type its parameter was unified to, the type of its default
         value, or raises when it has neither."""
-        params = self.positional.values()
-        assert len(provided) == len(params), 'argument count mismatch'
+        assert len(provided.positional) == len(self.positional.by_id), 'argument count mismatch'
         # unify the type parameters over the provided arguments: two
         # arguments of parameters annotated with the same type parameter
         # must marshal to the same type
         solver = TypeVarSolver()
-        for param, cand in zip(params, provided):
-            if cand is not None and isinstance(param.type, TypeVar):
-                solver.add_constraint(param.type, cand)
+        for param, cand in zip(self.positional.by_id, provided.positional):
+            if cand is not None and param.type is not None:
+                solver.add_constraint(cand, param.type, True)
+        if self.varargs is not None and self.varargs.type is not None:
+            for cand in provided.varargs:
+                if cand is not None:
+                    solver.add_constraint(cand, self.varargs.type, True)
+        if self.kwargs is not None and self.kwargs.type is not None:
+            for _, type in provided.kwargs:
+                if type is not None:
+                    solver.add_constraint(type, self.kwargs.type, True)
         solver.finish()
-        solved: dict[TypeVar, Type] = {
-            k: v
-            for k, v in solver.get_solved().items()
-            if isinstance(v, Type)
-        }
-        types: list[Type] = []
-        for param, cand in zip(params, provided):
-            if cand is not None:
-                # a provided argument types the parameter it is provided
-                # for
-                types.append(cand)
-            elif isinstance(param.type, TypeVar):
-                bound = solved.get(param.type)
-                if bound is not None:
-                    types.append(bound)
-                elif param.default_value is not None:
-                    types.append(_default_value_type(param))
-                else:
-                    raise TypeMismatchError(f"missing argument '{param.name}'")
-            elif param.default_value is not None:
-                types.append(_default_value_type(param))
-            else:
-                raise TypeMismatchError(f"missing argument '{param.name}'")
-        return tuple(types)
-
-    def solve_return_type(self, arg_types: tuple[Type, ...]) -> Type | None:
-        """The declared return type of one call whose formal parameter
-        types are ``arg_types``, or ``None`` when the function declares
-        none (the return type is then inferred from the body).  A return
-        annotation that names a type parameter resolves to the type the
-        parameter is bound to - the type of the first parameter
-        annotated with the same type parameter."""
-        ret = self.ret_type
-        if ret is None:
-            return None
-        if isinstance(ret, TypeVar):
-            for param, t in zip(self.positional.values(), arg_types):
-                if param.type is ret:
-                    return t
-            return None
-        return ret
+        solved = solver.get_solved()
+        ret: list[Value] = []
+        for type_var in self.generic_args:
+            if type_var not in solved:
+                raise TypeMismatchError(f"type variable {type_var.name} not solved")
+            ret.append(solved[type_var])
+        return tuple(ret)
 
     def is_generic(self) -> bool:
-        if len(self.generic_args.by_id) > 0 or self.varargs is not None or self.kwargs is not None:
+        if len(self.generic_args) > 0 or self.varargs is not None or self.kwargs is not None:
             return True
         if self.ret_type is None:
             return True
@@ -212,10 +271,15 @@ class Signature:
             return None
         assert self.ret_type is not None
         formal: list[FormalArg] = []
-        for arg in self.positional.by_id:
+        for name, arg in self.positional.items():
             assert arg.type is not None
-            formal.append(FormalArg(arg.name, arg.type, arg.default_value))
+            formal.append(FormalArg(name, arg.type, arg.default_value))
         return FunctionType(tuple(formal), self.ret_type)
+
+    def specialize(self, provided: ArgList[Type | None]) -> SpecializedSignature:
+        type_vars = self.solve_param_types(provided)
+        # TODO: substitute solved type vars, fill remaining
+        raise NotImplementedError
 
 
 @dataclass
@@ -225,49 +289,6 @@ class FunctionIR:
     body: tuple[hir.Inst, ...]
     # The result location the return statements of the body write into
     # (see ``hir.ResultLoc``)
-
-    # -- the aot signature (``mode == 'aot'``) ---------------------------
-
-    def aot_param_type(self, param: ParamDef) -> Type:
-        """The concrete spy type the annotation of the ``aot`` parameter
-        ``param`` declares.  Raises :class:`TypeMismatchError` when the
-        parameter is unannotated, annotated with a type parameter, or
-        annotated with a value that is not a spy type."""
-        t = param.type
-        if t is None:
-            raise TypeMismatchError(
-                f"parameter '{param.name}' of function {self.name} requires a "
-                'type annotation'
-            )
-        if isinstance(t, TypeVar):
-            raise TypeMismatchError(
-                f'type parameter {t.name} is not allowed in aot function {self.name}'
-            )
-        if not isinstance(t, Type):
-            raise TypeMismatchError(
-                f"annotation of parameter '{param.name}' of function {self.name} "
-                f'is not a spy type: {t!r}'
-            )
-        return t
-
-    def aot_return_type(self) -> Type:
-        """The declared return type of an ``aot`` function - mandatory:
-        unlike a method, a plain ``aot`` function must declare its
-        return type."""
-        ret = self.signature.ret_type
-        if ret is None:
-            raise TypeMismatchError(
-                f'function {self.name} requires a return type annotation'
-            )
-        if isinstance(ret, TypeVar):
-            raise TypeMismatchError(
-                f'type parameter {ret.name} is not allowed in aot function {self.name}'
-            )
-        if not isinstance(ret, Type):
-            raise TypeMismatchError(
-                f'return annotation of function {self.name} is not a spy type: {ret!r}'
-            )
-        return ret
 
 @dataclass
 class NativeFn:
@@ -313,97 +334,6 @@ class NativeFn:
     def print_all(self) -> list[str]:
         return self.lines
 
-
-class ArgSignatureNode:
-    pass
-
-@dataclass(frozen=True)
-class ComptimeValSignatureNode(ArgSignatureNode):
-    value: AnyValue
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-@dataclass(frozen=True)
-class RuntimeValSignatureNode(ArgSignatureNode):
-    type: Type
-    by_ref: bool
-    mir_arg_index: int
-
-    def __str__(self) -> str:
-        return f"<{self.type}>"
-
-@dataclass(frozen=True)
-class FnInstanceSignature:
-    """
-        A function signature.
-
-        Serves both as the cache key of the specialization and how to call the MIR function
-    """
-    positional: tuple[ArgSignatureNode, ...]
-    varargs: tuple[ArgSignatureNode, ...]
-    kwargs: frozenset[tuple[str, ArgSignatureNode]]
-
-    def __str__(self) -> str:
-        positional = ", ".join(str(a) for a in self.positional)
-        varargs = ", ".join(str(a) for a in self.varargs)
-        kwargs = ", ".join(f"{k}={v}" for k, v in self.kwargs)
-        return f"({positional}{", " if varargs else ""}({varargs}){", " if kwargs else ""}{{{kwargs}}})"
-
-    def mir_arg_count(self):
-        count = 0
-        for arg in self.positional + self.varargs + tuple(a[1] for a in self.kwargs):
-            if isinstance(arg, RuntimeValSignatureNode):
-                count += 1
-        return count
-
-class FunctionReturnInfo:
-    pass
-
-@dataclass(frozen=True)
-class FunctionValueReturnInfo(FunctionReturnInfo):
-    """Return by value: No result location pointer, mir function returns `mir_type`."""
-    mir_type: mir.MayBeVoidType
-
-@dataclass(frozen=True)
-class FunctionRetLocReturnInfo(FunctionReturnInfo):
-    """Return by result location: the result pointer is the `arg_index`-th argument, mir function returns void."""
-    arg_index: int
-
-def function_call_info(type: FunctionType) -> tuple[FnInstanceSignature, FunctionReturnInfo, mir.FunctionType]:
-    positional: list[ArgSignatureNode] = []
-    mir_args: list[mir.Type] = []
-    for arg in type.args:
-        mir_type = to_mir_type(arg.type)
-        if isinstance(mir_type, mir.VoidType):
-            val = arg.type.get_unit_value()
-            assert val is not None
-            positional.append(ComptimeValSignatureNode(val))
-        else:
-            positional.append(RuntimeValSignatureNode(arg.type, False, len(mir_args)))
-            mir_args.append(mir_type)
-    return_info = None
-    if returns_via_result_ptr(type.return_type):
-        # the result is written into a caller-provided location whose
-        # address is appended as the trailing MIR argument; the lowered
-        # function returns void
-        result_type = to_mir_type(type.return_type)
-        assert not isinstance(result_type, mir.VoidType)
-        return_info = FunctionRetLocReturnInfo(arg_index=len(mir_args))
-        mir_args.append(mir.PointerType(result_type, False))
-    else:
-        return_info = FunctionValueReturnInfo(mir_type=to_mir_type(type.return_type))
-    signature = FnInstanceSignature(
-        positional=tuple(positional),
-        varargs=(),
-        kwargs=frozenset(),
-    )
-    return (
-        signature,
-        return_info,
-        mir.FunctionType(tuple(mir_args), to_mir_type(type.return_type)),
-    )
-
 @dataclass(frozen=True)
 class FunctionInstance:
     """The compiled artifact of one ``@jit`` specialization: its native
@@ -415,13 +345,7 @@ class FunctionInstance:
 
     mir: mir.Function
     native_fn: NativeFn | None = None
-    mir_type: mir.FunctionType | None = None
     complete: bool = False
-
-class HirCompiler:
-    @abstractmethod
-    def compile(self, signature: FnInstanceSignature) -> FunctionInstance:
-        ...
 
 class FunctionValue(Value):
     """The function value of a ``@jit`` function: only compiled - and
@@ -434,18 +358,17 @@ class FunctionValue(Value):
     lives in the interpreter and the host, not here.
     """
 
-    def __init__(self, name_base: str, hir: FunctionIR) -> None:
+    def __init__(self, name_base: str, hir: FunctionIR, force_inline: bool = False) -> None:
         # the context-unique base name of the native symbols
         self.name_base = name_base
         # the parsed HIR of the function (see ``JitContext.hir_of``)
         self.hir = hir
+        self.force_inline = force_inline
         # spy argument types -> the compiled artifacts of the
         # specialization (see ``LazyJitFunctionInstance``)
-        self.specs: dict[FnInstanceSignature, FunctionInstance] = {}
+        self.specs: dict[SpecializedSignature, FunctionInstance] = {}
         # spy argument types -> error message of a failed compilation
-        self.failed: dict[FnInstanceSignature, str] = {}
-
-        self._non_generic_instance: FunctionInstance | None = None
+        self.failed: dict[SpecializedSignature, str] = {}
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -457,6 +380,10 @@ class FunctionValue(Value):
     def get_type(self) -> Type:
         return self.hir.signature.as_non_generic_fn_type() or AnyFunction()
 
+@dataclass
+class FnSymbol:
+    fn: FunctionValue
+    sig: SpecializedSignature
 
 class SymbolTable:
     def __init__(self) -> None:

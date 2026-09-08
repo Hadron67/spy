@@ -1,5 +1,7 @@
 import types
 from abc import abstractmethod
+from collections.abc import Callable
+from enum import IntEnum
 from inspect import isclass
 from types import GenericAlias
 from typing import Union, get_args, get_origin, override
@@ -9,7 +11,7 @@ from weakref import WeakKeyDictionary
 def next_unique_name(prefix: str, used_names: set[str]) -> str:
     i = 0
     while True:
-        name = prefix + str(i)
+        name = prefix + f".dup.{i}"
         if name not in used_names:
             used_names.add(name)
             return name
@@ -295,12 +297,14 @@ class IndexedMap[K, V]:
     def __init__(self) -> None:
         self.by_id: list[V] = []
         self.by_key: dict[K, int] = {}
+        self.keys: list[K] = []
 
     def add(self, key: K, value: V) -> int:
         assert key not in self.by_key
         id = len(self.by_id)
         self.by_key[key] = id
         self.by_id.append(value)
+        self.keys.append(key)
         return id
 
     def get_by_id(self, id: int) -> V:
@@ -312,6 +316,28 @@ class IndexedMap[K, V]:
     def values(self):
         return self.by_id
 
+    def map(self, fn: Callable[[V], V]) -> 'IndexedMap[K, V]':
+        ret = IndexedMap[K, V]()
+        for key, id in self.by_key.items():
+            ret.add(key, fn(self.by_id[id]))
+        return ret
+
+    def items(self):
+        return zip(self.keys, self.by_id)
+
 def sanitize_name(name: str) -> str:
     """Convert any string into valid LLVM identifier."""
     raise NotImplementedError
+
+class TriState(IntEnum):
+    UNKNOWN = 0
+    TRUE = 1
+    FALSE = 2
+
+    @staticmethod
+    def and_(a: 'TriState', b: 'TriState') -> 'TriState':
+        if a == TriState.FALSE or b == TriState.FALSE:
+            return TriState.FALSE
+        if a == TriState.TRUE and b == TriState.TRUE:
+            return TriState.TRUE
+        return TriState.UNKNOWN
