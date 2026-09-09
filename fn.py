@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import ctypes
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, override
 
-from spy.util import IndexedMap
+from spy.util import IndexedMap, frozendict
 
 from . import hir, mir
 from .errors import TypeMismatchError
@@ -33,7 +35,7 @@ class SignatureFormalArg:
     # (see ``Signature``); None when the parameter has no default.
     default_value: AnyValue | None
 
-    def map_type(self, f: Callable[[Type], Type]) -> 'SignatureFormalArg':
+    def map_type(self, f: Callable[[Type], Type]) -> SignatureFormalArg:
         return SignatureFormalArg(
             None if self.type is None else f(self.type),
             self.is_comptime,
@@ -50,26 +52,31 @@ class ArgEntry[T]:
 @dataclass(frozen=True)
 class RawArgList[T]:
     positional: tuple[T, ...]
-    kwargs: frozenset[tuple[str, T]]
+    kwargs: frozendict[str, T]
 
-    def map[K](self, f: Callable[[T], K]) -> 'RawArgList[K]':
+    def map[K](self, f: Callable[[T], K]) -> RawArgList[K]:
         return RawArgList(
             tuple(f(p) for p in self.positional),
-            frozenset((k, f(v)) for k, v in self.kwargs),
+            frozendict((k, f(v)) for k, v in self.kwargs.items()),
         )
 
 @dataclass(frozen=True)
 class ArgList[T]:
     positional: tuple[T, ...]
     varargs: tuple[T, ...]
-    kwargs: frozenset[tuple[str, T]]
+    kwargs: frozendict[str, T]
 
-    def map[K](self, f: Callable[[T], K]) -> 'ArgList[K]':
+    def map[K](self, f: Callable[[T], K]) -> ArgList[K]:
         return ArgList(
             tuple(f(p) for p in self.positional),
             tuple(f(v) for v in self.varargs),
-            frozenset((k, f(v)) for k, v in self.kwargs),
+            frozendict((k, f(v)) for k, v in self.kwargs.items()),
         )
+
+    def values(self) -> Iterable[T]:
+        yield from self.positional
+        yield from self.varargs
+        yield from self.kwargs.values()
 
 class SpecializedFormalArg:
     pass
@@ -94,7 +101,7 @@ class SpecializedSignature:
     generic_args: tuple[Value, ...]
     positional: tuple[tuple[str, SpecializedFormalArg]]
     varargs: tuple[SpecializedFormalArg, ...] | None
-    kwargs: frozenset[tuple[str, SpecializedFormalArg]] | None
+    kwargs: frozendict[str, SpecializedFormalArg] | None
     ret_by_ref: bool | None
     ret_type: Type | None
 
@@ -107,11 +114,11 @@ class SpecializedSignature:
             s = ", ".join(str(a) for a in self.varargs)
             parts.append(f"*({s})")
         if self.kwargs is not None:
-            s = ", ".join(str(a) for a in self.kwargs)
+            s = ", ".join(f"{k}={v}" for k, v in self.kwargs.items())
             parts.append(f"**{{{s}}}")
         return f"[{generic}]({', '.join(parts)})"
 
-    def with_ret_type(self, ret_type: Type, ret_by_ret: bool) -> 'SpecializedSignature':
+    def with_ret_type(self, ret_type: Type, ret_by_ret: bool) -> SpecializedSignature:
         return SpecializedSignature(
             generic_args=self.generic_args,
             positional=self.positional,
@@ -193,7 +200,7 @@ class Signature:
                 )
         # the keyword arguments bind the remaining parameters by name
         kwargs_out: dict[str, T] = {}
-        for key, value in kwargs:
+        for key, value in kwargs.items():
             idx = self.positional.by_key.get(key)
             if idx is not None:
                 if idx in values:
@@ -213,7 +220,7 @@ class Signature:
                 if default is None:
                     raise TypeError(f"missing required argument '{name}'")
                 bound.append(default_converter(default))
-        return ArgList(tuple(bound), tuple(varargs_out), frozenset(kwargs_out.items()))
+        return ArgList(tuple(bound), tuple(varargs_out), frozendict(kwargs_out))
 
     def solve_param_types(
         self, provided: ArgList[Type | None]
@@ -244,7 +251,7 @@ class Signature:
                 if cand is not None:
                     solver.add_constraint(cand, self.varargs.type, True)
         if self.kwargs is not None and self.kwargs.type is not None:
-            for _, type in provided.kwargs:
+            for type in provided.kwargs.values():
                 if type is not None:
                     solver.add_constraint(type, self.kwargs.type, True)
         solver.finish()
@@ -278,7 +285,7 @@ class Signature:
 
     def specialize(self, provided: ArgList[Type | None]) -> SpecializedSignature:
         type_vars = self.solve_param_types(provided)
-        # TODO: substitute solved type vars, fill remaining
+        # TODO: substitute solved type vars, fill `None` types in formal args with types from `provided`
         raise NotImplementedError
 
 

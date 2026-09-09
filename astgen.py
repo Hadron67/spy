@@ -54,7 +54,7 @@ import textwrap
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
-from spy.util import IndexedMap
+from spy.util import IndexedMap, frozendict
 
 from . import hir
 from .errors import CompileError
@@ -389,7 +389,7 @@ class _Builder:
         for kw in keywords:
             if kw.arg is not None:
                 kwargs[kw.arg] = self._gen_arg(kw.value)
-        return RawArgList(positional, frozenset(kwargs.items()))
+        return RawArgList(positional, frozendict(kwargs.items()))
 
     def _gen_call(self, node: ast.Call, result_loc: hir.Value) -> None:
         """One call whose result is written into ``result_loc``: a method
@@ -471,7 +471,7 @@ class _Builder:
                 )
 
 
-def parse_function(fn: Callable, mode: str = 'jit', self_type: Type | None = None) -> FunctionIR:
+def parse_function(fn: Callable, self_type: Type | None = None) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
     ``mode`` is how the function will be compiled and typed when it is

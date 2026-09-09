@@ -23,8 +23,11 @@ resolved to its function entry when the reference runs (see
 """
 
 from dataclasses import dataclass
+from typing import cast
 
-from .fn import FunctionValue
+from . import astgen, sval
+from .fn import FunctionValue, RawArgList
+from .util import frozendict
 
 
 @dataclass(frozen=True)
@@ -44,8 +47,24 @@ class RegisteredFn:
         self.meta = meta
         self.entry: FunctionValue | None = None
 
-def jit(*, sfv: bool = False, extern: bool = False, linkname: str | None = None):
-    meta = FnMetadata(sfv=sfv, extern=extern, linkname=linkname)
-    def wrapper(fn):
-        return RegisteredFn(fn, None, meta)
-    return wrapper
+    def __call__(self, *args, **kwds):
+        entry = self.get_entry()
+        arglist = entry.hir.signature.bind_arg_pos(
+            RawArgList(tuple(sval.as_value(a) for a in args), frozendict((k, sval.as_value(v)) for k, v in kwds.items())),
+            lambda e: e,
+        )
+
+    def get_entry(self):
+        if self.entry is None:
+            hir = astgen.parse_function(self.fn, self.cls)
+            self.entry = FunctionValue(self.fn.__qualname__, hir)
+        return self.entry
+
+class _Context:
+    def __init__(self) -> None:
+        pass
+    def func(*, sfv: bool = False, extern: bool = False, linkname: str | None = None):
+        meta = FnMetadata(sfv=sfv, extern=extern, linkname=linkname)
+        def wrapper[T](fn: T) -> T:
+            return cast(T, RegisteredFn(fn, None, meta))
+        return wrapper

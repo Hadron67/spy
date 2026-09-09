@@ -19,9 +19,10 @@ are equal), which is what makes the compile-time comparisons in
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, final, override
+from typing import Any, override
 
 from spy.fn import RawArgList
+from spy.util import frozendict
 
 from . import mir
 from .errors import CompileError, SpyError, TypeMismatchError
@@ -36,26 +37,26 @@ class Value:
     (used as values by ``spy.typeof``) and other compile-time objects.
     Concrete values expose their spy type as ``.type``."""
     @abstractmethod
-    def get_type(self) -> 'Type':
+    def get_type(self) -> Type:
         raise NotImplementedError
 
 AnyValue = Value | int | float | str | bool
 
 class Type(Value):
     def get_unit_value(self) -> AnyValue | None:
-        """The canonical *unit value* of a zero-sized type (ZST): ``None``
+        """Th          e canonical *unit value* of a zero-sized type (ZST): ``None``
         when the type has a runtime representation (it is not
-        zero-sized), otherwise the one compile-time value every value of
+        zer   o-sized), othervc       wise the one compile-time value every value of
         the type equals - ``Void()`` for the void type, ``Int(0, T)`` for
         a zero-bit integer, an ``AggregateValue`` for a struct whose
         fields are all ZSTs.  A ZST has no runtime representation: its
         ``mir`` mirror is ``None`` (``to_mir_type`` returns ``None``)."""
         return None
 
-    def is_subtype_of(self, other: 'Type') -> bool:
+    def is_subtype_of(self, other: Type) -> bool:
         return isinstance(other, self.__class__)
 
-    def resolve_peer_type(self, other: 'Type') -> 'Type | None':
+    def resolve_peer_type(self, other: Type) -> Type | None:
         return other if self.is_subtype_of(other) else None
 
 @dataclass(frozen=True)
@@ -66,11 +67,13 @@ class TypeType(Type):
         return TypeType(self.level + 1)
 
     @override
-    def is_subtype_of(self, other: 'Type') -> bool:
+    def is_subtype_of(self, other: Type) -> bool:
         type = other.get_type()
         assert isinstance(type, TypeType)
         return self.level <= type.level
 
+    def __str__(self) -> str:
+        return f'type({self.level})'
 
 class TypeVar(Type):
     def __init__(self, name: str) -> None:
@@ -84,6 +87,24 @@ class TypeVar(Type):
     def __hash__(self) -> int:
         return object.__hash__(self)
 
+    def __str__(self) -> str:
+        return self.name
+
+@dataclass(frozen=True)
+class TupleType(Type):
+    types: tuple[Type, ...]
+    has_ellipsis: bool
+
+    def __str__(self) -> str:
+        return f'tuple[{", ".join(str(t) for t in self.types)}{", ..." if self.has_ellipsis else ""}]'
+
+
+@dataclass(frozen=True)
+class StrDictType(Type):
+    values: frozendict[str, Type]
+
+    def __str__(self) -> str:
+        return f'{{{", ".join(f"{k}: {v}" for k, v in self.values.items())}}}'
 
 TYPE_TYPE = TypeType(0)
 
@@ -95,14 +116,20 @@ class BoolType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
+    def __str__(self) -> str:
+        return 'bool'
+
 @dataclass(frozen=True)
 class EmptyType(Type):
-    def get_type(self) -> 'Type':
+    def get_type(self) -> Type:
         return TYPE_TYPE
 
     @override
-    def resolve_peer_type(self, other: 'Type') -> 'Type | None':
+    def resolve_peer_type(self, other: Type) -> Type | None:
         return other
+
+    def __str__(self) -> str:
+        return 'empty'
 
 @dataclass(frozen=True)
 class VoidType(Type):
@@ -122,6 +149,9 @@ class VoidType(Type):
     def get_unit_value(self) -> Value | None:
         return Void()
 
+    def __str__(self) -> str:
+        return 'void'
+
 class Void(Value):
     """The unique *value* of the unit type :class:`VoidType` (which is a
     zero-sized type): the compile-time object that denotes "no value" -
@@ -132,6 +162,9 @@ class Void(Value):
     def get_type(self) -> Type:
         return VoidType()
 
+    def __str__(self) -> str:
+        return 'void{{}}'
+
 @dataclass
 class ConstRef(Value):
     value: AnyValue
@@ -140,15 +173,22 @@ class ConstRef(Value):
     def get_type(self) -> Type:
         return PointerType(type_of(self.value), is_const=True)
 
+    def __str__(self) -> str:
+        return '&' + str(self.value)
+
 class BuiltinFn(Value):
     @override
-    def get_type(self) -> 'Type':
+    def get_type(self) -> Type:
         return AnyFunction()
 
 @dataclass
 class AnyIntType(Type):
-    def get_type(self) -> 'Type':
+    def get_type(self) -> Type:
         return TYPE_TYPE
+
+    def __str__(self) -> str:
+        return 'int'
+
 
 @dataclass(frozen=True)
 class IntType(Type):
@@ -166,7 +206,7 @@ class IntType(Type):
         return None
 
     @override
-    def is_subtype_of(self, other: 'Type') -> bool:
+    def is_subtype_of(self, other: Type) -> bool:
         if isinstance(other, AnyIntType):
             return True
         if not isinstance(other, IntType):
@@ -181,7 +221,7 @@ class IntType(Type):
         upper = max(upper, value)
         return min_int_type(lower, upper)
 
-    def resolve_peer_type(self, other: 'Type') -> 'Type | None':
+    def resolve_peer_type(self, other: Type) -> Type | None:
         match other:
             case IntType():
                 self_range = int_range(self)
@@ -195,6 +235,9 @@ class IntType(Type):
                         return self.peer_type_with_value(other.value.value)
         return None
 
+    def __str__(self) -> str:
+        return f'{'i' if self.signed else 'u'}{self.bits}'
+
 @dataclass(frozen=True)
 class Int(Value):
     value: int
@@ -203,6 +246,9 @@ class Int(Value):
     @override
     def get_type(self) -> Type:
         return self.type
+
+    def __str__(self) -> str:
+        return str(self.value) + str(self.type)
 
 @dataclass(frozen=True)
 class FloatType(Type):
@@ -215,10 +261,13 @@ class FloatType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
-    def is_subtype_of(self, other: 'Type') -> bool:
+    def is_subtype_of(self, other: Type) -> bool:
         if not isinstance(other, FloatType):
             return False
         return self.bits <= other.bits
+
+    def __str__(self) -> str:
+        return f"f{self.bits}"
 
 @dataclass(frozen=True)
 class Float(Type):
@@ -229,6 +278,8 @@ class Float(Type):
     def get_type(self) -> Type:
         return self.type
 
+    def __str__(self) -> str:
+        return f"{self.value}{self.type}"
 
 @dataclass(frozen=True)
 class PointerType(Type):
@@ -241,6 +292,8 @@ class PointerType(Type):
         assert isinstance(child, TypeType)
         return TypeType(child.level + 1)
 
+    def __str__(self) -> str:
+        return f"{'ptr' if not self.is_const else 'cptr'}({self.elem})"
 
 @dataclass(frozen=True)
 class Undefined(Value):
@@ -249,6 +302,9 @@ class Undefined(Value):
     @override
     def get_type(self) -> Type:
         return self.type
+
+    def __str__(self) -> str:
+        return "undefined"
 
 @dataclass(frozen=True)
 class ValueType(Type):
@@ -268,10 +324,14 @@ class ValueType(Type):
         return self.value
 
     @override
-    def resolve_peer_type(self, other: 'Type') -> 'Type | None':
+    def resolve_peer_type(self, other: Type) -> Type | None:
         if isinstance(other, ValueType):
             return self if self.value == other.value else None
         return other.resolve_peer_type(self)
+
+    def __str__(self) -> str:
+        return f"Literal({self.value})"
+
 
 @dataclass(frozen=True)
 class FormalArg:
@@ -304,6 +364,10 @@ class FunctionType(Type):
         level = max(level, child.level)
         return TypeType(level)
 
+    def __str__(self) -> str:
+        return f"fn({', '.join(str(arg.type) for arg in self.args)}) -> {self.return_type}"
+
+
 @dataclass(frozen=True)
 class StructField:
     name: str
@@ -317,6 +381,10 @@ class AggregateValue(Value):
     @override
     def get_type(self) -> Type:
         return self.type
+
+    def __str__(self) -> str:
+        return f"{self.type}({', '.join(str(value) for value in self.values)})"
+
 
 class StructType(Type):
     """A spy struct type: the object ``@cache.struct()`` binds to the class
@@ -408,6 +476,9 @@ class StructType(Type):
     def __repr__(self) -> str:
         return f'<spy struct {self.name}>'
 
+    def __str__(self) -> str:
+        return self.name
+
     @override
     def get_type(self) -> Type:
         level = 0
@@ -441,6 +512,7 @@ class StructType(Type):
             field_mir_indices: list[int | None] = []
             for field in self._fields:
                 field_type = to_mir_type(field.type)
+                assert field_type is not None, f"field {field.name!r} has no MIR representation"
                 if isinstance(field_type, mir.VoidType):
                     field_mir_indices.append(None)
                 else:
@@ -489,8 +561,12 @@ class AnyFunction(Type):
     no MIR mirror - such a value never crosses into runtime code."""
 
     @override
-    def get_type(self) -> 'Type':
+    def get_type(self) -> Type:
         return TYPE_TYPE
+
+    def __str__(self) -> str:
+        return "anyfn"
+
 
 def int_range(type: IntType) -> tuple[int, int]:
     if type.signed:
@@ -501,31 +577,6 @@ def min_int_type(lower: int, upper: int) -> IntType:
     bits = (lower - 1).bit_length() + 1
     bits_upper = (upper - 1).bit_length() + 1
     return IntType(max(bits, bits_upper), lower < 0)
-
-def type_str(type: Type) -> str:
-    """A short, printable name of a type (used in error messages and in the
-    mangled names of compiled specializations)."""
-    match type:
-        case BoolType():
-            return 'bool'
-        case IntType():
-            return ('i' if type.signed else 'u') + str(type.bits)
-        case FloatType():
-            return 'f' + str(type.bits)
-        case PointerType(elem, is_const):
-            return '*' + ('const ' if is_const else '') + type_str(elem)
-        case FunctionType(args, ret):
-            return f'fn({', '.join(type_str(a.type) for a in args)}) -> {type_str(ret)}'
-        case TypeVar():
-            return type.name
-        case AnyFunction():
-            return 'any fn'
-        case VoidType():
-            return 'void'
-        case StructType():
-            return type.name
-        case _:
-            return str(type)
 
 # ---------------------------------------------------------------------------
 # the return convention of a type: whether a function returning it returns a
@@ -560,7 +611,7 @@ def _alignment_of(type: Type) -> int:
                 default=1,
             )
         case _:
-            raise SpyError(f"type {type_str(type)} has no layout")
+            raise SpyError(f"type {type} has no layout")
 
 
 def _size_of(type: Type) -> int:
@@ -587,7 +638,7 @@ def _size_of(type: Type) -> int:
             align = _alignment_of(type)
             return (offset + align - 1) // align * align
         case _:
-            raise SpyError(f"type {type_str(type)} has no layout")
+            raise SpyError(f"type {type} has no layout")
 
 
 def returns_via_result_ptr(type: Type) -> bool:
@@ -618,7 +669,7 @@ def returns_via_result_ptr(type: Type) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def to_mir_type(type: Type) -> mir.MayBeVoidType:
+def to_mir_type(type: Type) -> mir.MayBeVoidType | None:
     """The MIR mirror of a spy type: the static type the runtime register
     of a value of ``type`` has.  The mapping is one-to-one over the types
     that can cross into runtime code.  A zero-sized type has no runtime
@@ -640,16 +691,24 @@ def to_mir_type(type: Type) -> mir.MayBeVoidType:
         case StructType():
             return type.get_mir_type()
         case PointerType():
-            return mir.PointerType(to_mir_type(type.elem), type.is_const)
+            child = to_mir_type(type.elem)
+            if child is None:
+                return None
+            return mir.PointerType(child, type.is_const)
         case FunctionType():
             args: list[mir.Type] = []
             for arg in type.args:
                 mir_type = to_mir_type(arg.type)
+                if mir_type is None:
+                    return None
                 if not isinstance(mir_type, mir.VoidType):
                     args.append(mir_type)
-            return mir.FunctionType(tuple(args), to_mir_type(type.return_type))
+            ret_type = to_mir_type(type.return_type)
+            if ret_type is None:
+                return None
+            return mir.FunctionType(tuple(args), ret_type)
         case _:
-            raise CompileError(f"spy type {type!r} has no MIR representation")
+            return None
 
 # ---------------------------------------------------------------------------
 # mapping Python values to spy types
@@ -726,19 +785,6 @@ def negate(value: AnyValue) -> AnyValue | None:
     if isinstance(value, (int, float)):
         return -value
     return None
-
-
-def _subtype_conflict(lhs: Value, rhs: Value) -> TypeMismatchError:
-    return TypeMismatchError(
-        f'conflicting types {_type_or_repr(lhs)} and {_type_or_repr(rhs)}'
-    )
-
-
-def _type_or_repr(value: Value) -> str:
-    if isinstance(value, Type):
-        return type_str(value)
-    return repr(value)
-
 
 @dataclass(frozen=True)
 class _Constraint:

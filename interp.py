@@ -80,6 +80,7 @@ from .fn import (
     SpecializedSignature,
 )
 from .info import FunctionResolver
+from .util import frozendict
 
 _MAX_INLINE_DEPTH = 64
 
@@ -151,11 +152,11 @@ class PendingSlot(InterpVal):
 
 @dataclass
 class ComptimeTuple(InterpVal):
-    values: tuple[InterpVal, ...]
+    value_ptrs: tuple[InterpVal, ...]
 
 @dataclass
 class ComptimeDict(InterpVal):
-    values: dict[str, InterpVal]
+    value_ptrs: dict[str, InterpVal]
 
 
 @dataclass
@@ -285,7 +286,8 @@ def _to_comptime(value: InterpVal) -> sval.AnyValue | None:
         case _:
             return None
 
-def _normalize(ev: InterpVal) -> InterpVal:
+def _shallow_normalize(ev: InterpVal) -> InterpVal:
+    """Shallow normalization, """
     if isinstance(ev, PendingSlot) and ev.type is not None:
         if ev.runtime_ptr is None:
             assert sval.to_mir_type(ev.type) is None
@@ -295,14 +297,16 @@ def _normalize(ev: InterpVal) -> InterpVal:
     else:
         return ev
 
-def _type_of(ev: InterpVal) -> sval.Type | None:
+def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
     """The spy type of the value ``ev`` denotes, or None when it has
     no spy representation (an un-typable compile-time object). Normalized values only"""
     match ev:
         case RuntimeVal(_, type):
+            if isinstance(type, sval.ValueType) and not allow_value_type:
+                return sval.type_of(type.value)
             return type
         case ComptimeVal(obj):
-            return sval.type_of(obj)
+            return sval.type_of(obj) if not allow_value_type else sval.ValueType(obj)
         case _:
             return None
 
@@ -426,7 +430,7 @@ class HirRunner:
         if signature.varargs:
             arg_values.append(ComptimeTuple(tuple(self._init_one_arg(a, mir_args) for a in signature.varargs)))
         if signature.kwargs:
-            arg_values.append(ComptimeDict({k: self._init_one_arg(v, mir_args) for k, v in signature.kwargs}))
+            arg_values.append(ComptimeDict({k: self._init_one_arg(v, mir_args) for k, v in signature.kwargs.items()}))
 
         return tuple(arg_values)
 
@@ -799,7 +803,7 @@ class HirRunner:
     # -- memory instructions -------------------------------------------------
 
     def load(self, ptr: InterpVal) -> InterpVal:
-        ptr = _normalize(ptr)
+        ptr = _shallow_normalize(ptr)
         type = _type_of(ptr)
         if not isinstance(type, sval.PointerType):
             raise CompileError(f"cannot load from a {type} value")
@@ -817,15 +821,15 @@ class HirRunner:
         raise CompileError('cannot load from a compile-time pointer')
 
     def store(self, ptr: InterpVal, value: InterpVal) -> None:
-        ptr = _normalize(ptr)
-        value = _normalize(value)
+        ptr = _shallow_normalize(ptr)
+        value = _shallow_normalize(value)
         ptr_type = _type_of(ptr)
         value_type = _type_of(value)
         if ptr_type is None:
             if value_type is None:
                 raise CompileError('cannot store a value when both the pointer and value have no type')
             self.materialize_location(ptr, value_type)
-            ptr = _normalize(ptr)
+            ptr = _shallow_normalize(ptr)
             ptr_type = _type_of(ptr)
 
         assert ptr_type is not None
@@ -859,7 +863,7 @@ class HirRunner:
 
     def exec_field_name_addr(self, ptr: InterpVal, name: str) -> InterpVal:
         """Note: has auto deref  """
-        ptr = self._auto_deref(_normalize(ptr))
+        ptr = self._auto_deref(_shallow_normalize(ptr))
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f"cannot take field address of {ptr}")
@@ -869,13 +873,13 @@ class HirRunner:
         index = container_type.field_index(name)
         if index is None:
             raise CompileError(
-                f"type {sval.type_str(container_type)} has no field named '{name}'"
+                f"type {container_type} has no field named '{name}'"
             )
 
         return self.field_index_addr(ptr, index)
 
     def field_index_addr(self, ptr: InterpVal, index: int) -> InterpVal:
-        type = _type_of(_normalize(ptr))
+        type = _type_of(_shallow_normalize(ptr))
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f"cannot take field address of {ptr}")
         container_type = type.elem
@@ -939,7 +943,7 @@ class HirRunner:
         if from_type == to_type:
             return value
         mir_to_type = sval.to_mir_type(to_type)
-        assert not isinstance(mir_to_type, mir.MayBeVoidType)
+        assert mir_to_type is not None and not isinstance(mir_to_type, mir.MayBeVoidType)
         if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.IntType):
             if from_type.bits < to_type.bits:
                 kind = 'sext' if from_type.signed else 'zext'
@@ -955,11 +959,11 @@ class HirRunner:
         if isinstance(from_type, sval.PointerType) and isinstance(to_type, sval.PointerType):
             if from_type.is_const and not to_type.is_const:
                 raise CompileError(
-                    f"cannot convert a {sval.type_str(from_type)} value to {sval.type_str(to_type)}"
+                    f"cannot convert a {from_type} value to {to_type}"
                 )
             return value
         raise CompileError(
-            f"cannot convert a {sval.type_str(from_type)} value to {sval.type_str(to_type)}"
+            f"cannot convert a {from_type} value to {to_type}"
         )
 
     # -- operators ------------------------------------------------------------
@@ -1021,6 +1025,7 @@ class HirRunner:
                     val.type = type
                     if not val.is_comptime:
                         mir_type = sval.to_mir_type(type)
+                        assert mir_type is not None
                         if not isinstance(mir_type, mir.VoidType):
                             val.runtime_ptr = self._emit(mir.Alloca(mir_type), val.mir_alloca_pos)
 
@@ -1058,7 +1063,7 @@ class HirRunner:
                 return None
 
     def call_method(self, ptr: InterpVal, method_name: str, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
-        ptr = self._auto_deref(_normalize(ptr))
+        ptr = self._auto_deref(_shallow_normalize(ptr))
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f'cannot call a method on a {type} value')
@@ -1074,7 +1079,7 @@ class HirRunner:
     def operand_arglist(self, args: RawArgList[ArgEntry[hir.Value]]) -> RawArgList[ArgEntry[InterpVal]]:
         return RawArgList(
             tuple(self.operand_arg(a) for a in args.positional),
-            frozenset((k, self.operand_arg(v)) for k, v in args.kwargs),
+            frozendict((k, self.operand_arg(v)) for k, v in args.kwargs.items()),
         )
 
     def operand_arg(self, arg: ArgEntry[hir.Value]) -> ArgEntry[InterpVal]:
@@ -1141,8 +1146,8 @@ class HirRunner:
                 convert_one(arg, sig_arg)
 
         if sig.kwargs:
-            for arg, sig_arg in zip(args.kwargs, sig.kwargs):
-                convert_one(arg[1], sig_arg[1])
+            for name, arg in args.kwargs.items():
+                convert_one(arg, sig.kwargs[name])
 
         if sig.ret_by_ref:
             assert ret is not None
@@ -1160,19 +1165,15 @@ class HirRunner:
     def _start_inline(
         self,
         hir: tuple[hir.Inst, ...],
-        args: tuple[InterpVal, ...],
+        args: ArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
-    ) -> None:
+    ) -> PollResult:
         if len(self._frames) - 1 >= _MAX_INLINE_DEPTH:
             raise CompileError(
                 f'inline recursion or nesting exceeded '
                 f'{_MAX_INLINE_DEPTH} levels'
             )
-        self._frames.append(InlineFrame(args, ret, hir))
-        # open the block that delimits the inlined body in the MIR: its
-        # ``End`` is emitted when the body's run ends (``_frame_ended``),
-        # and a ``return`` inside the body will break out of it
-        self._emit(mir.Block())
+        raise NotImplementedError
 
 class Analyser:
     def __init__(self) -> None:

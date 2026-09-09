@@ -4,7 +4,7 @@ from collections.abc import Callable
 from enum import IntEnum
 from inspect import isclass
 from types import GenericAlias
-from typing import Union, get_args, get_origin, override
+from typing import Iterable, Union, get_args, get_origin, override
 from weakref import WeakKeyDictionary
 
 
@@ -341,3 +341,43 @@ class TriState(IntEnum):
         if a == TriState.TRUE and b == TriState.TRUE:
             return TriState.TRUE
         return TriState.UNKNOWN
+
+
+class frozendict[K, V]:
+    def __init__(self, value: dict[K, V] | Iterable[tuple[K, V]] | None = None) -> None:
+        self._dict = dict(value) if value else {}
+        self._hash: int | None = None
+
+    def __eq__(self, value: object, /) -> bool:
+        if not isinstance(value, frozendict):
+            return False
+        return self._dict == value._dict
+
+    def __hash__(self) -> int:
+        if self._hash is None:
+            self._hash = hash(frozenset(self._dict.items()))
+        return self._hash
+
+    def __setitem__(self, key: K, value: V) -> None:
+        raise ValueError("frozendict is immutable")
+
+    def __getitem__(self, key: K) -> V:
+        return self._dict[key]
+
+    def __len__(self) -> int:
+        return len(self._dict)
+
+    def keys(self):
+        return self._dict.keys()
+
+    def values(self):
+        return self._dict.values()
+
+    def items(self):
+        return self._dict.items()
+
+    def get(self, key: K, default: V | None = None) -> V | None:
+        return self._dict.get(key, default)
+
+    def __contains__(self, key: K) -> bool:
+        return key in self._dict
