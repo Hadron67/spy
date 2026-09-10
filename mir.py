@@ -13,7 +13,7 @@ from .errors import CompileError
 
 class Type:
     @abstractmethod
-    def get_children(self) -> tuple[Type, ...]:
+    def get_children(self) -> tuple[Any, ...]:
         ...
 
 
@@ -23,6 +23,9 @@ class VoidType:
     def __repr__(self) -> str:
         return 'void'
 
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
 VOID = VoidType()
 
 type MayBeVoidType = Type | VoidType
@@ -31,16 +34,25 @@ type MayBeVoidType = Type | VoidType
 class BoolType(Type):
     """Booleans; they are ``i1`` at the LLVM level."""
 
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
 
 @dataclass(frozen=True)
 class IntType(Type):
     bits: int
     signed: bool
 
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
 
 @dataclass(frozen=True)
 class FloatType(Type):
     bits: int
+
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +90,10 @@ class StructType(Type):
         self.fields: list[FormalArg] = []
         if fields is not None:
             self.fields.extend(fields)
+        # the ctypes class mirroring the LLVM layout of this struct (what
+        # a struct value crossing the Python boundary is viewed as);
+        # materialized on demand and cached by ``lower``
+        self.ctype: Any = None
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -85,16 +101,25 @@ class StructType(Type):
     def __hash__(self) -> int:
         return object.__hash__(self)
 
+    def get_children(self) -> tuple[Any, ...]:
+        return tuple(f.type for f in self.fields)
+
 
 @dataclass(frozen=True)
 class PointerType(Type):
     elem: MayBeVoidType
     is_const: bool = False
 
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.elem,)
+
 @dataclass(frozen=True)
 class ArrayType(Type):
     elem: Type
     length: int
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.elem,)
 
 @dataclass(frozen=True)
 class FunctionType(Type):
@@ -103,6 +128,9 @@ class FunctionType(Type):
 
     args: tuple[Type, ...]
     return_type: MayBeVoidType
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (*self.args, self.return_type)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +144,7 @@ class Value:
         ...
 
     @abstractmethod
-    def get_children(self) -> tuple[Type, ...]:
+    def get_children(self) -> tuple[Any, ...]:
         ...
 
 @dataclass(frozen=True)
@@ -126,6 +154,9 @@ class BoolValue(Value):
     @override
     def get_type(self) -> MayBeVoidType:
         return BoolType()
+
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
 
 
 @dataclass(frozen=True)
@@ -137,6 +168,9 @@ class Int(Value):
     def get_type(self) -> MayBeVoidType:
         return self.type
 
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
 
 @dataclass(frozen=True)
 class Float(Value):
@@ -147,12 +181,18 @@ class Float(Value):
     def get_type(self) -> MayBeVoidType:
         return self.type
 
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
 class GlobalValue(Value):
     def __hash__(self) -> int:
         return object.__hash__(self)
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
+
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
 
     @abstractmethod
     def get_name(self) -> tuple[str, bool]:
@@ -169,6 +209,9 @@ class ExternSymbol(GlobalValue):
     def get_type(self) -> MayBeVoidType:
         return self.type
 
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
+
     @override
     def get_name(self) -> tuple[str, bool]:
         return self.name, False
@@ -184,11 +227,14 @@ class ExternAnonSymbol(GlobalValue):
     def get_type(self) -> MayBeVoidType:
         return self.type
 
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
+
     @override
     def get_name(self) -> tuple[str, bool]:
         return self.name_base, True
 
-@dataclass
+@dataclass(eq=False)
 class Param(Value):
     """The index-th by-value argument of the enclosing function."""
 
@@ -199,6 +245,9 @@ class Param(Value):
     @override
     def get_type(self) -> MayBeVoidType:
         return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
 
 
 class Inst(Value):
@@ -215,6 +264,9 @@ class Inst(Value):
     def get_type(self) -> MayBeVoidType:
         return VOID
 
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
 @dataclass(eq=False)
 class Alloca(Inst):
     """Allocate a slot for one value; produces a pointer to ``type``."""
@@ -224,6 +276,9 @@ class Alloca(Inst):
     @override
     def get_type(self) -> MayBeVoidType:
         return PointerType(self.type)
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
 
 
 @dataclass(eq=False)
@@ -236,11 +291,17 @@ class Load(Inst):
         assert isinstance(ptr_type, PointerType) and ptr_type.elem is not None
         return ptr_type.elem
 
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.ptr,)
+
 
 @dataclass(eq=False)
 class Store(Inst):
     ptr: Value
     value: Value
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.ptr, self.value)
 
 
 @dataclass(eq=False)
@@ -264,6 +325,9 @@ class Gep(Inst):
             )
         self.type: Type = PointerType(ptype.elem.fields[index].type)
 
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.ptr,)
+
 
 @dataclass(eq=False)
 class Arith(Inst):
@@ -285,6 +349,9 @@ class Arith(Inst):
     def get_type(self) -> Type:
         return self.type
 
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.lhs, self.rhs)
+
 
 @dataclass(eq=False)
 class Convert(Inst):
@@ -298,6 +365,9 @@ class Convert(Inst):
     @override
     def get_type(self) -> Type:
         return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,)
 
 
 @dataclass(eq=False)
@@ -314,6 +384,9 @@ class Cmp(Inst):
     @override
     def get_type(self) -> MayBeVoidType:
         return BoolType()
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.lhs, self.rhs)
 
 
 @dataclass(eq=False)
@@ -332,6 +405,9 @@ class Call(Inst):
     def get_type(self) -> MayBeVoidType:
         return self.type
 
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.callee, *self.args)
+
 
 @dataclass(eq=False)
 class Ret(Inst):
@@ -340,6 +416,9 @@ class Ret(Inst):
     for a void return (a ``ret void``)."""
 
     value: Value | None
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,) if self.value is not None else ()
 
 
 @dataclass(eq=False)
@@ -361,6 +440,9 @@ class If(Inst):
     ``If`` that is reachable)."""
 
     cond: Value
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.cond,)
 
 
 @dataclass(eq=False)
@@ -431,10 +513,29 @@ class Function(GlobalValue):
     def get_name(self) -> tuple[str, bool]:
         return self.name_base, not self.impose_linkname
 
+    def get_children(self) -> tuple[Any, ...]:
+        """Everything this function references: the argument and return
+        types of its lowered signature, and the operands of its
+        instructions.  Instruction operands (registers) are flattened
+        away - the instructions that define them are part of ``insts``
+        and are traversed on their own - so the result holds only the
+        values and types the module must also declare."""
+        ret: list[Type] = list(self.args)
+        if not isinstance(self.ret_type, VoidType):
+            ret.append(self.ret_type)
+        for inst in self.insts:
+            for child in inst.get_children():
+                if not isinstance(child, Inst):
+                    ret.append(child)
+        return tuple(ret)
+
 class Module:
     def __init__(self) -> None:
         self.symbols: StrBiMap[StructType | GlobalValue] = StrBiMap()
-        self._pending_symbols: set[StructType | GlobalValue] = set()
+        # the symbols discovered from the entries, in discovery order (a
+        # dict keeps the insertion order, which makes the assigned names
+        # deterministic)
+        self._pending_symbols: dict[StructType | GlobalValue, None] = {}
 
     def add_recursively(self, entry: list[StructType | GlobalValue]) -> None:
         todo: list[Value | Type] = [a for a in entry]
@@ -442,8 +543,8 @@ class Module:
             value = todo.pop()
             if value in self._pending_symbols:
                 continue
-            if isinstance(value, (StructType, Function, ExternSymbol)):
-                self._pending_symbols.add(value)
+            if isinstance(value, (StructType, GlobalValue)):
+                self._pending_symbols[value] = None
             todo.extend(reversed([a for a in value.get_children() if not isinstance(a, Inst)]))
 
     def finish(self):

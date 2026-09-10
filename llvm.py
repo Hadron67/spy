@@ -35,11 +35,11 @@ class Type:
 
     @abstractmethod
     def size(self, pointer_size: int) -> int:
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def align(self, pointer_size: int) -> int:
-        raise NotImplementedError
+        ...
 
 class Value:
     @abstractmethod
@@ -435,7 +435,7 @@ class GlobalValue(Value):
     @abstractmethod
     def get_default_name_prefix(self) -> tuple[str, bool]:
         """Returns the name for this value, and whether it could be renamed."""
-        raise NotImplementedError
+        ...
 
 class GlobalValueFlags:
     IS_CONST = 1
@@ -619,11 +619,11 @@ class FunctionState(IntEnum):
 class IFunction:
     @abstractmethod
     def add_arg(self, type: Type) -> int:
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def get_arg(self, index: int) -> Value:
-        raise NotImplementedError
+        ...
 
 class FunctionArgs(IFunction):
 
@@ -1002,11 +1002,11 @@ class FNeg(Unary):
 class BinaryOp:
     @abstractmethod
     def get_type(self) -> Type:
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def head_name(self) -> str:
-        raise NotImplementedError
+        ...
 
     def try_evaluate(self, lhs: Value, rhs: Value) -> Value | None:
         return None

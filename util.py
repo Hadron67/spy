@@ -104,7 +104,7 @@ class SourceBuilder:
 class ClassVisitorCodeGen:
     @abstractmethod
     def gen_leaf(self, type: type) -> str:
-        raise NotImplementedError
+        ...
 
 class SubExprFnBuilder:
     _base_cls: type
@@ -328,9 +328,25 @@ class IndexedMap[K, V]:
     def items(self):
         return zip(self.keys, self.by_id)
 
+_LLVM_IDENT_OK = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789$._')
+
+
 def sanitize_name(name: str) -> str:
-    """Convert any string into valid LLVM identifier."""
-    raise NotImplementedError
+    """Convert any string into valid LLVM identifier.
+
+    LLVM identifiers may only contain ``[A-Za-z0-9$._]`` (variables and
+    named globals; ``-`` is allowed too but not as the first character),
+    so every other character of ``name`` - the parentheses and commas of
+    a rendered specialization signature, for instance - is replaced by
+    ``_``.  The mapping is deterministic, so the same input always gives
+    the same identifier (which is what lets a cross-module reference
+    resolve to the symbol of the module that defined it)."""
+    out = ''.join(c if c in _LLVM_IDENT_OK else '_' for c in name)
+    if not out:
+        return '_'
+    if out[0].isdigit():
+        out = '_' + out
+    return out
 
 class TriState(IntEnum):
     UNKNOWN = 0
@@ -366,6 +382,9 @@ class frozendict[K, V]:
 
     def __getitem__(self, key: K) -> V:
         return self._dict[key]
+
+    def __iter__(self):
+        return iter(self._dict)
 
     def __len__(self) -> int:
         return len(self._dict)

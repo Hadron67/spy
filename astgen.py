@@ -191,7 +191,7 @@ class _Builder:
         and ``End`` markers).  A branch is a lexical scope of its own -
         a child of the enclosing scope - so declarations inside it
         shadow outer bindings and are not visible after the block."""
-        sub = _Builder(self._fn_ir, self.fn, _Scope(self._scope))
+        sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope))
         for stmt in stmts:
             sub._gen_stmt(stmt)
         self.insts.extend(sub.insts)
@@ -335,7 +335,7 @@ class _Builder:
                     raise AttributeError(f"Attribute '{node.attr}' not found on {base.value}")
                 return self.add(hir.FieldAddr(self._gen_ref(node.value), node.attr))
             case _:
-                loc = self.add(hir.Alloca())
+                loc = self.add(hir.Alloca(True))
                 self._gen_result_loc(node, loc)
                 return loc
 
@@ -444,8 +444,18 @@ class _Builder:
             case ast.Name():
                 return self._gen_name(node.id, False)
             case ast.BoolOp():
-                # do not implement this yet
-                raise NotImplementedError
+                op = _BOOL_OPS.get(type(node.op))
+                if op is None:
+                    raise CompileError(
+                        f"unsupported boolean operator {type(node.op).__name__} in spy function {fn_name}"
+                    )
+                if len(node.values) != 2:
+                    raise CompileError(
+                        f"chained boolean operators are not supported yet in spy function {fn_name}"
+                    )
+                lhs = self._gen_arg(node.values[0])
+                rhs = self._gen_arg(node.values[1])
+                return self.add(hir.BoolOp(op, lhs, rhs))
             case ast.Compare():
                 if len(node.ops) != 1 or len(node.comparators) != 1:
                     raise CompileError(
@@ -592,10 +602,10 @@ def parse_function(fn: Callable, self_type: Type | None = None) -> FunctionIR:
             arg.arg, SignatureFormalArg(arg_type, False, False, default_value)
         )
 
-    # TODO: implement varargs and kwargs here
-
-    # spy function definitions reject *args/**kwargs (above), so the
-    # ``*args``/``**kwargs`` parameters are always absent for now
+    # ``*args``/``**kwargs`` are rejected above (a spy function definition
+    # may not declare them yet), so the ``varargs``/``kwargs`` slots of the
+    # signature are always None; the signature model and ``bind_arg_pos``
+    # already support them for the calls the parser will allow later.
     signature = Signature(
         tuple(generic_args), positional, None, None, annotation_of(ret_annotation), None,
     )

@@ -12,20 +12,7 @@ marshal layer understands).
 from typing import Any, cast
 
 from .errors import SpyError
-from .sval import Type
-
-
-class AsValue:
-    """A Python value bound to an explicit spy type (``spy.as(x, T)``)."""
-
-    __slots__ = ('type', 'value')
-
-    def __init__(self, value: Any, type: Type) -> None:
-        self.value = value
-        self.type = type
-
-    def __repr__(self) -> str:
-        return f'AsValue({self.value!r}, {self.type!r})'
+from .sval import AsValue, Type
 
 
 def spy_typeof(value: Any) -> None:

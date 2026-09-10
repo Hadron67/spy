@@ -8,7 +8,7 @@ from typing import Any, override
 
 from spy.util import IndexedMap, frozendict
 
-from . import hir, mir
+from . import hir, mir, opt
 from .errors import TypeMismatchError
 from .sval import (
     AnyFunction,
@@ -19,6 +19,11 @@ from .sval import (
     TypeVar,
     TypeVarSolver,
     Value,
+    concretize_type,
+    pass_by_ref,
+    replace_type_vars_type,
+    returns_via_result_ptr,
+    type_of,
 )
 
 
@@ -105,7 +110,7 @@ class ReturnSignature:
 @dataclass(frozen=True)
 class SpecializedCallSignature:
     generic_args: tuple[Value, ...]
-    positional: tuple[tuple[str, SpecializedFormalArg]]
+    positional: tuple[tuple[str, SpecializedFormalArg], ...]
     varargs: tuple[SpecializedFormalArg, ...] | None
     kwargs: frozendict[str, SpecializedFormalArg] | None
 
@@ -113,7 +118,7 @@ class SpecializedCallSignature:
         """Note: return type not included"""
         generic = ", ".join(str(a) for a in self.generic_args)
         parts: list[str] = []
-        parts.extend(str(a[1] for a in self.positional))
+        parts.extend(str(a[1]) for a in self.positional)
         if self.varargs is not None:
             s = ", ".join(str(a) for a in self.varargs)
             parts.append(f"*({s})")
@@ -220,42 +225,52 @@ class Signature:
     def solve_param_types(
         self, provided: ArgList[Type | None]
     ) -> tuple[Value, ...]:
-        """The concrete spy type of every formal parameter of one call,
-        given ``provided``: the marshaled type of each argument the call
-        provides, and ``None`` for a parameter whose default value
-        applies (no argument was provided for it).
+        """The concrete value of every declared generic type parameter
+        of one call, given ``provided``: the marshaled type of each
+        argument the call provides, and ``None`` for a parameter whose
+        default value applies (no argument was provided for it).
 
-        This is how a jit function is typed: a provided argument always
-        types the parameter it is provided for (parameter annotations,
-        concrete ones included, do not constrain a jit call), but
-        parameters annotated with the same type parameter must all be
-        provided arguments marshaling to one type, which the type
-        parameter unifies.  A parameter that no argument covers takes
-        the type its parameter was unified to, the type of its default
-        value, or raises when it has neither."""
+        A provided argument always types the parameter it is provided
+        for (parameter annotations, concrete ones included, do not
+        constrain a jit call - a call always resolves to the exact type
+        of its arguments), but parameters annotated with the same type
+        parameter must all be provided arguments whose types unify,
+        which the type parameter solves to.  A missing argument can
+        still solve a type parameter when its default value has a spy
+        type."""
         assert len(provided.positional) == len(self.positional.by_id), 'argument count mismatch'
         # unify the type parameters over the provided arguments: two
         # arguments of parameters annotated with the same type parameter
         # must marshal to the same type
         solver = TypeVarSolver()
         for param, cand in zip(self.positional.by_id, provided.positional):
-            if cand is not None and param.type is not None:
-                solver.add_constraint(cand, param.type, True)
-        if self.varargs is not None and self.varargs.type is not None:
+            declared = param.type
+            if not isinstance(declared, TypeVar):
+                continue
+            if cand is not None:
+                solver.add_constraint(cand, declared, True)
+            elif param.default_value is not None:
+                default_type = type_of(param.default_value)
+                if default_type is not None:
+                    solver.add_constraint(default_type, declared, True)
+        if self.varargs is not None and isinstance(self.varargs.type, TypeVar):
             for cand in provided.varargs:
                 if cand is not None:
                     solver.add_constraint(cand, self.varargs.type, True)
-        if self.kwargs is not None and self.kwargs.type is not None:
-            for type in provided.kwargs.values():
-                if type is not None:
-                    solver.add_constraint(type, self.kwargs.type, True)
+        if self.kwargs is not None and isinstance(self.kwargs.type, TypeVar):
+            for cand in provided.kwargs.values():
+                if cand is not None:
+                    solver.add_constraint(cand, self.kwargs.type, True)
         solver.finish()
         solved = solver.get_solved()
         ret: list[Value] = []
         for type_var in self.generic_args:
             if type_var not in solved:
                 raise TypeMismatchError(f"type variable {type_var.name} not solved")
-            ret.append(solved[type_var])
+            value = solved[type_var]
+            if isinstance(value, Type):
+                value = concretize_type(value)
+            ret.append(value)
         return tuple(ret)
 
     def is_generic(self) -> bool:
@@ -279,9 +294,89 @@ class Signature:
         return FunctionType(tuple(formal), self.ret_type)
 
     def specialize(self, provided: ArgList[Type | None]) -> tuple[SpecializedCallSignature, ReturnSignature | None]:
-        type_vars = self.solve_param_types(provided)
-        # TODO: substitute solved type vars, fill `None` types in formal args with types from `provided`
-        raise NotImplementedError
+        """Specialize one call of this signature: the concrete typing of
+        its arguments and (when the signature declares a return type)
+        of its result.
+
+        The declared generic type parameters are solved from ``provided``
+        (see :meth:`solve_param_types`) and substituted into every
+        annotation.  A parameter's type is then, in order of precedence:
+        its (substituted) annotation, the marshaled type of the argument
+        the call provides for it, or the spy type of its default value.
+        The compiler decides the calling convention here too: a parameter
+        whose type is a large aggregate, or whose formal declares it as a
+        reference, is passed by reference (see ``sval.pass_by_ref``).  A
+        zero-sized parameter is dropped from the runtime signature - it
+        carries its unit value as a compile-time argument.
+
+        Returns the specialized call signature - also the cache key of
+        the specialization - and the return signature, or ``None`` when
+        the signature declares no return type (the interpreter infers
+        it from the body)."""
+        type_var_values = self.solve_param_types(provided)
+        reps: dict[TypeVar, Value] = dict(zip(self.generic_args, type_var_values))
+
+        def substitute(type: Type) -> Type:
+            replaced = replace_type_vars_type(type, reps)
+            replaced = concretize_type(replaced)
+            if isinstance(replaced, TypeVar):
+                raise TypeMismatchError(f"type variable {replaced.name} is not solved")
+            return replaced
+
+        def resolve(name: str, param: SignatureFormalArg, cand: Type | None) -> SpecializedFormalArg:
+            resolved: Type | None = None
+            if param.type is not None:
+                resolved = substitute(param.type)
+            if resolved is None:
+                resolved = cand
+            if resolved is None and param.default_value is not None:
+                resolved = type_of(param.default_value)
+            if resolved is None:
+                raise TypeMismatchError(
+                    f"cannot determine the type of parameter '{name}'"
+                )
+            resolved = concretize_type(resolved)
+            unit = resolved.get_unit_value()
+            if unit is not None:
+                assert isinstance(unit, Value)
+                return SpecializedComptimeArg(unit)
+            if param.is_comptime:
+                raise TypeMismatchError(
+                    f"compile-time parameter '{name}' must have a zero-sized type"
+                )
+            return SpecializedRuntimeArg(resolved, param.by_ref or pass_by_ref(resolved))
+
+        positional = tuple(
+            (name, resolve(name, param, cand))
+            for (name, param), cand in zip(self.positional.items(), provided.positional)
+        )
+
+        varargs: tuple[SpecializedFormalArg, ...] | None = None
+        if self.varargs is not None:
+            formal = self.varargs
+            varargs = tuple(
+                resolve('*args', formal, cand) for cand in provided.varargs
+            )
+
+        kwargs: frozendict[str, SpecializedFormalArg] | None = None
+        if self.kwargs is not None:
+            kw = self.kwargs
+            kwargs = frozendict(
+                (name, resolve(name, kw, cand))
+                for name, cand in provided.kwargs.items()
+            )
+
+        call_sig = SpecializedCallSignature(
+            tuple(type_var_values), positional, varargs, kwargs
+        )
+
+        if self.ret_type is None:
+            return call_sig, None
+        ret_type = substitute(self.ret_type)
+        ret_by_ref = self.ret_by_ref
+        if ret_by_ref is None:
+            ret_by_ref = returns_via_result_ptr(ret_type)
+        return call_sig, ReturnSignature(ret_by_ref, ret_type)
 
 
 @dataclass
@@ -290,7 +385,7 @@ class FunctionIR:
     signature: Signature
     body: tuple[hir.Inst, ...]
 
-@dataclass
+@dataclass(eq=False)
 class NativeFn:
     @abstractmethod
     def call(self, *values: ctypes._CDataType) -> ctypes._CDataType | None:
@@ -300,7 +395,7 @@ class NativeFn:
     def print_all(self) -> list[str]:
         ...
 
-@dataclass
+@dataclass(eq=False)
 class FunctionInstance:
     """The compiled artifact of one ``@jit`` specialization: its native
     function (what a Python-side call invokes, see :class:`NativeFn`)
@@ -327,7 +422,7 @@ class FunctionValue(Value):
     def __init__(self, name_base: str, hir: FunctionIR, force_inline: bool = False) -> None:
         # the context-unique base name of the native symbols
         self.name_base = name_base
-        # the parsed HIR of the function (see ``JitContext.hir_of``)
+        # the parsed HIR of the function (see ``astgen.parse_function``)
         self.hir = hir
         self.force_inline = force_inline
         # spy argument types -> the compiled artifacts of the
@@ -361,13 +456,18 @@ class SymbolTable:
         mir_mod = mir.Module()
         self.add_to_mir(mir_mod)
 
+        for instance in self.newly_compiled:
+            # fold the trivial store/load slots of the freshly typed body
+            # back into registers before it is lowered
+            opt.simplify(instance.mir)
+
         native_fns = backend.compile(mir_mod) if self.newly_compiled else {}
         for instance in self.newly_compiled:
             instance.native_fn = native_fns[instance.mir]
 
 class FunctionResolver:
     @abstractmethod
-    def resolve_global(self, value: Any) -> AnyValue:
+    def resolve_global(self, value: Any) -> AnyValue | None:
         """The spy value a global object referenced inside a function
         body resolves to.  A function registered in this host - reached
         as the raw function object or through the callable view its
@@ -375,9 +475,9 @@ class FunctionResolver:
         (creating the entry of an aot function that is not used yet);
         any other object is not a spy value of this host and returns
         ``None`` (the object stays a plain compile-time Python value)."""
-        raise NotImplementedError
+        ...
 
 class Backend:
     @abstractmethod
-    def compile(self, mir: mir.Module) -> dict[mir.GlobalValue, NativeFn]:
+    def compile(self, module: mir.Module) -> dict[mir.GlobalValue, NativeFn]:
         ...

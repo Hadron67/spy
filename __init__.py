@@ -2,16 +2,10 @@
 
 Example::
 
-    import symlat.spy as spy
+    import spy
 
-    cache = spy.JitContext()
-
-    @cache.jit()
+    @spy.func()
     def add[T](a: T, b: T) -> T:
-        return a + b
-
-    @cache.aot()
-    def add_u64(a: spy.u64, b: spy.u64) -> spy.u64:
         return a + b
 
     print(add(1, 2))        # compiles add(i32, i32) on first call
@@ -29,7 +23,7 @@ from types import NoneType
 from typing import TYPE_CHECKING
 
 from . import builtins as _builtins
-from .dsl import JitContext
+from .dsl import func
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
 
@@ -71,7 +65,6 @@ else:
 
 __all__ = [
     'CompileError',
-    'JitContext',
     'SpyError',
     'TypeMismatchError',
     'as_',
@@ -79,6 +72,7 @@ __all__ = [
     'compile_log',
     'f32',
     'f64',
+    'func',
     'i8',
     'i16',
     'i32',

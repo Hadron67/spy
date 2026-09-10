@@ -12,20 +12,25 @@ mirrors of these types defined by ``mir``; the interpreter converts
 between the two when it emits instructions.
 
 Types are immutable and compare structurally (two ``IntType(64, False)``
+types are structurally (two ``IntType(64, False)``
 are equal), which is what makes the compile-time comparisons in
 ``spy.typeof(a) == spy.u64`` work.
 """
+
+from __future__ import annotations
 
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, override
 
-from spy.fn import RawArgList
 from spy.util import frozendict
 
 from . import mir
-from .errors import CompileError, SpyError, TypeMismatchError
+from .errors import SpyError
+
+if typing.TYPE_CHECKING:
+    from spy.fn import RawArgList
 
 INT_DEFAULT_BITS = 32
 """A plain Python ``int`` argument is mapped to this signedness/width by
@@ -38,9 +43,30 @@ class Value:
     Concrete values expose their spy type as ``.type``."""
     @abstractmethod
     def get_type(self) -> Type:
-        raise NotImplementedError
+        ...
 
 AnyValue = Value | int | float | str | bool
+
+
+class AsValue(Value):
+    """A Python value bound to an explicit spy type (``spy.as_(x, T)``).
+
+    It appears only at the Python call boundary: the interpreter reads
+    the type off it (``type_of`` returns :attr:`type`) to type the call,
+    while the native call is handed the wrapped Python value.  Defining
+    it here (rather than in ``builtins``) keeps the boundary marshaling
+    of ``sval`` self-contained."""
+
+    def __init__(self, value: Any, type: Type) -> None:
+        self.value = value
+        self.type = type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def __repr__(self) -> str:
+        return f'AsValue({self.value!r}, {self.type!r})'
 
 class Type(Value):
     def get_unit_value(self) -> AnyValue | None:
@@ -71,10 +97,10 @@ class Type(Value):
         values of one struct share one identity.  Types with no MIR
         mirror at all (``TypeType``, ``AnyFunction``, ...) are a compile
         error."""
-        raise NotImplementedError
+        ...
 
     def is_zst(self) -> bool:
-        return isinstance(self.to_mir_type(), mir.MayBeVoidType)
+        return isinstance(self.to_mir_type(), mir.VoidType)
 
 @dataclass(frozen=True)
 class TypeType(Type):
@@ -222,11 +248,22 @@ class ConstRef(Value):
         return '&' + str(self.value)
 
 class BuiltinFn(Value):
+    """A ``spy.*`` builtin that the compile-time interpreter evaluates
+    while running the HIR (``spy.typeof``, ``spy.compile_log``).  The
+    name identifies the builtin to the interpreter; ``spy.as_`` is not
+    a compile-time builtin (it only exists at the call boundary)."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
     @override
     def get_type(self) -> Type:
         return AnyFunction()
 
-@dataclass
+    def __str__(self) -> str:
+        return f'spy.{self.name}'
+
+@dataclass(frozen=True)
 class AnyIntType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
@@ -513,10 +550,40 @@ class StructType(Type):
         assert all(f.name != name for f in self._fields)
         self._fields.append(StructField(name, type))
 
-    def bind_default_ctor_args[T](self, args: RawArgList[T]) -> tuple[T, ...]:
+    def bind_default_ctor_args[T](self, args: RawArgList[T]) -> tuple[T | None, ...]:
+        """Bind the arguments of a struct construction ``Foo(...)`` to
+        the fields of the default constructor (the fields in declaration
+        order).  Positional arguments bind the leading fields, keyword
+        arguments bind fields by name.  A zero-sized field occupies no
+        storage and needs no argument: binding it yields ``None`` (the
+        caller writes nothing to it).  A missing argument for a field
+        with a runtime representation is a ``TypeError``."""
         ret: list[T | None] = []
-        # TODO
-        raise NotImplementedError
+        positional = args.positional
+        kwargs = args.kwargs
+        field_names = {f.name for f in self._fields}
+        for key in kwargs:
+            if key not in field_names:
+                raise TypeError(f"got an unexpected keyword argument '{key}'")
+        for i, field in enumerate(self._fields):
+            if i < len(positional):
+                if field.name in kwargs:
+                    raise TypeError(f"got multiple values for field '{field.name}'")
+                ret.append(positional[i])
+                continue
+            if field.name in kwargs:
+                ret.append(kwargs[field.name])
+                continue
+            if field.type.get_unit_value() is not None:
+                ret.append(None)
+                continue
+            raise TypeError(f"missing a value for field '{field.name}'")
+        if len(positional) > len(self._fields):
+            raise TypeError(
+                f"takes {len(self._fields)} positional arguments but "
+                f"{len(positional)} were given"
+            )
+        return tuple(ret)
 
     @property
     def fields(self) -> tuple[StructField, ...]:
@@ -549,7 +616,7 @@ class StructType(Type):
         on it."""
         if self._py_init is None:
             raise SpyError(
-                f'struct {self.name_base} is not bound to a JitContext; '
+                f'struct {self.name_base} is not bound to a spy context; '
                 'define it with @cache.struct() and construct it after the '
                 'module has loaded'
             )
@@ -752,6 +819,34 @@ def returns_via_result_ptr(type: Type) -> bool:
             return False
 
 
+def pass_by_ref(type: Type) -> bool:
+    """Whether a parameter of spy type ``type`` is passed by reference
+    (as a const pointer) rather than by value: the calling convention of
+    one argument, decided by the compiler.
+
+    The policy mirrors :func:`returns_via_result_ptr`: an aggregate too
+    large to be passed in registers (larger than the by-value limit) is
+    passed as a pointer, everything else by value.  A parameter whose
+    formal declares it as a reference (``SignatureFormalArg.by_ref``) is
+    passed by reference regardless of its type."""
+    match type:
+        case StructType():
+            return _size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
+        case _:
+            return False
+
+
+def concretize_type(type: Type) -> Type:
+    """Replace a compile-time-only type by the concrete type a runtime
+    value of it is represented by: the open integer type ``AnyIntType``
+    (the type of a plain Python ``int``) becomes the default signed
+    integer type (:data:`INT_DEFAULT_BITS`).  Every other type passes
+    through unchanged."""
+    if isinstance(type, AnyIntType):
+        return IntType(INT_DEFAULT_BITS, True)
+    return type
+
+
 # ---------------------------------------------------------------------------
 # mapping Python values to spy types
 # ---------------------------------------------------------------------------
@@ -923,8 +1018,11 @@ class TypeVarSolver:
                 if isinstance(lhs, TypeVar):
                     self._solve_type_var_bound(lhs, rhs, False)
 
-                # TODO: more cases after generics are added
-
+                # only top-level spy values are unified for now: a
+                # constraint between two compound types (an aggregate
+                # containing a type parameter, a pointer to one, ...) is
+                # recorded as unsatisfied and reused once the solver
+                # learns to unify their children
                 if lhs != rhs:
                     self._add_unsatisfied(lhs, rhs, is_subtype)
 

@@ -68,10 +68,13 @@ types both branches (both survive at runtime).  Future block
 instructions (loops, ...) will use the same marker representation.
 """
 
-from dataclasses import dataclass
-from typing import Any
+from __future__ import annotations
 
-from spy.fn import ArgEntry, RawArgList
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from spy.fn import ArgEntry, RawArgList
 
 
 class Value:
