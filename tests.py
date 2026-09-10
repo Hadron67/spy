@@ -136,7 +136,7 @@ def call_inline_log(a: i32, b: i32) -> i32:
 
 @func()
 def use_default[T: Numeric](a: T) -> T:
-    return add_default(a)
+    return add_default(a) # pyright: ignore[reportReturnType]
 
 
 @func()
@@ -181,7 +181,7 @@ def is_u64(a) -> spy_bool:
 
 
 @func()
-def nothing(a: i32) -> None:
+def nothing(_: i32) -> None:
     pass
 
 
@@ -298,7 +298,9 @@ class SpyFunctionCallTest(TestCase):
         self.assertFalse(eq(3, 4))
 
     def test_comptime_typeof(self) -> None:
-        self.assertTrue(is_i32(1))
+        # a plain Python int marshals to i64 (see ``dsl._INT_LITERAL_BITS``)
+        self.assertFalse(is_i32(1))
+        self.assertTrue(is_i32(spy_as(1, i32)))
         self.assertFalse(is_i32(1.0))
         self.assertTrue(is_u64(spy_as(1, u64)))
 

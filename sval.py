@@ -27,7 +27,7 @@ from typing import Any, override
 from spy.util import frozendict
 
 from . import mir
-from .errors import SpyError
+from .errors import CompileError, SpyError
 
 if typing.TYPE_CHECKING:
     from spy.fn import RawArgList
@@ -70,13 +70,13 @@ class AsValue(Value):
 
 class Type(Value):
     def get_unit_value(self) -> AnyValue | None:
-        """Th          e canonical *unit value* of a zero-sized type (ZST): ``None``
+        """The canonical *unit value* of a zero-sized type (ZST): ``None``
         when the type has a runtime representation (it is not
-        zer   o-sized), othervc       wise the one compile-time value every value of
+        zer   o-sized), otherwise the one compile-time value every value of
         the type equals - ``Void()`` for the void type, ``Int(0, T)`` for
         a zero-bit integer, an ``AggregateValue`` for a struct whose
         fields are all ZSTs.  A ZST has no runtime representation: its
-        ``mir`` mirror is ``None`` (``to_mir_type`` returns ``None``)."""
+        ``mir`` mirror is ``VoidType`` (``to_mir_type`` returns ``VoidType``)."""
         return None
 
     def is_subtype_of(self, other: Type) -> bool:
@@ -275,6 +275,10 @@ class AnyIntType(Type):
     def __str__(self) -> str:
         return 'int'
 
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, (IntType, AnyIntType)):
+            return other
+        return None
 
 @dataclass(frozen=True)
 class IntType(Type):
@@ -317,6 +321,8 @@ class IntType(Type):
                 self_range = int_range(self)
                 other_range = int_range(other)
                 return min_int_type(min(self_range[0], other_range[0]), max(self_range[1], other_range[1]))
+            case AnyIntType():
+                return self
             case ValueType():
                 match other.value:
                     case int():
@@ -432,7 +438,7 @@ class ValueType(Type):
 
     @override
     def to_mir_type(self) -> mir.MayBeVoidType | None:
-        return None
+        return mir.VoidType()
 
     def __str__(self) -> str:
         return f"Literal({self.value})"
@@ -652,13 +658,6 @@ class StructType(Type):
         return self.get_mir_type()
 
     def _calculate_mir(self) -> None:
-        """Build (once) the MIR mirror of the struct together with the
-        position map of its fields: the fields whose spy type has no
-        runtime representation (``to_mir_type`` is ``None`` - a
-        zero-sized type) occupy no storage and are dropped from the
-        mirror, so a field's mirror position differs from its
-        declaration index, and a zero-sized field itself has no
-        position at all (its map entry is ``None``)."""
         if self._mir is None:
             assert self._field_mir_indices is None
             fields: list[mir.FormalArg] = []
@@ -745,37 +744,10 @@ def min_int_type(lower: int, upper: int) -> IntType:
 # size that the C ABIs of the supported targets pass in registers)
 _AGGREGATE_VALUE_RETURN_LIMIT = 16
 
-
-def _alignment_of(type: Type) -> int:
-    """The natural alignment of a type, in bytes (the layout rules of
-    the ctypes instances - and of the LLVM structs they mirror - for the
-    types that may occur in a struct).  Zero-sized (ZST) types occupy no
-    storage and are skipped inside aggregates."""
-    match type:
-        case BoolType():
-            return 1
-        case IntType():
-            return type.bits // 8 if type.bits != 0 else 1
-        case FloatType():
-            return type.bits // 8
-        case StructType():
-            return max(
-                (
-                    _alignment_of(f.type)
-                    for f in type.fields
-                    if f.type.get_unit_value() is None
-                ),
-                default=1,
-            )
-        case _:
-            raise SpyError(f"type {type} has no layout")
-
-
-def _size_of(type: Type) -> int:
-    """The size of a type in bytes, rounded up to its alignment (the
-    natural layout the ctypes instances - and the LLVM structs they
-    mirror - use).  A ZST is zero-sized; ZST fields occupy no storage
-    inside an aggregate."""
+def estimated_size_of(type: Type) -> int:
+    """Returns the estimated size of a type in bytes. The size is obtained
+    using ctypes size rule, but is not guaranteed to be the actual size of
+    the type. ZSTs are guaranteed to return 0."""
     match type:
         case BoolType():
             return 1
@@ -789,14 +761,35 @@ def _size_of(type: Type) -> int:
                 if field.type.get_unit_value() is not None:
                     # a zero-sized field occupies no storage
                     continue
-                align = _alignment_of(field.type)
+                align = estimated_alignment_of(field.type)
                 offset = (offset + align - 1) // align * align
-                offset += _size_of(field.type)
-            align = _alignment_of(type)
+                offset += estimated_size_of(field.type)
+            align = estimated_alignment_of(type)
             return (offset + align - 1) // align * align
         case _:
             raise SpyError(f"type {type} has no layout")
 
+def estimated_alignment_of(type: Type) -> int:
+    """Estimated alignment of a type in bytes. Like :func:`estimated_size_of`,
+    this is not guaranteed to be the actual alignment of the type. ZSTs have alignment 1."""
+    match type:
+        case BoolType():
+            return 1
+        case IntType():
+            return type.bits // 8 if type.bits != 0 else 1
+        case FloatType():
+            return type.bits // 8
+        case StructType():
+            return max(
+                (
+                    estimated_alignment_of(f.type)
+                    for f in type.fields
+                    if f.type.get_unit_value() is None
+                ),
+                default=1,
+            )
+        case _:
+            raise SpyError(f"type {type} has no layout")
 
 def returns_via_result_ptr(type: Type) -> bool:
     """Whether a function returning ``type`` delivers its result by
@@ -814,7 +807,7 @@ def returns_via_result_ptr(type: Type) -> bool:
     are always returned by value."""
     match type:
         case StructType():
-            return _size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
+            return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
 
@@ -831,20 +824,9 @@ def pass_by_ref(type: Type) -> bool:
     passed by reference regardless of its type."""
     match type:
         case StructType():
-            return _size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
+            return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
-
-
-def concretize_type(type: Type) -> Type:
-    """Replace a compile-time-only type by the concrete type a runtime
-    value of it is represented by: the open integer type ``AnyIntType``
-    (the type of a plain Python ``int``) becomes the default signed
-    integer type (:data:`INT_DEFAULT_BITS`).  Every other type passes
-    through unchanged."""
-    if isinstance(type, AnyIntType):
-        return IntType(INT_DEFAULT_BITS, True)
-    return type
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +834,7 @@ def concretize_type(type: Type) -> Type:
 # ---------------------------------------------------------------------------
 
 
-def type_of(value: AnyValue) -> Type:
+def type_of(value: AnyValue, int_literal_bits: int | None = None) -> Type:
     """The spy type a Python *value* is marshaled to at the call boundary.
 
     ``None`` is returned for values that have no spy representation (e.g.
@@ -865,32 +847,13 @@ def type_of(value: AnyValue) -> Type:
         case bool():
             return BoolType()
         case int():
-            return AnyIntType()
+            return AnyIntType() if int_literal_bits is None else IntType(int_literal_bits, True)
         case float():
             return FloatType(64)
         case str():
             # strings are compiled as arrays of u8; until arrays get their
             # own type they are represented by a const pointer to u8
             return PointerType(IntType(8, False), is_const=True)
-
-
-def value_repr(value: object) -> str:
-    """Human readable description of a Python value (used in errors)."""
-    match value:
-        case int():
-            return f'integer {value}'
-        case float():
-            return f'float {value}'
-        case str():
-            return 'string'
-        case bool():
-            return 'bool'
-        case _:
-            cls = type(value)
-            descriptor = getattr(cls, '__spy_struct_type__', None)
-            if descriptor is not None:
-                return f'a {descriptor.name} struct'
-            return repr(value)
 
 def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
@@ -1064,3 +1027,47 @@ def is_comptime_only_type(type: Type) -> bool:
             return True
         case _:
             return False
+
+def is_numeric_type(type: Type):
+    match type:
+        case AnyIntType() | IntType() | FloatType():
+            return True
+        case _:
+            return False
+
+def coerce_const(value: AnyValue, type: Type) -> AnyValue:
+    """Turn a Python literal into the typed MIR constant that mirrors the
+    spy type ``type``."""
+    if isinstance(value, AsValue):
+        value = value.value
+    match type:
+        case BoolType():
+            if not isinstance(value, bool):
+                raise CompileError(f"cannot use {value!r} as a bool constant")
+            return value
+        case IntType():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise CompileError(f"cannot use {value!r} as an integer constant")
+            if type.signed:
+                lo, hi = (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
+            else:
+                lo, hi = (0, 2 ** type.bits - 1)
+            if not lo <= value <= hi:
+                raise CompileError(
+                    f"integer constant {value} is out of range for {type}"
+                )
+            return Int(value, type)
+        case FloatType():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise CompileError(f"cannot use {value} as a float constant")
+            return Float(float(value), type)
+        case TypeType():
+            if not isinstance(value, Type):
+                raise CompileError(f"cannot use {value} as a type constant")
+            if value.get_type() != type:
+                raise CompileError(f"cannot use {value} as a type constant")
+            return value
+        case _:
+            raise CompileError(
+                f"cannot create a constant of type {type} from {value}"
+            )

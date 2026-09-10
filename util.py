@@ -1,10 +1,10 @@
 import types
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from enum import IntEnum
 from inspect import isclass
 from types import GenericAlias
-from typing import Iterable, Union, get_args, get_origin, override
+from typing import Union, get_args, get_origin, override
 from weakref import WeakKeyDictionary
 
 
@@ -319,7 +319,7 @@ class IndexedMap[K, V]:
     def values(self):
         return self.by_id
 
-    def map(self, fn: Callable[[V], V]) -> 'IndexedMap[K, V]':
+    def map(self, fn: Callable[[V], V]) -> IndexedMap[K, V]:
         ret = IndexedMap[K, V]()
         for key, id in self.by_key.items():
             ret.add(key, fn(self.by_id[id]))
@@ -354,7 +354,7 @@ class TriState(IntEnum):
     FALSE = 2
 
     @staticmethod
-    def and_(a: 'TriState', b: 'TriState') -> 'TriState':
+    def and_(a: TriState, b: TriState) -> TriState:
         if a == TriState.FALSE or b == TriState.FALSE:
             return TriState.FALSE
         if a == TriState.TRUE and b == TriState.TRUE:

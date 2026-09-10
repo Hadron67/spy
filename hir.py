@@ -273,3 +273,23 @@ class End(Inst):
     after this marker is the continuation of the enclosing block.  A
     marker produces no register; it only delimits the flat instruction
     stream."""
+
+def scan_block(insts: tuple[Inst, ...], entry: int) -> tuple[int | None, int]:
+    """The positions of the ``Else`` (or None when the block has no
+    else branch) and ``End`` markers that close the block opened at
+    ``entry`` (an ``hir.If``) of the executing frame's flat
+    instruction list, found by a balanced scan forward from the
+    entry (nested blocks close their own markers first)."""
+    depth = 0
+    p_else: int | None = None
+    for i in range(entry + 1, len(insts)):
+        inst = insts[i]
+        if isinstance(inst, If):
+            depth += 1
+        elif isinstance(inst, End):
+            if depth == 0:
+                return p_else, i
+            depth -= 1
+        elif isinstance(inst, Else) and depth == 0:
+            p_else = i
+    assert False, 'unclosed block in the HIR'

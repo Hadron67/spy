@@ -29,7 +29,6 @@ from spy.lower import LLVMBackend
 
 from . import astgen, sval
 from .builtins import spy_as, spy_compile_log, spy_typeof
-from .errors import CompileError
 from .fn import (
     AnyValue,
     ArgList,
@@ -79,6 +78,7 @@ def _to_py_arg(value: sval.AnyValue) -> Any:
         case _:
             return value
 
+_INT_LITERAL_BITS = 64
 
 class _RegisteredFn:
     def __init__(self, fn, cls, meta: FnMetadata, context: _Context) -> None:
@@ -97,7 +97,7 @@ class _RegisteredFn:
             ),
             lambda e: e,
         )
-        arg_types: ArgList[sval.Type | None] = arglist.map(lambda a: sval.type_of(a))
+        arg_types: ArgList[sval.Type | None] = arglist.map(lambda a: sval.type_of(a, _INT_LITERAL_BITS))
         call_sig, ret_sig = entry.hir.signature.specialize(arg_types)
 
         analyser = Analyser(self.context)
@@ -107,8 +107,7 @@ class _RegisteredFn:
 
         instance = entry.specs[call_sig]
         native_fn = instance.native_fn
-        if native_fn is None:
-            raise CompileError(f'function {self.fn.__qualname__} was not compiled')
+        assert native_fn is not None
 
         # the native call takes the arguments of the *lowered* signature:
         # a zero-sized (compile-time) parameter is not passed

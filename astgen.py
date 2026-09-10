@@ -54,9 +54,7 @@ import textwrap
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
-from spy.util import IndexedMap, frozendict
-
-from . import hir
+from . import hir, sval
 from .errors import CompileError
 from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
@@ -70,6 +68,7 @@ from .sval import (
 from .sval import (
     TypeVar as SpyTypeVar,
 )
+from .util import IndexedMap, frozendict
 
 _BIN_OPS = {
     ast.Add: '+',
@@ -620,5 +619,6 @@ def parse_function(fn: Callable, self_type: Type | None = None) -> FunctionIR:
     builder = _Builder(fn, ir, scope)
     for stmt in node.body:
         builder._gen_stmt(stmt)
+    builder.add(hir.Store(hir.ResultLoc(), hir.Const(sval.Void())))
     ir.body = tuple(builder.insts)
     return ir

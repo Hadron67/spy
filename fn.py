@@ -19,7 +19,6 @@ from .sval import (
     TypeVar,
     TypeVarSolver,
     Value,
-    concretize_type,
     pass_by_ref,
     replace_type_vars_type,
     returns_via_result_ptr,
@@ -268,8 +267,6 @@ class Signature:
             if type_var not in solved:
                 raise TypeMismatchError(f"type variable {type_var.name} not solved")
             value = solved[type_var]
-            if isinstance(value, Type):
-                value = concretize_type(value)
             ret.append(value)
         return tuple(ret)
 
@@ -318,7 +315,6 @@ class Signature:
 
         def substitute(type: Type) -> Type:
             replaced = replace_type_vars_type(type, reps)
-            replaced = concretize_type(replaced)
             if isinstance(replaced, TypeVar):
                 raise TypeMismatchError(f"type variable {replaced.name} is not solved")
             return replaced
@@ -335,7 +331,6 @@ class Signature:
                 raise TypeMismatchError(
                     f"cannot determine the type of parameter '{name}'"
                 )
-            resolved = concretize_type(resolved)
             unit = resolved.get_unit_value()
             if unit is not None:
                 assert isinstance(unit, Value)

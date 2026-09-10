@@ -129,25 +129,13 @@ decision."""
 
 @dataclass
 class PendingSlot(InterpVal):
-    """The value of an executed ``hir.Alloca``: an addressable slot whose
-    concrete type is fixed by its first store (the interpreter emits the
-    typed MIR alloca at that moment).  A slot that receives the result of
-    a *native* call (RLS) first only *records* the value: scalar and
-    compile-time results are never given real memory - the matching
-    ``Load`` hands the recorded value out directly - and memory is
-    allocated only when the slot really must hold its value at a fixed
-    address (a later plain ``Store``, a struct result, which the callee
-    writes into the slot in place, or the result of an *inlined* call,
-    whose per-path delivery stores into the slot immediately, see
-    ``_deliver_inline_result``)."""
-
     # the spy type of the slot content (the type the slot is typed with
     # by its first store, in ``type.py``)
     mir_alloca_pos: int
-    is_comptime: bool
+    is_inline_val: bool
     type: sval.Type | None = None
     runtime_ptr: mir.Value | None = None
-    comptime_val: sval.AnyValue | None = None
+    inline_val: InterpVal | None = None
     # This indicates the slot is a result pointer: write to this slot
     # would trigger ``_bind_result_loc``
     is_result_loc_ptr: bool = False
@@ -160,6 +148,28 @@ class ComptimeTuple(InterpVal):
 class ComptimeDict(InterpVal):
     value_ptrs: dict[str, InterpVal]
 
+def _is_comptime_val(val: InterpVal) -> bool:
+    todo = [val]
+    while todo:
+        val = todo.pop()
+        match val:
+            case RuntimeVal():
+                return False
+            case PendingSlot():
+                if val.type is None:
+                    return False
+                if val.type.get_unit_value() is not None:
+                    return True
+                if val.runtime_ptr is not None or val.inline_val is None:
+                    return False
+                todo.append(val.inline_val)
+            case ComptimeVal():
+                return True
+            case ComptimeTuple():
+                todo.extend(val.value_ptrs)
+            case ComptimeDict():
+                todo.extend(val.value_ptrs.values())
+    return True
 
 @dataclass
 class BlockFrame:
@@ -227,37 +237,6 @@ class InlineFrame:
 # so none of them is a method of :class:`HirRunner`
 # ---------------------------------------------------------------------------
 
-def _const_of_py(value: sval.AnyValue, type: sval.Type) -> sval.AnyValue:
-    """Turn a Python literal into the typed MIR constant that mirrors the
-    spy type ``type``."""
-    if isinstance(value, sval.AsValue):
-        value = value.value
-    match type:
-        case sval.BoolType():
-            if not isinstance(value, bool):
-                raise CompileError(f"cannot use {value!r} as a bool constant")
-            return value
-        case sval.IntType():
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise CompileError(f"cannot use {value!r} as an integer constant")
-            if type.signed:
-                lo, hi = (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
-            else:
-                lo, hi = (0, 2 ** type.bits - 1)
-            if not lo <= value <= hi:
-                raise CompileError(
-                    f"integer constant {value} is out of range for {type}"
-                )
-            return sval.Int(value, type)
-        case sval.FloatType():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise CompileError(f"cannot use {value!r} as a float constant")
-            return sval.Float(float(value), type)
-        case _:
-            raise CompileError(
-                f"cannot create a constant of type {type} from {value!r}"
-            )
-
 
 def _sval_to_runtime(value: sval.AnyValue) -> mir.Value:
     match value:
@@ -299,19 +278,23 @@ def _shallow_normalize(ev: InterpVal) -> InterpVal:
     value it denotes, so that pointer operations (load, field access,
     store through the slot) see one shape.  A slot with no memory (a
     compile-time slot) is left alone for ``load``/``store`` to handle."""
-    if isinstance(ev, PendingSlot) and ev.type is not None and ev.runtime_ptr is not None:
-        return RuntimeVal(ev.runtime_ptr, sval.PointerType(ev.type, is_const=False))
+    if isinstance(ev, PendingSlot) and ev.type is not None:
+        if ev.runtime_ptr is not None:
+            return RuntimeVal(ev.runtime_ptr, sval.PointerType(ev.type, is_const=False))
+        val = ev.type.get_unit_value()
+        if val is not None:
+            return ComptimeVal(sval.ConstRef(val))
     return ev
 
 def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
     """The spy type of the value ``ev`` denotes, or None when it has
-    no spy representation (an un-typable compile-time object)."""
+    no spy representation (an un-typable compile-time object).
+    Should work on non-normalized values."""
     match ev:
         case PendingSlot():
-            # the content type of the slot (a slot is a storage, not a
-            # pointer value: ``_shallow_normalize`` turns a slot with
-            # memory into its pointer)
-            return ev.type
+            if ev.type is None:
+                return None
+            return sval.PointerType(ev.type, is_const=False)
         case RuntimeVal(_, type):
             if isinstance(type, sval.ValueType) and not allow_value_type:
                 return sval.type_of(type.value)
@@ -325,13 +308,9 @@ def _arg_type_of(arg: ArgEntry[InterpVal]):
     """The spy type of the *value* an argument denotes: a reference
     argument carries the address of its value, so one pointer layer is
     stripped here."""
-    ev = arg.value
-    if isinstance(ev, PendingSlot):
-        # a slot is the address of its content: the argument's value type
-        # is the content type
-        return ev.type
-    type = _type_of(ev)
-    if arg.is_ref and isinstance(type, sval.PointerType):
+    type = _type_of(arg.value)
+    if arg.is_ref:
+        assert isinstance(type, sval.PointerType), f"pointer expected, got {type}"
         return type.elem
     return type
 
@@ -352,53 +331,6 @@ def _comptime_py_op(op: str, lhs: Any, rhs: Any) -> Any:
         raise CompileError(
             f"cannot apply '{op}' to {lhs!r} and {rhs!r} at compile time: {e}"
         ) from e
-
-
-def _bin_types(lhs: InterpVal, rhs: InterpVal) -> tuple[sval.Type | None, sval.Type | None]:
-    """The spy types of the two operands of a binary operation.  A
-    compile-time integer constant adopts the type of a runtime integer
-    operand (``x + 1`` with ``x: u64`` is a u64 addition, like an integer
-    argument marshals to the annotated type at the Python boundary)."""
-    lt = _type_of(lhs)
-    rt = _type_of(rhs)
-    if (
-        isinstance(rhs, ComptimeVal)
-        and not isinstance(rhs.obj, bool)
-        and isinstance(rhs.obj, int)
-        and isinstance(lt, sval.IntType)
-    ):
-        rt = lt
-    elif (
-        isinstance(lhs, ComptimeVal)
-        and not isinstance(lhs.obj, bool)
-        and isinstance(lhs.obj, int)
-        and isinstance(rt, sval.IntType)
-    ):
-        lt = rt
-    return lt, rt
-
-
-def _binary_type(lt: sval.Type, rt: sval.Type, what: str) -> sval.Type | None:
-    """The spy type a binary operation on ``lt``/``rt`` is performed on,
-    or None if the operand combination is not a number pair."""
-    if isinstance(lt, sval.AnyIntType):
-        lt = sval.IntType(sval.INT_DEFAULT_BITS, True)
-    if isinstance(rt, sval.AnyIntType):
-        rt = sval.IntType(sval.INT_DEFAULT_BITS, True)
-    if isinstance(lt, sval.IntType) and isinstance(rt, sval.IntType):
-        if lt != rt:
-            raise CompileError(
-                f"cannot {what} a {lt} value with a {rt} value "
-                "(different integer types)"
-            )
-        return lt
-    if isinstance(lt, sval.FloatType) and isinstance(rt, sval.FloatType):
-        return sval.FloatType(max(lt.bits, rt.bits))
-    if isinstance(lt, sval.IntType) and isinstance(rt, sval.FloatType):
-        return rt
-    if isinstance(lt, sval.FloatType) and isinstance(rt, sval.IntType):
-        return lt
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +411,7 @@ class HirRunner:
                 return ComptimeVal(sval.ConstRef(node.value))
             case SpecializedRuntimeArg():
                 type = node.type.to_mir_type()
-                assert type is not None and not isinstance(type, mir.VoidType)
+                assert type is not None and not isinstance(type, mir.VoidType), f"void type has no runtime representation: {node.type}"
                 index = len(mir_args)
                 if node.is_ref:
                     type = mir.PointerType(type, True)
@@ -488,6 +420,7 @@ class HirRunner:
                 else:
                     mir_args.append(type)
                     ret = self.alloca()
+                    self.materialize_location(ret, node.type)
                     self.store(ret, RuntimeVal(mir.Param(index, type), node.type))
                     return ret
             case _:
@@ -554,9 +487,7 @@ class HirRunner:
                 raise CompileError(f'type {type} has no runtime representation')
             mir_fn.ret_type = mir_ret
             self.return_sig = ReturnSignature(False, type)
-            location = self._current_result_loc()
-            if isinstance(location, PendingSlot):
-                location.type = type
+            self._init_pending_slot(self._current_result_loc(), type)
 
     # -- return statements ------------------------------------------------
 
@@ -594,41 +525,6 @@ class HirRunner:
             self._emit(mir.End())
         self._frames.pop()
 
-    def _set_void_result(self) -> None:
-        """Record that the function proper returns no value (a bare
-        ``return``, or a body that falls off its end).  A function whose
-        return type is already fixed to a non-void type rejects it."""
-        if self.return_sig is None:
-            self._fn_instance.mir.ret_type = mir.VOID
-            self.return_sig = ReturnSignature(False, sval.VoidType())
-        elif not isinstance(self.return_sig.ret_type, sval.VoidType):
-            raise CompileError(
-                f"cannot return without a value where "
-                f"{self.return_sig.ret_type} is expected"
-            )
-
-    def _complete_function(self) -> None:
-        """The run of the function proper ended by a ``return`` on this
-        path: a full-return function has typed every runtime path, so the
-        run is complete.  A body that reached here without ever writing a
-        result is a void function."""
-        if self.return_sig is None:
-            self._set_void_result()
-
-    def _finish_function(self) -> None:
-        """The body of the function proper fell off its end (no code
-        after the last instruction): a void body ends with an implicit
-        ``ret void``; a value-returning function must end every path with
-        a ``return``."""
-        if self.return_sig is None:
-            self._set_void_result()
-            return
-        if not isinstance(self.return_sig.ret_type, sval.VoidType):
-            raise CompileError(
-                f"function {self._fn_instance.mir.name_base} returns a value on "
-                "some paths but falls off its end (without a return) on others"
-            )
-
     def _step(self) -> PollResult:
         """Execute one step of the machine: the instruction at the pc of
         the executing frame, advancing the pc - or the end of the
@@ -639,7 +535,6 @@ class HirRunner:
             # marker transitions) - the run of the frame ended
             assert not frame.block_stack
             if len(self._frames) == 1:
-                self._finish_function()
                 return PollResult.DONE
             self._pop_frame()
             return PollResult.AGAIN
@@ -648,25 +543,7 @@ class HirRunner:
         return self._exec_inst(inst)
 
     def _scan_block(self, entry: int) -> tuple[int | None, int]:
-        """The positions of the ``Else`` (or None when the block has no
-        else branch) and ``End`` markers that close the block opened at
-        ``entry`` (an ``hir.If``) of the executing frame's flat
-        instruction list, found by a balanced scan forward from the
-        entry (nested blocks close their own markers first)."""
-        insts = self._frames[-1].insts
-        depth = 0
-        p_else: int | None = None
-        for i in range(entry + 1, len(insts)):
-            inst = insts[i]
-            if isinstance(inst, hir.If):
-                depth += 1
-            elif isinstance(inst, hir.End):
-                if depth == 0:
-                    return p_else, i
-                depth -= 1
-            elif isinstance(inst, hir.Else) and depth == 0:
-                p_else = i
-        assert False, 'unclosed block in the HIR'
+        return hir.scan_block(self._frames[-1].insts, entry)
 
     def _exec_inst(self, inst: hir.Inst) -> PollResult:
         """Execute one instruction of the executing frame.  A control
@@ -687,34 +564,13 @@ class HirRunner:
                         self._emit(mir.Break(level))
                     return self._cut()
                 location = self._current_result_loc()
-                if isinstance(location, PendingSlot) and location.type is None:
-                    # nothing was written into the result location on this
-                    # path: a bare return of a void function
-                    self._set_void_result()
-                    self._emit(mir.Ret(None))
-                    return self._cut()
-                ret_val = self.load(location)
-                ret_type = _type_of(ret_val)
-                if ret_type is None:
-                    raise CompileError('cannot determine the return type')
-                return_sig = self.return_sig
-                if return_sig is None:
-                    self._materialize_result_ptr(ret_type, None)
-                    return_sig = self.return_sig
-                    assert return_sig is not None
-                elif return_sig.ret_type != ret_type:
-                    raise CompileError(
-                        f"function returns values of conflicting types "
-                        f"{return_sig.ret_type} and {ret_type}"
-                    )
-                if return_sig.ret_by_ref:
-                    # the value was written through the result pointer;
-                    # the function itself returns void
-                    self._emit(mir.Ret(None))
-                elif isinstance(ret_type, sval.VoidType):
+
+                assert self.return_sig is not None
+
+                if self.return_sig.ret_by_ref or self.return_sig.ret_type.is_zst():
                     self._emit(mir.Ret(None))
                 else:
-                    self._emit(mir.Ret(_to_runtime(ret_val)))
+                    self._emit(mir.Ret(_to_runtime(self.load(location))))
                 return self._cut()
             case hir.If():
                 self._exec_if(inst)
@@ -919,7 +775,6 @@ class HirRunner:
                 # the body run ended in a return: skip the dead code
                 # after it
                 if len(self._frames) == 1:
-                    self._complete_function()
                     return PollResult.DONE
                 self._pop_frame()
                 return PollResult.AGAIN
@@ -995,9 +850,9 @@ class HirRunner:
             if unit_value is not None:
                 return ComptimeVal(unit_value)
             if ptr.runtime_ptr is None:
-                if ptr.comptime_val is None:
+                if ptr.inline_val is None:
                     raise CompileError('cannot load from a slot that was never written')
-                return ComptimeVal(ptr.comptime_val)
+                return ptr.inline_val
             return RuntimeVal(self._emit(mir.Load(ptr.runtime_ptr)), ptr.type)
         if isinstance(ptr, ComptimeVal) and isinstance(ptr.obj, sval.ConstRef):
             # a reference to an immutable compile-time global behaves like
@@ -1020,41 +875,16 @@ class HirRunner:
         load/store is ever emitted for it); any other store materializes
         the slot's memory (at the position its ``Alloca`` was reserved
         at) and emits the typed store."""
-        if isinstance(ptr, PendingSlot):
-            location = ptr
-            if location.type is None:
-                value_type = _type_of(value)
-                if value_type is None:
-                    raise CompileError('cannot store a value that has no spy type')
-                self.materialize_location(location, sval.concretize_type(value_type))
-            elem = location.type
-            assert elem is not None
-            if elem.is_zst():
-                return
-            if isinstance(value, ComptimeVal) and sval.is_comptime_only_type(elem):
-                location.comptime_val = value.obj
-                return
-            coerced = self._coerce(value, elem)
-            if isinstance(coerced, sval.Undefined):
-                return
-            comptime_value = _to_comptime(coerced)
-            if comptime_value is not None and location.is_comptime and location.runtime_ptr is None:
-                location.comptime_val = comptime_value
-                return
-            if location.runtime_ptr is None:
-                mir_type = elem.to_mir_type()
-                if mir_type is None or isinstance(mir_type, mir.VoidType):
-                    raise CompileError(
-                        f'cannot give a value of type {elem} a runtime representation'
-                    )
-                location.runtime_ptr = self._emit(
-                    mir.Alloca(mir_type), location.mir_alloca_pos
-                )
-            self._emit(mir.Store(location.runtime_ptr, _to_runtime(coerced)))
-            return
-
         ptr = _shallow_normalize(ptr)
         ptr_type = _type_of(ptr)
+        if ptr_type is None:
+            value_type = _type_of(value)
+            if value_type is None:
+                raise CompileError('cannot store a value that has no spy type')
+            self.materialize_location(ptr, value_type)
+            ptr = _shallow_normalize(ptr)
+            ptr_type = _type_of(ptr)
+
         if not isinstance(ptr_type, sval.PointerType):
             raise CompileError(f"cannot store to a {ptr_type} value")
         elem = ptr_type.elem
@@ -1066,6 +896,23 @@ class HirRunner:
         match ptr:
             case RuntimeVal():
                 self._emit(mir.Store(ptr.value, _to_runtime(coerced)))
+            case PendingSlot():
+                assert ptr.is_inline_val, f"cannot store to a pending slot that does not allow inline values: {ptr!r}"
+                if _to_comptime(coerced) is not None:
+                    ptr.inline_val = coerced
+                else:
+                    # a runtime value cannot live in an inline slot: it may
+                    # be defined inside a block (e.g. the result of an
+                    # inlined call) and must outlive it, so give the slot
+                    # memory
+                    if ptr.runtime_ptr is None:
+                        mir_type = elem.to_mir_type()
+                        if mir_type is None or isinstance(mir_type, mir.VoidType):
+                            raise CompileError(
+                                f'cannot give a value of type {elem} a runtime representation'
+                            )
+                        ptr.runtime_ptr = self._emit(mir.Alloca(mir_type), ptr.mir_alloca_pos)
+                    self._emit(mir.Store(ptr.runtime_ptr, _to_runtime(coerced)))
             case _:
                 raise CompileError('cannot store through a compile-time pointer')
 
@@ -1156,7 +1003,7 @@ class HirRunner:
         applied."""
         match ev:
             case ComptimeVal(obj):
-                return ComptimeVal(_const_of_py(obj, target))
+                return ComptimeVal(sval.coerce_const(obj, target))
             case RuntimeVal(value, type):
                 return RuntimeVal(self._convert(value, type, target), target)
             case _:
@@ -1194,67 +1041,91 @@ class HirRunner:
     # -- operators ------------------------------------------------------------
 
     def _eval_binary(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
-        lv = self._arg_value(lhs)
-        rv = self._arg_value(rhs)
-        if isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal):
+        if isinstance(lhs, ComptimeVal) and isinstance(rhs, ComptimeVal):
+            lv = self._arg_value(lhs)
+            rv = self._arg_value(rhs)
+            assert isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal)
             self.store(ret, ComptimeVal(_comptime_py_op(op, lv.obj, rv.obj)))
             return PollResult.AGAIN
-        lt, rt = _bin_types(lv, rv)
-        if lt is None or rt is None:
-            raise CompileError(f"cannot apply '{op}' to a compile-time object")
-        type = _binary_type(lt, rt, f"apply '{op}' to")
-        if type is None:
-            raise CompileError(f"cannot apply '{op}' to {lt} and {rt}")
-        if isinstance(type, sval.IntType):
-            if op == '/':
-                raise CompileError(
-                    "integer division ('/') is not supported; divide float values instead"
-                )
-            if op == '//':
-                raise CompileError("integer floor division ('//') is not supported yet")
-            if op == '**':
-                raise CompileError("integer exponentiation ('**') is not supported yet")
-            if op not in ('+', '-', '*', '%'):
-                raise CompileError(f"unsupported operator '{op}' for integers")
+
+        lhs_type = _arg_type_of(lhs)
+        rhs_type = _arg_type_of(rhs)
+
+        if lhs_type is None or rhs_type is None:
+            raise CompileError(f"cannot apply '{op}' to untyped objects")
+        if sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type):
+            lv = self._arg_value(lhs)
+            rv = self._arg_value(rhs)
+            type = lhs_type.resolve_peer_type(rhs_type)
+            if type is None:
+                raise CompileError(f"cannot apply '{op}' to {lhs_type} and {rhs_type}")
+            if isinstance(type, sval.IntType):
+                if op == '/':
+                    raise CompileError(
+                        "integer division ('/') is not supported; divide float values instead"
+                    )
+                if op == '//':
+                    raise CompileError("integer floor division ('//') is not supported yet")
+                if op == '**':
+                    raise CompileError("integer exponentiation ('**') is not supported yet")
+                if op not in ('+', '-', '*', '%'):
+                    raise CompileError(f"unsupported operator '{op}' for integers")
+            else:
+                if op == '**':
+                    raise CompileError("float exponentiation ('**') is not supported yet")
+                if op == '//':
+                    raise CompileError("float floor division ('//') is not supported yet")
+                if op not in ('+', '-', '*', '/'):
+                    raise CompileError(f"unsupported operator '{op}' for floats")
+            lc = self._coerce(lv, type)
+            rc = self._coerce(rv, type)
+            signed = isinstance(type, sval.IntType) and type.signed
+            mir_type = type.to_mir_type()
+            assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+            value = self._emit(
+                mir.Arith(_ARITH_OPS[op], signed, _to_runtime(lc), _to_runtime(rc), mir_type)
+            )
+            self.store(ret, RuntimeVal(value, type))
+            return PollResult.AGAIN
+        elif isinstance(lhs_type, sval.StructType) or isinstance(rhs_type, sval.StructType):
+            # call `__xxx__` methods
+            raise NotImplementedError
         else:
-            if op == '**':
-                raise CompileError("float exponentiation ('**') is not supported yet")
-            if op == '//':
-                raise CompileError("float floor division ('//') is not supported yet")
-            if op not in ('+', '-', '*', '/'):
-                raise CompileError(f"unsupported operator '{op}' for floats")
-        lc = self._coerce(lv, type)
-        rc = self._coerce(rv, type)
-        signed = isinstance(type, sval.IntType) and type.signed
-        mir_type = type.to_mir_type()
-        assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
-        value = self._emit(
-            mir.Arith(_ARITH_OPS[op], signed, _to_runtime(lc), _to_runtime(rc), mir_type)
-        )
-        self.store(ret, RuntimeVal(value, type))
-        return PollResult.AGAIN
+            raise CompileError(f"unsupported operator '{op}' for {lhs_type} and {rhs_type}")
 
     def _eval_cmp(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret_reg: hir.Inst) -> PollResult:
-        lv = self._arg_value(lhs)
-        rv = self._arg_value(rhs)
-        if isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal):
+        lhs_type = _arg_type_of(lhs)
+        rhs_type = _arg_type_of(rhs)
+
+        if _is_comptime_val(lhs.value) and _is_comptime_val(rhs.value):
+            lv = self._arg_value(lhs)
+            rv = self._arg_value(rhs)
+            assert isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal)
             self._frames[-1].regs[ret_reg] = ComptimeVal(_comptime_py_op(op, lv.obj, rv.obj))
             return PollResult.AGAIN
-        lt, rt = _bin_types(lv, rv)
-        if lt is None or rt is None:
-            raise CompileError('cannot compare a compile-time object')
-        type = _binary_type(lt, rt, 'compare')
-        if type is None:
-            raise CompileError(f'cannot compare {lt} and {rt}')
-        lc = self._coerce(lv, type)
-        rc = self._coerce(rv, type)
-        kind = 'int' if isinstance(type, sval.IntType) else 'float'
-        signed = isinstance(type, sval.IntType) and type.signed
-        value = self._emit(
-            mir.Cmp(_CMP_OPS[op], signed, kind, _to_runtime(lc), _to_runtime(rc))
-        )
-        self._frames[-1].regs[ret_reg] = RuntimeVal(value, sval.BoolType())
-        return PollResult.AGAIN
+
+        if lhs_type is None or rhs_type is None:
+            raise CompileError(f"cannot apply '{op}' to untyped objects")
+        if sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type):
+            lv = self._arg_value(lhs)
+            rv = self._arg_value(rhs)
+            type = lhs_type.resolve_peer_type(rhs_type)
+            if type is None:
+                raise CompileError(f'cannot compare {lhs_type} and {rhs_type}')
+            lc = self._coerce(lv, type)
+            rc = self._coerce(rv, type)
+            kind = 'int' if isinstance(type, sval.IntType) else 'float'
+            signed = isinstance(type, sval.IntType) and type.signed
+            value = self._emit(
+                mir.Cmp(_CMP_OPS[op], signed, kind, _to_runtime(lc), _to_runtime(rc))
+            )
+            self._frames[-1].regs[ret_reg] = RuntimeVal(value, sval.BoolType())
+            return PollResult.AGAIN
+        elif isinstance(lhs_type, sval.StructType) and isinstance(rhs_type, sval.StructType):
+            # call `__xxx__` methods
+            raise NotImplementedError
+        else:
+            raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
 
     def _eval_boolop(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret_reg: hir.Inst) -> PollResult:
         lv = self._arg_value(lhs)
@@ -1377,6 +1248,19 @@ class HirRunner:
             return PollResult.AGAIN
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 
+    def _init_pending_slot(self, val: InterpVal, type: sval.Type):
+        """Called by :meth:`materialize_location` and :meth:`_init_args_from_signature`."""
+        if isinstance(val, PendingSlot) and val.type is None:
+            if sval.is_comptime_only_type(type) and not val.is_inline_val:
+                raise CompileError('cannot store a comptime-only value to a runtime pointer')
+            val.type = type
+            if not val.is_inline_val:
+                runtime_type = type.to_mir_type()
+                if runtime_type is None:
+                    raise CompileError(f'cannot store a value of type {type} to a runtime pointer')
+                if not isinstance(runtime_type, mir.VoidType):
+                    val.runtime_ptr = self._emit(mir.Alloca(runtime_type), val.mir_alloca_pos)
+
     def materialize_location(self, val: InterpVal, type: sval.Type):
         """Give an untyped pending slot its content type (the type of its
         first store).  A slot that is the function's result location
@@ -1384,11 +1268,7 @@ class HirRunner:
         ``_materialize_result_ptr``)."""
         match val:
             case PendingSlot():
-                if val.type is not None:
-                    return
-                if sval.is_comptime_only_type(type) and not val.is_comptime:
-                    raise CompileError('cannot store a comptime-only value to a runtime pointer')
-                val.type = type
+                self._init_pending_slot(val, type)
                 if val.is_result_loc_ptr:
                     self._materialize_result_ptr(type)
             case _:
