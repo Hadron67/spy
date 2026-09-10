@@ -2,9 +2,8 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, override
 
-from spy.util import StrBiMap
-
 from .errors import CompileError
+from .util import StrBiMap
 
 # ---------------------------------------------------------------------------
 # static types

@@ -25,8 +25,6 @@ import types as pytypes
 from dataclasses import dataclass
 from typing import Any, cast, override
 
-from spy.lower import LLVMBackend
-
 from . import astgen, sval
 from .builtins import spy_as, spy_compile_log, spy_typeof
 from .fn import (
@@ -41,6 +39,7 @@ from .fn import (
     SpecializedComptimeArg,
 )
 from .interp import Analyser
+from .lower import LLVMBackend
 from .util import frozendict
 
 # the ``spy.*`` builtins, by the name the interpreter knows them by

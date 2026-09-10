@@ -6,8 +6,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, override
 
-from spy.util import IndexedMap, frozendict
-
 from . import hir, mir, opt
 from .errors import TypeMismatchError
 from .sval import (
@@ -24,6 +22,7 @@ from .sval import (
     returns_via_result_ptr,
     type_of,
 )
+from .util import IndexedMap, frozendict
 
 
 @dataclass(frozen=True)
