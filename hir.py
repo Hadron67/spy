@@ -274,6 +274,11 @@ class End(Inst):
     marker produces no register; it only delimits the flat instruction
     stream."""
 
+@dataclass(eq=False)
+class CommitSlot(Inst):
+    slot: Value
+
+
 def scan_block(insts: tuple[Inst, ...], entry: int) -> tuple[int | None, int]:
     """The positions of the ``Else`` (or None when the block has no
     else branch) and ``End`` markers that close the block opened at

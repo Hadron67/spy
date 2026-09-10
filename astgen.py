@@ -205,6 +205,7 @@ class _Builder:
         straight into the target slot (result-location semantics): a
         constructor ``x = Bar(...)`` fills the fields of the slot in
         place, and a scalar call result is only recorded in it."""
+        emit_commit = False
         if isinstance(target, ast.Name):
             slot = self._scope.bindings.get(target.id)
             if slot is None:
@@ -215,7 +216,11 @@ class _Builder:
                 # ``y``
                 slot = self.add(hir.Alloca())
                 self._scope.bindings[target.id] = slot
-        self.add(hir.Store(self._gen_ref(target), self._gen_value(value)))
+                emit_commit = True
+        lhs = self._gen_ref(target)
+        self.add(hir.Store(lhs, self._gen_value(value)))
+        if emit_commit:
+            self.add(hir.CommitSlot(lhs))
 
     def _gen_augassign(self, node: ast.AugAssign) -> None:
         """One ``name += expr`` statement: read the value, add ``expr``
@@ -336,6 +341,7 @@ class _Builder:
             case _:
                 loc = self.add(hir.Alloca(True))
                 self._gen_result_loc(node, loc)
+                self.add(hir.CommitSlot(loc))
                 return loc
 
     # -- struct values ---------------------------------------------------------
@@ -471,6 +477,7 @@ class _Builder:
             case ast.Call() | ast.BinOp() | ast.UnaryOp():
                 loc = self.add(hir.Alloca(True))
                 self._gen_result_loc(node, loc)
+                self.add(hir.CommitSlot(loc))
                 return self._make_load(loc)
             case ast.Attribute():
                 return self._make_load(self._gen_ref(node))

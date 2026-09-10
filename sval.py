@@ -730,9 +730,13 @@ def int_range(type: IntType) -> tuple[int, int]:
     return (0, 2 ** type.bits - 1)
 
 def min_int_type(lower: int, upper: int) -> IntType:
-    bits = (lower - 1).bit_length() + 1
-    bits_upper = (upper - 1).bit_length() + 1
-    return IntType(max(bits, bits_upper), lower < 0)
+    """The smallest integer type whose range contains ``[lower, upper]``."""
+    if lower < 0:
+        # signed: it needs ``-2**(bits-1) <= lower`` and
+        # ``upper <= 2**(bits-1) - 1``
+        need = max(-lower, upper + 1, 1)
+        return IntType((need - 1).bit_length() + 1, True)
+    return IntType(max(upper.bit_length(), 1), False)
 
 # ---------------------------------------------------------------------------
 # the return convention of a type: whether a function returning it returns a
@@ -1067,6 +1071,10 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             if value.get_type() != type:
                 raise CompileError(f"cannot use {value} as a type constant")
             return value
+        case VoidType():
+            if isinstance(value, Void):
+                return value
+            raise CompileError(f"cannot use {value} as a void constant")
         case _:
             raise CompileError(
                 f"cannot create a constant of type {type} from {value}"
