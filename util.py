@@ -53,19 +53,22 @@ class StrBiMap[V]:
     def has_value(self, value: V):
         return value in self._v2k
 
-    def next_unique_name(self, prefix: str='') -> str:
+    def next_unique_name(self, prefix: str='', rename_prefix: str='.renamed.') -> str:
         if prefix not in self._k2v:
             return prefix
         i = 0
         while True:
-            name = prefix + str(i)
+            name = prefix + rename_prefix + str(i)
             if name not in self._k2v:
                 return name
             i += 1
 
-    def add(self, key: str, value: V):
-        assert key not in self._k2v
-        assert value not in self._v2k
+    def add(self, key: str, value: V, rename: bool = False):
+        if not rename:
+            assert key not in self._k2v
+            assert value not in self._v2k
+        elif key in self._k2v:
+            key = self.next_unique_name(key)
         self._k2v[key] = value
         self._v2k[value] = key
 

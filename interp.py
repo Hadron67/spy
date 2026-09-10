@@ -72,14 +72,17 @@ from .fn import (
     ArgEntry,
     ArgList,
     FunctionInstance,
+    FunctionResolver,
     FunctionValue,
+    NativeFn,
     RawArgList,
+    ReturnSignature,
+    SpecializedCallSignature,
     SpecializedComptimeArg,
     SpecializedFormalArg,
     SpecializedRuntimeArg,
-    SpecializedSignature,
+    SymbolTable,
 )
-from .info import FunctionResolver
 from .util import frozendict
 
 _MAX_INLINE_DEPTH = 64
@@ -242,7 +245,7 @@ def _const_of_py(value: sval.AnyValue, type: sval.Type) -> sval.AnyValue:
                 lo, hi = (0, 2 ** type.bits - 1)
             if not lo <= value <= hi:
                 raise CompileError(
-                    f"integer constant {value} is out of range for {sval.type_str(type)}"
+                    f"integer constant {value} is out of range for {type}"
                 )
             return sval.Int(value, type)
         case sval.FloatType():
@@ -251,7 +254,7 @@ def _const_of_py(value: sval.AnyValue, type: sval.Type) -> sval.AnyValue:
             return sval.Float(float(value), type)
         case _:
             raise CompileError(
-                f"cannot create a constant of type {sval.type_str(type)} from {value!r}"
+                f"cannot create a constant of type {type} from {value!r}"
             )
 
 
@@ -290,7 +293,7 @@ def _shallow_normalize(ev: InterpVal) -> InterpVal:
     """Shallow normalization, """
     if isinstance(ev, PendingSlot) and ev.type is not None:
         if ev.runtime_ptr is None:
-            assert sval.to_mir_type(ev.type) is None
+            assert ev.type.to_mir_type() is None
             return ComptimeVal(sval.Undefined(ev.type))
         else:
             return RuntimeVal(ev.runtime_ptr, sval.PointerType(ev.type, is_const=False))
@@ -332,14 +335,9 @@ class PollResult(IntEnum):
     DONE = auto()
 
 @dataclass
-class FunctionInstanceRequest:
-    hir: tuple[hir.Inst, ...]
-    fn_entry: FunctionValue
-    signature: SpecializedSignature
-
-@dataclass
 class ResumeInfo:
     args: ArgList[ArgEntry[InterpVal]]
+    call_sig: SpecializedCallSignature
     ret_loc: InterpVal | None
     ret_reg: hir.Inst | None
 
@@ -363,8 +361,8 @@ class HirRunner:
       inlined), or ``None`` when the struct has no such method.
     """
 
-    def __init__(self, resolver: FunctionResolver, fn_instance: FunctionInstance) -> None:
-        self._resolver = resolver
+    def __init__(self, analyser: Analyser, fn_instance: FunctionInstance) -> None:
+        self._analyser = analyser
         # the frames of the function bodies under execution: the function
         # proper at the bottom, one frame per inlined plain function
         # above it (see ``_in_function_proper``; each frame carries the
@@ -373,8 +371,8 @@ class HirRunner:
         # the function proper whose body is currently being typed (see
         # ``_bind_result_ptr``)
         self._fn_instance = fn_instance
+        self.return_sig: ReturnSignature | None = None
 
-        self.request: FunctionInstanceRequest | None = None
         self.resume_info: ResumeInfo | None = None
 
     # -- entry point ---------------------------------------------------------
@@ -382,16 +380,16 @@ class HirRunner:
     def run_function(
         self,
         hir: tuple[hir.Inst, ...],
-        sig: SpecializedSignature,
+        sig: SpecializedCallSignature,
+        ret_sig: ReturnSignature | None,
     ):
         ret_loc = PendingSlot(self._reserve(), False, is_result_loc_ptr=True)
-        mir_args: list[mir.Type] = []
+        mir_args = self._fn_instance.mir.args
         args = self._init_args_from_signature(sig, mir_args)
         for arg in mir_args:
             assert arg is not None
-        self._fn_instance.mir.args = tuple(typing.cast(list[mir.Type], mir_args))
-        if sig.ret_type is not None:
-            self._materialize_result_ptr(sig.ret_type)
+        if ret_sig is not None:
+            self._materialize_result_ptr(ret_sig.ret_type, ret_sig.ret_by_ref)
 
         frame = InlineFrame(args, ret_loc, hir)
         self._frames.append(frame)
@@ -402,8 +400,8 @@ class HirRunner:
             case SpecializedComptimeArg():
                 return ComptimeVal(sval.ConstRef(node.value))
             case SpecializedRuntimeArg():
-                type = sval.to_mir_type(node.type)
-                assert not isinstance(type, mir.VoidType)
+                type = node.type.to_mir_type()
+                assert type is not None and not isinstance(type, mir.VoidType)
                 index = len(mir_args)
                 if node.is_ref:
                     type = mir.PointerType(type, True)
@@ -419,7 +417,7 @@ class HirRunner:
 
     def _init_args_from_signature(
         self,
-        signature: SpecializedSignature,
+        signature: SpecializedCallSignature,
         mir_args: list[mir.Type],
     ) -> tuple[InterpVal, ...]:
         arg_values: list[InterpVal] = []
@@ -434,7 +432,7 @@ class HirRunner:
 
         return tuple(arg_values)
 
-    def _materialize_result_ptr(self, type: sval.Type) -> None:
+    def _materialize_result_ptr(self, type: sval.Type, ret_by_ref: bool | None = None) -> None:
         """ """
         raise NotImplementedError
 
@@ -769,7 +767,7 @@ class HirRunner:
                 # ``FunctionResolver.resolve_global``)
                 obj = value.value
                 if not isinstance(obj, (int, float, str, bool, pytypes.NoneType)):
-                    resolved = self._resolver.resolve_global(obj)
+                    resolved = self._analyser._resolver.resolve_global(obj)
                     if resolved is not None:
                         return ComptimeVal(resolved)
                 return ComptimeVal(sval.as_value(obj))
@@ -784,7 +782,7 @@ class HirRunner:
                 # referenced object is resolved to its entry like a
                 # ``Const`` value.
                 obj = value.value
-                resolved = self._resolver.resolve_global(obj)
+                resolved = self._analyser._resolver.resolve_global(obj)
                 return ComptimeVal(sval.ConstRef(resolved))
             case hir.Arg(index):
                 assert len(self._frames) > 0, 'Arg outside of any function frame'
@@ -837,7 +835,7 @@ class HirRunner:
             raise CompileError(f"cannot store to a {ptr_type} value")
         value = self._coerce(value, ptr_type.elem)
 
-        if isinstance(sval.to_mir_type(ptr_type.elem), mir.MayBeVoidType) or isinstance(value, sval.Undefined):
+        if isinstance(ptr_type.elem.is_zst(), mir.VoidType) or isinstance(value, sval.Undefined):
             # ZST
             return
 
@@ -942,8 +940,8 @@ class HirRunner:
     ) -> mir.Value:
         if from_type == to_type:
             return value
-        mir_to_type = sval.to_mir_type(to_type)
-        assert mir_to_type is not None and not isinstance(mir_to_type, mir.MayBeVoidType)
+        mir_to_type = to_type.to_mir_type()
+        assert mir_to_type is not None and not isinstance(mir_to_type, mir.VoidType)
         if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.IntType):
             if from_type.bits < to_type.bits:
                 kind = 'sext' if from_type.signed else 'zext'
@@ -1010,8 +1008,6 @@ class HirRunner:
             "functions and the spy builtins can be called"
         )
 
-    # -- struct constructors and methods ----------------------------------------
-
     def materialize_location(self, val: InterpVal, type: sval.Type):
         """Initialize pending slot. Does not check type"""
         match val:
@@ -1024,10 +1020,13 @@ class HirRunner:
                         raise CompileError('cannot store a comptime-only value to a runtime pointer')
                     val.type = type
                     if not val.is_comptime:
-                        mir_type = sval.to_mir_type(type)
+                        mir_type = type.to_mir_type()
                         assert mir_type is not None
                         if not isinstance(mir_type, mir.VoidType):
                             val.runtime_ptr = self._emit(mir.Alloca(mir_type), val.mir_alloca_pos)
+
+                    if val.is_result_loc_ptr:
+                        self._materialize_result_ptr(type)
 
     def call_constructor(self, desc: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """A struct constructor ``Bar(a, b)``: the result slot receives a
@@ -1042,7 +1041,7 @@ class HirRunner:
         struct = desc
         self.materialize_location(ret, struct)
         if '__init__' in desc.methods:
-            init = self._resolver.resolve_global(desc.methods['__init__'])
+            init = self._analyser._resolver.resolve_global(desc.methods['__init__'])
             if init is not None and isinstance(init, FunctionValue):
                 return self._call_function_entry(init, args, ret)
 
@@ -1057,7 +1056,7 @@ class HirRunner:
         match type:
             case sval.StructType():
                 if method_name in type.methods:
-                    return self._resolver.resolve_global(type.methods[method_name])
+                    return self._analyser._resolver.resolve_global(type.methods[method_name])
                 return None
             case _:
                 return None
@@ -1105,25 +1104,24 @@ class HirRunner:
         spec_sig = sig.specialize(arg_types)
 
         if not fn.force_inline:
-            self.request = FunctionInstanceRequest(fn.hir.body, fn, spec_sig)
-            self.resume_info = ResumeInfo(binded_args, ret, None)
-            if spec_sig in fn.specs:
-                return self.resume()
+            self.resume_info = ResumeInfo(binded_args, spec_sig[0], ret, None)
+            res = self._analyser._request_function(fn, spec_sig[0], spec_sig[1])
+            if res is not None:
+                fn_mir, ret_sig = res
+                self.resume(fn_mir, ret_sig)
+                return PollResult.AGAIN
             else:
                 return PollResult.SUSPEND
         else:
             raise NotImplementedError
 
-    def resume(self) -> PollResult:
-        req = self.request
+    def resume(self, fn_mir: mir.Value, ret_sig: ReturnSignature):
         ri = self.resume_info
-        assert ri is not None and req is not None
-        instance = req.fn_entry.specs[req.signature]
-        self._make_runtime_call(instance.mir, ri.args, ri.ret_loc, ri.ret_reg, req.signature)
-        return PollResult.AGAIN
+        assert ri is not None
+        self.resume_info = None
+        self._make_runtime_call(fn_mir, ri.args, ri.ret_loc, ri.ret_reg, ri.call_sig, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal | None, ret_reg: hir.Inst | None, sig: SpecializedSignature) -> None:
-        assert sig.ret_by_ref is not None and sig.ret_type is not None
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal | None, ret_reg: hir.Inst | None, call_sig: SpecializedCallSignature, ret_sig: ReturnSignature) -> None:
         mir_args: list[mir.Value] = []
 
         def convert_one(arg: ArgEntry[InterpVal], sig_arg: SpecializedFormalArg):
@@ -1138,24 +1136,26 @@ class HirRunner:
                 else:
                     mir_args.append(_to_runtime(self._coerce(arg.value, sig_arg.type)))
 
-        for arg, (_, sig_arg) in zip(args.positional, sig.positional):
+        for arg, (_, sig_arg) in zip(args.positional, call_sig.positional):
             convert_one(arg, sig_arg)
 
-        if sig.varargs:
-            for arg, sig_arg in zip(args.varargs, sig.varargs):
+        if call_sig.varargs:
+            for arg, sig_arg in zip(args.varargs, call_sig.varargs):
                 convert_one(arg, sig_arg)
 
-        if sig.kwargs:
+        if call_sig.kwargs:
             for name, arg in args.kwargs.items():
-                convert_one(arg, sig.kwargs[name])
+                convert_one(arg, call_sig.kwargs[name])
 
-        if sig.ret_by_ref:
+        if ret_sig.ret_by_ref:
             assert ret is not None
-            self.materialize_location(ret, sig.ret_type)
+            self.materialize_location(ret, ret_sig.ret_type)
             mir_args.append(_to_runtime(ret))
             self._emit(mir.Call(callee, tuple(mir_args), mir.VoidType()))
         else:
-            ret_val = RuntimeVal(self._emit(mir.Call(callee, tuple(mir_args), sval.to_mir_type(sig.ret_type))), sig.ret_type)
+            ret_type = ret_sig.ret_type.to_mir_type()
+            assert ret_type is not None
+            ret_val = RuntimeVal(self._emit(mir.Call(callee, tuple(mir_args), ret_type)), ret_sig.ret_type)
             if ret is not None:
                 self.store(ret, ret_val)
             else:
@@ -1176,5 +1176,65 @@ class HirRunner:
         raise NotImplementedError
 
 class Analyser:
-    def __init__(self) -> None:
+    def __init__(self, resolver: FunctionResolver) -> None:
+        self._resolver = resolver
         self._analyse_stack: list[HirRunner] = []
+        self._symbol_table = SymbolTable(
+            extern_anon_symbols={},
+            newly_compiled=set(),
+        )
+
+    def _resolve_extern_anon_symbol(self, name: str, fn: NativeFn, type: mir.Type) -> mir.ExternAnonSymbol:
+        st = self._symbol_table
+        if fn in st.extern_anon_symbols:
+            return st.extern_anon_symbols[fn]
+        ret = mir.ExternAnonSymbol(name, type)
+        st.extern_anon_symbols[fn] = ret
+        return ret
+
+    def _request_function(self, fn_entry: FunctionValue, call_sig: SpecializedCallSignature, ret_sig: ReturnSignature | None) -> tuple[mir.Value, ReturnSignature] | None:
+        st = self._symbol_table
+
+        name = f"{fn_entry.name_base}({call_sig})"
+        if call_sig in fn_entry.specs:
+            instance = fn_entry.specs[call_sig]
+            if not instance.mir.is_complete:
+                raise CompileError("specification not yet complete")
+            assert instance.ret_sig is not None
+            if instance.native_fn is not None:
+                # this function is previously compiled
+                return self._resolve_extern_anon_symbol(name, instance.native_fn, instance.mir.get_type()), instance.ret_sig
+            # this function is compiled in this round
+            assert instance in st.newly_compiled
+            return instance.mir, instance.ret_sig
+        else:
+            mir_fn = mir.Function(name, [], [], mir.VoidType(), [])
+            instance = FunctionInstance(mir_fn)
+            st.newly_compiled.add(instance)
+            fn_entry.specs[call_sig] = instance
+            runner = HirRunner(self, instance)
+            runner.run_function(fn_entry.hir.body, call_sig, ret_sig)
+            self._analyse_stack.append(runner)
+            return None
+
+    def _run(self):
+        while self._analyse_stack:
+            top = self._analyse_stack[-1]
+            if top._run_machine() == PollResult.DONE:
+                assert top.return_sig is not None
+                self._analyse_stack.pop()
+                instance = top._fn_instance
+                if self._analyse_stack:
+                    last_top = self._analyse_stack[-1]
+                    last_top.resume(instance.mir, top.return_sig)
+                else:
+                    return instance.mir, top.return_sig
+
+        raise AssertionError("unreachable")
+
+    def analyse_function(self, fn_entry: FunctionValue, call_sig: SpecializedCallSignature, ret_sig: ReturnSignature | None):
+        self._request_function(fn_entry, call_sig, ret_sig)
+        self._run()
+
+    def finish(self) -> SymbolTable:
+        return self._symbol_table

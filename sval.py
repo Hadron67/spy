@@ -59,6 +59,23 @@ class Type(Value):
     def resolve_peer_type(self, other: Type) -> Type | None:
         return other if self.is_subtype_of(other) else None
 
+    @abstractmethod
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        """The MIR mirror of this spy type: the static type the runtime
+        register of a value of this type has.  The mapping is one-to-one
+        over the types that can cross into runtime code.  A zero-sized
+        type has no runtime representation and mirrors to ``None`` (the
+        MIR's "void": a function whose return type is a ZST returns
+        void); a spy struct type mirrors to one :class:`mir.StructType`
+        object (created lazily and cached on the descriptor), so that all
+        values of one struct share one identity.  Types with no MIR
+        mirror at all (``TypeType``, ``AnyFunction``, ...) are a compile
+        error."""
+        raise NotImplementedError
+
+    def is_zst(self) -> bool:
+        return isinstance(self.to_mir_type(), mir.MayBeVoidType)
+
 @dataclass(frozen=True)
 class TypeType(Type):
     level: int
@@ -71,6 +88,10 @@ class TypeType(Type):
         type = other.get_type()
         assert isinstance(type, TypeType)
         return self.level <= type.level
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return None
 
     def __str__(self) -> str:
         return f'type({self.level})'
@@ -87,6 +108,10 @@ class TypeVar(Type):
     def __hash__(self) -> int:
         return object.__hash__(self)
 
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return None
+
     def __str__(self) -> str:
         return self.name
 
@@ -95,6 +120,10 @@ class TupleType(Type):
     types: tuple[Type, ...]
     has_ellipsis: bool
 
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return None
+
     def __str__(self) -> str:
         return f'tuple[{", ".join(str(t) for t in self.types)}{", ..." if self.has_ellipsis else ""}]'
 
@@ -102,6 +131,10 @@ class TupleType(Type):
 @dataclass(frozen=True)
 class StrDictType(Type):
     values: frozendict[str, Type]
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return None
 
     def __str__(self) -> str:
         return f'{{{", ".join(f"{k}: {v}" for k, v in self.values.items())}}}'
@@ -116,6 +149,10 @@ class BoolType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
+    @override
+    def to_mir_type(self) -> mir.BoolType:
+        return mir.BoolType()
+
     def __str__(self) -> str:
         return 'bool'
 
@@ -127,6 +164,10 @@ class EmptyType(Type):
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
         return other
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return None
 
     def __str__(self) -> str:
         return 'empty'
@@ -148,6 +189,10 @@ class VoidType(Type):
     @override
     def get_unit_value(self) -> Value | None:
         return Void()
+
+    @override
+    def to_mir_type(self) -> mir.VoidType:
+        return mir.VOID
 
     def __str__(self) -> str:
         return 'void'
@@ -186,6 +231,10 @@ class AnyIntType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return None
+
     def __str__(self) -> str:
         return 'int'
 
@@ -204,6 +253,10 @@ class IntType(Type):
         if self.bits == 0:
             return Int(0, self)
         return None
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return mir.VOID if self.bits == 0 else mir.IntType(self.bits, self.signed)
 
     @override
     def is_subtype_of(self, other: Type) -> bool:
@@ -261,6 +314,10 @@ class FloatType(Type):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
+    @override
+    def to_mir_type(self) -> mir.FloatType:
+        return mir.FloatType(self.bits)
+
     def is_subtype_of(self, other: Type) -> bool:
         if not isinstance(other, FloatType):
             return False
@@ -291,6 +348,13 @@ class PointerType(Type):
         child = self.elem.get_type()
         assert isinstance(child, TypeType)
         return TypeType(child.level + 1)
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        child = self.elem.to_mir_type()
+        if child is None:
+            return None
+        return mir.PointerType(child, self.is_const)
 
     def __str__(self) -> str:
         return f"{'ptr' if not self.is_const else 'cptr'}({self.elem})"
@@ -329,6 +393,10 @@ class ValueType(Type):
             return self if self.value == other.value else None
         return other.resolve_peer_type(self)
 
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return None
+
     def __str__(self) -> str:
         return f"Literal({self.value})"
 
@@ -364,6 +432,20 @@ class FunctionType(Type):
         level = max(level, child.level)
         return TypeType(level)
 
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        args: list[mir.Type] = []
+        for arg in self.args:
+            mir_type = arg.type.to_mir_type()
+            if mir_type is None:
+                return None
+            if not isinstance(mir_type, mir.VoidType):
+                args.append(mir_type)
+        ret_type = self.return_type.to_mir_type()
+        if ret_type is None:
+            return None
+        return mir.FunctionType(tuple(args), ret_type)
+
     def __str__(self) -> str:
         return f"fn({', '.join(str(arg.type) for arg in self.args)}) -> {self.return_type}"
 
@@ -397,8 +479,8 @@ class StructType(Type):
     ``spy.typeof(x) == Foo`` work.
     """
 
-    def __init__(self, name: str) -> None:
-        self.name = name
+    def __init__(self, name_base: str) -> None:
+        self.name_base = name_base
         self._fields: list[StructField] = []
         # the spy methods of the struct, by name.  ``@cache.struct``
         # extracts them from the Python class when the struct is created
@@ -467,17 +549,17 @@ class StructType(Type):
         on it."""
         if self._py_init is None:
             raise SpyError(
-                f'struct {self.name} is not bound to a JitContext; '
+                f'struct {self.name_base} is not bound to a JitContext; '
                 'define it with @cache.struct() and construct it after the '
                 'module has loaded'
             )
         return self._py_init(*args, **kwargs)
 
     def __repr__(self) -> str:
-        return f'<spy struct {self.name}>'
+        return f'<spy struct {self.name_base}>'
 
     def __str__(self) -> str:
-        return self.name
+        return self.name_base
 
     @override
     def get_type(self) -> Type:
@@ -498,6 +580,10 @@ class StructType(Type):
             values.append(val)
         return AggregateValue(tuple(values), self)
 
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return self.get_mir_type()
+
     def _calculate_mir(self) -> None:
         """Build (once) the MIR mirror of the struct together with the
         position map of its fields: the fields whose spy type has no
@@ -511,7 +597,7 @@ class StructType(Type):
             fields: list[mir.FormalArg] = []
             field_mir_indices: list[int | None] = []
             for field in self._fields:
-                field_type = to_mir_type(field.type)
+                field_type = field.type.to_mir_type()
                 assert field_type is not None, f"field {field.name!r} has no MIR representation"
                 if isinstance(field_type, mir.VoidType):
                     field_mir_indices.append(None)
@@ -522,7 +608,7 @@ class StructType(Type):
             if all(a is None for a in self._field_mir_indices):
                 self._mir = None
             else:
-                self._mir = mir.StructType(self, tuple(fields))
+                self._mir = mir.StructType(self.name_base, tuple(fields))
 
     def get_mir_type(self) -> mir.MayBeVoidType:
         """The (cached) MIR mirror of the struct: the one
@@ -563,6 +649,10 @@ class AnyFunction(Type):
     @override
     def get_type(self) -> Type:
         return TYPE_TYPE
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        return None
 
     def __str__(self) -> str:
         return "anyfn"
@@ -661,54 +751,6 @@ def returns_via_result_ptr(type: Type) -> bool:
         case _:
             return False
 
-
-# ---------------------------------------------------------------------------
-# mirroring spy types into MIR types: the only place MIR types are produced
-# from spy types (valid spy types always mirror to valid MIR - ``lower`` maps
-# MIR onto LLVM the same one-way way)
-# ---------------------------------------------------------------------------
-
-
-def to_mir_type(type: Type) -> mir.MayBeVoidType | None:
-    """The MIR mirror of a spy type: the static type the runtime register
-    of a value of ``type`` has.  The mapping is one-to-one over the types
-    that can cross into runtime code.  A zero-sized type has no runtime
-    representation and mirrors to ``None`` (the MIR's "void": a function
-    whose return type is a ZST returns void); a spy struct type mirrors
-    to one :class:`mir.StructType` object (created lazily and cached on
-    the descriptor), so that all values of one struct share one
-    identity.  Types with no MIR mirror at all (``TypeType``,
-    ``AnyFunction``, ...) are a compile error."""
-    match type:
-        case BoolType():
-            return mir.BoolType()
-        case IntType():
-            return mir.VOID if type.bits == 0 else mir.IntType(type.bits, type.signed)
-        case FloatType():
-            return mir.FloatType(type.bits)
-        case VoidType():
-            return mir.VOID
-        case StructType():
-            return type.get_mir_type()
-        case PointerType():
-            child = to_mir_type(type.elem)
-            if child is None:
-                return None
-            return mir.PointerType(child, type.is_const)
-        case FunctionType():
-            args: list[mir.Type] = []
-            for arg in type.args:
-                mir_type = to_mir_type(arg.type)
-                if mir_type is None:
-                    return None
-                if not isinstance(mir_type, mir.VoidType):
-                    args.append(mir_type)
-            ret_type = to_mir_type(type.return_type)
-            if ret_type is None:
-                return None
-            return mir.FunctionType(tuple(args), ret_type)
-        case _:
-            return None
 
 # ---------------------------------------------------------------------------
 # mapping Python values to spy types

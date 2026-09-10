@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import ctypes
+from abc import abstractmethod
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, override
 
 from spy.util import IndexedMap, frozendict
@@ -91,19 +92,22 @@ class SpecializedRuntimeArg(SpecializedFormalArg):
 
 @dataclass(frozen=True)
 class SpecializedComptimeArg(SpecializedFormalArg):
-    value: AnyValue
+    value: Value
 
     def __str__(self) -> str:
         return str(self.value)
 
 @dataclass(frozen=True)
-class SpecializedSignature:
+class ReturnSignature:
+    ret_by_ref: bool
+    ret_type: Type
+
+@dataclass(frozen=True)
+class SpecializedCallSignature:
     generic_args: tuple[Value, ...]
     positional: tuple[tuple[str, SpecializedFormalArg]]
     varargs: tuple[SpecializedFormalArg, ...] | None
     kwargs: frozendict[str, SpecializedFormalArg] | None
-    ret_by_ref: bool | None
-    ret_type: Type | None
 
     def __str__(self) -> str:
         """Note: return type not included"""
@@ -118,15 +122,6 @@ class SpecializedSignature:
             parts.append(f"**{{{s}}}")
         return f"[{generic}]({', '.join(parts)})"
 
-    def with_ret_type(self, ret_type: Type, ret_by_ret: bool) -> SpecializedSignature:
-        return SpecializedSignature(
-            generic_args=self.generic_args,
-            positional=self.positional,
-            varargs=self.varargs,
-            kwargs=self.kwargs,
-            ret_type=ret_type,
-            ret_by_ref=ret_by_ret,
-        )
 
 @dataclass
 class Signature:
@@ -283,7 +278,7 @@ class Signature:
             formal.append(FormalArg(name, arg.type, arg.default_value))
         return FunctionType(tuple(formal), self.ret_type)
 
-    def specialize(self, provided: ArgList[Type | None]) -> SpecializedSignature:
+    def specialize(self, provided: ArgList[Type | None]) -> tuple[SpecializedCallSignature, ReturnSignature | None]:
         type_vars = self.solve_param_types(provided)
         # TODO: substitute solved type vars, fill `None` types in formal args with types from `provided`
         raise NotImplementedError
@@ -294,54 +289,18 @@ class FunctionIR:
     name: str
     signature: Signature
     body: tuple[hir.Inst, ...]
-    # The result location the return statements of the body write into
-    # (see ``hir.ResultLoc``)
 
 @dataclass
 class NativeFn:
-    """A compiled native function of one specialization.
+    @abstractmethod
+    def call(self, *values: ctypes._CDataType) -> ctypes._CDataType | None:
+        ...
 
-    ``arg_types``/``ret_type`` are the *lowered* signature (see
-    ``mir.returns_via_result_ptr``): a function that returns through a
-    result pointer carries its trailing result pointer formal in
-    ``arg_types``, a ``None`` (void) ``ret_type`` and its logical return
-    type in ``result_type``.  The Python-facing ``_entry`` is
-    pointer-ABI form (see ``lower.compile_module``)."""
-
-    name: str
-    arg_types: tuple[mir.Type, ...]
-    ret_type: mir.Type | None
-    lines: list[str] = field(default_factory=list)
-    # the return type of a result-pointer function (``ret_type`` is then
-    # ``None`` and ``arg_types`` carries the trailing result pointer
-    # formal); None for a direct-return function
-    result_type: mir.Type | None = None
-    _engine: object = None  # type: ignore[assignment]
-    _addr: int = 0
-    _entry: Any = None
-
-    def call(self, *values) -> object:
-        logical = self.result_type if self.result_type is not None else self.ret_type
-        if isinstance(logical, mir.StructType):
-            # the Python-facing entry writes the result into an out buffer
-            # (see ``lower.compile_module``): allocate the instance, pass
-            # its address as the trailing argument and return it.  The
-            # class of the buffer is the ctypes view of the struct's MIR
-            # layout (``lower.struct_ctype``), materialized when the
-            # function was compiled
-            out = logical.ctype()
-            self._entry(*values, ctypes.addressof(out))
-            return out
-        return self._entry(*values)
-
-    @property
-    def addr(self) -> int:
-        return self._addr
-
+    @abstractmethod
     def print_all(self) -> list[str]:
-        return self.lines
+        ...
 
-@dataclass(frozen=True)
+@dataclass
 class FunctionInstance:
     """The compiled artifact of one ``@jit`` specialization: its native
     function (what a Python-side call invokes, see :class:`NativeFn`)
@@ -351,8 +310,8 @@ class FunctionInstance:
     ``type.function_call_info``)."""
 
     mir: mir.Function
+    ret_sig: ReturnSignature | None = None
     native_fn: NativeFn | None = None
-    complete: bool = False
 
 class FunctionValue(Value):
     """The function value of a ``@jit`` function: only compiled - and
@@ -373,9 +332,9 @@ class FunctionValue(Value):
         self.force_inline = force_inline
         # spy argument types -> the compiled artifacts of the
         # specialization (see ``LazyJitFunctionInstance``)
-        self.specs: dict[SpecializedSignature, FunctionInstance] = {}
+        self.specs: dict[SpecializedCallSignature, FunctionInstance] = {}
         # spy argument types -> error message of a failed compilation
-        self.failed: dict[SpecializedSignature, str] = {}
+        self.failed: dict[SpecializedCallSignature, str] = {}
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -388,10 +347,37 @@ class FunctionValue(Value):
         return self.hir.signature.as_non_generic_fn_type() or AnyFunction()
 
 @dataclass
-class FnSymbol:
-    fn: FunctionValue
-    sig: SpecializedSignature
-
 class SymbolTable:
-    def __init__(self) -> None:
-        self._symbols: dict[str, FunctionInstance] = {}
+    extern_anon_symbols: dict[NativeFn, mir.ExternAnonSymbol]
+    newly_compiled: set[FunctionInstance]
+
+    def add_to_mir(self, mir_mod: mir.Module) -> None:
+        for anon_sym in self.extern_anon_symbols.values():
+            mir_mod.add_recursively([anon_sym])
+        for fn in self.newly_compiled:
+            mir_mod.add_recursively([fn.mir])
+
+    def compile(self, backend: Backend):
+        mir_mod = mir.Module()
+        self.add_to_mir(mir_mod)
+
+        native_fns = backend.compile(mir_mod) if self.newly_compiled else {}
+        for instance in self.newly_compiled:
+            instance.native_fn = native_fns[instance.mir]
+
+class FunctionResolver:
+    @abstractmethod
+    def resolve_global(self, value: Any) -> AnyValue:
+        """The spy value a global object referenced inside a function
+        body resolves to.  A function registered in this host - reached
+        as the raw function object or through the callable view its
+        decorated name binds to - resolves to its function entry
+        (creating the entry of an aot function that is not used yet);
+        any other object is not a spy value of this host and returns
+        ``None`` (the object stays a plain compile-time Python value)."""
+        raise NotImplementedError
+
+class Backend:
+    @abstractmethod
+    def compile(self, mir: mir.Module) -> dict[mir.GlobalValue, NativeFn]:
+        ...

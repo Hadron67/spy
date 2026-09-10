@@ -10,27 +10,27 @@ from .util import ObjectCounter, StrBiMap, gen_get_children
 
 class NameContext:
     @abstractmethod
-    def get_struct_type_name(self, type: 'StructType') -> str:
+    def get_struct_type_name(self, type: StructType) -> str:
         pass
 
     @abstractmethod
-    def get_global_name(self, value: 'GlobalValue') -> str:
+    def get_global_name(self, value: GlobalValue) -> str:
         pass
 
 class Type:
-    def from_float(self, value: float) -> 'Value':
+    def from_float(self, value: float) -> Value:
         raise TypeError(f'cannot create float from {self}')
 
-    def from_int(self, value: int) -> 'Value':
+    def from_int(self, value: int) -> Value:
         return self.from_float(float(value))
 
-    def stringify(self, name_context: 'NameContext | None' = None) -> str:
+    def stringify(self, name_context: NameContext | None = None) -> str:
         return str(self)
 
-    def get_children(self) -> 'list[Type]':
+    def get_children(self) -> list[Type]:
         return []
 
-    def is_compatible(self, other: 'Type'):
+    def is_compatible(self, other: Type):
         return self == other
 
     @abstractmethod
@@ -47,14 +47,14 @@ class Value:
         pass
 
     @final
-    def stringify(self, name_context: NameContext, local_counter: 'ObjectCounter[LocalValue] | None' = None) -> str:
+    def stringify(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue] | None = None) -> str:
         return self.get_type().stringify(name_context) + ' ' + self.stringify_value(name_context, local_counter)
 
     @abstractmethod
-    def stringify_value(self, name_context: NameContext, local_counter: 'ObjectCounter[LocalValue] | None' = None) -> str:
+    def stringify_value(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue] | None = None) -> str:
         return str(self)
 
-    def get_children(self) -> 'list[Value]':
+    def get_children(self) -> list[Value]:
         return []
 
 # def gen_get_children(cls=None, excludes: set[str] | None = None):
@@ -82,7 +82,7 @@ class FloatType(Type):
                 raise ValueError(f"invalid float bits {self.bits}")
 
     @override
-    def from_float(self, value: float) -> 'Value':
+    def from_float(self, value: float) -> Value:
         return FloatValue(value, self)
 
     @override
@@ -115,7 +115,7 @@ class IntType(Type):
             return (0, 2**bits - 1)
 
     @override
-    def from_int(self, value: int) -> 'Value':
+    def from_int(self, value: int) -> Value:
         min, max = self.get_range(True)
         if not min <= value <= max:
             raise ValueError(f'value {value} out of range for {self}')
@@ -146,7 +146,7 @@ class PointerType(Type):
     def __str__(self) -> str:
         return f"{self.child}*"
 
-    def stringify(self, name_context: 'NameContext | None' = None) -> str:
+    def stringify(self, name_context: NameContext | None = None) -> str:
         return 'ptr'
 
     @override
@@ -173,13 +173,13 @@ class FnType(Type):
         return f'fn({", ".join(str(arg) for arg in self.args)}) -> {self.return_type}'
 
     @override
-    def get_children(self) -> 'list[Type]':
+    def get_children(self) -> list[Type]:
         ret = list(self.args)
         ret.append(self.return_type)
         return ret
 
     @override
-    def stringify(self, name_context: 'NameContext | None' = None) -> str:
+    def stringify(self, name_context: NameContext | None = None) -> str:
         ret = self.return_type.stringify(name_context)
         args = [i.stringify(name_context) for i in self.args]
         if self.varargs:
@@ -210,7 +210,8 @@ class StructType(AggregateType):
     fields: list[Type]
 
     @override
-    def __init__(self, *fields: Type) -> None:
+    def __init__(self, name_base: str | None, *fields: Type) -> None:
+        self.name_base = name_base
         self.fields = list(fields)
 
     def add_field(self, type: Type):
@@ -220,7 +221,7 @@ class StructType(AggregateType):
     def __str__(self) -> str:
         return f"struct@{id(self)} {{{", ".join(str(i) for i in self.fields)}}}"
 
-    def write_definition(self, name_context: 'NameContext') -> list[str]:
+    def write_definition(self, name_context: NameContext) -> list[str]:
         return [f"%{name_context.get_struct_type_name(self)} = type {{{', '.join(i.stringify(name_context) for i in self.fields)}}}"]
 
     @override
@@ -232,7 +233,7 @@ class StructType(AggregateType):
         return self is value
 
     @override
-    def stringify(self, name_context: 'NameContext | None' = None) -> str:
+    def stringify(self, name_context: NameContext | None = None) -> str:
         if name_context is not None:
             return '%' + name_context.get_struct_type_name(self)
         else:
@@ -248,7 +249,7 @@ class ArrayType(AggregateType):
         return f"[{self.length} x {self.child}]"
 
     @override
-    def stringify(self, name_context: 'NameContext | None' = None) -> str:
+    def stringify(self, name_context: NameContext | None = None) -> str:
         return f"[{self.length} x {self.child.stringify(name_context)}]"
 
     @override
@@ -269,7 +270,7 @@ class LocalValue(Value):
 
     @final
     @override
-    def stringify_value(self, name_context: NameContext, local_counter: 'ObjectCounter[LocalValue] | None' = None) -> str:
+    def stringify_value(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue] | None = None) -> str:
         assert local_counter is not None
         return f"%{local_counter.get_id(self)}"
 
@@ -355,16 +356,11 @@ class Undef(Value):
         return "undef"
 
 class Module(NameContext):
-    _globals: 'StrBiMap[GlobalValue]'
-    _global_constants: 'dict[Value, GlobalValue]'
-    _struct_types: 'StrBiMap[StructType]'
-
     def __init__(self) -> None:
-        self._globals = StrBiMap()
-        self._struct_types = StrBiMap()
-        self._global_constants = {}
+        self._pending_symbols: set[GlobalValue | StructType] = set()
+        self._symbols: StrBiMap[GlobalValue | StructType] = StrBiMap()
 
-    def add_recursively(self, types: list[Type] | None = None, values: 'list[Value] | None' = None):
+    def add_recursively(self, types: list[Type] | None = None, values: list[Value] | None = None):
         todo_values: list[Value] = []
         todo_types: list[Type] = []
         if types is not None:
@@ -377,46 +373,47 @@ class Module(NameContext):
             if isinstance(value, (Inst, BasicBlock)):
                 continue
             if isinstance(value, GlobalValue):
-                if self._globals.has_value(value):
+                if value in self._pending_symbols:
                     continue
-                name = value.get_required_name()
-                assert name is None or not self._globals.has_key(name)
-                self._add_global(value, name)
+                self._pending_symbols.add(value)
             todo_values.extend(value.get_children())
             todo_types.append(value.get_type())
 
             while len(todo_types) > 0:
                 type = todo_types.pop()
                 if isinstance(type, StructType):
-                    if self._struct_types.has_value(type):
+                    if type in self._pending_symbols:
                         continue
-                    self._add_struct_type(type)
+                    self._pending_symbols.add(type)
                 todo_types.extend(type.get_children())
 
-    @override
-    def get_global_name(self, value: 'GlobalValue') -> str:
-        return self._globals.get_key(value)
+    def finish(self):
+        for sym in self._pending_symbols:
+            if isinstance(sym, GlobalValue):
+                name, can_rename = sym.get_default_name_prefix()
+                if not can_rename:
+                    self._symbols.add(name, sym)
+
+        for sym in self._pending_symbols:
+            if isinstance(sym, StructType):
+                self._symbols.add(sym.name_base or 'anon', sym, True)
+            else:
+                name, can_rename = sym.get_default_name_prefix()
+                if can_rename:
+                    self._symbols.add(name, sym, True)
 
     @override
-    def get_struct_type_name(self, type: 'StructType') -> str:
-        return self._struct_types.get_key(type)
+    def get_global_name(self, value: GlobalValue) -> str:
+        return self._symbols.get_key(value)
 
-    def _add_global(self, value: 'GlobalValue', name_prefix: str | None = None):
-        if name_prefix is None:
-            name_prefix = value.get_default_name_prefix()
-        self._globals.add(self._globals.next_unique_name(name_prefix), value)
-
-    def _add_struct_type(self, type: StructType, name_prefix: str | None = None):
-        if name_prefix is None:
-            name_prefix = 'struct'
-        self._struct_types.add(self._struct_types.next_unique_name(name_prefix), type)
+    @override
+    def get_struct_type_name(self, type: StructType) -> str:
+        return self._symbols.get_key(type)
 
     def write(self) -> list[str]:
         ret: list[str] = []
-        for type in self._struct_types.values():
-            ret.extend(type.write_definition(self))
-        for value in self._globals.values():
-            ret.extend(value.write_definition(self))
+        for sym in self._symbols.values():
+            ret.extend(sym.write_definition(self))
         return ret
 
 class GlobalValue(Value):
@@ -435,11 +432,9 @@ class GlobalValue(Value):
     def stringify_value(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue] | None = None) -> str:
         return '@' + name_context.get_global_name(self)
 
-    def get_required_name(self) -> str | None:
-        return None
-
     @abstractmethod
-    def get_default_name_prefix(self) -> str:
+    def get_default_name_prefix(self) -> tuple[str, bool]:
+        """Returns the name for this value, and whether it could be renamed."""
         raise NotImplementedError
 
 class GlobalValueFlags:
@@ -487,7 +482,7 @@ class GlobalScalarValue(GlobalValue):
 
     @override
     def get_default_name_prefix(self):
-        return "global"
+        return "global", True
 
 @gen_get_children
 class GlobalAggregateValue(GlobalValue):
@@ -527,7 +522,7 @@ class GlobalAggregateValue(GlobalValue):
 
     @override
     def get_default_name_prefix(self):
-        return "global"
+        return "global", True
 
 @gen_get_children
 class GlobalZeroAggregateValue(GlobalValue):
@@ -550,8 +545,8 @@ class GlobalZeroAggregateValue(GlobalValue):
         return PointerType(self.type)
 
     @override
-    def get_default_name_prefix(self) -> str:
-        return 'global'
+    def get_default_name_prefix(self) -> tuple[str, bool]:
+        return 'global', True
 
 def escape_byte(b: int) -> str:
     # 可打印 ASCII 且不特殊的字符直接输出
@@ -584,7 +579,7 @@ class GlobalStringValue(GlobalValue):
 
     @override
     def get_default_name_prefix(self):
-        return "global"
+        return "global", True
 
 @gen_get_children
 class DeclareFunction(GlobalValue):
@@ -611,12 +606,9 @@ class DeclareFunction(GlobalValue):
     def write_definition(self, name_context: NameContext) -> list[str]:
         return [f"declare {self.type.return_type.stringify(name_context)} @{self.name}({', '.join(self.write_args(name_context))})"]
 
-    def get_required_name(self) -> str | None:
-        return self.name
-
     @override
     def get_default_name_prefix(self):
-        return 'fn'
+        return self.name, False
 
 class FunctionState(IntEnum):
     BUILDING_ARGS = 0
@@ -635,7 +627,7 @@ class IFunction:
 
 class FunctionArgs(IFunction):
 
-    def __init__(self, parent: 'FunctionArgs | None' = None) -> None:
+    def __init__(self, parent: FunctionArgs | None = None) -> None:
         self.parent = parent
         self.args: list[ArgValue] = []
 
@@ -650,11 +642,12 @@ class FunctionArgs(IFunction):
         return ret
 
 class Function(GlobalValue, IFunction):
-    def __init__(self, name: str | None = None, entry: 'BasicBlock | None' = None) -> None:
+    def __init__(self, name: str | None = None, internal: bool = False, entry: BasicBlock | None = None) -> None:
         self.name = name
         self._entry = entry if entry is not None else BasicBlock()
         self._args: list[ArgValue] = []
         self._type: FnType | None = None
+        self._internal = internal
 
     @property
     def entry(self):
@@ -665,7 +658,7 @@ class Function(GlobalValue, IFunction):
         assert self._type is not None
         ret: list[str] = []
         local_counter: ObjectCounter[LocalValue] = ObjectCounter()
-        ret.append(f'define {'internal ' if self.name is None else ''}{self._type.return_type.stringify(name_context)} @{name_context.get_global_name(self)}({', '.join(i.stringify(name_context, local_counter) for i in self._args)}) {{')
+        ret.append(f'define {'internal ' if self._internal else ''}{self._type.return_type.stringify(name_context)} @{name_context.get_global_name(self)}({', '.join(i.stringify(name_context, local_counter) for i in self._args)}) {{')
 
         blocks = self._entry.collect_blocks()
 
@@ -720,12 +713,9 @@ class Function(GlobalValue, IFunction):
                 ret.extend(i for i in inst.get_children() if not isinstance(i, Inst) and not isinstance(i, BasicBlock))
         return ret
 
-    def get_required_name(self) -> str | None:
-        return self.name
-
     @override
-    def get_default_name_prefix(self) -> str:
-        return 'fn'
+    def get_default_name_prefix(self):
+        return self.name or 'fn', not self._internal
 
 class Inst(LocalValue):
     @abstractmethod
@@ -747,7 +737,7 @@ class BasicBlock(LocalValue):
         self._finished = False
 
     @override
-    def get_children(self) -> 'list[Value]':
+    def get_children(self) -> list[Value]:
         raise RuntimeError("cannot be called directly")
 
     def get_outgoing_blocks(self):
@@ -844,7 +834,7 @@ class BasicBlock(LocalValue):
     def fdiv(self, lhs: Value, rhs: Value):
         return self.emit(Binary(FDiv(), lhs, rhs))
 
-    def atomicrmw(self, op: 'BinaryOp', ptr: Value, rhs: Value, ordering: 'Ordering') -> Value:
+    def atomicrmw(self, op: BinaryOp, ptr: Value, rhs: Value, ordering: Ordering) -> Value:
         return self.emit(AtomicRmw(op, ptr, rhs, ordering))
 
     def rem(self, lhs: Value, rhs: Value, signed: bool) -> Value:
@@ -901,10 +891,10 @@ class BasicBlock(LocalValue):
     def ptrtoint(self, value: Value, type: IntType):
         return self.emit(PtrToInt(value, type))
 
-    def icmp(self, op: 'IcmpOp', signed: bool, lhs: Value, rhs: Value):
+    def icmp(self, op: IcmpOp, signed: bool, lhs: Value, rhs: Value):
         return self.emit(Icmp(op, signed, lhs, rhs))
 
-    def fcmp(self, op: 'IcmpOp', lhs: Value, rhs: Value):
+    def fcmp(self, op: IcmpOp, lhs: Value, rhs: Value):
         return self.emit(Fcmp(op, lhs, rhs))
 
     def and_(self, lhs: Value, rhs: Value):
@@ -916,15 +906,15 @@ class BasicBlock(LocalValue):
     def xor(self, lhs: Value, rhs: Value):
         return self.emit(Binary(XorOp(), lhs, rhs))
 
-    def phi(self, *incomings: 'tuple[Value, BasicBlock]'):
+    def phi(self, *incomings: tuple[Value, BasicBlock]):
         ret = self.emit(Phi(*incomings))
         assert isinstance(ret, Phi)
         return ret
 
-    def br(self, cond: Value, if_true: 'BasicBlock', if_false: 'BasicBlock'):
+    def br(self, cond: Value, if_true: BasicBlock, if_false: BasicBlock):
         self.emit(Br(cond, if_true, if_false))
 
-    def jmp(self, target: 'BasicBlock'):
+    def jmp(self, target: BasicBlock):
         self.emit(BrDirect(target))
 
     def call(self, fn: Value, *args: Value):

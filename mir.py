@@ -1,44 +1,8 @@
-"""The typed MIR.
-
-The interpreter ("runs" the untyped HIR) emits a :class:`Function` per
-specialization as one *flat* list of typed instructions: the body of
-one specialization, with every runtime branch inlined into it and
-delimited by the :class:`If`/``Else``/``End`` markers (WASM-style),
-mirroring the HIR.  Control flow is structured (no basic blocks, no
-phi): a branch that ends in a :class:`Ret` returns on that path, a
-branch that does not return falls through to the code after its
-``End`` marker in the enclosing list - exactly the shape of control
-flow that recursion needs.  An inlined function body is delimited by
-:class:`Block`/``End`` markers (a ``Block`` is entered unconditionally,
-like a WASM ``block``), and a path may leave it early with a
-:class:`Break` (WASM ``br``) - the way an inlined ``return`` leaves the
-inlined body; ``If`` and ``Block`` both count as blocks for a
-``Break``'s ``level``.
-
-The MIR owns its static type system (:class:`Type`): a closed,
-LLVM-shaped universe of the types a runtime register can have.  The
-interpreter computes its types in the ``spy`` type system of
-``type.py`` (which also has to represent compile-time values - type
-descriptors, functions, ... - that never cross into runtime code) and
-mirrors them into these types when it emits an instruction.  ``lower``
-then maps the flat list onto LLVM basic blocks.
-
-The representation is deliberately close to LLVM so that ``lower`` is a
-mechanical mapping; every MIR value exposes a ``.type`` (a MIR type).
-A compiled function is a :class:`Function` value: the host creates and
-registers it - with an empty body - *before* the body is run, so a call
-the body makes to it (recursion) resolves to the very :class:`Function`
-being typed; calls within one LLVM module reference the callee's
-:class:`Function` (lowered to a ``define``).  A callee compiled in an
-*earlier* module is referenced by a :class:`Symbol` (lowered to an
-external declaration).
-"""
-
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import Any, override
 
-from typing_extensions import override
+from spy.util import StrBiMap
 
 from .errors import CompileError
 
@@ -48,7 +12,9 @@ from .errors import CompileError
 
 
 class Type:
-    pass
+    @abstractmethod
+    def get_children(self) -> tuple[Type, ...]:
+        ...
 
 
 class VoidType:
@@ -59,7 +25,7 @@ class VoidType:
 
 VOID = VoidType()
 
-MayBeVoidType: TypeAlias = Type | VoidType
+type MayBeVoidType = Type | VoidType
 
 @dataclass(frozen=True)
 class BoolType(Type):
@@ -105,12 +71,13 @@ class StructType(Type):
 
     def __init__(
         self,
-        spy_type: Any,
-        fields: tuple[FormalArg, ...],
+        name_base: str | None,
+        fields: tuple[FormalArg, ...] | None,
     ) -> None:
-        self.spy_type = spy_type
-        self.fields = fields
-        self.ctype: Any = None  # lazily built from the MIR fields by ``lower``
+        self.name_base = name_base
+        self.fields: list[FormalArg] = []
+        if fields is not None:
+            self.fields.extend(fields)
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -125,34 +92,17 @@ class PointerType(Type):
     is_const: bool = False
 
 @dataclass(frozen=True)
+class ArrayType(Type):
+    elem: Type
+    length: int
+
+@dataclass(frozen=True)
 class FunctionType(Type):
     """The signature of a function value (the element type of its
     pointer)."""
 
     args: tuple[Type, ...]
     return_type: MayBeVoidType
-
-
-def type_str(type: Type) -> str:
-    """A short printable name of a type (used in error messages).  It
-    mirrors the strings of the corresponding ``spy`` types; the mangled
-    names of compiled specializations are still built from the ``spy``
-    side."""
-    match type:
-        case BoolType():
-            return 'bool'
-        case IntType():
-            return ('i' if type.signed else 'u') + str(type.bits)
-        case FloatType():
-            return 'f' + str(type.bits)
-        case PointerType(elem):
-            return '*' + str(elem)
-        case StructType():
-            return type.spy_type.name
-        case FunctionType(args, ret):
-            return f'fn({", ".join(type_str(a) for a in args)}) -> {ret}'
-        case _:
-            return str(type)
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +113,11 @@ def type_str(type: Type) -> str:
 class Value:
     @abstractmethod
     def get_type(self) -> MayBeVoidType:
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
+    def get_children(self) -> tuple[Type, ...]:
+        ...
 
 @dataclass(frozen=True)
 class BoolValue(Value):
@@ -194,21 +147,46 @@ class Float(Value):
     def get_type(self) -> MayBeVoidType:
         return self.type
 
+class GlobalValue(Value):
+    def __hash__(self) -> int:
+        return object.__hash__(self)
+
+    def __eq__(self, value: object, /) -> bool:
+        return self is value
+
+    @abstractmethod
+    def get_name(self) -> tuple[str, bool]:
+        """Returns (name, can_be_renamed)"""
+        ...
 
 @dataclass(frozen=True)
-class Symbol(Value):
-    """A function value bound to a module symbol of an *earlier* module:
-    the target of a native call whose definition is linked in at compile
-    time.  Lowered to a ``declare``d external symbol whose address is
-    resolved at link time."""
-
+class ExternSymbol(GlobalValue):
+    """External symbol, used to import/export symbol from/into the symbol table. Not currently used, but will be used in the future."""
     name: str
-    fn_type: FunctionType
+    type: Type
 
     @override
     def get_type(self) -> MayBeVoidType:
-        return PointerType(self.fn_type)
+        return self.type
 
+    @override
+    def get_name(self) -> tuple[str, bool]:
+        return self.name, False
+
+
+class ExternAnonSymbol(GlobalValue):
+    """An anonymous external symbol, used to import previously compiled spy function."""
+    def __init__(self, name_base: str, type: Type) -> None:
+        self.name_base = name_base
+        self.type = type
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
+
+    @override
+    def get_name(self) -> tuple[str, bool]:
+        return self.name_base, True
 
 @dataclass
 class Param(Value):
@@ -281,7 +259,7 @@ class Gep(Inst):
         ptype = ptr.type  # type: ignore[attr-defined]
         if not isinstance(ptype, PointerType) or not isinstance(ptype.elem, StructType):
             raise CompileError(
-                f'cannot take a field of a {type_str(ptype)} value '
+                f'cannot take a field of a {ptype} value '
                 '(field access requires a struct value)'
             )
         self.type: Type = PointerType(ptype.elem.fields[index].type)
@@ -426,17 +404,19 @@ class Break(Inst):
 
 
 @dataclass(eq=False)
-class Function(Value):
+class Function(GlobalValue):
     """One compiled MIR function.  As a value it is the in-module
     function value of a call target: a call whose callee is this object
     is lowered to a call of the ``define``d function (functions of one
     module are compiled together)."""
 
-    name: str
-    args: tuple[Type, ...]
-    arg_names: tuple[str | None, ...]
+    name_base: str
+    args: list[Type]
+    arg_names: list[str | None]
     ret_type: MayBeVoidType
     insts: list[Inst]
+    is_complete: bool = False
+    impose_linkname: bool = False
 
     @override
     def get_type(self) -> Type:
@@ -444,4 +424,41 @@ class Function(Value):
         (logical) signature - the callee side of calls in the MIR is
         always the *lowered* form, so this logical view is only used by
         the host."""
-        return PointerType(FunctionType(self.args, self.ret_type), True)
+        assert self.is_complete
+        return PointerType(FunctionType(tuple(self.args), self.ret_type), True)
+
+    @override
+    def get_name(self) -> tuple[str, bool]:
+        return self.name_base, not self.impose_linkname
+
+class Module:
+    def __init__(self) -> None:
+        self.symbols: StrBiMap[StructType | GlobalValue] = StrBiMap()
+        self._pending_symbols: set[StructType | GlobalValue] = set()
+
+    def add_recursively(self, entry: list[StructType | GlobalValue]) -> None:
+        todo: list[Value | Type] = [a for a in entry]
+        while todo:
+            value = todo.pop()
+            if value in self._pending_symbols:
+                continue
+            if isinstance(value, (StructType, Function, ExternSymbol)):
+                self._pending_symbols.add(value)
+            todo.extend(reversed([a for a in value.get_children() if not isinstance(a, Inst)]))
+
+    def finish(self):
+        for sym in self._pending_symbols:
+            if isinstance(sym, GlobalValue):
+                name, can_be_renamed = sym.get_name()
+                if not can_be_renamed:
+                    self.symbols.add(name, sym)
+
+        for sym in self._pending_symbols:
+            if isinstance(sym, StructType):
+                self.symbols.add(sym.name_base or 'anon', sym, True)
+            else:
+                name, can_be_renamed = sym.get_name()
+                if can_be_renamed:
+                    self.symbols.add(name, sym, True)
+
+        return self.symbols

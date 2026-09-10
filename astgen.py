@@ -106,7 +106,7 @@ class _Scope:
 
     __slots__ = ('bindings', 'parent')
 
-    def __init__(self, parent: '_Scope | None') -> None:
+    def __init__(self, parent: _Scope | None) -> None:
         self.parent = parent
         self.bindings: dict[str, hir.Value] = {}
 
