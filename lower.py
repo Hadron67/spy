@@ -182,31 +182,18 @@ class _Lowerer:
 
     def __init__(
         self,
-        llvm_fns: dict[mir.Function, sllvm.Function],
+        globals: StrBiMap[mir.GlobalValue],
         types: _ModuleTypes,
-        symbols: StrBiMap[mir.StructType | mir.GlobalValue],
     ) -> None:
-        self._llvm_fns = llvm_fns
         self._types = types
-        self._symbols = symbols
         self._lowered: dict[object, sllvm.Value] = {}
-        self._declarations: dict[mir.GlobalValue, sllvm.DeclareFunction] = {}
+        self._globals = globals
+        self.lowered_globals: dict[mir.GlobalValue, sllvm.GlobalValue] = {}
 
     def _to_llvm(self, type: mir.MayBeVoidType) -> sllvm.Type:
         return self._types.to_llvm(type)
 
-    @property
-    def declarations(self) -> dict[mir.GlobalValue, sllvm.DeclareFunction]:
-        """The extern declarations this lowering created, by the MIR
-        symbol of the earlier module they refer to."""
-        return self._declarations
-
-    def _link_name(self, value: mir.GlobalValue) -> str:
-        """The link name of a MIR global in this module: the name its
-        symbol-table entry carries, sanitized into an LLVM identifier."""
-        return sanitize_name(self._symbols.get_key(value))
-
-    def lower(self, fn: mir.Function) -> None:
+    def _lower_function_no_cache(self, fn: mir.Function) -> sllvm.Function:
         """Lower the flat instruction list of ``fn`` into its
         pre-created ``sllvm.Function``.
 
@@ -216,7 +203,14 @@ class _Lowerer:
         whose result is delivered per path, see ``interp``), and its
         address must then be defined on every path that stores to it or
         reads it later."""
-        llvm_fn = self._llvm_fns[fn]
+        assert fn not in self.lowered_globals
+        llvm_fn = sllvm.Function(self._globals.get_key(fn))
+        # register the definition before lowering the body: a call to this
+        # function inside its own body (recursion) must resolve to it
+        self.lowered_globals[fn] = llvm_fn
+        llvm_fn.add_args(*(self._to_llvm(a) for a in fn.args))
+        llvm_fn.set_return_type(self._to_llvm(fn.ret_type))
+
         arg_values = llvm_fn.get_args()
         for inst in fn.insts:
             if isinstance(inst, mir.Alloca):
@@ -224,6 +218,7 @@ class _Lowerer:
         self._lower_region(
             llvm_fn, llvm_fn.entry, fn.insts, 0, len(fn.insts), arg_values, None, ()
         )
+        return llvm_fn
 
     def _scan_block(
         self, insts: list[mir.Inst], i: int, has_else: bool
@@ -355,35 +350,34 @@ class _Lowerer:
             return sllvm.IntValue(value.value, sllvm.IntType(value.type.bits))
         if isinstance(value, mir.Float):
             return sllvm.FloatType(value.type.bits).from_float(value.value)
-        if isinstance(value, (mir.Function, mir.ExternAnonSymbol, mir.ExternSymbol)):
-            return self._global(value)
+        if isinstance(value, mir.GlobalValue):
+            return self.lower_global(value)
         raise CompileError(f'cannot lower value {value!r}')
 
-    def _global(self, value: mir.GlobalValue) -> sllvm.Value:
+    def _lower_global_no_cache(self, value: mir.GlobalValue):
+        assert value not in self.lowered_globals
+        match value:
+            case mir.Function():
+                return self._lower_function_no_cache(value)
+            case mir.ExternAnonSymbol() | mir.ExternSymbol():
+                name = self._globals.get_key(value)
+                if isinstance(value.type, mir.PointerType) and isinstance(value.type.elem, mir.FunctionType):
+                    fn_type = self._to_llvm(value.type.elem)
+                    assert isinstance(fn_type, sllvm.FnType)
+                    return sllvm.DeclareFunction(name, fn_type)
+                else:
+                    raise NotImplementedError(f"TODO: lower global {value!r}")
+            case _:
+                raise NotImplementedError(f"TODO: lower global {value!r}")
+
+    def lower_global(self, value: mir.GlobalValue) -> sllvm.GlobalValue:
         """The lowered form of a function value: the in-module
         ``define`` of a :class:`mir.Function`, or a (cached) extern
         declaration of a symbol compiled in an earlier module."""
-        if isinstance(value, mir.Function):
-            llvm_fn = self._llvm_fns.get(value)
-            if llvm_fn is None:
-                raise CompileError(
-                    f'internal error: function {value.name_base} is not part of the module'
-                )
-            return llvm_fn
-        decl = self._declarations.get(value)
-        if decl is None:
-            type = value.get_type()
-            if isinstance(type, mir.PointerType):
-                type = type.elem
-            if not isinstance(type, mir.FunctionType):
-                raise CompileError(f'cannot lower the symbol {value!r}')
-            fn_type = sllvm.fn_type(
-                self._to_llvm(type.return_type),
-                *(self._to_llvm(a) for a in type.args),
-            )
-            decl = sllvm.DeclareFunction(self._link_name(value), fn_type)
-            self._declarations[value] = decl
-        return decl
+        if value not in self.lowered_globals:
+            ret = self._lower_global_no_cache(value)
+            self.lowered_globals[value] = ret
+        return self.lowered_globals[value]
 
     def _lower_inst(
         self,
@@ -555,49 +549,41 @@ class _NativeFn(NativeFn):
 
 
 class LLVMBackend(Backend):
-    """The MCJIT backend of the spy compiler: compiles one MIR module at
-    a time, remembers the LLVM global value of every MIR global it has
-    lowered and the address of every symbol it has emitted, so that a
-    later module can resolve the symbols it imports."""
+    """The MCJIT backend of the spy compiler: lowers one MIR module at a
+    time into one LLVM module and adds it to a single, reused engine.
+
+    The MIR symbol table (``fn.SymbolTable``) has already given every
+    global the unique link name it keeps across modules, so the engine
+    resolves a module's external references by name: an import of an
+    earlier-compiled function carries the exporter's name, and an
+    ``ExternSymbol`` falls back to the process.  The engine is kept alive
+    so the addresses of everything it has compiled stay valid."""
 
     def __init__(self) -> None:
         super().__init__()
-        # every MIR global value that has been lowered, mapped to its
-        # LLVM counterpart in the module it was lowered into
-        self._globals: dict[mir.GlobalValue, sllvm.GlobalValue] = {}
-        # the address of every emitted symbol, by its link name
-        self._exported: dict[str, int] = {}
-        # the engines are kept alive so the addresses stay valid
-        self._engines: list[object] = []
+        target = llvm.Target.from_default_triple()
+        tm = target.create_target_machine()
+        backing_mod = llvm.parse_assembly('')
+        # one engine for the whole process: modules added to it resolve
+        # each other's symbols by name
+        self._engine = llvm.create_mcjit_compiler(backing_mod, tm)
 
-    def compile(self, module: mir.Module) -> dict[mir.GlobalValue, NativeFn]:
-        symbols = module.finish()
-        fns = [v for v in symbols.values() if isinstance(v, mir.Function)]
+    def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue]) -> dict[mir.GlobalValue, NativeFn]:
         types = _ModuleTypes()
+        for struct in structs:
+            types.to_llvm(struct)
 
-        # the MIR symbol table has already assigned every symbol its
-        # unique name; sanitize it into an LLVM identifier and hand it to
-        # the LLVM builder, whose own symbol table resolves any remaining
-        # collision
-        def link_name(value: mir.GlobalValue) -> str:
-            return sanitize_name(symbols.get_key(value))
+        lowerer = _Lowerer(globals, types)
 
-        # create one sllvm.Function per MIR function up front: bodies may
-        # call any function of the module, and the call sites need the
-        # callee's definition (its signature) to type the call
+        fns: list[mir.Function] = sorted(
+            (sym for sym in globals.values() if isinstance(sym, mir.Function)),
+            key=lambda fn: globals.get_key(fn),
+        )
         llvm_fns: dict[mir.Function, sllvm.Function] = {}
         for fn in fns:
-            llvm_fn = sllvm.Function(link_name(fn))
-            llvm_fn.add_args(*(types.to_llvm(a) for a in fn.args))
-            llvm_fn.set_return_type(types.to_llvm(fn.ret_type))
+            llvm_fn = lowerer.lower_global(fn)
+            assert isinstance(llvm_fn, sllvm.Function)
             llvm_fns[fn] = llvm_fn
-            self._globals[fn] = llvm_fn
-
-        lowerer = _Lowerer(llvm_fns, types, symbols)
-        for fn in fns:
-            lowerer.lower(fn)
-        for sym, decl in lowerer.declarations.items():
-            self._globals[sym] = decl
 
         # the Python-facing entry of every function whose value form
         # ctypes cannot call directly (see ``_py_entry_thunk``)
@@ -607,7 +593,7 @@ class LLVMBackend(Backend):
             has_struct_arg = any(isinstance(a, mir.StructType) for a in fn.args)
             if out_struct_ret or has_struct_arg:
                 entry_by_fn[fn] = _py_entry_thunk(
-                    types, llvm_fns[fn], fn, out_struct_ret, link_name(fn)
+                    types, llvm_fns[fn], fn, out_struct_ret, globals.get_key(fn)
                 )
 
         lmod = sllvm.Module()
@@ -618,39 +604,21 @@ class LLVMBackend(Backend):
         lmod.finish()
         lines = lmod.write()
 
-        target = llvm.Target.from_default_triple()
-        tm = target.create_target_machine()
         llvm_mod = llvm.parse_assembly('\n'.join(lines))
         llvm_mod.verify()
-
-        backing_mod = llvm.parse_assembly('')
-        engine = llvm.create_mcjit_compiler(backing_mod, tm)
-        engine.add_module(llvm_mod)
-        module_names = ', '.join(sorted(fn.name_base for fn in fns))
-        for f in llvm_mod.functions:
-            if not f.is_declaration:
-                continue
-            addr = self._exported.get(f.name)
-            if addr is None:
-                raise CompileError(
-                    f'cannot resolve the external symbol {f.name} referenced '
-                    f'by the module ({module_names})'
-                )
-            engine.add_global_mapping(f, addr)
-        engine.finalize_object()
-        engine.run_static_constructors()
-        self._engines.append(engine)
+        self._engine.add_module(llvm_mod)
+        self._engine.finalize_object()
+        self._engine.run_static_constructors()
 
         rets: dict[mir.GlobalValue, NativeFn] = {}
         for fn in fns:
-            # the link name the LLVM module actually emitted (it resolves
-            # a collision itself, so read it back rather than assume it)
+            # the link name the LLVM module actually emitted
             name = lmod.get_global_name(llvm_fns[fn])
-            value_addr = engine.get_function_address(name)
+            value_addr = self._engine.get_function_address(name)
             entry_fn = entry_by_fn.get(fn)
             if entry_fn is not None:
                 entry_name = lmod.get_global_name(entry_fn)
-                entry_addr = engine.get_function_address(entry_name)
+                entry_addr = self._engine.get_function_address(entry_name)
             else:
                 entry_addr = value_addr
             arg_ctypes: list[Any] = [py_entry_arg_ctype(a) for a in fn.args]
@@ -672,5 +640,4 @@ class LLVMBackend(Backend):
                 out_struct_type,
             )
             rets[fn] = native
-            self._exported[name] = value_addr
         return rets

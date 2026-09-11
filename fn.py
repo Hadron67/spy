@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, override
 
 from . import hir, mir, opt
-from .errors import TypeMismatchError
+from .errors import CompileError, TypeMismatchError
 from .sval import (
     AnyFunction,
     AnyValue,
@@ -22,7 +22,7 @@ from .sval import (
     returns_via_result_ptr,
     type_of,
 )
-from .util import IndexedMap, frozendict
+from .util import IndexedMap, StrBiMap, frozendict, sanitize_name
 
 
 @dataclass(frozen=True)
@@ -435,29 +435,75 @@ class FunctionValue(Value):
     def get_type(self) -> Type:
         return self.hir.signature.as_non_generic_fn_type() or AnyFunction()
 
-@dataclass
 class SymbolTable:
+    def __init__(self):
+        self._symbols: StrBiMap[NativeFn] = StrBiMap()
+
+    def _assign_names(self, globals: set[mir.GlobalValue], extern_anon_symbols: dict[NativeFn, mir.ExternAnonSymbol]):
+        ret: dict[mir.GlobalValue, str] = {}
+        used: set[str] = set()
+
+        ext_anon_sym_to_native_fn = {v: k for k, v in extern_anon_symbols.items()}
+
+        # scan unrenamable globals first, so that if a renamable global
+        # shares the same name as an unrenamable global, it can be properly renamed.
+        for g in globals:
+            name, can_rename = g.get_name()
+            if not can_rename:
+                if name in used or self._symbols.has_key(name):
+                    raise CompileError(f"Duplicate global name: {name}")
+                ret[g] = name
+                used.add(name)
+
+        for g in globals:
+            name, can_rename = g.get_name()
+            if can_rename:
+                if isinstance(g, mir.ExternAnonSymbol):
+                    ret[g] = self._symbols.get_key(ext_anon_sym_to_native_fn[g])
+                else:
+                    name = sanitize_name('__spy_' + name)
+                    name = self._symbols.next_unique_name(name, extra_set=used)
+                    ret[g] = name
+                    used.add(name)
+        return ret
+
+    def _add(self, name: str, fn: NativeFn):
+        self._symbols.add(name, fn)
+
+@dataclass
+class CompileBatch:
     extern_anon_symbols: dict[NativeFn, mir.ExternAnonSymbol]
     newly_compiled: set[FunctionInstance]
 
-    def add_to_mir(self, mir_mod: mir.Module) -> None:
-        for anon_sym in self.extern_anon_symbols.values():
-            mir_mod.add_recursively([anon_sym])
+    def collect_symbols(self) -> set[mir.GlobalValue | mir.StructType]:
+        entry: list[mir.GlobalValue] = list(self.extern_anon_symbols.values())
         for fn in self.newly_compiled:
-            mir_mod.add_recursively([fn.mir])
+            entry.append(fn.mir)
+        return mir.collect_symbols(entry)
 
-    def compile(self, backend: Backend):
-        mir_mod = mir.Module()
-        self.add_to_mir(mir_mod)
+    def compile(self, symbol_table: SymbolTable, backend: Backend):
+        mir_symbols = self.collect_symbols()
 
         for instance in self.newly_compiled:
             # fold the trivial store/load slots of the freshly typed body
             # back into registers before it is lowered
             opt.simplify(instance.mir)
 
-        native_fns = backend.compile(mir_mod) if self.newly_compiled else {}
+        names = symbol_table._assign_names({a for a in mir_symbols if isinstance(a, mir.GlobalValue)}, self.extern_anon_symbols)
+
+        structs: set[mir.StructType] = set()
+        globals: StrBiMap[mir.GlobalValue] = StrBiMap()
+        for sym in mir_symbols:
+            if isinstance(sym, mir.StructType):
+                structs.add(sym)
+            elif isinstance(sym, mir.GlobalValue):
+                globals.add(names[sym], sym)
+
+        native_fns = backend.compile(structs, globals) if self.newly_compiled else {}
         for instance in self.newly_compiled:
-            instance.native_fn = native_fns[instance.mir]
+            native_fn = native_fns[instance.mir]
+            instance.native_fn = native_fn
+            symbol_table._add(names[instance.mir], native_fn)
 
 class FunctionResolver:
     @abstractmethod
@@ -473,5 +519,5 @@ class FunctionResolver:
 
 class Backend:
     @abstractmethod
-    def compile(self, module: mir.Module) -> dict[mir.GlobalValue, NativeFn]:
+    def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue]) -> dict[mir.GlobalValue, NativeFn]:
         ...

@@ -37,6 +37,7 @@ from .fn import (
     ReturnSignature,
     SpecializedCallSignature,
     SpecializedComptimeArg,
+    SymbolTable,
 )
 from .interp import Analyser
 from .lower import LLVMBackend
@@ -102,7 +103,7 @@ class _RegisteredFn:
         analyser = Analyser(self.context)
         analyser.analyse_function(entry, call_sig, ret_sig)
         sym = analyser.finish()
-        sym.compile(self.context.backend)
+        sym.compile(self.context._symbol_table, self.context.backend)
 
         instance = entry.specs[call_sig]
         native_fn = instance.native_fn
@@ -131,6 +132,7 @@ class _Context(FunctionResolver):
         # the inline entries of the undecorated Python functions reached
         # from a spy body, by function object
         self._inline_cache: dict[Any, FunctionValue] = {}
+        self._symbol_table = SymbolTable()
 
     @override
     def resolve_global(self, value: Any) -> AnyValue | None:
@@ -159,7 +161,7 @@ class _Context(FunctionResolver):
         analyser = Analyser(self)
         analyser.analyse_function(fn, call_sig, ret_sig)
         sym = analyser.finish()
-        sym.compile(self.backend)
+        sym.compile(self._symbol_table, self.backend)
 
     def func(self, sfv: bool = False, extern: bool = False, linkname: str | None = None):
         meta = FnMetadata(sfv=sfv, extern=extern, linkname=linkname)

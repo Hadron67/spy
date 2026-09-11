@@ -54,7 +54,7 @@ import textwrap
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
-from . import hir, sval
+from . import hir
 from .errors import CompileError
 from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (

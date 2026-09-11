@@ -70,6 +70,7 @@ from .errors import CompileError
 from .fn import (
     ArgEntry,
     ArgList,
+    CompileBatch,
     FunctionInstance,
     FunctionResolver,
     FunctionValue,
@@ -80,7 +81,6 @@ from .fn import (
     SpecializedComptimeArg,
     SpecializedFormalArg,
     SpecializedRuntimeArg,
-    SymbolTable,
 )
 from .util import frozendict
 
@@ -1608,7 +1608,7 @@ class Analyser:
     def __init__(self, resolver: FunctionResolver) -> None:
         self._resolver = resolver
         self._analyse_stack: list[HirRunner] = []
-        self._symbol_table = SymbolTable(
+        self._symbol_table = CompileBatch(
             extern_anon_symbols={},
             newly_compiled=set(),
         )
@@ -1689,5 +1689,5 @@ class Analyser:
         if self._request_function(fn_entry, call_sig, ret_sig) is None:
             self._run()
 
-    def finish(self) -> SymbolTable:
+    def finish(self) -> CompileBatch:
         return self._symbol_table

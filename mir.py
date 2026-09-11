@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Any, override
 
 from .errors import CompileError
-from .util import StrBiMap
 
 # ---------------------------------------------------------------------------
 # static types
@@ -528,37 +527,14 @@ class Function(GlobalValue):
                     ret.append(child)
         return tuple(ret)
 
-class Module:
-    def __init__(self) -> None:
-        self.symbols: StrBiMap[StructType | GlobalValue] = StrBiMap()
-        # the symbols discovered from the entries, in discovery order (a
-        # dict keeps the insertion order, which makes the assigned names
-        # deterministic)
-        self._pending_symbols: dict[StructType | GlobalValue, None] = {}
-
-    def add_recursively(self, entry: list[StructType | GlobalValue]) -> None:
-        todo: list[Value | Type] = [a for a in entry]
-        while todo:
-            value = todo.pop()
-            if value in self._pending_symbols:
-                continue
-            if isinstance(value, (StructType, GlobalValue)):
-                self._pending_symbols[value] = None
-            todo.extend(reversed([a for a in value.get_children() if not isinstance(a, Inst)]))
-
-    def finish(self):
-        for sym in self._pending_symbols:
-            if isinstance(sym, GlobalValue):
-                name, can_be_renamed = sym.get_name()
-                if not can_be_renamed:
-                    self.symbols.add(name, sym)
-
-        for sym in self._pending_symbols:
-            if isinstance(sym, StructType):
-                self.symbols.add(sym.name_base or 'anon', sym, True)
-            else:
-                name, can_be_renamed = sym.get_name()
-                if can_be_renamed:
-                    self.symbols.add(name, sym, True)
-
-        return self.symbols
+def collect_symbols(entry: list[GlobalValue]) -> set[GlobalValue | StructType]:
+    symbols: set[GlobalValue | StructType] = set()
+    todo: list[Value | StructType] = [a for a in entry]
+    while todo:
+        value = todo.pop()
+        if value in symbols:
+            continue
+        if isinstance(value, (StructType, GlobalValue)):
+            symbols.add(value)
+        todo.extend(reversed([a for a in value.get_children() if not isinstance(a, Inst)]))
+    return symbols
