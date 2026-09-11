@@ -238,7 +238,7 @@ class BlockFrame:
 
 class InlineFrame:
     def __init__(self, arg_values: tuple[InterpVal, ...], ret_loc: InterpVal, insts: tuple[hir.Inst, ...]) -> None:
-        self.arg_values: tuple[InterpVal, ...] = arg_values
+        self.arg_values = arg_values
         self.ret_loc = ret_loc
         self.insts = insts
         self.pc: int = 0
@@ -625,6 +625,8 @@ class HirRunner:
                 regs[inst] = self.alloca(inst.allow_comptime)
             case hir.Store():
                 self.store(self.operand(inst.ptr), self.operand(inst.value))
+            case hir.StoreVoidRetloc():
+                self.store(self._current_result_loc(), ComptimeVal(sval.Void()))
             case hir.Binary():
                 return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self.operand(inst.ret))
             case hir.Compare():
@@ -684,7 +686,8 @@ class HirRunner:
         if data.chosen is None:
             # a runtime ``if``: its then-region fell off its end (it
             # does not return); the else-region is typed next
-            self._rt_then_fell()
+            data.then_returns = False
+            self._emit(mir.Else())
             return
         # a compile-time ``if`` whose chosen branch is the then branch,
         # which fell off its end: the (unchosen) else branch is dead -
@@ -713,7 +716,12 @@ class HirRunner:
                     # a compile-time ``if``: the chosen branch fell off its end
                     frame.block_stack.pop()
                     return
-                self._rt_else_fell()
+                frame = self._frames[-1]
+                bf = frame.block_stack[-1].data
+                assert isinstance(bf, IfBlockData)
+                assert bf.chosen is None
+                self._emit(mir.End())
+                frame.block_stack.pop()
             case _:
                 raise AssertionError('unreachable')
 
@@ -727,63 +735,6 @@ class HirRunner:
         frame = self._frames[-1]
         self._emit(mir.If(cond.value))
         frame.block_stack.append(BlockFrame(entry, IfBlockData()))
-
-    def _rt_then_fell(self) -> None:
-        bf = self._frames[-1].block_stack[-1].data
-        assert isinstance(bf, IfBlockData)
-        assert bf.chosen is None and bf.then_returns is None
-        bf.then_returns = False
-        self._emit(mir.Else())
-
-    def _rt_then_returned(self) -> None:
-        """The then-region of the runtime ``if`` on top of the executing
-        frame's block stack ended in a ``return`` (the path was cut):
-        the else-region is typed next - or, when the ``if`` has no else
-        branch, the ``if`` is complete (the empty else branch falls
-        through) and the code after it is typed."""
-        frame = self._frames[-1]
-        bf = frame.block_stack[-1]
-        data = bf.data
-        assert isinstance(data, IfBlockData)
-        assert data.chosen is None and data.then_returns is None
-        data.then_returns = True
-        p_else, p_end = self._scan_block(bf.entry)
-        if p_else is not None:
-            self._emit(mir.Else())
-            frame.pc = p_else + 1
-            return
-        self._emit(mir.End())
-        frame.block_stack.pop()
-        frame.pc = p_end + 1
-
-    def _rt_else_fell(self) -> None:
-        frame = self._frames[-1]
-        bf = frame.block_stack[-1].data
-        assert isinstance(bf, IfBlockData)
-        assert bf.chosen is None
-        self._emit(mir.End())
-        frame.block_stack.pop()
-
-    def _rt_else_returned(self) -> bool:
-        """The else-region of the runtime ``if`` on top of the executing
-        frame's block stack ended in a ``return``: the ``if`` is
-        complete.  Returns True when every path of the ``if`` returned
-        (the code after it is dead and the enclosing path is cut too);
-        otherwise the code after the ``if`` is typed next (it is the
-        continuation of the then-region, which fell through)."""
-        frame = self._frames[-1]
-        bf = frame.block_stack[-1]
-        data = bf.data
-        assert isinstance(data, IfBlockData)
-        assert data.chosen is None
-        then_returns = data.then_returns
-        assert then_returns is not None
-        self._emit(mir.End())
-        frame.block_stack.pop()
-        if not then_returns:
-            _, p_end = self._scan_block(bf.entry)
-            frame.pc = p_end + 1
-        return then_returns
 
     def _cut(self) -> PollResult:
         """The current path of the executing frame ended - a ``return``
@@ -805,22 +756,38 @@ class HirRunner:
                     return PollResult.DONE
                 self._pop_frame()
                 return PollResult.AGAIN
-            bf = frame.block_stack[-1].data
-            match bf:
+            bf = frame.block_stack[-1]
+            data = bf.data
+            match data:
                 case IfBlockData():
-                    if bf.chosen is not None:
+                    if data.chosen is not None:
                         # the path ran through the chosen branch of a
                         # compile-time ``if`` and returned: dead code after it
                         frame.block_stack.pop()
                         continue
-                    if bf.then_returns is None:
+                    if data.then_returns is None:
                         # the path ended inside the then-region: type the
                         # else-region next (it is a fresh path)
-                        self._rt_then_returned()
+                        data.then_returns = True
+                        p_else, p_end = self._scan_block(bf.entry)
+                        if p_else is not None:
+                            self._emit(mir.Else())
+                            frame.pc = p_else + 1
+                            return PollResult.AGAIN
+                        self._emit(mir.End())
+                        frame.block_stack.pop()
+                        frame.pc = p_end + 1
                         return PollResult.AGAIN
                     # the path ended inside the else-region: the ``if`` is
                     # complete; when every path returned the cut keeps unwinding
-                    if self._rt_else_returned():
+                    then_returns = data.then_returns
+                    assert then_returns is not None
+                    self._emit(mir.End())
+                    frame.block_stack.pop()
+                    if not then_returns:
+                        _, p_end = self._scan_block(bf.entry)
+                        frame.pc = p_end + 1
+                    if then_returns:
                         continue
                 case _:
                     raise AssertionError('unreachable')

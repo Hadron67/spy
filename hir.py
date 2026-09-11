@@ -152,6 +152,11 @@ class Store(Inst):
 
 
 @dataclass(eq=False)
+class StoreVoidRetloc(Inst):
+    """Equivalent to ``Store(RetLoc(), Const(sval.Void()))``."""
+
+
+@dataclass(eq=False)
 class FieldAddr(Inst):
     """The address of the field ``name`` of the struct ``base`` points
     at.  ``base`` denotes the *storage* of a struct value: the slot of a

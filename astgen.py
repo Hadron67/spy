@@ -156,6 +156,8 @@ class _Builder:
                 # materializing a temporary value first
                 if node.value is not None:
                     self._gen_result_loc(node.value, hir.ResultLoc())
+                else:
+                    self.add(hir.StoreVoidRetloc())
                 self.add(hir.Ret())
             case ast.Pass():
                 pass
@@ -626,6 +628,6 @@ def parse_function(fn: Callable, self_type: Type | None = None) -> FunctionIR:
     builder = _Builder(fn, ir, scope)
     for stmt in node.body:
         builder._gen_stmt(stmt)
-    builder.add(hir.Store(hir.ResultLoc(), hir.Const(sval.Void())))
+    builder.add(hir.StoreVoidRetloc())
     ir.body = tuple(builder.insts)
     return ir
