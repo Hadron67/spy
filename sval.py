@@ -756,15 +756,13 @@ def estimated_size_of(type: Type) -> int:
         case BoolType():
             return 1
         case IntType():
-            return type.bits // 8 if type.bits != 0 else 0
+            return (type.bits + 7) // 8
         case FloatType():
-            return type.bits // 8
+            return (type.bits + 7) // 8
         case StructType():
             offset = 0
             for field in type.fields:
-                if field.type.get_unit_value() is not None:
-                    # a zero-sized field occupies no storage
-                    continue
+                # a zero-sized fields are handled correctly
                 align = estimated_alignment_of(field.type)
                 offset = (offset + align - 1) // align * align
                 offset += estimated_size_of(field.type)
@@ -855,9 +853,7 @@ def type_of(value: AnyValue, int_literal_bits: int | None = None) -> Type:
         case float():
             return FloatType(64)
         case str():
-            # strings are compiled as arrays of u8; until arrays get their
-            # own type they are represented by a const pointer to u8
-            return PointerType(IntType(8, False), is_const=True)
+            return PointerType(IntType(8, False), True)
 
 def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
@@ -1017,6 +1013,10 @@ def replace_type_var(value: Value, reps: dict[TypeVar, Value]) -> Value:
     match value:
         case TypeVar():
             return reps.get(value, value)
+        case PointerType():
+            type = replace_type_var(value.elem, reps)
+            assert isinstance(type, Type)
+            return PointerType(type, value.is_const)
         case _:
             return value
 

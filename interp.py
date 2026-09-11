@@ -223,50 +223,20 @@ def _is_comptime_val(val: InterpVal) -> bool:
                 todo.extend(val.value_ptrs.values())
     return True
 
-@dataclass
-class BlockFrame:
-    """One open structured block of the flat instruction stream of the
-    executing frame - an ``If`` whose branches are being typed (future
-    block instructions will use the same frame).  The frame records the
-    *entry* - the pc of the block-opening ``If`` in the frame's
-    instruction list, from which the matching ``Else``/``End`` markers
-    are found by a balanced scan - and the typing state of the ``if``:
-    for a compile-time ``if`` the chosen branch (``chosen`` True: then,
-    False: else), for a runtime ``if`` whether its then-region ended in
-    a ``return`` (set once its typing leaves the then-region; the
-    else-region is being typed once it is set, since both regions of a
-    runtime ``if`` are always typed)."""
+class BlockFrameData:
+    pass
 
-    entry: int
+@dataclass
+class IfBlockData(BlockFrameData):
     chosen: bool | None = None
     then_returns: bool | None = None
 
+@dataclass
+class BlockFrame:
+    entry: int
+    data: BlockFrameData
 
 class InlineFrame:
-    """One function body being executed at compile time: the IR of the
-    body it runs (``fn_ir``, which also fixes its by-value arguments -
-    resolved by ``hir.Arg`` leaves: one ``InterpVal`` per argument, in
-    declaration order - and its result location, the ``hir.ResultLoc``
-    leaf its return statements write into, paired with the ``RetLocVal``
-    holding the location's content, see ``RetLocVal``), together with the
-    execution state of its body: the flat instruction list of the body
-    (``insts``, its ``fn_ir.body``) with the pc of its next instruction
-    (the walk of the list is driven by ``HirRunner``), the stack of its
-    open blocks (see ``BlockFrame``) and, for an inlined callee, the
-    pending call of the caller that the callee's value resumes when its
-    run ends (``resume``; None for the function proper, whose run end
-    just ends the machine) and the register table of its body
-    (``regs``: the value of every executed instruction of the body,
-    keyed by the instruction object - an instruction's register is only
-    ever read by other instructions of the same body, so the table
-    lives with the frame).
-
-    Every frame carries its own ``fn_ir``, so the chain of frames above
-    the function proper - one frame per inlined plain function - is
-    also the chain of inlined bodies: the runner needs no separate
-    inline stack (see ``HirRunner._start_inline``), and the number of
-    inlined bodies under execution is ``len(frames) - 1``."""
-
     def __init__(self, arg_values: tuple[InterpVal, ...], ret_loc: InterpVal, insts: tuple[hir.Inst, ...]) -> None:
         self.arg_values: tuple[InterpVal, ...] = arg_values
         self.ret_loc = ret_loc
@@ -278,8 +248,13 @@ class InlineFrame:
     def ret_levels(self):
         open_ifs = 0
         for bf in self.block_stack:
-            if bf.chosen is None:
-                open_ifs += 1
+            data = bf.data
+            match data:
+                case IfBlockData():
+                    if data.chosen is None:
+                        open_ifs += 1
+                case _:
+                    raise AssertionError('unexpected block frame data')
         return open_ifs + 1 if open_ifs > 0 else 0
 
 # ---------------------------------------------------------------------------
@@ -686,7 +661,7 @@ class HirRunner:
         if isinstance(cond, ComptimeVal):
             if cond.obj:
                 # the then branch is chosen: it follows the ``If``
-                frame.block_stack.append(BlockFrame(entry, chosen=True))
+                frame.block_stack.append(BlockFrame(entry, IfBlockData(True)))
                 return
             # the else branch is chosen: skip the (dead) then branch
             p_else, p_end = self._scan_block(entry)
@@ -694,7 +669,7 @@ class HirRunner:
                 # no else branch either: the whole ``if`` is dead
                 frame.pc = p_end + 1
                 return
-            frame.block_stack.append(BlockFrame(entry, chosen=False))
+            frame.block_stack.append(BlockFrame(entry, IfBlockData(False)))
             frame.pc = p_else + 1
             return
         self._exec_runtime_if(cond, entry)
@@ -704,7 +679,9 @@ class HirRunner:
         ``Else`` marker of the innermost open block."""
         frame = self._frames[-1]
         bf = frame.block_stack[-1]
-        if bf.chosen is None:
+        data = bf.data
+        assert isinstance(data, IfBlockData)
+        if data.chosen is None:
             # a runtime ``if``: its then-region fell off its end (it
             # does not return); the else-region is typed next
             self._rt_then_fell()
@@ -712,7 +689,7 @@ class HirRunner:
         # a compile-time ``if`` whose chosen branch is the then branch,
         # which fell off its end: the (unchosen) else branch is dead -
         # skip it and close the block
-        assert bf.chosen
+        assert data.chosen
         frame.block_stack.pop()
         _, p_end = self._scan_block(bf.entry)
         frame.pc = p_end + 1
@@ -729,46 +706,31 @@ class HirRunner:
         the state crossing the join in memory slots, where it needs no
         phi."""
         frame = self._frames[-1]
-        bf = frame.block_stack[-1]
-        if bf.chosen is not None:
-            # a compile-time ``if``: the chosen branch fell off its end
-            frame.block_stack.pop()
-            return
-        self._rt_else_fell()
+        data = frame.block_stack[-1].data
+        match data:
+            case IfBlockData():
+                if data.chosen is not None:
+                    # a compile-time ``if``: the chosen branch fell off its end
+                    frame.block_stack.pop()
+                    return
+                self._rt_else_fell()
+            case _:
+                raise AssertionError('unreachable')
 
     # -- runtime ``if`` regions --------------------------------------------
 
     def _exec_runtime_if(
         self, cond: InterpVal, entry: int
     ) -> None:
-        """A runtime ``if``: both branch bodies are typed and emitted
-        (both survive at runtime): the walk continues into the
-        then-region, then - once it ends, by falling off at its ``Else``
-        marker or by a ``return`` (see ``_rt_then_fell`` and
-        ``_rt_then_returned``) - into the else-region.  The MIR is
-        emitted inline: a ``mir.If`` marker is opened here, closed by
-        the ``mir.Else``/``mir.End`` markers emitted when the regions
-        end.  A branch that falls off continues with the code after the
-        ``End`` (both branches may fall through: the MIR's falling
-        branches join there, see ``_rt_else_fell``).
-
-        Inside an inlined body every return already stores its value
-        into the call's result location on its own path (see the
-        ``hir.Ret`` handling); a return inside a runtime branch
-        additionally leaves the body with a ``mir.Break``."""
         if not isinstance(cond, RuntimeVal) or cond.type != sval.BoolType():
             raise CompileError('runtime if conditions must be boolean values')
         frame = self._frames[-1]
         self._emit(mir.If(cond.value))
-        frame.block_stack.append(BlockFrame(entry))
+        frame.block_stack.append(BlockFrame(entry, IfBlockData()))
 
     def _rt_then_fell(self) -> None:
-        """The then-region of the runtime ``if`` on top of the executing
-        frame's block stack fell off its end (its ``Else`` marker was
-        reached): the else-region is typed next - the ``mir.Else``
-        marker is emitted and the walk continues (its pc already points
-        into the else-region)."""
-        bf = self._frames[-1].block_stack[-1]
+        bf = self._frames[-1].block_stack[-1].data
+        assert isinstance(bf, IfBlockData)
         assert bf.chosen is None and bf.then_returns is None
         bf.then_returns = False
         self._emit(mir.Else())
@@ -781,8 +743,10 @@ class HirRunner:
         through) and the code after it is typed."""
         frame = self._frames[-1]
         bf = frame.block_stack[-1]
-        assert bf.chosen is None and bf.then_returns is None
-        bf.then_returns = True
+        data = bf.data
+        assert isinstance(data, IfBlockData)
+        assert data.chosen is None and data.then_returns is None
+        data.then_returns = True
         p_else, p_end = self._scan_block(bf.entry)
         if p_else is not None:
             self._emit(mir.Else())
@@ -793,16 +757,9 @@ class HirRunner:
         frame.pc = p_end + 1
 
     def _rt_else_fell(self) -> None:
-        """The region of the runtime ``if`` on top of the executing
-        frame's block stack that is currently being typed fell off its
-        end (the ``End`` marker was reached): the ``if`` is complete and
-        the code after the ``End`` is typed next.  A region that fell
-        off continues at runtime with that code; when both branches fell
-        through, both join it (a join - the MIR's falling branches
-        already continue at the shared post-``End`` code, and block
-        scoping keeps cross-join state in memory)."""
         frame = self._frames[-1]
-        bf = frame.block_stack[-1]
+        bf = frame.block_stack[-1].data
+        assert isinstance(bf, IfBlockData)
         assert bf.chosen is None
         self._emit(mir.End())
         frame.block_stack.pop()
@@ -816,8 +773,10 @@ class HirRunner:
         continuation of the then-region, which fell through)."""
         frame = self._frames[-1]
         bf = frame.block_stack[-1]
-        assert bf.chosen is None
-        then_returns = bf.then_returns
+        data = bf.data
+        assert isinstance(data, IfBlockData)
+        assert data.chosen is None
+        then_returns = data.then_returns
         assert then_returns is not None
         self._emit(mir.End())
         frame.block_stack.pop()
@@ -846,21 +805,25 @@ class HirRunner:
                     return PollResult.DONE
                 self._pop_frame()
                 return PollResult.AGAIN
-            bf = frame.block_stack[-1]
-            if bf.chosen is not None:
-                # the path ran through the chosen branch of a
-                # compile-time ``if`` and returned: dead code after it
-                frame.block_stack.pop()
-                continue
-            if bf.then_returns is None:
-                # the path ended inside the then-region: type the
-                # else-region next (it is a fresh path)
-                self._rt_then_returned()
-                return PollResult.AGAIN
-            # the path ended inside the else-region: the ``if`` is
-            # complete; when every path returned the cut keeps unwinding
-            if self._rt_else_returned():
-                continue
+            bf = frame.block_stack[-1].data
+            match bf:
+                case IfBlockData():
+                    if bf.chosen is not None:
+                        # the path ran through the chosen branch of a
+                        # compile-time ``if`` and returned: dead code after it
+                        frame.block_stack.pop()
+                        continue
+                    if bf.then_returns is None:
+                        # the path ended inside the then-region: type the
+                        # else-region next (it is a fresh path)
+                        self._rt_then_returned()
+                        return PollResult.AGAIN
+                    # the path ended inside the else-region: the ``if`` is
+                    # complete; when every path returned the cut keeps unwinding
+                    if self._rt_else_returned():
+                        continue
+                case _:
+                    raise AssertionError('unreachable')
             return PollResult.AGAIN
 
     def operand(self, value: hir.Value) -> InterpVal:
