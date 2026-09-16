@@ -15,7 +15,7 @@ function no earlier test has compiled.
 
 import io
 from contextlib import redirect_stdout
-from typing import Protocol, Self
+from typing import Any, Protocol, Self
 from unittest import TestCase
 
 from spy.dsl import func
@@ -25,10 +25,13 @@ from . import (
     compile_log,
     f32,
     f64,
+    i8,
     i32,
     i64,
+    mir,
     sval,
     u64,
+    void,
 )
 from . import as_ as spy_as
 from . import bool as spy_bool
@@ -225,18 +228,55 @@ def id_f32(a: f32) -> f32:
 
 # ---------------------------------------------------------------------------
 # struct values: the fields of a struct slot are filled when the slot is
-# committed (a pending default constructor, see ``interp``).  A small struct
-# (up to the by-value limit) is returned by value, a larger one through a
-# result pointer (``sval.returns_via_result_ptr``).
+# committed (a pending default constructor, see ``interp``), and the struct
+# is laid out by the mirror rules of ``sval.StructType._calculate_mir``.  A
+# small struct (up to the by-value limit) is returned by value, a larger one
+# through a result pointer (``sval.returns_via_result_ptr``).
+#
+# A struct type object is a compile-time value of the spy source: a spy body
+# constructs one as ``Foo(...)``, which the interpreter resolves to the
+# struct itself.  There is no Python-level constructor, so the structs of
+# this module are typed loosely for the type checker.
 # ---------------------------------------------------------------------------
 
-Small = sval.StructType('Small')
-Small.add_field('a', i32)  # pyright: ignore[reportArgumentType]
-Small.add_field('b', i32)  # pyright: ignore[reportArgumentType]
+Small: Any = sval.StructType('Small')
+Small.add_field('a', i32)
+Small.add_field('b', i32)
 
-Large = sval.StructType('Large')
+Large: Any = sval.StructType('Large')
 for _field in 'abcd':
-    Large.add_field(_field, i64)  # pyright: ignore[reportArgumentType]
+    Large.add_field(_field, i64)
+
+# a struct of one field mirrors to that field's own type, and the fields of
+# a struct of several fields are ordered by alignment (the least-aligned
+# first) - unless the struct is ``extern_c``, which keeps the C layout
+One: Any = sval.StructType('One')
+One.add_field('a', i32)
+
+Nested: Any = sval.StructType('Nested')
+Nested.add_field('inner', One)
+
+Mixed: Any = sval.StructType('Mixed')
+Mixed.add_field('wide', i64)
+Mixed.add_field('narrow', i8)
+
+ExternOne: Any = sval.StructType('ExternOne', sval.StructModifiers(extern_c=True))
+ExternOne.add_field('a', i32)
+
+ExternMixed: Any = sval.StructType('ExternMixed', sval.StructModifiers(extern_c=True))
+ExternMixed.add_field('wide', i64)
+ExternMixed.add_field('narrow', i8)
+
+# a zero-sized field occupies no storage: it has no mirror position and its
+# value is the unit value of its type
+Holder: Any = sval.StructType('Holder')
+Holder.add_field('v', void)
+Holder.add_field('n', i32)
+
+# a pointer field is word-aligned, like the integers of that width
+WithPointer: Any = sval.StructType('WithPointer')
+WithPointer.add_field('p', sval.PointerType(i32))  # pyright: ignore[reportArgumentType]
+WithPointer.add_field('n', i8)
 
 
 @func()
@@ -272,6 +312,36 @@ def make_large(x: i64, c: spy_bool) -> Large:  # pyright: ignore[reportInvalidTy
 @func()
 def use_large(x: i64, c: spy_bool) -> i64:
     return make_large(x, c).a + make_large(x, c).d
+
+
+@func()
+def one_field_local(x: i32) -> i32:
+    s = One(x)
+    return s.a
+
+
+@func()
+def mixed_fields_local(w: i64, n: i8) -> i64:
+    m = Mixed(w, n)
+    return m.wide + m.narrow
+
+
+@func()
+def extern_one_field_local(x: i32) -> i32:
+    s = ExternOne(x)
+    return s.a
+
+
+@func()
+def zst_field_local(n: i32) -> i32:
+    h = Holder(None, n)
+    return h.n
+
+
+@func()
+def nested_field_local(x: i32) -> i32:
+    n = Nested(One(x))
+    return n.inner.a
 
 
 @func()
@@ -449,6 +519,55 @@ class SpyStructTest(TestCase):
         self.assertEqual(use_large(5, True), 8)
         self.assertEqual(use_large(5, False), 11)
 
+    def test_one_field_mirror(self) -> None:
+        # the field of such a struct is the struct itself: the slot of the
+        # local is the storage of the field, with no address arithmetic
+        self.assertEqual(one_field_local(5), 5)
+
+    def test_reordered_fields(self) -> None:
+        self.assertEqual(mixed_fields_local(5, 3), 8)
+
+    def test_extern_c_field(self) -> None:
+        self.assertEqual(extern_one_field_local(5), 5)
+
+    def test_zero_sized_field(self) -> None:
+        self.assertEqual(zst_field_local(5), 5)
+
+    def test_nested_field(self) -> None:
+        self.assertEqual(nested_field_local(5), 5)
+
+
+class SpyStructMirrorTest(TestCase):
+    """How a struct lowers to MIR (``sval.StructType._calculate_mir``): a spy
+    struct is laid out by the compiler, an ``extern_c`` one for the C ABI."""
+
+    def test_single_field_mirrors_to_the_field(self) -> None:
+        self.assertEqual(One.get_mir_type(), mir.IntType(32, True))
+        self.assertEqual(One.get_field_mir_indices(), (0,))
+        # ... and so does a struct of one struct field, whose own mirror is
+        # the mirror of the field it holds
+        self.assertEqual(Nested.get_mir_type(), mir.IntType(32, True))
+
+    def test_fields_are_ordered_by_alignment(self) -> None:
+        mirror = Mixed.get_mir_type()
+        assert isinstance(mirror, mir.StructType)
+        self.assertEqual([f.name for f in mirror.fields], ['narrow', 'wide'])
+        self.assertEqual(Mixed.get_field_mir_indices(), (1, 0))
+
+        # a pointer is word-aligned, like an integer of that width
+        mirror = WithPointer.get_mir_type()
+        assert isinstance(mirror, mir.StructType)
+        self.assertEqual([f.name for f in mirror.fields], ['n', 'p'])
+
+    def test_extern_c_keeps_the_declaration_order(self) -> None:
+        mirror = ExternMixed.get_mir_type()
+        assert isinstance(mirror, mir.StructType)
+        self.assertEqual([f.name for f in mirror.fields], ['wide', 'narrow'])
+        self.assertEqual(ExternMixed.get_field_mir_indices(), (0, 1))
+        # an ``extern_c`` struct of one field keeps its wrapper struct, so
+        # that the C layout is the one the declaration asks for
+        self.assertIsInstance(ExternOne.get_mir_type(), mir.StructType)
+
 
 class SpyCompileLogTest(TestCase):
     def test_compile_log_prints_at_compile_time(self) -> None:
@@ -458,4 +577,4 @@ class SpyCompileLogTest(TestCase):
         self.assertIn('add_inline was compiled', out.getvalue())
 
 
-all_tests = [SpyFunctionCallTest, SpyStructTest, SpyCompileLogTest]
+all_tests = [SpyFunctionCallTest, SpyStructTest, SpyStructMirrorTest, SpyCompileLogTest]

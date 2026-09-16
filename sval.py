@@ -19,6 +19,7 @@ are equal), which is what makes the compile-time comparisons in
 
 from __future__ import annotations
 
+import ctypes
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -510,6 +511,9 @@ class AggregateValue(Value):
     def __str__(self) -> str:
         return f"{self.type}({', '.join(str(value) for value in self.values)})"
 
+@dataclass(frozen=True)
+class StructModifiers:
+    extern_c: bool = False
 
 class StructType(Type):
     """A spy struct type: the object ``@cache.struct()`` binds to the class
@@ -522,31 +526,11 @@ class StructType(Type):
     ``spy.typeof(x) == Foo`` work.
     """
 
-    def __init__(self, name_base: str) -> None:
+    def __init__(self, name_base: str, modifiers: StructModifiers | None = None) -> None:
         self.name_base = name_base
         self._fields: list[StructField] = []
-        # the spy methods of the struct, by name.  ``@cache.struct``
-        # extracts them from the Python class when the struct is created
-        # (a decorated method contributes its registration handle, a
-        # plain function stays a plain function and is inlined on call);
-        # methods may also be added later, including methods that have no
-        # counterpart in the Python class
         self.methods: dict[str, Any] = {}
-        # the ``__init__`` method (a registration handle) of a
-        # user-provided constructor, or None when the default constructor
-        # (which writes the arguments into the fields in declaration
-        # order) applies
-        self.custom_init: Any | None = None
-        # the Python-side callable that constructs struct instances
-        # (``Foo(a, b)``); installed by the host when the struct is
-        # created
-        self._py_init: Any = None
-        # the Python class of the struct instances (a ctypes.Structure
-        # subclass mirroring the LLVM layout); installed by the host
-        self._py_cls: Any = None
-        # the MIR mirror of the type, created lazily when the lowering
-        # of a function body needs it (see ``to_mir_type``); None until
-        # then
+        self.modifiers = modifiers or StructModifiers()
         self._mir: mir.MayBeVoidType | None = None
         # the mirror position of every field, in declaration order (see
         # ``get_field_mir_indices``), computed together with the mirror
@@ -608,26 +592,6 @@ class StructType(Type):
         index = self.field_index(name)
         return self._fields[index].type if index is not None else None
 
-    def method_of(self, name: str) -> Any:
-        """The spy method ``name`` of the struct: its registration handle
-        (a decorated ``@aot``/``@jit`` method) or its plain function
-        (inlined on call).  Raises a ``KeyError`` when the struct has no
-        such method."""
-        return self.methods[name]
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Python-side construction of a struct value: ``Foo(a, b)``
-        allocates a native instance and runs the struct's constructor
-        (the ``__init__`` method, or the default field-wise constructor)
-        on it."""
-        if self._py_init is None:
-            raise SpyError(
-                f'struct {self.name_base} is not bound to a spy context; '
-                'define it with @cache.struct() and construct it after the '
-                'module has loaded'
-            )
-        return self._py_init(*args, **kwargs)
-
     def __repr__(self) -> str:
         return f'<spy struct {self.name_base}>'
 
@@ -658,38 +622,64 @@ class StructType(Type):
         return self.get_mir_type()
 
     def _calculate_mir(self) -> None:
-        if self._mir is None:
-            assert self._field_mir_indices is None
-            fields: list[mir.FormalArg] = []
-            field_mir_indices: list[int | None] = []
-            for field in self._fields:
-                field_type = field.type.to_mir_type()
-                assert field_type is not None, f"field {field.name!r} has no MIR representation"
-                if isinstance(field_type, mir.VoidType):
-                    field_mir_indices.append(None)
-                else:
-                    field_mir_indices.append(len(fields))
-                    fields.append(mir.FormalArg(field.name, field_type))
-            self._field_mir_indices = tuple(field_mir_indices)
-            if all(a is None for a in self._field_mir_indices):
-                self._mir = None
-            else:
-                self._mir = mir.StructType(self.name_base, tuple(fields))
+        if self._mir is not None:
+            return
+        assert self._field_mir_indices is None
+        # the fields that occupy storage, each with the mirror of its type:
+        # a zero-sized field occupies none and has no mirror position
+        mirrored: list[tuple[int, StructField, mir.Type]] = []
+        for index, field in enumerate(self._fields):
+            field_mir = field.type.to_mir_type()
+            assert field_mir is not None, f"field {field.name!r} has no MIR representation"
+            if not isinstance(field_mir, mir.VoidType):
+                mirrored.append((index, field, field_mir))
+
+        # an ``extern_c`` struct is laid out for the C ABI: the mirror holds
+        # its fields in declaration order.  A spy struct is laid out by the
+        # compiler, which is free to reorder: the least-aligned fields come
+        # first (the mirror then packs tighter), a struct that holds exactly
+        # one field *is* that field - its mirror is the field's own mirror,
+        # with no wrapper struct - and one that holds none is a zero-sized
+        # type, mirroring to the void type
+        if not self.modifiers.extern_c:
+            mirrored.sort(key=lambda field: estimated_alignment_of(field[1].type))
+
+        indices: list[int | None] = [None] * len(self._fields)
+        for position, (index, _, _) in enumerate(mirrored):
+            indices[index] = position
+        self._field_mir_indices = tuple(indices)
+
+        if len(mirrored) == 0:
+            self._mir = mir.VoidType()
+        elif len(mirrored) == 1 and not self.modifiers.extern_c:
+            self._mir = mirrored[0][2]
+        else:
+            self._mir = mir.StructType(
+                self.name_base,
+                tuple(
+                    mir.FormalArg(field.name, field_mir)
+                    for _, field, field_mir in mirrored
+                ),
+            )
 
     def get_mir_type(self) -> mir.MayBeVoidType:
-        """The (cached) MIR mirror of the struct: the one
-        :class:`mir.StructType` object every value of the struct
-        mirrors to (created lazily, shared by all users), with the
-        zero-sized fields dropped from the LLVM layout."""
+        """The (cached) MIR mirror of the struct: the one ``mir`` type every
+        value of the struct mirrors to (created lazily, shared by all users),
+        with the zero-sized fields dropped.  An ``extern_c`` struct mirrors
+        to a ``mir.StructType`` of its declaration order; a spy struct orders
+        the fields by alignment instead, mirrors to the type of its own field
+        when it holds exactly one, and to the void type when it holds none."""
         self._calculate_mir()
         assert self._mir is not None
         return self._mir
 
     def get_field_mir_indices(self) -> tuple[int | None, ...]:
         """The mirror position of every field, in declaration order: the
-        i-th entry is the position of the i-th field in the mirror
-        returned by :meth:`get_mir_type` - zero-sized fields occupy no
-        position and map to ``None``."""
+        i-th entry is the position of the i-th field in the mirror returned
+        by :meth:`get_mir_type` - a zero-sized field occupies no position
+        and maps to ``None``.  A mirror that is the type of the struct's own
+        field (see :meth:`_calculate_mir`) has that field at position 0, and
+        the field sits at the address of the value itself."""
         self._calculate_mir()
         assert self._field_mir_indices is not None
         return self._field_mir_indices
@@ -748,6 +738,10 @@ def min_int_type(lower: int, upper: int) -> IntType:
 # size that the C ABIs of the supported targets pass in registers)
 _AGGREGATE_VALUE_RETURN_LIMIT = 16
 
+_POINTER_BYTES = ctypes.sizeof(ctypes.c_void_p)
+"""The size (and alignment) of a pointer of the host: the addresses the
+compiled code works with are the host's (see ``lower``)."""
+
 def estimated_size_of(type: Type) -> int:
     """Returns the estimated size of a type in bytes. The size is obtained
     using ctypes size rule, but is not guaranteed to be the actual size of
@@ -759,6 +753,8 @@ def estimated_size_of(type: Type) -> int:
             return (type.bits + 7) // 8
         case FloatType():
             return (type.bits + 7) // 8
+        case PointerType():
+            return _POINTER_BYTES
         case StructType():
             offset = 0
             for field in type.fields:
@@ -781,6 +777,8 @@ def estimated_alignment_of(type: Type) -> int:
             return type.bits // 8 if type.bits != 0 else 1
         case FloatType():
             return type.bits // 8
+        case PointerType():
+            return _POINTER_BYTES
         case StructType():
             return max(
                 (

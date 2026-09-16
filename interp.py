@@ -1004,7 +1004,7 @@ class HirRunner:
                 ptr,
                 _PendingStore(
                     type=value_type,
-                    is_comptime=isinstance(value, ComptimeVal),
+                    is_comptime=_is_comptime_val(value),
                     value=value,
                 ),
             )
@@ -1076,9 +1076,10 @@ class HirRunner:
             raise CompileError(f"cannot take field address of {ptr}")
 
         field_type = container_type.fields[index].type
-        mir_index = container_type.get_field_mir_indices()[index]
-        if mir_index is None:
-            return ComptimeVal(sval.Undefined(sval.PointerType(field_type, type.is_const)))
+        field_ptr_type = sval.PointerType(field_type, type.is_const)
+        if field_type.is_zst():
+            # a zero-sized field occupies no storage and has no address
+            return ComptimeVal(sval.Undefined(field_ptr_type))
 
         match ptr:
             case ComptimeVal():
@@ -1086,7 +1087,16 @@ class HirRunner:
                     'cannot take the address of a field of a compile-time value'
                 )
             case RuntimeVal():
-                return RuntimeVal(self._emit(mir.Gep(ptr.value, mir_index)), sval.PointerType(field_type, type.is_const))
+                if isinstance(container_type.get_mir_type(), mir.StructType):
+                    mir_index = container_type.get_field_mir_indices()[index]
+                    assert mir_index is not None, 'a field with storage has a mirror position'
+                    return RuntimeVal(
+                        self._emit(mir.Gep(ptr.value, mir_index)), field_ptr_type
+                    )
+                # the mirror of the struct is the mirror of its own field
+                # (see ``sval.StructType._calculate_mir``): the field is the
+                # value itself, so it takes no address arithmetic
+                return RuntimeVal(ptr.value, field_ptr_type)
             case _:
                 raise CompileError(f"cannot take field address of {ptr}")
 
