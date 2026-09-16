@@ -386,15 +386,18 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
         case _:
             return None
 
-def _arg_type_of(arg: ArgEntry[InterpVal]):
+def _arg_type_of(arg: ArgEntry[InterpVal]) -> sval.Type | None:
     """The spy type of the *value* an argument denotes: a reference
     argument carries the address of its value, so one pointer layer is
-    stripped here."""
+    stripped here.  ``None`` when the value has no spy type yet (a slot
+    that is not committed, an un-typable compile-time object)."""
     type = _type_of(arg.value)
-    if arg.is_ref:
-        assert isinstance(type, sval.PointerType), f"pointer expected, got {type}"
-        return type.elem
-    return type
+    if not arg.is_ref:
+        return type
+    if type is None:
+        return None
+    assert isinstance(type, sval.PointerType), f"pointer expected, got {type}"
+    return type.elem
 
 def _no_runtime_type(type: sval.Type) -> CompileError:
     """The error for a runtime location whose type has no representation
@@ -1136,11 +1139,18 @@ class HirRunner:
     # -- operators ------------------------------------------------------------
 
     def _eval_binary(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
-        lv = self._arg_value(lhs)
-        rv = self._arg_value(rhs)
-        if isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal):
+        # what the operation *is* follows from the types of the operands - a
+        # primitive arithmetic instruction, or (later) an overload method
+        # that takes the operands by reference (``a + b`` becomes
+        # ``a.__add__(b)``, see ``call_method``), so the operands are kept as
+        # the references they are and a value is only loaded where one is
+        # needed
+        if _is_comptime_val(lhs.value) and _is_comptime_val(rhs.value):
             # every operand is compile-time: the operation is evaluated
-            # eagerly, whatever the runtime types of the operands are
+            # eagerly in Python, whatever the runtime types are
+            lv = self._arg_value(lhs)
+            rv = self._arg_value(rhs)
+            assert isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal)
             self.store(ret, ComptimeVal(_comptime_py_op(op, lv.obj, rv.obj)))
             return PollResult.AGAIN
 
@@ -1150,6 +1160,8 @@ class HirRunner:
         if lhs_type is None or rhs_type is None:
             raise CompileError(f"cannot apply '{op}' to untyped objects")
         if sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type):
+            lv = self._arg_value(lhs)
+            rv = self._arg_value(rhs)
             type = lhs_type.resolve_peer_type(rhs_type)
             if type is None:
                 raise CompileError(f"cannot apply '{op}' to {lhs_type} and {rhs_type}")
@@ -1222,9 +1234,10 @@ class HirRunner:
             raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
 
     def _eval_boolop(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret_reg: hir.Inst) -> PollResult:
-        lv = self._arg_value(lhs)
-        rv = self._arg_value(rhs)
-        if isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal):
+        if _is_comptime_val(lhs.value) and _is_comptime_val(rhs.value):
+            lv = self._arg_value(lhs)
+            rv = self._arg_value(rhs)
+            assert isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal)
             result = (lv.obj and rv.obj) if op == 'and' else (lv.obj or rv.obj)
             self._frames[-1].regs[ret_reg] = ComptimeVal(bool(result))
             return PollResult.AGAIN
@@ -1234,8 +1247,9 @@ class HirRunner:
         )
 
     def _eval_unary(self, op: str, operand: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
-        ev = self._arg_value(operand)
-        if isinstance(ev, ComptimeVal):
+        if _is_comptime_val(operand.value):
+            ev = self._arg_value(operand)
+            assert isinstance(ev, ComptimeVal)
             obj = ev.obj
             if op == 'not':
                 result: sval.AnyValue = not obj
@@ -1248,13 +1262,14 @@ class HirRunner:
                 raise CompileError(f"unsupported unary operator '{op}'")
             self.store(ret, ComptimeVal(result))
             return PollResult.AGAIN
-        type = _type_of(ev)
+
+        type = _arg_type_of(operand)
         if type is None:
-            raise CompileError(f"cannot apply unary '{op}' to a compile-time object")
-        coerced = self._coerce(ev, type)
+            raise CompileError(f"cannot apply unary '{op}' to a value that has no type yet")
         if op == 'not':
             if not isinstance(type, sval.BoolType):
                 raise CompileError(f"cannot apply 'not' to a {type} value")
+            coerced = self._coerce(self._arg_value(operand), type)
             value = self._emit(
                 mir.Cmp('eq', False, 'int', _to_runtime(coerced), mir.BoolValue(False))
             )
@@ -1271,6 +1286,7 @@ class HirRunner:
                 zero = mir.Int(0, mir_type)
             else:
                 raise CompileError(f'cannot negate a {type} value')
+            coerced = self._coerce(self._arg_value(operand), type)
             value = self._emit(
                 mir.Arith('sub', False, zero, _to_runtime(coerced), mir_type)
             )
