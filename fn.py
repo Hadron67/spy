@@ -106,7 +106,7 @@ class ReturnSignature:
     ret_type: Type
 
 @dataclass(frozen=True)
-class SpecializedCallSignature:
+class CallSignature:
     generic_args: tuple[Value, ...]
     positional: tuple[tuple[str, SpecializedFormalArg], ...]
     varargs: tuple[SpecializedFormalArg, ...] | None
@@ -289,7 +289,7 @@ class Signature:
             formal.append(FormalArg(name, arg.type, arg.default_value))
         return FunctionType(tuple(formal), self.ret_type)
 
-    def specialize(self, provided: ArgList[Type | None]) -> tuple[SpecializedCallSignature, ReturnSignature | None]:
+    def specialize(self, provided: ArgList[Type | None]) -> tuple[CallSignature, ReturnSignature | None]:
         """Specialize one call of this signature: the concrete typing of
         its arguments and (when the signature declares a return type)
         of its result.
@@ -360,7 +360,7 @@ class Signature:
                 for name, cand in provided.kwargs.items()
             )
 
-        call_sig = SpecializedCallSignature(
+        call_sig = CallSignature(
             tuple(type_var_values), positional, varargs, kwargs
         )
 
@@ -379,14 +379,13 @@ class FunctionIR:
     signature: Signature
     body: tuple[hir.Inst, ...]
 
-@dataclass(eq=False)
 class NativeFn:
     @abstractmethod
-    def call(self, *values: ctypes._CDataType) -> ctypes._CDataType | None:
+    def print_all(self) -> list[str]:
         ...
 
     @abstractmethod
-    def print_all(self) -> list[str]:
+    def call(self, *args: ctypes._CDataType) -> ctypes._CDataType | None:
         ...
 
 @dataclass(eq=False)
@@ -400,6 +399,7 @@ class FunctionInstance:
 
     mir: mir.Function
     ret_sig: ReturnSignature | None = None
+    wrapper_fn: NativeFn | None = None
     native_fn: NativeFn | None = None
 
 class FunctionValue(Value):
@@ -421,9 +421,9 @@ class FunctionValue(Value):
         self.force_inline = force_inline
         # spy argument types -> the compiled artifacts of the
         # specialization (see ``LazyJitFunctionInstance``)
-        self.specs: dict[SpecializedCallSignature, FunctionInstance] = {}
+        self.specs: dict[CallSignature, FunctionInstance] = {}
         # spy argument types -> error message of a failed compilation
-        self.failed: dict[SpecializedCallSignature, str] = {}
+        self.failed: dict[CallSignature, str] = {}
 
     def __eq__(self, value: object, /) -> bool:
         return self is value
@@ -435,7 +435,24 @@ class FunctionValue(Value):
     def get_type(self) -> Type:
         return self.hir.signature.as_non_generic_fn_type() or AnyFunction()
 
+class FunctionResolver:
+    @abstractmethod
+    def resolve_global(self, value: Any) -> AnyValue | None:
+        """The spy value a global object referenced inside a function
+        body resolves to.  A function registered in this host - reached
+        as the raw function object or through the callable view its
+        decorated name binds to - resolves to its function entry
+        (creating the entry of an aot function that is not used yet);
+        any other object is not a spy value of this host and returns
+        ``None`` (the object stays a plain compile-time Python value)."""
+        ...
+
+
 class SymbolTable:
+    """The link names of every compiled function of the process, and the
+    native function each name refers to.  A later compilation resolves the
+    functions it imports from here."""
+
     def __init__(self):
         self._symbols: StrBiMap[NativeFn] = StrBiMap()
 
@@ -470,6 +487,73 @@ class SymbolTable:
     def _add(self, name: str, fn: NativeFn):
         self._symbols.add(name, fn)
 
+def _must_pass_by_ref(type: mir.MayBeVoidType) -> bool:
+    """Whether a value of ``type`` crosses the native boundary as a
+    pointer: ctypes cannot carry an aggregate (a struct or an array) by
+    value, so those are passed by pointer there."""
+    return isinstance(type, (mir.StructType, mir.ArrayType))
+
+def _needs_thunk(fn: mir.Function) -> bool:
+    """Whether this function's value form cannot be called through
+    ctypes directly, so that a Python-entry thunk is needed."""
+    return _must_pass_by_ref(fn.ret_type) or any(
+        _must_pass_by_ref(a) for a in fn.args
+    )
+
+def _make_thunk(fn: mir.Function) -> mir.Function:
+    """The Python-facing entry of this function: a MIR function that
+    adapts its value form to the ABI ctypes can call - a by-value
+    aggregate argument is taken as a pointer and loaded, and a
+    by-value aggregate result is written through a trailing out
+    pointer (the thunk then returns void).  Spy-to-spy calls never go
+    through it: they call this function directly."""
+    arg_types: list[mir.Type] = []
+    arg_names: list[str | None] = []
+    by_refs: list[bool] = []
+    for arg, name in zip(fn.args, fn.arg_names):
+        br = _must_pass_by_ref(arg)
+        by_refs.append(br)
+        arg_types.append(mir.PointerType(arg) if br else arg)
+        arg_names.append(name)
+
+    out_arg: mir.Param | None = None
+    ret_type: mir.MayBeVoidType = fn.ret_type
+    if not isinstance(ret_type, mir.VoidType) and _must_pass_by_ref(ret_type):
+        out_arg = mir.Param(len(arg_types), mir.PointerType(ret_type))
+        arg_types.append(out_arg.type)
+        arg_names.append('$result')
+        ret_type = mir.VOID
+
+    thunk = mir.Function(
+        f'{fn.name_base}.thunk', arg_types, arg_names, ret_type, [],
+        is_complete=True,
+    )
+
+    call_args: list[mir.Value] = []
+    for i, (arg_type, by_ref) in enumerate(zip(arg_types, by_refs)):
+        if by_ref:
+            value = mir.Load(mir.Param(i, arg_type))
+            thunk.insts.append(value)
+            call_args.append(value)
+        else:
+            call_args.append(mir.Param(i, arg_type))
+
+    if out_arg is not None:
+        assert not isinstance(fn.ret_type, mir.VoidType)
+        value = mir.Call(fn, tuple(call_args), fn.ret_type)
+        thunk.insts.append(value)
+        thunk.insts.append(mir.Store(out_arg, value))
+        thunk.insts.append(mir.Ret(None))
+    elif isinstance(fn.ret_type, mir.VoidType):
+        thunk.insts.append(mir.Call(fn, tuple(call_args), mir.VOID))
+        thunk.insts.append(mir.Ret(None))
+    else:
+        value = mir.Call(fn, tuple(call_args), fn.ret_type)
+        thunk.insts.append(value)
+        thunk.insts.append(mir.Ret(value))
+
+    return thunk
+
 @dataclass
 class CompileBatch:
     extern_anon_symbols: dict[NativeFn, mir.ExternAnonSymbol]
@@ -482,6 +566,12 @@ class CompileBatch:
         return mir.collect_symbols(entry)
 
     def compile(self, symbol_table: SymbolTable, backend: Backend):
+        thunks: dict[mir.Function, mir.Function] = {}
+        for instance in self.newly_compiled:
+            if _needs_thunk(instance.mir):
+                thunk = _make_thunk(instance.mir)
+                thunks[instance.mir] = thunk
+
         mir_symbols = self.collect_symbols()
 
         for instance in self.newly_compiled:
@@ -504,18 +594,9 @@ class CompileBatch:
             native_fn = native_fns[instance.mir]
             instance.native_fn = native_fn
             symbol_table._add(names[instance.mir], native_fn)
+            thunk = thunks.get(instance.mir)
+            instance.wrapper_fn = native_fns[thunk] if thunk is not None else None
 
-class FunctionResolver:
-    @abstractmethod
-    def resolve_global(self, value: Any) -> AnyValue | None:
-        """The spy value a global object referenced inside a function
-        body resolves to.  A function registered in this host - reached
-        as the raw function object or through the callable view its
-        decorated name binds to - resolves to its function entry
-        (creating the entry of an aot function that is not used yet);
-        any other object is not a spy value of this host and returns
-        ``None`` (the object stays a plain compile-time Python value)."""
-        ...
 
 class Backend:
     @abstractmethod

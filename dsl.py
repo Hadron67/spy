@@ -31,11 +31,11 @@ from .fn import (
     AnyValue,
     ArgList,
     Backend,
+    CallSignature,
     FunctionResolver,
     FunctionValue,
     RawArgList,
     ReturnSignature,
-    SpecializedCallSignature,
     SpecializedComptimeArg,
     SymbolTable,
 )
@@ -106,7 +106,9 @@ class _RegisteredFn:
         sym.compile(self.context._symbol_table, self.context.backend)
 
         instance = entry.specs[call_sig]
-        native_fn = instance.native_fn
+        # a function whose value form ctypes cannot call directly has a
+        # Python-entry thunk (see ``fn._fn_thunk``); call that instead
+        native_fn = instance.wrapper_fn or instance.native_fn
         assert native_fn is not None
 
         # the native call takes the arguments of the *lowered* signature:
@@ -156,7 +158,7 @@ class _Context(FunctionResolver):
                 return None
 
     def _resolve_call(
-        self, fn: FunctionValue, call_sig: SpecializedCallSignature, ret_sig: ReturnSignature | None
+        self, fn: FunctionValue, call_sig: CallSignature, ret_sig: ReturnSignature | None
     ):
         analyser = Analyser(self)
         analyser.analyse_function(fn, call_sig, ret_sig)

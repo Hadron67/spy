@@ -482,7 +482,6 @@ class Break(Inst):
 
     level: int
 
-
 @dataclass(eq=False)
 class Function(GlobalValue):
     """One compiled MIR function.  As a value it is the in-module

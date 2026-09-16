@@ -70,6 +70,7 @@ from .errors import CompileError
 from .fn import (
     ArgEntry,
     ArgList,
+    CallSignature,
     CompileBatch,
     FunctionInstance,
     FunctionResolver,
@@ -77,7 +78,6 @@ from .fn import (
     NativeFn,
     RawArgList,
     ReturnSignature,
-    SpecializedCallSignature,
     SpecializedComptimeArg,
     SpecializedFormalArg,
     SpecializedRuntimeArg,
@@ -378,7 +378,7 @@ class PollResult(IntEnum):
 @dataclass
 class ResumeInfo:
     args: ArgList[ArgEntry[InterpVal]]
-    call_sig: SpecializedCallSignature
+    call_sig: CallSignature
     ret_loc: InterpVal | None
     ret_reg: hir.Inst | None
 
@@ -421,7 +421,7 @@ class HirRunner:
     def run_function(
         self,
         body: tuple[hir.Inst, ...],
-        sig: SpecializedCallSignature,
+        sig: CallSignature,
         ret_sig: ReturnSignature | None,
     ):
         # reset the per-specialization state; the result location of the
@@ -464,7 +464,7 @@ class HirRunner:
 
     def _init_args_from_signature(
         self,
-        signature: SpecializedCallSignature,
+        signature: CallSignature,
         mir_args: list[mir.Type],
     ) -> tuple[InterpVal, ...]:
         arg_values: list[InterpVal] = []
@@ -1442,7 +1442,7 @@ class HirRunner:
         self.resume_info = None
         self._make_runtime_call(fn_mir, ri.args, ri.ret_loc, ri.ret_reg, ri.call_sig, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal | None, ret_reg: hir.Inst | None, call_sig: SpecializedCallSignature, ret_sig: ReturnSignature) -> None:
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal | None, ret_reg: hir.Inst | None, call_sig: CallSignature, ret_sig: ReturnSignature) -> None:
         """Emit the native call of an already-resolved callee and hand its
         result to the call's result location (or register)."""
         mir_args: list[mir.Value] = []
@@ -1621,7 +1621,7 @@ class Analyser:
         st.extern_anon_symbols[fn] = ret
         return ret
 
-    def _request_function(self, fn_entry: FunctionValue, call_sig: SpecializedCallSignature, ret_sig: ReturnSignature | None) -> tuple[mir.Value, ReturnSignature] | None:
+    def _request_function(self, fn_entry: FunctionValue, call_sig: CallSignature, ret_sig: ReturnSignature | None) -> tuple[mir.Value, ReturnSignature] | None:
         """Make sure the specialization ``call_sig`` of ``fn_entry`` is
         compiled (into the module being built) and return its callee
         value and return signature - or ``None`` when the specialization
@@ -1683,7 +1683,7 @@ class Analyser:
                     return instance.mir, top.return_sig
         return None
 
-    def analyse_function(self, fn_entry: FunctionValue, call_sig: SpecializedCallSignature, ret_sig: ReturnSignature | None):
+    def analyse_function(self, fn_entry: FunctionValue, call_sig: CallSignature, ret_sig: ReturnSignature | None):
         """Type (and thereby compile) the specialization ``call_sig`` of
         ``fn_entry`` if it is not compiled yet."""
         if self._request_function(fn_entry, call_sig, ret_sig) is None:

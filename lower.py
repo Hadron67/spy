@@ -459,48 +459,6 @@ class _Lowerer:
             self._lowered[id(inst)] = result
 
 
-def _py_entry_thunk(
-    types: _ModuleTypes,
-    value_fn: sllvm.Function,
-    fn: mir.Function,
-    out_struct_ret: bool,
-    link_name: str,
-) -> sllvm.Function:
-    """The Python-facing entry of one MIR function whose value form
-    ctypes cannot call directly: a pointer-form wrapper that loads every
-    by-value struct argument, calls the by-value function and - for a
-    by-value struct result - stores the returned struct into a trailing
-    out buffer.  Spy-to-spy calls never go through it."""
-    thunk = sllvm.Function(f'{link_name}.py')
-    arg_types = tuple(
-        sllvm.PointerType(types.to_llvm(a)) if isinstance(a, mir.StructType) else types.to_llvm(a)
-        for a in fn.args
-    )
-    args = thunk.add_args(*arg_types)
-    out: sllvm.Value | None = None
-    if out_struct_ret:
-        assert isinstance(fn.ret_type, mir.StructType)
-        out = thunk.get_arg(thunk.add_arg(sllvm.PointerType(types.to_llvm(fn.ret_type))))
-        thunk.set_return_type(sllvm.VoidType())
-    else:
-        thunk.set_return_type(types.to_llvm(fn.ret_type))
-    block = thunk.entry
-    call_args = tuple(
-        block.load(arg) if isinstance(a, mir.StructType) else arg
-        for a, arg in zip(fn.args, args)
-    )
-    if out_struct_ret:
-        assert out is not None
-        block.store(out, block.call(value_fn, *call_args))
-        block.ret(None)
-    elif isinstance(fn.ret_type, mir.VoidType):
-        block.call(value_fn, *call_args)
-        block.ret(None)
-    else:
-        block.ret(block.call(value_fn, *call_args))
-    return thunk
-
-
 class _NativeFn(NativeFn):
     """The concrete compiled artifact of one specialization: the ctypes
     entry bound to its Python-facing ABI and the address of its value
@@ -509,40 +467,21 @@ class _NativeFn(NativeFn):
     def __init__(
         self,
         name: str,
-        arg_types: tuple[mir.Type, ...],
-        ret_type: mir.MayBeVoidType,
         lines: list[str],
         addr: int,
-        entry: object,
-        arg_ctypes: list[Any],
-        out_struct_type: type[ctypes.Structure] | None,
+        entry: ctypes._CFunctionType,
     ) -> None:
         self.name = name
-        self.arg_types = arg_types
-        self.ret_type = ret_type
         self._lines = lines
         self._addr = addr
         self._entry = entry
-        self._arg_ctypes = arg_ctypes
-        self._out_struct_type = out_struct_type
 
     @property
     def addr(self) -> int:
         return self._addr
 
     def call(self, *values: ctypes._CDataType) -> ctypes._CDataType | None:
-        converted: list[object] = []
-        for ctype, value in zip(self._arg_ctypes, values):
-            if ctype is ctypes.c_void_p and isinstance(value, ctypes.Structure):
-                converted.append(ctypes.addressof(value))
-            else:
-                converted.append(value)
-        assert self._entry is not None
-        if self._out_struct_type is not None:
-            out = self._out_struct_type()
-            self._entry(*converted, ctypes.addressof(out))  # type: ignore[operator]
-            return out
-        return self._entry(*converted)  # type: ignore[operator]
+        return self._entry(*values)
 
     def print_all(self) -> list[str]:
         return self._lines
@@ -585,21 +524,8 @@ class LLVMBackend(Backend):
             assert isinstance(llvm_fn, sllvm.Function)
             llvm_fns[fn] = llvm_fn
 
-        # the Python-facing entry of every function whose value form
-        # ctypes cannot call directly (see ``_py_entry_thunk``)
-        entry_by_fn: dict[mir.Function, sllvm.Function] = {}
-        for fn in fns:
-            out_struct_ret = isinstance(fn.ret_type, mir.StructType)
-            has_struct_arg = any(isinstance(a, mir.StructType) for a in fn.args)
-            if out_struct_ret or has_struct_arg:
-                entry_by_fn[fn] = _py_entry_thunk(
-                    types, llvm_fns[fn], fn, out_struct_ret, globals.get_key(fn)
-                )
-
         lmod = sllvm.Module()
-        module_values: list[sllvm.Value] = [llvm_fns[fn] for fn in fns]
-        module_values.extend(entry_by_fn.values())
-        lmod.add_recursively(values=module_values)
+        lmod.add_recursively(values=[llvm_fns[fn] for fn in fns])
         lmod.add_recursively(types=types.struct_types())
         lmod.finish()
         lines = lmod.write()
@@ -614,30 +540,16 @@ class LLVMBackend(Backend):
         for fn in fns:
             # the link name the LLVM module actually emitted
             name = lmod.get_global_name(llvm_fns[fn])
-            value_addr = self._engine.get_function_address(name)
-            entry_fn = entry_by_fn.get(fn)
-            if entry_fn is not None:
-                entry_name = lmod.get_global_name(entry_fn)
-                entry_addr = self._engine.get_function_address(entry_name)
-            else:
-                entry_addr = value_addr
+            addr = self._engine.get_function_address(name)
             arg_ctypes: list[Any] = [py_entry_arg_ctype(a) for a in fn.args]
-            out_struct_type: type[ctypes.Structure] | None = None
-            if isinstance(fn.ret_type, mir.StructType):
-                arg_ctypes.append(ctypes.c_void_p)
-                out_struct_type = struct_ctype(fn.ret_type)
             restype = to_ctype(fn.ret_type)
             proto = ctypes.CFUNCTYPE(restype, *arg_ctypes)  # type: ignore[arg-type]
-            entry = ctypes.cast(entry_addr, proto)
+            entry = ctypes.cast(addr, proto)
             native = _NativeFn(
                 name,
-                tuple(fn.args),
-                fn.ret_type,
                 lines,
-                value_addr,
+                addr,
                 entry,
-                arg_ctypes,
-                out_struct_type,
             )
             rets[fn] = native
         return rets
