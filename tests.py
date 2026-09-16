@@ -26,6 +26,8 @@ from . import (
     f32,
     f64,
     i32,
+    i64,
+    sval,
     u64,
 )
 from . import as_ as spy_as
@@ -222,6 +224,79 @@ def id_f32(a: f32) -> f32:
 
 
 # ---------------------------------------------------------------------------
+# struct values: the fields of a struct slot are filled when the slot is
+# committed (a pending default constructor, see ``interp``).  A small struct
+# (up to the by-value limit) is returned by value, a larger one through a
+# result pointer (``sval.returns_via_result_ptr``).
+# ---------------------------------------------------------------------------
+
+Small = sval.StructType('Small')
+Small.add_field('a', i32)  # pyright: ignore[reportArgumentType]
+Small.add_field('b', i32)  # pyright: ignore[reportArgumentType]
+
+Large = sval.StructType('Large')
+for _field in 'abcd':
+    Large.add_field(_field, i64)  # pyright: ignore[reportArgumentType]
+
+
+@func()
+def struct_local(x: i32) -> i32:
+    s = Small(x, 1)
+    return s.a + s.b
+
+
+@func()
+def struct_all_comptime() -> i32:
+    s = Small(1, 2)
+    return s.a + s.b
+
+
+@func()
+def make_small(x: i32) -> Small:  # pyright: ignore[reportInvalidTypeForm]
+    return Small(x, 2)
+
+
+@func()
+def use_small(x: i32) -> i32:
+    s = make_small(x)
+    return s.a + s.b
+
+
+@func()
+def make_large(x: i64, c: spy_bool) -> Large:  # pyright: ignore[reportInvalidTypeForm]
+    if c:
+        return Large(x, 1, 2, 3)
+    return Large(x, 4, 5, 6)
+
+
+@func()
+def use_large(x: i64, c: spy_bool) -> i64:
+    return make_large(x, c).a + make_large(x, c).d
+
+
+@func()
+def untyped_local(n: i32) -> i32:
+    x = 1
+    x = 2
+    return x + n
+
+
+@func()
+def untyped_return():
+    return 1
+
+
+@func()
+def untyped_param(x) -> i32:
+    return x
+
+
+@func()
+def call_untyped_param() -> i32:
+    return untyped_param(1)
+
+
+# ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
 
@@ -338,10 +413,41 @@ class SpyFunctionCallTest(TestCase):
         with self.assertRaises(CompileError):
             div(1, 2)
 
+    def test_untyped_integer_slot_is_rejected(self) -> None:
+        # an untyped integer literal has no runtime type of its own: a
+        # slot that has to live in memory must declare its type
+        with self.assertRaises(CompileError):
+            untyped_local(5)
+        with self.assertRaises(CompileError):
+            untyped_return()
+        # the same holds for the slot of an unannotated parameter, which
+        # is typed by the call (here: by an untyped literal argument)
+        with self.assertRaises(CompileError):
+            call_untyped_param()
+
 
 @func()
 def div(a: i32, b: i32) -> i32:
     return a / b # pyright: ignore[reportReturnType]
+
+
+class SpyStructTest(TestCase):
+    """Struct values: a construction writes its fields when the slot it is
+    constructed into is committed, and the result of a struct-returning
+    call is delivered to the caller's result location."""
+
+    def test_fields_of_a_local(self) -> None:
+        self.assertEqual(struct_local(5), 6)
+
+    def test_all_fields_comptime(self) -> None:
+        self.assertEqual(struct_all_comptime(), 3)
+
+    def test_by_value_return(self) -> None:
+        self.assertEqual(use_small(5), 7)
+
+    def test_result_pointer_return(self) -> None:
+        self.assertEqual(use_large(5, True), 8)
+        self.assertEqual(use_large(5, False), 11)
 
 
 class SpyCompileLogTest(TestCase):
@@ -352,4 +458,4 @@ class SpyCompileLogTest(TestCase):
         self.assertIn('add_inline was compiled', out.getvalue())
 
 
-all_tests = [SpyFunctionCallTest, SpyCompileLogTest]
+all_tests = [SpyFunctionCallTest, SpyStructTest, SpyCompileLogTest]

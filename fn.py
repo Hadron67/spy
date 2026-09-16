@@ -510,11 +510,12 @@ def _make_thunk(fn: mir.Function) -> mir.Function:
     arg_types: list[mir.Type] = []
     arg_names: list[str | None] = []
     by_refs: list[bool] = []
-    for arg, name in zip(fn.args, fn.arg_names):
+    for arg in fn.args:
         br = _must_pass_by_ref(arg)
         by_refs.append(br)
         arg_types.append(mir.PointerType(arg) if br else arg)
-        arg_names.append(name)
+        # the interpreter does not name the formals of a specialization
+        arg_names.append(None)
 
     out_arg: mir.Param | None = None
     ret_type: mir.MayBeVoidType = fn.ret_type
@@ -559,10 +560,11 @@ class CompileBatch:
     extern_anon_symbols: dict[NativeFn, mir.ExternAnonSymbol]
     newly_compiled: set[FunctionInstance]
 
-    def collect_symbols(self) -> set[mir.GlobalValue | mir.StructType]:
+    def collect_symbols(self, extra: Iterable[mir.Function] = ()) -> set[mir.GlobalValue | mir.StructType]:
         entry: list[mir.GlobalValue] = list(self.extern_anon_symbols.values())
         for fn in self.newly_compiled:
             entry.append(fn.mir)
+        entry.extend(extra)
         return mir.collect_symbols(entry)
 
     def compile(self, symbol_table: SymbolTable, backend: Backend):
@@ -572,7 +574,10 @@ class CompileBatch:
                 thunk = _make_thunk(instance.mir)
                 thunks[instance.mir] = thunk
 
-        mir_symbols = self.collect_symbols()
+        # a Python-entry thunk is a function of the module like any other
+        # (the host calls it through the symbol table), so it is collected
+        # and lowered with the freshly typed functions
+        mir_symbols = self.collect_symbols(thunks.values())
 
         for instance in self.newly_compiled:
             # fold the trivial store/load slots of the freshly typed body

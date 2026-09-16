@@ -361,12 +361,13 @@ class Module(NameContext):
         self._symbols: StrBiMap[GlobalValue | StructType] = StrBiMap()
 
     def add_recursively(self, types: list[Type] | None = None, values: list[Value] | None = None):
-        todo_values: list[Value] = []
-        todo_types: list[Type] = []
-        if types is not None:
-            todo_types.extend(types)
-        if values is not None:
-            todo_values.extend(values)
+        """Register the symbols a module must declare: every named value
+        reachable from ``values`` (their types included) and every struct
+        type reachable from ``types`` - a struct type a body only uses
+        internally (the slot of a struct-valued local) is not part of any
+        signature, so it has to be registered on its own."""
+        todo_values: list[Value] = [] if values is None else list(values)
+        todo_types: list[Type] = [] if types is None else list(types)
 
         while len(todo_values) > 0:
             value = todo_values.pop()
@@ -379,13 +380,15 @@ class Module(NameContext):
             todo_values.extend(value.get_children())
             todo_types.append(value.get_type())
 
-            while len(todo_types) > 0:
-                type = todo_types.pop()
-                if isinstance(type, StructType):
-                    if type in self._pending_symbols:
-                        continue
-                    self._pending_symbols.add(type)
-                todo_types.extend(type.get_children())
+        # a type's children are types again, so one drain of the type
+        # frontier reaches every struct the module has to declare
+        while len(todo_types) > 0:
+            type = todo_types.pop()
+            if isinstance(type, StructType):
+                if type in self._pending_symbols:
+                    continue
+                self._pending_symbols.add(type)
+            todo_types.extend(type.get_children())
 
     def finish(self):
         for sym in self._pending_symbols:
@@ -412,8 +415,16 @@ class Module(NameContext):
 
     def write(self) -> list[str]:
         ret: list[str] = []
-        for sym in self._symbols.values():
-            ret.extend(sym.write_definition(self))
+        symbols = list(self._symbols.values())
+        # the struct type definitions come first: a function body allocates
+        # and accesses structs of its own, and LLVM needs a named type to
+        # be complete (sized) before it is used
+        for sym in symbols:
+            if isinstance(sym, StructType):
+                ret.extend(sym.write_definition(self))
+        for sym in symbols:
+            if not isinstance(sym, StructType):
+                ret.extend(sym.write_definition(self))
         return ret
 
 class GlobalValue(Value):

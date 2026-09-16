@@ -61,6 +61,7 @@ type information of its own.
 
 import operator
 import types as pytypes
+from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import Any
@@ -142,45 +143,82 @@ class ComptimeBox(InterpVal):
 class _MirInsertionBlock:
     """A list of MIR instructions to be spliced into the flat body at
     ``pos`` once the whole body has been generated (see
-    ``HirRunner._splice_insertions``).  ``pos`` is an index into the body
+    ``_splice_insertions``).  ``pos`` is an index into the body
     the interpreter emitted before splicing."""
 
     insts: list[mir.Inst]
     pos: int
 
+class _PendingActionData:
+    """One action recorded by a :class:`PendingSlot`: how it is delivered
+    once the slot has an address is decided by the runner (see
+    ``HirRunner._exec_pending_action``), the slot itself only asks for the
+    type it contributes and whether it is compile-time."""
+
+    @abstractmethod
+    def info(self) -> tuple[sval.Type, bool]:
+        """Returns (type, is_comptime)"""
+        ...
 
 @dataclass
-class _PendingRetlocCall:
+class _PendingAction:
+    """A pending action together with the MIR insertion block it is
+    delivered into: the block sits at the position the action was recorded
+    at, so it is spliced into the body after it has been filled."""
+
+    insertion: _MirInsertionBlock
+    data: _PendingActionData
+
+@dataclass
+class _PendingRetlocCall(_PendingActionData):
     """An RLS native call recorded by a :class:`PendingSlot` before the
     slot is materialized: the callee and the already emitted arguments.
     The hidden result pointer is only known (and appended) once the slot
     has an address."""
 
+    type: sval.Type
     callee: mir.Value
     prev_args: tuple[mir.Value, ...]
 
+    def info(self) -> tuple[sval.Type, bool]:
+        return self.type, False
 
 @dataclass
-class _PendingStore:
+class _PendingStore(_PendingActionData):
     """One store point recorded by a :class:`PendingSlot`: the spy type of
-    the stored value, whether it is compile-time, and how to deliver it
-    once the slot's final type is known.  Exactly one of ``value`` (a
-    plain store) and ``call`` (an RLS call writing into the slot) is set."""
+    the stored value and whether it is compile-time.  The store itself is
+    delivered once the slot's final type is known (the stored value is
+    coerced to it then)."""
 
     type: sval.Type
     is_comptime: bool
-    insertion: _MirInsertionBlock
-    value: InterpVal | None = None
-    call: _PendingRetlocCall | None = None
+    value: InterpVal
 
+    def info(self) -> tuple[sval.Type, bool]:
+        return self.type, self.is_comptime
+
+@dataclass
+class _PendingDefaultCtor(_PendingActionData):
+    """A struct construction (the default constructor of a struct without
+    an ``__init__``) recorded by a :class:`PendingSlot`: the field values
+    are written to the fields of the constructed value once the slot has
+    an address (``None`` for a zero-sized field, which is never written)."""
+
+    type: sval.Type
+    fields: tuple[InterpVal | None, ...]
+
+    def info(self) -> tuple[sval.Type, bool]:
+        # TODO: a struct has no compile-time representation yet, so all
+        # structs are currently allocated in memory
+        return self.type, False
 
 @dataclass
 class PendingSlot(InterpVal):
     """The value of an executed ``hir.Alloca`` before it is *committed*.
     In this phase a store (or an RLS call) into the slot only records a
-    :class:`_PendingStore`; the slot acquires its final type (the pairwise
-    ``resolve_peer_type`` of the store types) and its storage when
-    ``hir.CommitSlot`` runs, which materializes it into a
+    :class:`_PendingAction`; the slot acquires its final type (the
+    pairwise ``resolve_peer_type`` of the action types) and its storage
+    when ``hir.CommitSlot`` runs, which materializes it into a
     :class:`RuntimeVal` (a pointer to real memory) or a
     :class:`ComptimeBox` (see ``HirRunner._commit_pending_slot``).
 
@@ -190,8 +228,28 @@ class PendingSlot(InterpVal):
 
     mir_alloca_pos: int
     allow_inline: bool
-    stores: list[_PendingStore] = field(default_factory=list)
+    stores: list[_PendingAction] = field(default_factory=list)
     committed: InterpVal | None = None
+
+    def committed_type(self) -> sval.Type:
+        type: sval.Type | None = None
+        for store in self.stores:
+            slot_type, _ = store.data.info()
+            if type is None:
+                type = slot_type
+            else:
+                peer = type.resolve_peer_type(slot_type)
+                if peer is None:
+                    raise CompileError(
+                        f"a slot is stored with incompatible types {type} and {slot_type}"
+                    )
+                type = peer
+        if type is None:
+            type = sval.EmptyType()
+        return type
+
+    def is_comptime(self) -> bool:
+        return self.allow_inline and all(store.data.info()[1] for store in self.stores)
 
 
 @dataclass
@@ -213,10 +271,6 @@ def _is_comptime_val(val: InterpVal) -> bool:
                 if val.committed is None:
                     return False
                 todo.append(val.committed)
-            case ComptimeBox():
-                return True
-            case ComptimeVal():
-                return True
             case ComptimeTuple():
                 todo.extend(val.value_ptrs)
             case ComptimeDict():
@@ -342,6 +396,18 @@ def _arg_type_of(arg: ArgEntry[InterpVal]):
         return type.elem
     return type
 
+def _no_runtime_type(type: sval.Type) -> CompileError:
+    """The error for a runtime location whose type has no representation
+    of its own.  A compile-time-only type (the type of an untyped integer
+    literal) is called out by name: the location has to declare its type,
+    since such a literal is only ever resolvable at compile time."""
+    if sval.is_comptime_only_type(type):
+        return CompileError(
+            f'{type} is the type of an untyped literal: a runtime location '
+            f'cannot hold it and must declare its type'
+        )
+    return CompileError(f'cannot give a value of type {type} a runtime representation')
+
 # ---------------------------------------------------------------------------
 # compile-time operators: pure functions over the spy values of the
 # operands (used when every operand of an operation is a compile-time value)
@@ -360,6 +426,54 @@ def _comptime_py_op(op: str, lhs: Any, rhs: Any) -> Any:
             f"cannot apply '{op}' to {lhs!r} and {rhs!r} at compile time: {e}"
         ) from e
 
+def _convert_inst(
+    value: mir.Value, from_type: sval.Type, to_type: sval.Type
+) -> mir.Inst | None:
+    """Build (but do not emit) the conversion of ``value`` from
+    ``from_type`` to ``to_type``; returns ``value`` itself when no
+    conversion is needed."""
+    if from_type == to_type:
+        return None
+    mir_to_type = to_type.to_mir_type()
+    assert mir_to_type is not None and not isinstance(mir_to_type, mir.VoidType)
+    if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.IntType):
+        if from_type.bits < to_type.bits:
+            kind = 'sext' if from_type.signed else 'zext'
+        else:
+            kind = 'trunc'
+        return mir.Convert(kind, value, mir_to_type)
+    if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.FloatType):
+        kind = 'sitofp' if from_type.signed else 'uitofp'
+        return mir.Convert(kind, value, mir_to_type)
+    if isinstance(from_type, sval.FloatType) and isinstance(to_type, sval.FloatType):
+        kind = 'fpext' if from_type.bits < to_type.bits else 'fptrunc'
+        return mir.Convert(kind, value, mir_to_type)
+    if isinstance(from_type, sval.PointerType) and isinstance(to_type, sval.PointerType):
+        if from_type.is_const and not to_type.is_const:
+            raise CompileError(
+                f"cannot convert a {from_type} value to {to_type}"
+            )
+        return None
+    raise CompileError(
+        f"cannot convert a {from_type} value to {to_type}"
+    )
+
+def _splice_insertions(
+    insts: list[mir.Inst], blocks: list[_MirInsertionBlock]
+) -> list[mir.Inst]:
+    """Build the final body by inserting every recorded block at its
+    position (blocks are spliced in position order, so the positions
+    - indices into the pre-splice body - stay valid)."""
+    if not blocks:
+        return insts
+    result: list[mir.Inst] = []
+    last = 0
+    for block in sorted(blocks, key=lambda b: b.pos):
+        result.extend(insts[last:block.pos])
+        result.extend(block.insts)
+        last = block.pos
+    result.extend(insts[last:])
+    return result
 
 # ---------------------------------------------------------------------------
 # the compile-time host interface
@@ -407,6 +521,7 @@ class HirRunner:
         # ``_bind_result_ptr``)
         self._fn_instance = fn_instance
         self._mir_insertion_blocks: list[_MirInsertionBlock] = []
+        self._mir_block_stack: list[list[mir.Inst]] = [fn_instance.mir.insts]
         # the ``hir.Ret`` positions of the function proper whose return
         # convention is not fixed yet (an unannotated return type); their
         # ``mir.Ret`` is filled in by ``_finish_function`` once the result
@@ -446,8 +561,10 @@ class HirRunner:
             case SpecializedComptimeArg():
                 return ComptimeVal(sval.ConstRef(node.value))
             case SpecializedRuntimeArg():
-                type = node.type.to_mir_type()
-                assert type is not None and not isinstance(type, mir.VoidType), f"void type has no runtime representation: {node.type}"
+                mir_type = node.type.to_mir_type()
+                if mir_type is None or isinstance(mir_type, mir.VoidType):
+                    raise _no_runtime_type(node.type)
+                type = mir_type
                 index = len(mir_args)
                 if node.is_ref:
                     type = mir.PointerType(type, True)
@@ -461,6 +578,12 @@ class HirRunner:
                     return ret
             case _:
                 raise CompileError(f'unsupported specialized argument {node!r}')
+
+    def push_insts(self, insts: list[mir.Inst]) -> None:
+        self._mir_block_stack.append(insts)
+
+    def pop_insts(self) -> list[mir.Inst]:
+        return self._mir_block_stack.pop()
 
     def _init_args_from_signature(
         self,
@@ -519,7 +642,7 @@ class HirRunner:
         else:
             mir_ret = type.to_mir_type()
             if mir_ret is None:
-                raise CompileError(f'type {type} has no runtime representation')
+                raise _no_runtime_type(type)
             mir_fn.ret_type = mir_ret
             self.return_sig = ReturnSignature(False, type)
             self._commit_pending_slot(location, type)
@@ -874,15 +997,13 @@ class HirRunner:
             value_type = _type_of(value)
             if value_type is None:
                 raise CompileError('cannot store a value that has no spy type')
-            insertion = _MirInsertionBlock([], len(self._fn_instance.mir.insts))
-            self._mir_insertion_blocks.append(insertion)
-            ptr.stores.append(
+            self._record_pending_action(
+                ptr,
                 _PendingStore(
                     type=value_type,
                     is_comptime=isinstance(value, ComptimeVal),
-                    insertion=insertion,
                     value=value,
-                )
+                ),
             )
             return
 
@@ -890,7 +1011,10 @@ class HirRunner:
         match ptr:
             case ComptimeBox():
                 # a compile-time writable pointer: the store is evaluated
-                # on the spot
+                # on the spot.  The box keeps the stored value itself (a
+                # consumer materializes it at the type it needs, see
+                # ``_coerce``), so a value with no runtime type of its own
+                # (an untyped literal) stays usable
                 ptr.value = value
                 return
         ptr_type = _type_of(ptr)
@@ -939,7 +1063,9 @@ class HirRunner:
         return self.field_index_addr(ptr, index)
 
     def field_index_addr(self, ptr: InterpVal, index: int) -> InterpVal:
-        type = _type_of(_shallow_normalize(ptr))
+        """Note: no auto deref, unlike ``exec_field_name_addr``"""
+        ptr = _shallow_normalize(ptr)
+        type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f"cannot take field address of {ptr}")
         container_type = type.elem
@@ -967,19 +1093,19 @@ class HirRunner:
         of a specialization into one list, delimited by the
         ``If``/``Else``/``End`` markers (there are no separate
         regions)."""
-        fn = self._fn_instance.mir
-        assert fn is not None
+        assert self._mir_block_stack
+        top = self._mir_block_stack[-1]
         if at is not None:
-            fn.insts[at] = inst
+            top[at] = inst
         else:
-            fn.insts.append(inst)
+            top.append(inst)
         return inst
 
     def _reserve(self) -> int:
-        fn = self._fn_instance.mir
-        assert fn is not None
-        ret = len(fn.insts)
-        fn.insts.append(mir.Nop())
+        assert self._mir_block_stack
+        top = self._mir_block_stack[-1]
+        ret = len(top)
+        top.append(mir.Nop())
         return ret
 
     def alloca(self, allow_comptime: bool = False):
@@ -1002,50 +1128,19 @@ class HirRunner:
     def _convert(
         self, value: mir.Value, from_type: sval.Type, to_type: sval.Type
     ) -> mir.Value:
-        converted = self._convert_inst(value, from_type, to_type)
+        converted = _convert_inst(value, from_type, to_type)
         if converted is None:
             return value
         return self._emit(converted)
 
-    def _convert_inst(
-        self, value: mir.Value, from_type: sval.Type, to_type: sval.Type
-    ) -> mir.Inst | None:
-        """Build (but do not emit) the conversion of ``value`` from
-        ``from_type`` to ``to_type``; returns ``value`` itself when no
-        conversion is needed."""
-        if from_type == to_type:
-            return None
-        mir_to_type = to_type.to_mir_type()
-        assert mir_to_type is not None and not isinstance(mir_to_type, mir.VoidType)
-        if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.IntType):
-            if from_type.bits < to_type.bits:
-                kind = 'sext' if from_type.signed else 'zext'
-            else:
-                kind = 'trunc'
-            return mir.Convert(kind, value, mir_to_type)
-        if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.FloatType):
-            kind = 'sitofp' if from_type.signed else 'uitofp'
-            return mir.Convert(kind, value, mir_to_type)
-        if isinstance(from_type, sval.FloatType) and isinstance(to_type, sval.FloatType):
-            kind = 'fpext' if from_type.bits < to_type.bits else 'fptrunc'
-            return mir.Convert(kind, value, mir_to_type)
-        if isinstance(from_type, sval.PointerType) and isinstance(to_type, sval.PointerType):
-            if from_type.is_const and not to_type.is_const:
-                raise CompileError(
-                    f"cannot convert a {from_type} value to {to_type}"
-                )
-            return None
-        raise CompileError(
-            f"cannot convert a {from_type} value to {to_type}"
-        )
-
     # -- operators ------------------------------------------------------------
 
     def _eval_binary(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
-        if isinstance(lhs, ComptimeVal) and isinstance(rhs, ComptimeVal):
-            lv = self._arg_value(lhs)
-            rv = self._arg_value(rhs)
-            assert isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal)
+        lv = self._arg_value(lhs)
+        rv = self._arg_value(rhs)
+        if isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal):
+            # every operand is compile-time: the operation is evaluated
+            # eagerly, whatever the runtime types of the operands are
             self.store(ret, ComptimeVal(_comptime_py_op(op, lv.obj, rv.obj)))
             return PollResult.AGAIN
 
@@ -1055,8 +1150,6 @@ class HirRunner:
         if lhs_type is None or rhs_type is None:
             raise CompileError(f"cannot apply '{op}' to untyped objects")
         if sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type):
-            lv = self._arg_value(lhs)
-            rv = self._arg_value(rhs)
             type = lhs_type.resolve_peer_type(rhs_type)
             if type is None:
                 raise CompileError(f"cannot apply '{op}' to {lhs_type} and {rhs_type}")
@@ -1249,56 +1342,38 @@ class HirRunner:
             return PollResult.AGAIN
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 
-    def _concretize(self, type: sval.Type) -> sval.Type:
-        """Resolve a type that has no runtime representation of its own
-        (an untyped integer literal) to a concrete default type."""
-        if isinstance(type, sval.AnyIntType):
-            return sval.IntType(sval.INT_DEFAULT_BITS, True)
-        return type
-
-    def _committed_type(self, slot: PendingSlot) -> sval.Type:
-        """The final content type of a pending slot: the pairwise
-        ``resolve_peer_type`` of its store-point types."""
-        type: sval.Type | None = None
-        for store in slot.stores:
-            if type is None:
-                type = store.type
-            else:
-                peer = type.resolve_peer_type(store.type)
-                if peer is None:
-                    raise CompileError(
-                        f"a slot is stored with incompatible types {type} and {store.type}"
-                    )
-                type = peer
-        if type is None:
-            return sval.VoidType()
-        return self._concretize(type)
+    def _record_pending_action(self, slot: PendingSlot, data: _PendingActionData) -> None:
+        """Record one action on a still uncommitted slot, reserving the
+        insertion block that will hold the instructions delivering it."""
+        insertion = _MirInsertionBlock([], len(self._fn_instance.mir.insts))
+        self._mir_insertion_blocks.append(insertion)
+        slot.stores.append(_PendingAction(insertion, data))
 
     def _commit_pending_slot(
         self, val: InterpVal, type: sval.Type | None = None, ptr: mir.Value | None = None
     ) -> None:
         """Materialize a pending slot: it becomes a :class:`ComptimeBox`
-        when it may inline values and every store point is compile-time,
-        and a :class:`RuntimeVal` pointer otherwise.  The type is the
-        pairwise ``resolve_peer_type`` of the store-point types (or the
-        given one).  The recorded store points are delivered through
-        ``_deliver_store``, which fills in the instructions that must be
-        spliced at their original positions."""
+        when it may inline values and every action is compile-time, and a
+        :class:`RuntimeVal` pointer otherwise.  The type is the pairwise
+        ``resolve_peer_type`` of the action types (or the given one).  The
+        recorded actions are delivered through ``_exec_pending_actions``,
+        which fills in the instructions that must be spliced at their
+        original positions."""
         if not isinstance(val, PendingSlot):
             raise CompileError('can only commit a pending slot')
         if val.committed is not None:
             return
         if type is None:
-            type = self._committed_type(val)
+            type = val.committed_type()
+
         if ptr is not None:
             self._bind_slot(val, ptr, type)
             return
-        if val.allow_inline and len(val.stores) > 0 and all(s.is_comptime for s in val.stores):
+
+        if len(val.stores) > 0 and val.is_comptime():
             box = ComptimeBox(type)
-            for store in val.stores:
-                if isinstance(store.value, ComptimeVal):
-                    box.value = ComptimeVal(sval.coerce_const(store.value.obj, type))
             val.committed = box
+            self._exec_pending_actions(val, type)
             return
         unit = type.get_unit_value()
         if unit is not None:
@@ -1306,37 +1381,43 @@ class HirRunner:
             return
         mir_type = type.to_mir_type()
         if mir_type is None or isinstance(mir_type, mir.VoidType):
-            raise CompileError(f'cannot give a value of type {type} a runtime representation')
+            raise _no_runtime_type(type)
         alloca = self._emit(mir.Alloca(mir_type), val.mir_alloca_pos)
         self._bind_slot(val, alloca, type)
 
     def _bind_slot(self, slot: PendingSlot, ptr: mir.Value, type: sval.Type) -> None:
         slot.committed = RuntimeVal(ptr, sval.PointerType(type, is_const=False))
-        for store in slot.stores:
-            self._deliver_store(store, ptr, type)
+        self._exec_pending_actions(slot, type)
 
-    def _deliver_store(self, store: _PendingStore, ptr: mir.Value, type: sval.Type) -> None:
-        if store.call is not None:
-            call = store.call
-            result_ptr = self._convert_result_ptr(ptr, type, store.type)
-            store.insertion.insts.append(
-                mir.Call(call.callee, (*call.prev_args, result_ptr), mir.VOID)
-            )
-            return
-        value = store.value
-        assert value is not None
-        if store.is_comptime:
-            assert isinstance(value, ComptimeVal)
-            coerced = sval.coerce_const(value.obj, type)
-            store.insertion.insts.append(mir.Store(ptr, _sval_to_runtime(coerced)))
-        else:
-            assert isinstance(value, RuntimeVal)
-            converted = self._convert_inst(value.value, value.type, type)
-            if converted is not None:
-                store.insertion.insts.append(converted)
-            else:
-                converted = value.value
-            store.insertion.insts.append(mir.Store(ptr, converted))
+    def _exec_pending_actions(self, slot: PendingSlot, type: sval.Type) -> None:
+        """Deliver every action a committed slot recorded: an action emits
+        the instructions that write its value into the slot, and they land
+        in the insertion block that sits at the position the action was
+        recorded at."""
+        assert slot.committed is not None
+        for action in slot.stores:
+            self.push_insts(action.insertion.insts)
+            self._exec_pending_action(action.data, slot.committed, type)
+            self.pop_insts()
+
+    def _exec_pending_action(self, action: _PendingActionData, ptr: InterpVal, type: sval.Type) -> None:
+        match action:
+            case _PendingStore():
+                self.store(ptr, action.value)
+            case _PendingDefaultCtor():
+                for i, field_value in enumerate(action.fields):
+                    if field_value is None:
+                        # a zero-sized field occupies no storage and takes no value
+                        continue
+                    self.store(self.field_index_addr(ptr, i), field_value)
+            case _PendingRetlocCall():
+                assert isinstance(ptr, RuntimeVal)
+                result_ptr = self._convert_result_ptr(ptr.value, type, action.type)
+                # the hidden result pointer is the last formal of the lowered
+                # signature (it is appended after every declared argument)
+                self._emit(mir.Call(action.callee, action.prev_args + (result_ptr,), mir.VOID))
+            case _:
+                raise CompileError(f'unsupported pending action {action}')
 
     def _convert_result_ptr(self, ptr: mir.Value, from_type: sval.Type, to_type: sval.Type) -> mir.Value:
         """The pointer a result-location call writes through, converted to
@@ -1346,21 +1427,35 @@ class HirRunner:
         return ptr
 
     def call_constructor(self, struct: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+        """Construct a struct whose fields the default constructor binds
+        from ``args`` (a struct with an ``__init__`` runs it instead): the
+        field values are written to the fields of the constructed value.
+        A result location that is not committed yet only records the
+        construction (see :class:`_PendingDefaultCtor`), like a store."""
         if '__init__' in struct.methods:
             init = self._analyser._resolver.resolve_global(struct.methods['__init__'])
             if init is not None and isinstance(init, FunctionValue):
                 return self._call_function_entry(init, args, ret)
 
-        # TODO: record pending slot!!!
-        assert not isinstance(ret, PendingSlot) or ret.committed is not None
-        for i, field_arg in enumerate(struct.bind_default_ctor_args(args)):
+        fields: list[InterpVal | None] = []
+        for field_arg in struct.bind_default_ctor_args(args):
             if field_arg is None:
                 # a zero-sized field occupies no storage and takes no value
+                fields.append(None)
                 continue
             arg = field_arg.value
             if field_arg.is_ref:
                 arg = self.load(arg)
-            self.store(self.field_index_addr(ret, i), arg)
+            fields.append(arg)
+
+        if isinstance(ret, PendingSlot) and ret.committed is None:
+            self._record_pending_action(ret, _PendingDefaultCtor(type=struct, fields=tuple(fields)))
+            return PollResult.AGAIN
+
+        for i, field_value in enumerate(fields):
+            if field_value is None:
+                continue
+            self.store(self.field_index_addr(ret, i), field_value)
         return PollResult.AGAIN
 
     def _resolve_method(self, type: sval.Type, method_name: str):
@@ -1484,15 +1579,13 @@ class HirRunner:
             if isinstance(ret, PendingSlot) and ret.committed is None:
                 # the result pointer of the slot is not known yet: record the
                 # call and let the slot's commit supply it
-                insertion = _MirInsertionBlock([], len(self._fn_instance.mir.insts))
-                self._mir_insertion_blocks.append(insertion)
-                ret.stores.append(
-                    _PendingStore(
+                self._record_pending_action(
+                    ret,
+                    _PendingRetlocCall(
                         type=ret_sig.ret_type,
-                        is_comptime=False,
-                        insertion=insertion,
-                        call=_PendingRetlocCall(callee, tuple(mir_args)),
-                    )
+                        callee=callee,
+                        prev_args=tuple(mir_args),
+                    ),
                 )
             else:
                 ptr = _to_runtime(_shallow_normalize(ret))
@@ -1553,7 +1646,7 @@ class HirRunner:
         insertion blocks into the body."""
         self._finish_function()
         mir_fn = self._fn_instance.mir
-        mir_fn.insts = self._splice_insertions(mir_fn.insts, self._mir_insertion_blocks)
+        mir_fn.insts = _splice_insertions(mir_fn.insts, self._mir_insertion_blocks)
 
     def _finish_function(self) -> None:
         """Fix the return convention of a function without a declared
@@ -1566,8 +1659,7 @@ class HirRunner:
                 self._fn_instance.mir.ret_type = mir.VOID
                 self.return_sig = ReturnSignature(False, sval.VoidType())
             else:
-                type = self._committed_type(location)
-                self._materialize_result_ptr(type, None)
+                self._materialize_result_ptr(location.committed_type(), None)
         ret_sig = self.return_sig
         assert ret_sig is not None
         location = self._current_result_loc()
@@ -1586,23 +1678,6 @@ class HirRunner:
                     block.insts.append(mir.Ret(_to_runtime(committed.value)))
                 else:
                     raise CompileError('cannot deliver the return value')
-
-    def _splice_insertions(
-        self, insts: list[mir.Inst], blocks: list[_MirInsertionBlock]
-    ) -> list[mir.Inst]:
-        """Build the final body by inserting every recorded block at its
-        position (blocks are spliced in position order, so the positions
-        - indices into the pre-splice body - stay valid)."""
-        if not blocks:
-            return insts
-        result: list[mir.Inst] = []
-        last = 0
-        for block in sorted(blocks, key=lambda b: b.pos):
-            result.extend(insts[last:block.pos])
-            result.extend(block.insts)
-            last = block.pos
-        result.extend(insts[last:])
-        return result
 
 class Analyser:
     def __init__(self, resolver: FunctionResolver) -> None:

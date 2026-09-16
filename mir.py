@@ -315,7 +315,7 @@ class Gep(Inst):
     def __init__(self, ptr: Value, index: int) -> None:
         self.ptr = ptr
         self.index = index
-        ptype = ptr.type  # type: ignore[attr-defined]
+        ptype = ptr.get_type()
         if not isinstance(ptype, PointerType) or not isinstance(ptype.elem, StructType):
             raise CompileError(
                 f'cannot take a field of a {ptype} value '
