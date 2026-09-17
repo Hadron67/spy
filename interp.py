@@ -1075,7 +1075,7 @@ class HirRunner:
         if not isinstance(container_type, sval.StructType):
             raise CompileError(f"cannot take field address of {ptr}")
 
-        field_type = container_type.fields[index].type
+        field_type = container_type.fields().get_by_id(index).type
         field_ptr_type = sval.PointerType(field_type, type.is_const)
         if field_type.is_zst():
             # a zero-sized field occupies no storage and has no address
@@ -1331,6 +1331,12 @@ class HirRunner:
             if isinstance(target, sval.StructType):
                 # a constructor ``Bar(...)``
                 return self.call_constructor(target, args, ret)
+            if isinstance(target, sval.StructTypeHead):
+                # the name of a generic struct stands for its template: a
+                # construction of it needs a specialization (not supported yet)
+                raise CompileError(
+                    f'{target} is a generic struct: constructing it is not supported yet'
+                )
         raise CompileError(
             f"cannot compile a call to {callee!r}; only spy functions, plain Python "
             "functions and the spy builtins can be called"
@@ -1453,15 +1459,14 @@ class HirRunner:
         return ptr
 
     def call_constructor(self, struct: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
-        """Construct a struct whose fields the default constructor binds
-        from ``args`` (a struct with an ``__init__`` runs it instead): the
-        field values are written to the fields of the constructed value.
-        A result location that is not committed yet only records the
-        construction (see :class:`_PendingDefaultCtor`), like a store."""
-        if '__init__' in struct.methods:
-            init = self._analyser._resolver.resolve_global(struct.methods['__init__'])
-            if init is not None and isinstance(init, FunctionValue):
-                return self._call_function_entry(init, args, ret)
+        """Construct a struct: the ``__init__`` of the struct runs if it has
+        one, and otherwise the fields are bound from ``args`` by the default
+        constructor (see :class:`PendingSlot`/:class:`_PendingDefaultCtor`)."""
+        init = struct.methods.get('__init__')
+        if init is not None:
+            init_fn = self._analyser._resolver.resolve_global(init)
+            if isinstance(init_fn, FunctionValue):
+                return self._call_init(init_fn, struct, args, ret)
 
         fields: list[InterpVal | None] = []
         for field_arg in struct.bind_default_ctor_args(args):
@@ -1484,12 +1489,40 @@ class HirRunner:
             self.store(self.field_index_addr(ret, i), field_value)
         return PollResult.AGAIN
 
+    def _call_init(
+        self,
+        init: FunctionValue,
+        struct: sval.StructType,
+        args: RawArgList[ArgEntry[InterpVal]],
+        ret: InterpVal,
+    ) -> PollResult:
+        """Run the ``__init__`` of a construction: the object is built in the
+        result location - which is materialized first, its type being the
+        struct - and ``self`` is the address of that location, so the body
+        fills it in place.  The (void) result of ``__init__`` goes to a
+        location of its own and is discarded, like Python's."""
+        if isinstance(ret, PendingSlot) and ret.committed is None:
+            self._commit_pending_slot(ret, struct)
+        obj = _shallow_normalize(ret)
+        if not isinstance(obj, RuntimeVal):
+            raise CompileError(f'cannot construct a {struct} in this location')
+        result = self.alloca(True)
+        # ``__init__`` returns nothing: its result is a void slot of its own
+        self._commit_pending_slot(result, sval.VoidType())
+        self_arg: ArgEntry[InterpVal] = ArgEntry(obj, True)
+        return self.call(
+            ComptimeVal(sval.ConstRef(init)),
+            RawArgList((self_arg,) + args.positional, args.kwargs),
+            result,
+        )
+
     def _resolve_method(self, type: sval.Type, method_name: str):
         match type:
             case sval.StructType():
-                if method_name in type.methods:
-                    return self._analyser._resolver.resolve_global(type.methods[method_name])
-                return None
+                method = type.methods.get(method_name)
+                if method is None:
+                    return None
+                return self._analyser._resolver.resolve_global(method)
             case _:
                 return None
 
@@ -1509,8 +1542,8 @@ class HirRunner:
         # already the pointer value the parameter expects
         self_is_ref = True
         if isinstance(method, FunctionValue):
-            first = method.hir.signature.positional.by_id[0].type
-            self_is_ref = not isinstance(first, sval.PointerType)
+            first = method.hir.signature.positional.by_id[0]
+            self_is_ref = first.by_ref or not isinstance(first.type, sval.PointerType)
 
         return self.call(
             ComptimeVal(sval.ConstRef(method)),

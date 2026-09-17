@@ -23,9 +23,9 @@ import ctypes
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, override
+from typing import Any, Literal, override
 
-from spy.util import frozendict
+from spy.util import IdentityObj, IndexedMap, frozendict
 
 from . import mir
 from .errors import CompileError, SpyError
@@ -47,7 +47,6 @@ class Value:
         ...
 
 AnyValue = Value | int | float | str | bool
-
 
 class AsValue(Value):
     """A Python value bound to an explicit spy type (``spy.as_(x, T)``).
@@ -102,6 +101,21 @@ class Type(Value):
 
     def is_zst(self) -> bool:
         return isinstance(self.to_mir_type(), mir.VoidType)
+
+    def is_copyable(self) -> bool:
+        return True
+
+    def get_type_children(self) -> tuple[Type, ...]:
+        return ()
+
+    def contains(self, needle: Type):
+        todo: list[Type] = [self]
+        while todo:
+            current = todo.pop()
+            if current is needle:
+                return True
+            todo.extend(reversed(current.get_type_children()))
+        return False
 
 @dataclass(frozen=True)
 class TypeType(Type):
@@ -514,31 +528,96 @@ class AggregateValue(Value):
 @dataclass(frozen=True)
 class StructModifiers:
     extern_c: bool = False
+    copyable: bool | Literal["inherit"] = "inherit"
+
+class StructTypeHead(Type, IdentityObj):
+    """The declaration of a spy struct: its name, its declared generic type
+    parameters, its modifiers, its fields (in declaration order) and its
+    methods, by name.  A struct *type* - what annotations and values name -
+    is a specialization of a head (:class:`StructType`), so a non-generic
+    struct has exactly one, and the head itself is only ever an annotation
+    of a generic struct (a template is not a type of any value yet).
+    """
+
+    def __init__(self, name_base: str, generic_args: tuple[TypeVar, ...] = (), modifiers: StructModifiers | None = None) -> None:
+        self.name_base = name_base
+        self.generic_args = generic_args
+        self.modifiers = modifiers or StructModifiers()
+        self.fields: IndexedMap[str, StructField] = IndexedMap()
+        self.methods: dict[str, Any] = {}
+        self._specs: dict[tuple[Value, ...], StructType] = {}
+
+    def add_field(self, name: str, type: Type) -> None:
+        """Declare one field, appended after the fields declared so far."""
+        assert name not in self.fields.by_key, f'{self.name_base} already has a field {name!r}'
+        self.fields.add(name, StructField(name, type))
+
+    def specialize(self, generic_args: tuple[Value, ...]) -> StructType:
+        """The struct type this head declares for ``generic_args``: the one
+        specialization of the head for those arguments (created lazily, so
+        that every reference to the same struct type names one object)."""
+        if generic_args in self._specs:
+            return self._specs[generic_args]
+        ret = StructType(self, generic_args)
+        self._specs[generic_args] = ret
+        return ret
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        raise CompileError(
+            f'{self} is a struct template: a struct type is a specialization '
+            'of it, and only one has a MIR mirror'
+        )
+
+    def __repr__(self) -> str:
+        return f'<spy struct {self}>'
+
+    def __str__(self) -> str:
+        if len(self.generic_args) == 0:
+            return self.name_base
+        return f'{self.name_base}[{", ".join(str(a) for a in self.generic_args)}]'
 
 class StructType(Type):
-    """A spy struct type: the object ``@cache.struct()`` binds to the class
-    name.  It doubles as the Python-side constructor of struct *values*:
-    calling ``Foo(a, b)`` creates a native struct instance whose memory
-    follows the LLVM layout (see ``_py_cls``).
+    """A spy struct *type*: one specialization of a :class:`StructTypeHead`,
+    which is what a value, an annotation or ``spy.typeof(x) == Foo`` names.
 
     The identity of the object *is* the identity of the type (two structs
     are equal only if they are the same object), which is what makes
-    ``spy.typeof(x) == Foo`` work.
+    ``spy.typeof(x) == Foo`` work; a specialization is cached on its head,
+    so naming the same struct twice names the same object.
     """
 
-    def __init__(self, name_base: str, modifiers: StructModifiers | None = None) -> None:
-        self.name_base = name_base
-        self._fields: list[StructField] = []
-        self.methods: dict[str, Any] = {}
-        self.modifiers = modifiers or StructModifiers()
+    def __init__(self, head: StructTypeHead, generic_args: tuple[Value, ...]) -> None:
+        self.head = head
+        self.generic_args = generic_args
+
+        self._fields: IndexedMap[str, StructField] | None = None
         self._mir: mir.MayBeVoidType | None = None
         # the mirror position of every field, in declaration order (see
         # ``get_field_mir_indices``), computed together with the mirror
         self._field_mir_indices: tuple[int | None, ...] | None = None
 
-    def add_field(self, name: str, type: Type) -> None:
-        assert all(f.name != name for f in self._fields)
-        self._fields.append(StructField(name, type))
+    @property
+    def name_base(self) -> str:
+        return self.head.name_base
+
+    @property
+    def modifiers(self) -> StructModifiers:
+        return self.head.modifiers
+
+    @property
+    def methods(self) -> dict[str, Any]:
+        """The methods of the struct, by name (see ``interp.call_method``)."""
+        return self.head.methods
+
+    def fields(self) -> IndexedMap[str, StructField]:
+        """The fields of this specialization, in declaration order: the
+        declared fields with the head's generic type parameters replaced by
+        this specialization's arguments.  Computed once and cached."""
+        if self._fields is None:
+            reps = {k: v for k, v in zip(self.head.generic_args, self.generic_args)}
+            self._fields = self.head.fields.map(lambda f: StructField(f.name, replace_type_vars_type(f.type, reps)))
+        return self._fields
 
     def bind_default_ctor_args[T](self, args: RawArgList[T]) -> tuple[T | None, ...]:
         """Bind the arguments of a struct construction ``Foo(...)`` to
@@ -551,11 +630,12 @@ class StructType(Type):
         ret: list[T | None] = []
         positional = args.positional
         kwargs = args.kwargs
-        field_names = {f.name for f in self._fields}
+        fields = self.fields()
+        field_names = fields.keys
         for key in kwargs:
             if key not in field_names:
                 raise TypeError(f"got an unexpected keyword argument '{key}'")
-        for i, field in enumerate(self._fields):
+        for i, field in enumerate(fields.values()):
             if i < len(positional):
                 if field.name in kwargs:
                     raise TypeError(f"got multiple values for field '{field.name}'")
@@ -568,32 +648,31 @@ class StructType(Type):
                 ret.append(None)
                 continue
             raise TypeError(f"missing a value for field '{field.name}'")
-        if len(positional) > len(self._fields):
+        if len(positional) > len(fields.by_id):
             raise TypeError(
-                f"takes {len(self._fields)} positional arguments but "
+                f"takes {len(fields.by_id)} positional arguments but "
                 f"{len(positional)} were given"
             )
         return tuple(ret)
 
-    @property
-    def fields(self) -> tuple[StructField, ...]:
-        return tuple(self._fields)
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        """Structs do not have subtypes yet: a struct type is a subtype of
+        itself and of nothing else (in particular, not of another struct)."""
+        return self is other
 
     def field_index(self, name: str) -> int | None:
         """The declaration index of the field ``name``, or None when the
         struct has no such field."""
-        for i, field in enumerate(self._fields):
-            if field.name == name:
-                return i
-        return None
+        return self.fields().by_key.get(name)
 
     def field_type(self, name: str) -> Type | None:
         """The spy type of the field ``name``."""
         index = self.field_index(name)
-        return self._fields[index].type if index is not None else None
+        return None if index is None else self.fields().get_by_id(index).type
 
     def __repr__(self) -> str:
-        return f'<spy struct {self.name_base}>'
+        return f'<spy struct {self}>'
 
     def __str__(self) -> str:
         return self.name_base
@@ -601,7 +680,7 @@ class StructType(Type):
     @override
     def get_type(self) -> Type:
         level = 0
-        for field in self._fields:
+        for field in self.fields().values():
             child = field.type.get_type()
             assert isinstance(child, TypeType)
             level = max(level, child.level)
@@ -610,12 +689,26 @@ class StructType(Type):
     @override
     def get_unit_value(self) -> AnyValue | None:
         values: list[AnyValue] = []
-        for field in self._fields:
+        for field in self.fields().values():
             val = field.type.get_unit_value()
             if val is None:
                 return None
             values.append(val)
         return AggregateValue(tuple(values), self)
+
+    @override
+    def is_copyable(self) -> bool:
+        """A struct is copyable when its ``copyable`` modifier says so;
+        ``inherit`` (the default) means its fields all are."""
+        match self.modifiers.copyable:
+            case 'inherit':
+                return all(f.type.is_copyable() for f in self.fields().values())
+            case copyable:
+                return copyable
+
+    @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        return tuple(f.type for f in self.fields().values())
 
     @override
     def to_mir_type(self) -> mir.MayBeVoidType | None:
@@ -625,10 +718,12 @@ class StructType(Type):
         if self._mir is not None:
             return
         assert self._field_mir_indices is None
+
         # the fields that occupy storage, each with the mirror of its type:
         # a zero-sized field occupies none and has no mirror position
+        fields = self.fields().values()
         mirrored: list[tuple[int, StructField, mir.Type]] = []
-        for index, field in enumerate(self._fields):
+        for index, field in enumerate(fields):
             field_mir = field.type.to_mir_type()
             assert field_mir is not None, f"field {field.name!r} has no MIR representation"
             if not isinstance(field_mir, mir.VoidType):
@@ -644,7 +739,7 @@ class StructType(Type):
         if not self.modifiers.extern_c:
             mirrored.sort(key=lambda field: estimated_alignment_of(field[1].type))
 
-        indices: list[int | None] = [None] * len(self._fields)
+        indices: list[int | None] = [None] * len(fields)
         for position, (index, _, _) in enumerate(mirrored):
             indices[index] = position
         self._field_mir_indices = tuple(indices)
@@ -757,7 +852,7 @@ def estimated_size_of(type: Type) -> int:
             return _POINTER_BYTES
         case StructType():
             offset = 0
-            for field in type.fields:
+            for field in type.fields().values():
                 # a zero-sized fields are handled correctly
                 align = estimated_alignment_of(field.type)
                 offset = (offset + align - 1) // align * align
@@ -783,7 +878,7 @@ def estimated_alignment_of(type: Type) -> int:
             return max(
                 (
                     estimated_alignment_of(f.type)
-                    for f in type.fields
+                    for f in type.fields().values()
                     if f.type.get_unit_value() is None
                 ),
                 default=1,
@@ -857,7 +952,9 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None) -
     """The spy-domain value of a Python compile-time object: Python
     scalars and ``sval.Value`` objects pass through, and ``None`` is the
     unit value of the zero-sized void type (``Void()``).  Class objects
-    of the scalar types map to their default spy types."""
+    of the scalar types map to their default spy types, and any object
+    that knows its own spy value (``as_spy_value``, the protocol of a
+    struct class, see ``dsl._RegisteredClass``) is asked for it."""
     if isinstance(value, (Value, int, float, str, bool)):
         return value
     if value is None:
@@ -876,6 +973,9 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None) -
         if type_vars is None:
             raise TypeError(f'cannot convert {value} to a value')
         return type_vars[value]
+    as_spy_value = getattr(value, 'as_spy_value', None)
+    if as_spy_value is not None:
+        return as_spy_value()
 
     raise TypeError(f'cannot convert {value} to a value')
 

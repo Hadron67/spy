@@ -489,7 +489,7 @@ class _Builder:
                 )
 
 
-def parse_function(fn: Callable, self_type: Type | None = None) -> FunctionIR:
+def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: bool = False) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
     ``mode`` is how the function will be compiled and typed when it is
@@ -497,6 +497,10 @@ def parse_function(fn: Callable, self_type: Type | None = None) -> FunctionIR:
     types solve each specialization) or ``'aot'`` (the concrete
     annotations fix its single signature).  A plain function that is
     only ever inlined is parsed in ``'jit'`` mode.
+
+    ``self_type`` is the struct a *method* belongs to: the first parameter
+    is then typed as that struct itself and passed by reference (its
+    address), unless ``self_by_value`` asks for the object's value.
     """
     try:
         source = inspect.getsource(fn)
@@ -604,10 +608,15 @@ def parse_function(fn: Callable, self_type: Type | None = None) -> FunctionIR:
         has_default = i >= offset
         default_value = default_of(defaults[i - offset]) if has_default else None
         arg_type = annotation_of(annotations.get(arg.arg))
+        by_ref = False
         if i == 0 and self_type is not None:
+            # the ``self`` of a method: the object is passed by reference
+            # (its address), which is what makes a method able to write
+            # through ``self``; ``self_by_value`` passes its value instead
             arg_type = self_type
+            by_ref = not self_by_value
         positional.add(
-            arg.arg, SignatureFormalArg(arg_type, False, False, default_value)
+            arg.arg, SignatureFormalArg(arg_type, False, by_ref, default_value)
         )
 
     # ``*args``/``**kwargs`` are rejected above (a spy function definition

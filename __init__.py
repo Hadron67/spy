@@ -23,7 +23,7 @@ from types import NoneType
 from typing import TYPE_CHECKING
 
 from . import builtins as _builtins
-from .dsl import func
+from .dsl import func, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
 
@@ -77,6 +77,7 @@ __all__ = [
     'i16',
     'i32',
     'i64',
+    'struct',
     'typeof',
     'u8',
     'u16',
