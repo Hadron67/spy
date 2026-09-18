@@ -483,6 +483,95 @@ class Break(Inst):
     level: int
 
 @dataclass(eq=False)
+class Insertion(Inst):
+    insts: list[Inst]
+    value: Value | None
+    type: MayBeVoidType = VOID
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.value.get_type() if self.value is not None else self.type
+
+
+def normalize(block: list[Inst]) -> list[Inst]:
+    """Eliminate :class:`Insertion` nodes from the block by flattening them and substituting their values."""
+    # every insertion that stands for a value, by identity; an insertion
+    # nested in another one's instructions counts too
+    subst: dict[Insertion, Value] = {}
+    todo: list[list[Inst]] = [block]
+    while todo:
+        insts = todo.pop()
+        for inst in insts:
+            if isinstance(inst, Insertion):
+                if inst.value is not None:
+                    subst[inst] = inst.value
+                todo.append(inst.insts)
+
+    def resolve(value: Value) -> Value:
+        # a substitution chain (an insertion resolved to another insertion)
+        # is followed iteratively
+        seen: set[Insertion] = set()
+        while isinstance(value, Insertion):
+            if value in seen:
+                raise CompileError('cycle in the MIR insertion substitution')
+            seen.add(value)
+            resolved = subst.get(value)
+            if resolved is None:
+                raise CompileError('a MIR insertion is referenced before it is resolved')
+            value = resolved
+        return value
+
+    def rewrite(inst: Inst) -> None:
+        # every operand a MIR instruction reads; an insertion is never
+        # rewritten (it is flattened away before its operands matter)
+        match inst:
+            case Load():
+                inst.ptr = resolve(inst.ptr)
+            case Store():
+                inst.ptr = resolve(inst.ptr)
+                inst.value = resolve(inst.value)
+            case Gep():
+                inst.ptr = resolve(inst.ptr)
+            case Arith():
+                inst.lhs = resolve(inst.lhs)
+                inst.rhs = resolve(inst.rhs)
+            case Convert():
+                inst.value = resolve(inst.value)
+            case Cmp():
+                inst.lhs = resolve(inst.lhs)
+                inst.rhs = resolve(inst.rhs)
+            case Call():
+                inst.callee = resolve(inst.callee)
+                inst.args = tuple(resolve(arg) for arg in inst.args)
+            case Ret():
+                if inst.value is not None:
+                    inst.value = resolve(inst.value)
+            case If():
+                inst.cond = resolve(inst.cond)
+            case _:
+                pass
+
+    # flatten iteratively: an insertion is replaced by its instructions at
+    # its own position, and every operand referring to it is replaced by
+    # the value it stands for
+    result: list[Inst] = []
+    pending: list[tuple[list[Inst], int]] = [(block, 0)]
+    while pending:
+        insts, index = pending.pop()
+        while index < len(insts):
+            inst = insts[index]
+            index += 1
+            if isinstance(inst, Insertion):
+                if index < len(insts):
+                    pending.append((insts, index))
+                insts = inst.insts
+                index = 0
+                continue
+            rewrite(inst)
+            result.append(inst)
+    return result
+
+@dataclass(eq=False)
 class Function(GlobalValue):
     """One compiled MIR function.  As a value it is the in-module
     function value of a call target: a call whose callee is this object

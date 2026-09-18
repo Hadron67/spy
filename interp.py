@@ -64,7 +64,7 @@ import types as pytypes
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Any
+from typing import Any, override
 
 from . import hir, mir, sval
 from .errors import CompileError
@@ -139,16 +139,6 @@ class ComptimeBox(InterpVal):
     value: InterpVal | None = None
 
 
-@dataclass
-class _MirInsertionBlock:
-    """A list of MIR instructions to be spliced into the flat body at
-    ``pos`` once the whole body has been generated (see
-    ``_splice_insertions``).  ``pos`` is an index into the body
-    the interpreter emitted before splicing."""
-
-    insts: list[mir.Inst]
-    pos: int
-
 class _PendingActionData:
     """One action recorded by a :class:`PendingSlot`: how it is delivered
     once the slot has an address is decided by the runner (see
@@ -166,22 +156,8 @@ class _PendingAction:
     delivered into: the block sits at the position the action was recorded
     at, so it is spliced into the body after it has been filled."""
 
-    insertion: _MirInsertionBlock
+    insertion: mir.Insertion
     data: _PendingActionData
-
-@dataclass
-class _PendingRetlocCall(_PendingActionData):
-    """An RLS native call recorded by a :class:`PendingSlot` before the
-    slot is materialized: the callee and the already emitted arguments.
-    The hidden result pointer is only known (and appended) once the slot
-    has an address."""
-
-    type: sval.Type
-    callee: mir.Value
-    prev_args: tuple[mir.Value, ...]
-
-    def info(self) -> tuple[sval.Type, bool]:
-        return self.type, False
 
 @dataclass
 class _PendingStore(_PendingActionData):
@@ -198,18 +174,13 @@ class _PendingStore(_PendingActionData):
         return self.type, self.is_comptime
 
 @dataclass
-class _PendingDefaultCtor(_PendingActionData):
-    """A struct construction (the default constructor of a struct without
-    an ``__init__``) recorded by a :class:`PendingSlot`: the field values
-    are written to the fields of the constructed value once the slot has
-    an address (``None`` for a zero-sized field, which is never written)."""
-
+class _PendingPtrConvertion(_PendingActionData):
     type: sval.Type
-    fields: tuple[InterpVal | None, ...]
+    input: InterpVal
+    output: mir.Insertion
 
+    @override
     def info(self) -> tuple[sval.Type, bool]:
-        # TODO: a struct has no compile-time representation yet, so all
-        # structs are currently allocated in memory
         return self.type, False
 
 @dataclass
@@ -461,23 +432,6 @@ def _convert_inst(
         f"cannot convert a {from_type} value to {to_type}"
     )
 
-def _splice_insertions(
-    insts: list[mir.Inst], blocks: list[_MirInsertionBlock]
-) -> list[mir.Inst]:
-    """Build the final body by inserting every recorded block at its
-    position (blocks are spliced in position order, so the positions
-    - indices into the pre-splice body - stay valid)."""
-    if not blocks:
-        return insts
-    result: list[mir.Inst] = []
-    last = 0
-    for block in sorted(blocks, key=lambda b: b.pos):
-        result.extend(insts[last:block.pos])
-        result.extend(block.insts)
-        last = block.pos
-    result.extend(insts[last:])
-    return result
-
 # ---------------------------------------------------------------------------
 # the compile-time host interface
 # ---------------------------------------------------------------------------
@@ -523,13 +477,12 @@ class HirRunner:
         # the function proper whose body is currently being typed (see
         # ``_bind_result_ptr``)
         self._fn_instance = fn_instance
-        self._mir_insertion_blocks: list[_MirInsertionBlock] = []
         self._mir_block_stack: list[list[mir.Inst]] = [fn_instance.mir.insts]
         # the ``hir.Ret`` positions of the function proper whose return
         # convention is not fixed yet (an unannotated return type); their
         # ``mir.Ret`` is filled in by ``_finish_function`` once the result
         # location has been materialized
-        self._deferred_returns: list[_MirInsertionBlock] = []
+        self._deferred_returns: list[mir.Insertion] = []
         self.return_sig: ReturnSignature | None = None
 
         self.resume_info: ResumeInfo | None = None
@@ -729,8 +682,8 @@ class HirRunner:
                     # return type): the ``mir.Ret`` is filled in by
                     # ``_finish_function`` once the result location has been
                     # materialized
-                    block = _MirInsertionBlock([], len(self._fn_instance.mir.insts))
-                    self._mir_insertion_blocks.append(block)
+                    block = mir.Insertion([], None)
+                    self._emit(block)
                     self._deferred_returns.append(block)
                     return self._cut()
                 location = self._current_result_loc()
@@ -1377,8 +1330,8 @@ class HirRunner:
     def _record_pending_action(self, slot: PendingSlot, data: _PendingActionData) -> None:
         """Record one action on a still uncommitted slot, reserving the
         insertion block that will hold the instructions delivering it."""
-        insertion = _MirInsertionBlock([], len(self._fn_instance.mir.insts))
-        self._mir_insertion_blocks.append(insertion)
+        insertion = mir.Insertion([], None)
+        self._emit(insertion)
         slot.stores.append(_PendingAction(insertion, data))
 
     def _commit_pending_slot(
@@ -1436,20 +1389,22 @@ class HirRunner:
         match action:
             case _PendingStore():
                 self.store(ptr, action.value)
-            case _PendingDefaultCtor():
-                for i, field_value in enumerate(action.fields):
-                    if field_value is None:
-                        # a zero-sized field occupies no storage and takes no value
-                        continue
-                    self.store(self.field_index_addr(ptr, i), field_value)
-            case _PendingRetlocCall():
-                assert isinstance(ptr, RuntimeVal)
-                result_ptr = self._convert_result_ptr(ptr.value, type, action.type)
-                # the hidden result pointer is the last formal of the lowered
-                # signature (it is appended after every declared argument)
-                self._emit(mir.Call(action.callee, action.prev_args + (result_ptr,), mir.VOID))
+            case _PendingPtrConvertion():
+                input_ptr = _shallow_normalize(action.input)
+                if not (isinstance(input_ptr, RuntimeVal) and isinstance(input_ptr.type, sval.PointerType)):
+                    raise CompileError('cannot convert a compile-time pointer')
+                action.output.value = self._convert_result_ptr(input_ptr.value, input_ptr.type.elem, action.type)
             case _:
                 raise CompileError(f'unsupported pending action {action}')
+
+    def _defer_ptr_convertion(self, slot: PendingSlot, type: sval.Type) -> RuntimeVal:
+        mir_type = type.to_mir_type()
+        if mir_type is None or isinstance(mir_type, mir.VoidType):
+            raise _no_runtime_type(type)
+        output = mir.Insertion([], None, mir.PointerType(mir_type))
+        self._emit(output)
+        slot.stores.append(_PendingAction(output, _PendingPtrConvertion(type, slot, output)))
+        return RuntimeVal(output, sval.PointerType(type, is_const=False))
 
     def _convert_result_ptr(self, ptr: mir.Value, from_type: sval.Type, to_type: sval.Type) -> mir.Value:
         """The pointer a result-location call writes through, converted to
@@ -1461,7 +1416,7 @@ class HirRunner:
     def call_constructor(self, struct: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """Construct a struct: the ``__init__`` of the struct runs if it has
         one, and otherwise the fields are bound from ``args`` by the default
-        constructor (see :class:`PendingSlot`/:class:`_PendingDefaultCtor`)."""
+        constructor (see :class:`PendingSlot`/:class:`_PendingPtrConvertion`)."""
         init = struct.methods.get('__init__')
         if init is not None:
             init_fn = self._analyser._resolver.resolve_global(init)
@@ -1480,7 +1435,11 @@ class HirRunner:
             fields.append(arg)
 
         if isinstance(ret, PendingSlot) and ret.committed is None:
-            self._record_pending_action(ret, _PendingDefaultCtor(type=struct, fields=tuple(fields)))
+            ptr = self._defer_ptr_convertion(ret, struct)
+            for i, field_value in enumerate(fields):
+                if field_value is None:
+                    continue
+                self.store(self.field_index_addr(ptr, i), field_value)
             return PollResult.AGAIN
 
         for i, field_value in enumerate(fields):
@@ -1636,16 +1595,10 @@ class HirRunner:
             if ret is None:
                 raise CompileError('a result-pointer call needs a result location')
             if isinstance(ret, PendingSlot) and ret.committed is None:
-                # the result pointer of the slot is not known yet: record the
-                # call and let the slot's commit supply it
-                self._record_pending_action(
-                    ret,
-                    _PendingRetlocCall(
-                        type=ret_sig.ret_type,
-                        callee=callee,
-                        prev_args=tuple(mir_args),
-                    ),
-                )
+                # the result pointer of the slot is not known yet: the call
+                # writes through a placeholder the slot's commit fills in
+                ptr = self._defer_ptr_convertion(ret, ret_sig.ret_type)
+                self._emit(mir.Call(callee, (*mir_args, ptr.value), mir.VOID))
             else:
                 ptr = _to_runtime(_shallow_normalize(ret))
                 self._emit(mir.Call(callee, (*mir_args, ptr), mir.VOID))
@@ -1705,7 +1658,7 @@ class HirRunner:
         insertion blocks into the body."""
         self._finish_function()
         mir_fn = self._fn_instance.mir
-        mir_fn.insts = _splice_insertions(mir_fn.insts, self._mir_insertion_blocks)
+        mir_fn.insts = mir.normalize(mir_fn.insts)
 
     def _finish_function(self) -> None:
         """Fix the return convention of a function without a declared
