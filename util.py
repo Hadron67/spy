@@ -363,6 +363,8 @@ class TriState(IntEnum):
 
 
 class frozendict[K, V]:
+    __slots__ = ('_dict', '_hash')
+
     def __init__(self, value: dict[K, V] | Iterable[tuple[K, V]] | None = None) -> None:
         self._dict = dict(value) if value else {}
         self._hash: int | None = None

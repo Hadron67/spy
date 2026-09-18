@@ -64,7 +64,7 @@ import types as pytypes
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Any, override
+from typing import Any, Callable, Self, override
 
 from . import hir, mir, sval
 from .errors import CompileError
@@ -446,14 +446,6 @@ class PollResult(IntEnum):
     SUSPEND = auto()
     DONE = auto()
 
-@dataclass
-class ResumeInfo:
-    args: ArgList[ArgEntry[InterpVal]]
-    call_sig: CallSignature
-    ret_loc: InterpVal | None
-    ret_reg: hir.Inst | None
-
-
 class HirRunner:
     """Runs one function body (and everything it inlines) at compile
     time, filling the pre-created typed :class:`mir.Function` of one
@@ -485,7 +477,7 @@ class HirRunner:
         self._deferred_returns: list[mir.Insertion] = []
         self.return_sig: ReturnSignature | None = None
 
-        self.resume_info: ResumeInfo | None = None
+        self._fn_req_resumer: Callable[[Self, mir.Value, ReturnSignature]] | None = None
 
     # -- entry point ---------------------------------------------------------
 
@@ -1417,6 +1409,9 @@ class HirRunner:
         """Construct a struct: the ``__init__`` of the struct runs if it has
         one, and otherwise the fields are bound from ``args`` by the default
         constructor (see :class:`PendingSlot`/:class:`_PendingPtrConvertion`)."""
+        if isinstance(ret, PendingSlot) and ret.committed is None:
+            ret = self._defer_ptr_convertion(ret, struct)
+
         init = struct.methods.get('__init__')
         if init is not None:
             init_fn = self._analyser._resolver.resolve_global(init)
@@ -1434,13 +1429,6 @@ class HirRunner:
                 arg = self.load(arg)
             fields.append(arg)
 
-        if isinstance(ret, PendingSlot) and ret.committed is None:
-            ptr = self._defer_ptr_convertion(ret, struct)
-            for i, field_value in enumerate(fields):
-                if field_value is None:
-                    continue
-                self.store(self.field_index_addr(ptr, i), field_value)
-            return PollResult.AGAIN
 
         for i, field_value in enumerate(fields):
             if field_value is None:
@@ -1455,13 +1443,6 @@ class HirRunner:
         args: RawArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
     ) -> PollResult:
-        """Run the ``__init__`` of a construction: the object is built in the
-        result location - which is materialized first, its type being the
-        struct - and ``self`` is the address of that location, so the body
-        fills it in place.  The (void) result of ``__init__`` goes to a
-        location of its own and is discarded, like Python's."""
-        if isinstance(ret, PendingSlot) and ret.committed is None:
-            self._commit_pending_slot(ret, struct)
         obj = _shallow_normalize(ret)
         if not isinstance(obj, RuntimeVal):
             raise CompileError(f'cannot construct a {struct} in this location')
@@ -1469,8 +1450,8 @@ class HirRunner:
         # ``__init__`` returns nothing: its result is a void slot of its own
         self._commit_pending_slot(result, sval.VoidType())
         self_arg: ArgEntry[InterpVal] = ArgEntry(obj, True)
-        return self.call(
-            ComptimeVal(sval.ConstRef(init)),
+        return self._call_function_entry(
+            init,
             RawArgList((self_arg,) + args.positional, args.kwargs),
             result,
         )
@@ -1541,7 +1522,11 @@ class HirRunner:
             return self._start_inline(fn.hir.body, binded_args, ret)
         arg_types = binded_args.map(_arg_type_of)
         spec_sig = sig.specialize(arg_types)
-        self.resume_info = ResumeInfo(binded_args, spec_sig[0], ret, None)
+
+        def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature):
+            self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
+
+        self._fn_req_resumer = _resumer
         res = self._analyser._request_function(fn, spec_sig[0], spec_sig[1])
         if res is not None:
             fn_mir, ret_sig = res
@@ -1550,12 +1535,12 @@ class HirRunner:
         return PollResult.SUSPEND
 
     def resume(self, fn_mir: mir.Value, ret_sig: ReturnSignature):
-        ri = self.resume_info
-        assert ri is not None
-        self.resume_info = None
-        self._make_runtime_call(fn_mir, ri.args, ri.ret_loc, ri.ret_reg, ri.call_sig, ret_sig)
+        resumer = self._fn_req_resumer
+        assert resumer is not None
+        self._fn_req_resumer = None
+        resumer(self, fn_mir, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal | None, ret_reg: hir.Inst | None, call_sig: CallSignature, ret_sig: ReturnSignature) -> None:
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal | hir.Inst, call_sig: CallSignature, ret_sig: ReturnSignature) -> None:
         """Emit the native call of an already-resolved callee and hand its
         result to the call's result location (or register)."""
         mir_args: list[mir.Value] = []
@@ -1592,16 +1577,15 @@ class HirRunner:
                 convert_one(arg, call_sig.kwargs[name])
 
         if ret_sig.ret_by_ref:
+            assert isinstance(ret, InterpVal)
             if ret is None:
                 raise CompileError('a result-pointer call needs a result location')
             if isinstance(ret, PendingSlot) and ret.committed is None:
                 # the result pointer of the slot is not known yet: the call
                 # writes through a placeholder the slot's commit fills in
-                ptr = self._defer_ptr_convertion(ret, ret_sig.ret_type)
-                self._emit(mir.Call(callee, (*mir_args, ptr.value), mir.VOID))
-            else:
-                ptr = _to_runtime(_shallow_normalize(ret))
-                self._emit(mir.Call(callee, (*mir_args, ptr), mir.VOID))
+                ret = self._defer_ptr_convertion(ret, ret_sig.ret_type)
+            ptr = _to_runtime(_shallow_normalize(ret))
+            self._emit(mir.Call(callee, (*mir_args, ptr), mir.VOID))
         else:
             ret_type = ret_sig.ret_type.to_mir_type()
             if ret_type is None or isinstance(ret_type, mir.VoidType):
@@ -1609,12 +1593,10 @@ class HirRunner:
             else:
                 call_inst = self._emit(mir.Call(callee, tuple(mir_args), ret_type))
                 value = RuntimeVal(call_inst, ret_sig.ret_type)
-                if ret is not None:
+                if isinstance(ret, InterpVal):
                     self.store(ret, value)
-                elif ret_reg is not None:
-                    self._frames[-1].regs[ret_reg] = value
                 else:
-                    raise CompileError('a call result has nowhere to go')
+                    self._frames[-1].regs[ret] = value
 
     def _start_inline(
         self,
