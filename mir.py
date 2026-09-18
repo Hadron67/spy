@@ -1,6 +1,7 @@
 from abc import abstractmethod
-from dataclasses import dataclass
-from typing import Any, override
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from typing import Any, Self, override
 
 from .errors import CompileError
 
@@ -265,6 +266,10 @@ class Inst(Value):
     def get_children(self) -> tuple[Any, ...]:
         return ()
 
+    @abstractmethod
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        ...
+
 @dataclass(eq=False)
 class Alloca(Inst):
     """Allocate a slot for one value; produces a pointer to ``type``."""
@@ -277,6 +282,9 @@ class Alloca(Inst):
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.type,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
 
 
 @dataclass(eq=False)
@@ -292,6 +300,10 @@ class Load(Inst):
     def get_children(self) -> tuple[Any, ...]:
         return (self.ptr,)
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        ptr = f(self.ptr)
+        return self if ptr is self.ptr else replace(self, ptr=ptr)
+
 
 @dataclass(eq=False)
 class Store(Inst):
@@ -300,6 +312,13 @@ class Store(Inst):
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.ptr, self.value)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        ptr = f(self.ptr)
+        value = f(self.value)
+        if ptr is self.ptr and value is self.value:
+            return self
+        return replace(self, ptr=ptr, value=value)
 
 
 @dataclass(eq=False)
@@ -326,6 +345,10 @@ class Gep(Inst):
     def get_children(self) -> tuple[Any, ...]:
         return (self.ptr,)
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        ptr = f(self.ptr)
+        return self if ptr is self.ptr else replace(self, ptr=ptr)
+
 
 @dataclass(eq=False)
 class Arith(Inst):
@@ -350,6 +373,13 @@ class Arith(Inst):
     def get_children(self) -> tuple[Any, ...]:
         return (self.lhs, self.rhs)
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        lhs = f(self.lhs)
+        rhs = f(self.rhs)
+        if lhs is self.lhs and rhs is self.rhs:
+            return self
+        return replace(self, lhs=lhs, rhs=rhs)
+
 
 @dataclass(eq=False)
 class Convert(Inst):
@@ -366,6 +396,10 @@ class Convert(Inst):
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.value,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
 
 
 @dataclass(eq=False)
@@ -385,6 +419,13 @@ class Cmp(Inst):
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.lhs, self.rhs)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        lhs = f(self.lhs)
+        rhs = f(self.rhs)
+        if lhs is self.lhs and rhs is self.rhs:
+            return self
+        return replace(self, lhs=lhs, rhs=rhs)
 
 
 @dataclass(eq=False)
@@ -406,6 +447,13 @@ class Call(Inst):
     def get_children(self) -> tuple[Any, ...]:
         return (self.callee, *self.args)
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        callee = f(self.callee)
+        args = tuple(f(arg) for arg in self.args)
+        if callee is self.callee and all(a is b for a, b in zip(args, self.args)):
+            return self
+        return replace(self, callee=callee, args=args)
+
 
 @dataclass(eq=False)
 class Ret(Inst):
@@ -418,11 +466,20 @@ class Ret(Inst):
     def get_children(self) -> tuple[Any, ...]:
         return (self.value,) if self.value is not None else ()
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        if self.value is None:
+            return self
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
+
 
 @dataclass(eq=False)
 class Nop(Inst):
     """A no-op instruction; used to reserve space in the MIR body for
     a future instruction to be emitted at a known position."""
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
 
 
 
@@ -442,6 +499,10 @@ class If(Inst):
     def get_children(self) -> tuple[Any, ...]:
         return (self.cond,)
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        cond = f(self.cond)
+        return self if cond is self.cond else replace(self, cond=cond)
+
 
 @dataclass(eq=False)
 class Block(Inst):
@@ -453,6 +514,9 @@ class Block(Inst):
     :class:`Break` may leave it early (the way an inlined ``return``
     leaves the inlined body before it ends)."""
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
+
 
 @dataclass(eq=False)
 class Else(Inst):
@@ -460,12 +524,18 @@ class Else(Inst):
     when the ``if`` has no else branch).  It produces no value; it only
     delimits the flat instruction list."""
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
+
 
 @dataclass(eq=False)
 class End(Inst):
     """The marker that closes a block opened by an :class:`If` or a
-    :class:`Block`.  It produces no value; it only delimits the flat
+    a :class:`Block`.  It produces no value; it only delimits the flat
     instruction list."""
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
 
 
 @dataclass(eq=False)
@@ -482,6 +552,9 @@ class Break(Inst):
 
     level: int
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
+
 @dataclass(eq=False)
 class Insertion(Inst):
     insts: list[Inst]
@@ -492,68 +565,44 @@ class Insertion(Inst):
     def get_type(self) -> MayBeVoidType:
         return self.value.get_type() if self.value is not None else self.type
 
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        if self.value is None:
+            return self
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
+
 
 def normalize(block: list[Inst]) -> list[Inst]:
     """Eliminate :class:`Insertion` nodes from the block by flattening them and substituting their values."""
-    # every insertion that stands for a value, by identity; an insertion
-    # nested in another one's instructions counts too
-    subst: dict[Insertion, Value] = {}
+    # every value that is replaced by another one: an insertion stands for
+    # its value, and an instruction whose operands changed is replaced by
+    # the mapped instruction ``map_values`` builds
+    repl: dict[Value, Value] = {}
     todo: list[list[Inst]] = [block]
     while todo:
         insts = todo.pop()
         for inst in insts:
             if isinstance(inst, Insertion):
                 if inst.value is not None:
-                    subst[inst] = inst.value
+                    repl[inst] = inst.value
                 todo.append(inst.insts)
 
     def resolve(value: Value) -> Value:
-        # a substitution chain (an insertion resolved to another insertion)
-        # is followed iteratively
-        seen: set[Insertion] = set()
-        while isinstance(value, Insertion):
+        # a replacement chain (an insertion resolved to another insertion, an
+        # instruction to its mapped copy) is followed iteratively
+        seen: set[Value] = set()
+        while value in repl:
             if value in seen:
-                raise CompileError('cycle in the MIR insertion substitution')
+                raise CompileError('cycle in the MIR substitution')
             seen.add(value)
-            resolved = subst.get(value)
-            if resolved is None:
-                raise CompileError('a MIR insertion is referenced before it is resolved')
-            value = resolved
+            value = repl[value]
+        if isinstance(value, Insertion):
+            raise CompileError('a MIR insertion is referenced before it is resolved')
         return value
 
-    def rewrite(inst: Inst) -> None:
-        # every operand a MIR instruction reads; an insertion is never
-        # rewritten (it is flattened away before its operands matter)
-        match inst:
-            case Load():
-                inst.ptr = resolve(inst.ptr)
-            case Store():
-                inst.ptr = resolve(inst.ptr)
-                inst.value = resolve(inst.value)
-            case Gep():
-                inst.ptr = resolve(inst.ptr)
-            case Arith():
-                inst.lhs = resolve(inst.lhs)
-                inst.rhs = resolve(inst.rhs)
-            case Convert():
-                inst.value = resolve(inst.value)
-            case Cmp():
-                inst.lhs = resolve(inst.lhs)
-                inst.rhs = resolve(inst.rhs)
-            case Call():
-                inst.callee = resolve(inst.callee)
-                inst.args = tuple(resolve(arg) for arg in inst.args)
-            case Ret():
-                if inst.value is not None:
-                    inst.value = resolve(inst.value)
-            case If():
-                inst.cond = resolve(inst.cond)
-            case _:
-                pass
-
     # flatten iteratively: an insertion is replaced by its instructions at
-    # its own position, and every operand referring to it is replaced by
-    # the value it stands for
+    # its own position, and every operand referring to a replaced value is
+    # rewritten by ``Inst.map_values``
     result: list[Inst] = []
     pending: list[tuple[list[Inst], int]] = [(block, 0)]
     while pending:
@@ -567,8 +616,10 @@ def normalize(block: list[Inst]) -> list[Inst]:
                 insts = inst.insts
                 index = 0
                 continue
-            rewrite(inst)
-            result.append(inst)
+            mapped = inst.map_values(resolve)
+            if mapped is not inst:
+                repl[inst] = mapped
+            result.append(mapped)
     return result
 
 @dataclass(eq=False)
