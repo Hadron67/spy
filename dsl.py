@@ -36,7 +36,7 @@ time.
 
 import types as pytypes
 from dataclasses import dataclass
-from typing import Any, cast, override
+from typing import Any, cast, dataclass_transform, override
 
 from . import astgen, sval
 from .builtins import spy_as, spy_compile_log, spy_typeof
@@ -264,6 +264,7 @@ class _Context(FunctionResolver):
             return cast(T, result)
         return wrapper
 
+    @dataclass_transform()
     def struct(self, extern_c: bool = False):
         meta = StructMetadata(extern_c=extern_c)
 

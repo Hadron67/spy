@@ -22,7 +22,6 @@ from spy.dsl import func, struct
 
 from . import (
     CompileError,
-    SpyError,
     compile_log,
     f32,
     f64,
@@ -250,18 +249,8 @@ def struct_type(handle: Any) -> sval.StructType:
     return type
 
 
-class _Struct:
-    """Only a type-checker aid: the spy compiler constructs a struct from the
-    annotations of its class body (the default constructor), so Python itself
-    gives the class no initializer for a construction to be checked against.
-    The declaration of a struct inherits this one and nothing else."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise SpyError('a struct is constructed by spy code, not by Python')
-
-
 @struct()
-class Small(_Struct):
+class Small:
     a: i32
     b: i32
 
@@ -270,7 +259,7 @@ class Small(_Struct):
 
 
 @struct()
-class Large(_Struct):
+class Large:
     a: i64
     b: i64
     c: i64
@@ -278,7 +267,7 @@ class Large(_Struct):
 
 
 @struct()
-class Counter(_Struct):
+class Counter:
     """A struct with a constructor and both kinds of method (a registered
     ``bump``, compiled into a native call, and a plain ``double``, inlined)."""
 
@@ -297,7 +286,7 @@ class Counter(_Struct):
 
 
 @struct()
-class Doubled(_Struct):
+class Doubled:
     """A struct whose ``__init__`` is a registered method of its own (built
     into a native call, like any other registered method)."""
 
@@ -315,7 +304,7 @@ class Doubled(_Struct):
 # a struct of several fields are ordered by alignment (the least-aligned
 # first) - unless the struct is ``extern_c``, which keeps the C layout
 @struct()
-class One(_Struct):
+class One:
     a: i32
 
     def get(self) -> i32:
@@ -323,23 +312,23 @@ class One(_Struct):
 
 
 @struct()
-class Nested(_Struct):
+class Nested:
     inner: One
 
 
 @struct()
-class Mixed(_Struct):
+class Mixed:
     wide: i64
     narrow: i8
 
 
 @struct(extern_c=True)
-class ExternOne(_Struct):
+class ExternOne:
     a: i32
 
 
 @struct(extern_c=True)
-class ExternMixed(_Struct):
+class ExternMixed:
     wide: i64
     narrow: i8
 
@@ -347,7 +336,7 @@ class ExternMixed(_Struct):
 # a zero-sized field occupies no storage: it has no mirror position and its
 # value is the unit value of its type
 @struct()
-class Holder(_Struct):
+class Holder:
     v: void
     n: i32
 
@@ -480,6 +469,28 @@ def untyped_param(x) -> i32:
 def call_untyped_param() -> i32:
     return untyped_param(1)
 
+
+@func()
+def tuple_declare(x: i32) -> i32:
+    a, b = x, x + 1
+    return a * 10 + b
+
+
+@func()
+def tuple_swap(a: i32, b: i32) -> i32:
+    a, b = b, a
+    return a * 10 + b
+
+
+@func()
+def tuple_nested(x: i32) -> i32:
+    a, (b, c) = x, (x + 1, x + 2)
+    return a * 100 + b * 10 + c
+
+@struct()
+class Slice[T]:
+    ptr: T
+    len: u64
 
 # ---------------------------------------------------------------------------
 # tests
@@ -705,6 +716,22 @@ class SpyStructMirrorTest(TestCase):
         self.assertIsInstance(struct_type(ExternOne).get_mir_type(), mir.StructType)
 
 
+class SpyTupleTest(TestCase):
+    """Compile-time tuples: destructuring assignment unpacks a tuple of
+    values into a tuple of target addresses (which may nest)."""
+
+    def test_declaring_destructuring(self) -> None:
+        self.assertEqual(tuple_declare(4), 45)
+
+    def test_swap_destructuring(self) -> None:
+        # the right-hand side is read before any target is stored, so a
+        # swap does not clobber its own operands
+        self.assertEqual(tuple_swap(1, 2), 21)
+
+    def test_nested_destructuring(self) -> None:
+        self.assertEqual(tuple_nested(4), 456)
+
+
 class SpyCompileLogTest(TestCase):
     def test_compile_log_prints_at_compile_time(self) -> None:
         out = io.StringIO()
@@ -713,4 +740,4 @@ class SpyCompileLogTest(TestCase):
         self.assertIn('add_inline was compiled', out.getvalue())
 
 
-all_tests = [SpyFunctionCallTest, SpyStructTest, SpyStructMirrorTest, SpyCompileLogTest]
+all_tests = [SpyFunctionCallTest, SpyStructTest, SpyStructMirrorTest, SpyTupleTest, SpyCompileLogTest]

@@ -205,6 +205,10 @@ class Subscript(Inst):
     index: Value
 
 @dataclass(eq=False)
+class Tuple(Inst):
+    values: tuple[Value, ...]
+
+@dataclass(eq=False)
 class Binary(Inst):
     """Arithmetic: '+', '-', '*', '/', '//', '%', '**'."""
 

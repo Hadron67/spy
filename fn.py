@@ -82,6 +82,13 @@ class ArgList[T]:
         yield from self.varargs
         yield from self.kwargs.values()
 
+type ArgNode = Value | RuntimeArgNode | tuple[ArgNode, ...] | frozendict[str, ArgNode]
+
+@dataclass(frozen=True, slots=True)
+class RuntimeArgNode:
+    type: Type
+    by_ref: bool
+
 class SpecializedFormalArg:
     pass
 

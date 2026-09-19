@@ -127,13 +127,11 @@ decision."""
 
 @dataclass
 class ComptimeBox(InterpVal):
-    """The materialization of a :class:`PendingSlot` whose stores are all
-    compile-time: a writable pointer to a *compile-time* value.  Unlike a
-    :class:`RuntimeVal` it owns no memory - ``value`` is the content
-    itself (``None`` before the first commit)."""
+    """A comptime-time writable box. Note that ``value`` does not have to
+    be a comptime-time value: it also can be a runtime value :class:`RuntimeVal`."""
 
     type: sval.Type
-    value: InterpVal | None = None
+    value: InterpVal
 
 
 class _PendingActionData:
@@ -180,7 +178,7 @@ class _PendingPtrConvertion(_PendingActionData):
     def info(self) -> tuple[sval.Type, bool]:
         return self.type, False
 
-@dataclass
+@dataclass(slots=True)
 class PendingSlot(InterpVal):
     """The value of an executed ``hir.Alloca`` before it is *committed*.
     In this phase a store (or an RLS call) into the slot only records a
@@ -220,9 +218,9 @@ class PendingSlot(InterpVal):
         return self.allow_inline and all(store.data.info()[1] for store in self.stores)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ComptimeTuple(InterpVal):
-    value_ptrs: tuple[InterpVal, ...]
+    values: tuple[InterpVal, ...]
 
 @dataclass
 class ComptimeDict(InterpVal):
@@ -240,7 +238,7 @@ def _is_comptime_val(val: InterpVal) -> bool:
                     return False
                 todo.append(val.committed)
             case ComptimeTuple():
-                todo.extend(val.value_ptrs)
+                todo.extend(val.values)
             case ComptimeDict():
                 todo.extend(val.value_ptrs.values())
     return True
@@ -259,7 +257,8 @@ class BlockFrame:
     data: BlockFrameData
 
 class InlineFrame:
-    def __init__(self, arg_values: tuple[InterpVal, ...], ret_loc: InterpVal, insts: tuple[hir.Inst, ...]) -> None:
+    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: InterpVal, insts: tuple[hir.Inst, ...]) -> None:
+        self.generic_var_values = generic_var_values
         self.arg_values = arg_values
         self.ret_loc = ret_loc
         self.insts = insts
@@ -491,7 +490,7 @@ class HirRunner:
         self.resume_info = None
         self._deferred_returns = []
         ret_loc = PendingSlot(self._reserve(), False)
-        frame = InlineFrame((), ret_loc, body)
+        frame = InlineFrame({}, (), ret_loc, body)
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
         args = self._init_args_from_signature(sig, mir_args)
@@ -699,6 +698,8 @@ class HirRunner:
                 self.store(self.operand(inst.ptr), self.operand(inst.value))
             case hir.StoreVoidRetloc():
                 self.store(self._current_result_loc(), ComptimeVal(sval.Void()))
+            case hir.Tuple():
+                regs[inst] = ComptimeTuple(tuple(self.operand(v) for v in inst.values))
             case hir.Binary():
                 return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self.operand(inst.ret))
             case hir.Compare():
@@ -942,6 +943,28 @@ class HirRunner:
         A store into a still uncommitted slot only records a store point
         (see :class:`PendingSlot`): the slot's final type is not known
         until it is committed, and the actual store is inserted then."""
+        if isinstance(ptr, ComptimeTuple):
+            # a destructuring target: a tuple of element *addresses*, one
+            # per element of the value it is stored with (a nested tuple
+            # target pairs with a nested tuple value)
+            todo: list[tuple[InterpVal, InterpVal]] = [(ptr, value)]
+            while todo:
+                target, source = todo.pop()
+                if isinstance(target, ComptimeTuple):
+                    if not isinstance(source, ComptimeTuple):
+                        raise CompileError(
+                            f'cannot unpack a value into {len(target.values)} targets'
+                        )
+                    if len(source.values) != len(target.values):
+                        raise CompileError(
+                            f'cannot unpack {len(source.values)} values into '
+                            f'{len(target.values)} targets'
+                        )
+                    todo.extend(reversed(list(zip(target.values, source.values))))
+                    continue
+                self.store(target, source)
+            return
+
         if isinstance(ptr, PendingSlot) and ptr.committed is None:
             value_type = _type_of(value)
             if value_type is None:
@@ -1355,7 +1378,7 @@ class HirRunner:
             return
 
         if len(val.stores) > 0 and val.is_comptime():
-            box = ComptimeBox(type)
+            box = ComptimeBox(type, ComptimeVal(sval.Undefined(type)))
             val.committed = box
             self._exec_pending_actions(val, type)
             return
@@ -1644,7 +1667,7 @@ class HirRunner:
                 self._commit_pending_slot(slot)
                 arg_values.append(slot)
         self._emit(mir.Block())
-        frame = InlineFrame(tuple(arg_values), ret, body)
+        frame = InlineFrame({}, tuple(arg_values), ret, body)
         self._frames.append(frame)
         return PollResult.AGAIN
 

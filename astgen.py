@@ -207,6 +207,13 @@ class _Builder:
         straight into the target slot (result-location semantics): a
         constructor ``x = Bar(...)`` fills the fields of the slot in
         place, and a scalar call result is only recorded in it."""
+        if isinstance(target, ast.Tuple):
+            new_slots: list[hir.Value] = []
+            ptrs = self._gen_target_tuple(target, new_slots)
+            self.add(hir.Store(ptrs, self._as_value(self._gen_expr(value))))
+            for slot in new_slots:
+                self.add(hir.CommitSlot(slot))
+            return
         emit_commit = False
         if isinstance(target, ast.Name):
             slot = self._scope.bindings.get(target.id)
@@ -225,6 +232,27 @@ class _Builder:
         self.add(hir.Store(lhs.value, self._as_value(self._gen_expr(value))))
         if emit_commit:
             self.add(hir.CommitSlot(lhs.value))
+
+    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value]) -> hir.Value:
+        """The tuple of addresses a destructuring target denotes: a plain
+        target contributes the address of its slot (or field), a nested
+        tuple target contributes its own tuple of addresses."""
+        elems: list[hir.Value] = []
+        for elt in target.elts:
+            if isinstance(elt, ast.Tuple):
+                elems.append(self._gen_target_tuple(elt, new_slots))
+                continue
+            if isinstance(elt, ast.Name) and elt.id not in self._scope.bindings:
+                slot = self.add(hir.Alloca())
+                self._scope.bindings[elt.id] = slot
+                new_slots.append(slot)
+            ref = self._gen_expr(elt, False)
+            if not ref.is_ref:
+                raise CompileError(
+                    f"target of a destructuring assignment must be addressable, got {elt}"
+                )
+            elems.append(ref.value)
+        return self.add(hir.Tuple(tuple(elems)))
 
     def _gen_augassign(self, node: ast.AugAssign) -> None:
         """One ``name += expr`` statement: read the value, add ``expr``
@@ -349,6 +377,9 @@ class _Builder:
                 lhs = self._gen_expr(node.left)
                 rhs = self._gen_expr(node.comparators[0])
                 return ArgEntry(self.add(hir.Compare(op, lhs, rhs)), False)
+            case ast.Tuple():
+                values = tuple(self._as_value(self._gen_expr(elt)) for elt in node.elts)
+                return ArgEntry(self.add(hir.Tuple(values)), False)
             case _:
                 if not allow_retloc:
                     raise CompileError(f"unexpected expression {node}")

@@ -23,15 +23,15 @@ import ctypes
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal, override
+from typing import TYPE_CHECKING, Any, Literal, override
 
 from spy.util import IdentityObj, IndexedMap, frozendict
 
 from . import mir
 from .errors import CompileError, SpyError
 
-if typing.TYPE_CHECKING:
-    from spy.fn import RawArgList
+if TYPE_CHECKING:
+    from .fn import RawArgList
 
 INT_DEFAULT_BITS = 32
 """A plain Python ``int`` argument is mapped to this signedness/width by
@@ -46,7 +46,7 @@ class Value:
     def get_type(self) -> Type:
         ...
 
-AnyValue = Value | int | float | str | bool
+type AnyValue = Value | int | float | str | bool
 
 class AsValue(Value):
     """A Python value bound to an explicit spy type (``spy.as_(x, T)``).
