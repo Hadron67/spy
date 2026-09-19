@@ -8,7 +8,7 @@ Example::
     def add[T](a: T, b: T) -> T:
         return a + b
 
-    print(add(1, 2))        # compiles add(i32, i32) on first call
+    print(add(1, 2))        # compiles add(i64, i64) on first call
     print(add(1.0, 2.0))    # compiles add(f64, f64)
 
 Pipeline: the Python source of a function is lowered by ``astgen`` into

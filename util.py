@@ -123,8 +123,9 @@ class SubExprFnBuilder:
         return isclass(type) and issubclass(type, self._base_cls)
 
     def _contains_expr(self, type) -> bool:
-        """Whether the type (or a nested collection of it) mentions an ``Expr``
-        subclass, i.e. whether ``map`` must descend into it."""
+        """Whether the type (or a nested collection of it) mentions a
+        ``_base_cls`` subclass, i.e. whether the generated traversal must
+        descend into it."""
         if self._check_type(type):
             return True
         if get_origin(type) is None:
@@ -241,8 +242,8 @@ class SubExprFnBuilder:
                 if exclude is not None and name in exclude:
                     continue
                 body.append('    ' + f'ret["{name}"] = {self._process_map(op, f'self.{name}', type)}')
-        # rebuild with the runtime type: subclasses of a decorated class (e.g.
-        # ``Sin`` of ``UnaryNumericFunction``) are mapped back to themselves
+        # rebuild with the runtime type, so that a subclass of the node
+        # class is mapped back to itself
         body.append('    return op(type(self)(**ret))')
         return body
 
@@ -339,8 +340,9 @@ def sanitize_name(name: str) -> str:
     so every other character of ``name`` - the parentheses and commas of
     a rendered specialization signature, for instance - is replaced by
     ``_``.  The mapping is deterministic, so the same input always gives
-    the same identifier (which is what lets a cross-module reference
-    resolve to the symbol of the module that defined it)."""
+    the same identifier; cross-module references do not depend on it,
+    they go through the name/native-function bijection of
+    ``fn.SymbolTable``."""
     out = ''.join(c if c in _LLVM_IDENT_OK else '_' for c in name)
     if not out:
         return '_'

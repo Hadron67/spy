@@ -7,8 +7,11 @@ goes through the handle, which at call time
 
 1. binds the Python arguments to the formal parameters (keyword
    arguments and default values are filled in here),
-2. solves the concrete spy types of the parameters from the marshaled
-   types of the arguments plus type-parameter unification,
+2. specializes the signature: the declared generic type parameters are
+   solved from the marshaled argument types, and each parameter then
+   takes its (substituted) annotation, the marshaled type of the
+   argument provided for it, or the spy type of its default value, in
+   that order,
 3. makes sure the specialization for those types is compiled (the
    compile pipeline is ``astgen -> hir -> interp (typed mir) -> lower``)
    and calls the native function.

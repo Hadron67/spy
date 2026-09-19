@@ -13,7 +13,7 @@ type parameters converted to ``sval.TypeVar``s).  The signature analysis
 itself - typing one call from its arguments - lives with
 :class:`Signature`/:class:`FunctionIR` in ``fn``, not here.
 
-Like ``symlat.jit.llvm`` the body is one *linear* list of instructions;
+Like ``llvm`` the body is one *linear* list of instructions;
 expression evaluation appends temporary instructions to the list and
 returns the instruction object whose register holds the value - or,
 with a result location (RLS, see ``_Builder._gen_expr``), writes the
@@ -23,10 +23,12 @@ location of a function itself (``hir.ResultLoc``) is the target of its
 function's result location, so a call in return position writes its
 result straight into the location the function returns through.
 
-``astgen`` performs *almost* all name resolution.  Since every parameter
-is addressable, the translated body starts with an
-``Alloca``/``Store`` prologue per parameter (storing the by-value
-``Arg(i)``), and a read of a parameter becomes a ``Load`` of its Alloca.
+``astgen`` performs *almost* all name resolution.  At HIR level a
+parameter is passed by reference (its address), so the translated body
+binds the name of a parameter directly to its ``hir.Arg(i)`` leaf and a
+read of it becomes a ``Load`` of that address; the interpreter
+materializes the parameter's storage (a MIR alloca holding
+``mir.Param``) when the first store runs.
 Local variables are addressable the same way: ``name = expr`` declares a
 block-local variable - a fresh ``Alloca`` - when ``name`` is not yet
 bound in the current block, and stores into the existing slot
@@ -44,8 +46,9 @@ such compile-time objects (``spy.typeof``, ``spy.u64``, ...) are
 evaluated here as well.  Whether a function object denotes a registered
 spy function - and which function value it stands for - is decided by
 the interpreter when a call runs: a function body may be parsed before
-its callees, or even itself (an aot function parses its own body while
-it is being registered), are registered.
+its callees, or even itself (a registered function defined in an
+enclosing scope refers to its own name before the decorator has bound
+it, see ``_resolve_closure``).
 """
 
 import ast
@@ -274,7 +277,7 @@ class _Builder:
     def _resolve_closure(self, name: str) -> Any | None:
         """The raw object of the name ``name`` captured from an
         enclosing Python scope (a spy function may be defined inside a
-        factory, e.g. ``def make(k): @cache.jit() def f(x): return x *
+        factory, e.g. ``def make(k): @func() def f(x): return x *
         k``), or None when the name is not a free variable.  A captured
         variable behaves like a global: the value of its closure cell at
         parse time is embedded as a compile-time constant."""
@@ -288,12 +291,13 @@ class _Builder:
                     except ValueError:
                         if name == self._fn_ir.name:
                             # the function refers to its own name while
-                            # it is being registered (an aot function
-                            # decorated in an enclosing scope is parsed
-                            # before the decorator has bound the name):
-                            # the name then holds the raw function
-                            # object, which the interpreter resolves to
-                            # the function value when a call runs
+                            # it is being registered (a registered
+                            # function decorated in an enclosing scope
+                            # is parsed before the decorator has bound
+                            # the name): the name then holds the raw
+                            # function object, which the interpreter
+                            # resolves to the function value when a call
+                            # runs
                             return fn
                         raise CompileError(
                             f"captured variable '{name}' is not bound yet in the "
@@ -331,12 +335,12 @@ class _Builder:
         return node.value
 
     def _gen_expr(self, node: ast.expr, allow_retloc: bool = True) -> ArgEntry[hir.Value]:
-        """A reference to the value of ``node`` (see ``_gen_expr``):
-        addressable names give their slot, the fields of a runtime
-        struct value give their address (a :class:`hir.FieldAddr` chain
-        rooted at the storage of the base), globals - immutable values -
-        give a :class:`hir.ConstRef` to them, and everything else gives
-        a pointer to a freshly allocated slot holding its value."""
+        """A reference to the value of ``node``: addressable names give
+        their slot, the fields of a runtime struct value give their
+        address (a :class:`hir.FieldAddr` chain rooted at the storage of
+        the base), globals - immutable values - give a
+        :class:`hir.ConstRef` to them, and everything else gives a
+        pointer to a freshly allocated slot holding its value."""
         match node:
             case ast.Name():
                 return ArgEntry(self._gen_name(node.id), True)
@@ -416,9 +420,10 @@ class _Builder:
                 rhs = self._gen_expr(node.right)
                 self.add(hir.Binary(op, lhs, rhs, result_loc))
             case _:
-                # every other expression computes a value first; only the
-                # call (and, later, the ``if`` expression) can write
-                # through a result location without materializing a value
+                # every other expression computes its value first and
+                # stores it into the result location; only a call, a
+                # unary and a binary operation (the cases above) write
+                # through the location without materializing a value
                 if not allow_fall_back:
                     raise CompileError(f"unsupported expression {node}")
                 value = self._as_value(self._gen_expr(node))
@@ -467,12 +472,6 @@ class _Builder:
 
 def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: bool = False) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
-
-    ``mode`` is how the function will be compiled and typed when it is
-    called (see ``FunctionIR.mode``): ``'jit'`` (the marshaled argument
-    types solve each specialization) or ``'aot'`` (the concrete
-    annotations fix its single signature).  A plain function that is
-    only ever inlined is parsed in ``'jit'`` mode.
 
     ``self_type`` is the struct a *method* belongs to: the first parameter
     is then typed as that struct itself and passed by reference (its
@@ -562,10 +561,9 @@ def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: b
             ) from e
 
     def annotation_of(annotation: Any) -> Type | None:
-        # an annotation is a spy type or a type parameter in practice; a
-        # value that is neither is kept as-is and rejected by the aot
-        # discipline (``FunctionIR.aot_param_type``) when the function
-        # is used
+        # an annotation is a spy type or a type parameter in practice;
+        # anything else is kept as-is and rejected when the call is
+        # specialized (``fn.Signature.specialize``)
         return cast(Type | None, convert(annotation, 'the annotation'))
 
     def default_of(value: Any) -> AnyValue | None:

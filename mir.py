@@ -64,15 +64,15 @@ class FormalArg:
 class StructType(Type):
     """The static type of a struct value (and of the elements of struct
     storage).  The type is an identity object mirroring one spy struct
-    type (``type.StructType``); two structs are equal only when they are
+    type (``sval.StructType``); two structs are equal only when they are
     the same object, which is what keeps the types of one struct apart
     from an accidentally identical one.
 
-    Fields are positional: ``fields[i]`` is the type of the i-th field,
-    in declaration order (the LLVM layout of the mirrored ``sllvm``
-    struct follows the same order).  ``spy_type`` is a back reference to
-    the spy-side descriptor, which carries the field names, the method
-    table and the Python-side ctypes class.
+    The fields are the fields of the *mirror*: ``fields[i]`` is the
+    :class:`FormalArg` (name and type) of the i-th field of the mirror.
+    A spy struct orders its fields by alignment and drops the zero-sized
+    ones, while an ``extern_c`` struct keeps the declaration order (see
+    ``sval.StructType._calculate_mir``).
 
     ``ctype`` is the ctypes class mirroring the LLVM layout of the
     struct (a plain ``ctypes.Structure`` subclass built from the MIR
@@ -236,7 +236,9 @@ class ExternAnonSymbol(GlobalValue):
 
 @dataclass(eq=False)
 class Param(Value):
-    """The index-th by-value argument of the enclosing function."""
+    """The index-th formal argument of the enclosing function's lowered
+    signature - a by-value parameter, a by-reference one, or the hidden
+    result pointer."""
 
     index: int
     type: Type
@@ -252,7 +254,7 @@ class Param(Value):
 
 class Inst(Value):
     """A MIR instruction; the object itself acts as its result register
-    (instructions have identity, mirroring ``symlat.jit.llvm``)."""
+    (instructions have identity, mirroring ``llvm``)."""
 
     def __eq__(self, other: object, /) -> bool:
         return self is other
@@ -325,9 +327,11 @@ class Store(Inst):
 @dataclass(eq=False)
 class Gep(Inst):
     """The address of a struct field: ``ptr`` must point at a struct
-    value and ``index`` names the field (by declaration index).  The
-    result is a pointer to the field; its type is computed here from the
-    static type of ``ptr`` (mirroring LLVM's ``getelementptr``)."""
+    value and ``index`` is the field's position in the *mirror* of the
+    struct (the declaration index mapped by
+    ``sval.StructType.get_field_mir_indices``).  The result is a pointer
+    to the field; its type is computed here from the static type of
+    ``ptr`` (mirroring LLVM's ``getelementptr``)."""
 
     ptr: Value
     index: int
@@ -431,10 +435,11 @@ class Cmp(Inst):
 @dataclass(eq=False)
 class Call(Inst):
     """A call of a function value returning a value of type ``type``
-    (``None`` for a call of a void function, which produces no
+    (``mir.VOID`` for a call of a void function, which produces no
     result).  The callee is either a :class:`Function` (compiled in the
-    same LLVM module) or a :class:`Symbol` (compiled in an earlier
-    module)."""
+    same LLVM module) or a :class:`GlobalValue` of an earlier module
+    (:class:`ExternAnonSymbol`, or an :class:`ExternSymbol` resolved from
+    the process)."""
 
     callee: Value
     args: tuple[Value, ...]
@@ -531,7 +536,7 @@ class Else(Inst):
 @dataclass(eq=False)
 class End(Inst):
     """The marker that closes a block opened by an :class:`If` or a
-    a :class:`Block`.  It produces no value; it only delimits the flat
+    :class:`Block`.  It produces no value; it only delimits the flat
     instruction list."""
 
     def map_values(self, f: Callable[[Value], Value]) -> Self:
@@ -639,10 +644,10 @@ class Function(GlobalValue):
 
     @override
     def get_type(self) -> Type:
-        """The type of the function value: a pointer to the function's
-        (logical) signature - the callee side of calls in the MIR is
-        always the *lowered* form, so this logical view is only used by
-        the host."""
+        """The pointer type of the function's lowered MIR signature (the
+        hidden result pointer included).  The callee side of a call in
+        the MIR is the function object itself, so this view exists for
+        the declaration an imported symbol needs."""
         assert self.is_complete
         return PointerType(FunctionType(tuple(self.args), self.ret_type), True)
 

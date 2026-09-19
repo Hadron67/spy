@@ -154,7 +154,7 @@ class Signature:
     positional: IndexedMap[str, SignatureFormalArg]
     # the ``*args``/``**kwargs`` parameters (always None for now: spy
     # function definitions do not accept them yet, but the signature
-    # model - and ``bind_args`` - already does)
+    # model - and ``bind_arg_pos`` - already does)
     varargs: SignatureFormalArg | None
     kwargs: SignatureFormalArg | None
     # the evaluated return annotation, in the spy domain (a concrete spy
@@ -230,23 +230,24 @@ class Signature:
     def solve_param_types(
         self, provided: ArgList[Type | None]
     ) -> tuple[Value, ...]:
-        """The concrete value of every declared generic type parameter
-        of one call, given ``provided``: the marshaled type of each
-        argument the call provides, and ``None`` for a parameter whose
-        default value applies (no argument was provided for it).
+        """The concrete value of every declared generic type parameter of
+        one call.  ``provided`` carries the marshaled type of each
+        argument the call provides and ``None`` for a parameter the call
+        leaves out (its default value applies).
 
-        A provided argument always types the parameter it is provided
-        for (parameter annotations, concrete ones included, do not
-        constrain a jit call - a call always resolves to the exact type
-        of its arguments), but parameters annotated with the same type
-        parameter must all be provided arguments whose types unify,
-        which the type parameter solves to.  A missing argument can
-        still solve a type parameter when its default value has a spy
-        type."""
+        Every provided argument records a subtype constraint on the type
+        parameter of the parameter it is provided for; ``finish`` solves
+        each parameter to the peer type of those bounds.  A parameter
+        annotated with a concrete type constrains nothing here - it keeps
+        its annotation, and the call specialized for it converts the
+        argument to that type (see :meth:`specialize`).  A missing
+        argument can still solve a type parameter when its default value
+        has a spy type."""
         assert len(provided.positional) == len(self.positional.by_id), 'argument count mismatch'
-        # unify the type parameters over the provided arguments: two
+        # unify the type parameters over the provided arguments:
         # arguments of parameters annotated with the same type parameter
-        # must marshal to the same type
+        # are recorded as subtype bounds, which the solver binds the
+        # parameter to the peer type of
         solver = TypeVarSolver()
         for param, cand in zip(self.positional.by_id, provided.positional):
             declared = param.type
@@ -397,12 +398,12 @@ class NativeFn:
 
 @dataclass(eq=False)
 class FunctionInstance:
-    """The compiled artifact of one ``@jit`` specialization: its native
-    function (what a Python-side call invokes, see :class:`NativeFn`)
-    and the lowering result its spy function type yields - the call
-    lowering plan a spy function body follows when it calls the
-    specialization, together with its lowered MIR signature (see
-    ``type.function_call_info``)."""
+    """The compiled artifact of one specialization of a registered
+    function: the lowered MIR function it was compiled into (``mir``),
+    its return convention (``ret_sig``) and the native functions a
+    Python-side call invokes - ``native_fn``, and ``wrapper_fn`` (the
+    Python-entry thunk) when the value form cannot be called through
+    ctypes (see ``_needs_thunk``/:class:`NativeFn`)."""
 
     mir: mir.Function
     ret_sig: ReturnSignature | None = None
@@ -410,14 +411,16 @@ class FunctionInstance:
     native_fn: NativeFn | None = None
 
 class FunctionValue(Value):
-    """The function value of a ``@jit`` function: only compiled - and
-    thereby typed - when a call specializes it, so as a value its type
-    is the untyped :class:`AnyFunction`.
+    """The function value of a registered function: only compiled - and
+    thereby typed - when a call specializes it, so its type is the
+    signature's :class:`~spy.sval.FunctionType` when that signature is
+    complete and the untyped :class:`~spy.sval.AnyFunction` otherwise.
 
-    Like :class:`FunctionValue` the value doubles as the per-function
-    entry of its host context (function values are identity objects: two
-    are equal only if they are the same object).  The call logic itself
-    lives in the interpreter and the host, not here.
+    Like :class:`~spy.sval.TypeVar` and :class:`~spy.sval.StructType`,
+    the value doubles as the per-function entry of its host context (it
+    is an identity object: two function values are equal only if they
+    are the same object).  The call logic itself lives in the interpreter
+    and the host, not here.
     """
 
     def __init__(self, name_base: str, hir: FunctionIR, force_inline: bool = False) -> None:
@@ -426,10 +429,11 @@ class FunctionValue(Value):
         # the parsed HIR of the function (see ``astgen.parse_function``)
         self.hir = hir
         self.force_inline = force_inline
-        # spy argument types -> the compiled artifacts of the
-        # specialization (see ``LazyJitFunctionInstance``)
+        # specialized call signatures -> the compiled artifacts of the
+        # specialization
         self.specs: dict[CallSignature, FunctionInstance] = {}
-        # spy argument types -> error message of a failed compilation
+        # specialized call signatures -> error message of a failed
+        # compilation
         self.failed: dict[CallSignature, str] = {}
 
     def __eq__(self, value: object, /) -> bool:
@@ -448,10 +452,12 @@ class FunctionResolver:
         """The spy value a global object referenced inside a function
         body resolves to.  A function registered in this host - reached
         as the raw function object or through the callable view its
-        decorated name binds to - resolves to its function entry
-        (creating the entry of an aot function that is not used yet);
-        any other object is not a spy value of this host and returns
-        ``None`` (the object stays a plain compile-time Python value)."""
+        decorated name binds to - resolves to its function entry (created
+        lazily when it is not parsed yet).  The host also resolves the
+        ``spy.*`` builtins, the struct classes it declares and the plain
+        Python functions it inlines; any other object is not a spy value
+        of this host and returns ``None`` (the object stays a plain
+        compile-time Python value)."""
         ...
 
 

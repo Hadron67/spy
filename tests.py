@@ -1,4 +1,4 @@
-"""Integration tests for the spy JIT (``symlat.spy``).
+"""Integration tests for the spy JIT (``spy``).
 
 The functions under test are defined at module level and registered with
 the ordinary ``@spy.func()`` decorator; a function body may call the
@@ -7,7 +7,9 @@ the compile-time interpreter) exactly like a user would.  The
 undecorated ``add_inline`` is deliberately left unregistered: it stays a
 plain Python function and is inlined at its call sites.
 
-Only function calls are exercised here (the struct features are not).
+Function calls are exercised by ``SpyFunctionCallTest`` below; the struct
+features (declaration, layout, construction and methods) by
+``SpyStructTest``/``SpyStructMirrorTest``.
 The global host context caches specializations, so the tests share the
 compiled functions; a test that needs a fresh compilation calls a
 function no earlier test has compiled.
@@ -512,7 +514,8 @@ class SpyFunctionCallTest(TestCase):
         self.assertEqual(mod(17, 5), 2)
 
     def test_generic_int(self) -> None:
-        # a plain Python int marshals to the default signed 32-bit type
+        # a plain Python int marshals to the default signed 64-bit type
+        # (see ``dsl._INT_LITERAL_BITS``)
         self.assertEqual(add(2, 3), 5)
 
     def test_generic_float(self) -> None:

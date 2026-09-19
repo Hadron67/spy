@@ -1,5 +1,6 @@
 """Cleanup passes over the typed MIR (``mir``), run once the
-interpreter has finished typing a function body (see ``dsl``).
+interpreter has finished typing a function body (see
+``fn.CompileBatch.compile``).
 
 The interpreter delivers every value an inlined function returns
 through the shared memory of the call's result location (see
@@ -25,7 +26,9 @@ folded only when
   before the store that lands between the store and a load would also
   reach the load without the store).
 
-Everything else keeps its memory.
+A slot that fails these conditions is left in memory and folded no
+further; one that is never read (together with the store that writes it)
+or is never referenced at all is deleted instead.
 """
 
 from . import mir

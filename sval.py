@@ -2,8 +2,8 @@
 
 Types appear in two roles:
 
-* as the type annotation values in AOT functions (``spy.u64``,
-  ``spy.f64``, ...), and
+* as the parameter and return annotation values of a function
+  (``spy.u64``, ``spy.f64``, ...), and
 * as compile-time values inside a function body (``spy.typeof(a) ==
   spy.u64``).
 
@@ -12,9 +12,9 @@ mirrors of these types defined by ``mir``; the interpreter converts
 between the two when it emits instructions.
 
 Types are immutable and compare structurally (two ``IntType(64, False)``
-types are structurally (two ``IntType(64, False)``
-are equal), which is what makes the compile-time comparisons in
-``spy.typeof(a) == spy.u64`` work.
+instances are equal) - except the identity types ``TypeVar`` and
+``StructType``, which are equal only to themselves.  That is what makes
+the compile-time comparisons in ``spy.typeof(a) == spy.u64`` work.
 """
 
 from __future__ import annotations
@@ -34,14 +34,14 @@ if TYPE_CHECKING:
     from .fn import RawArgList
 
 INT_DEFAULT_BITS = 32
-"""A plain Python ``int`` argument is mapped to this signedness/width by
-default (see ``value_type``)."""
+"""The signedness/width of the default spy integer type: the type a
+plain Python ``int`` maps to (see ``as_value``)."""
 
 
 class Value:
     """Base of the *spy values* of the compile-time domain: types
     (used as values by ``spy.typeof``) and other compile-time objects.
-    Concrete values expose their spy type as ``.type``."""
+    Concrete values report their spy type through ``get_type()``."""
     @abstractmethod
     def get_type(self) -> Type:
         ...
@@ -72,11 +72,12 @@ class Type(Value):
     def get_unit_value(self) -> AnyValue | None:
         """The canonical *unit value* of a zero-sized type (ZST): ``None``
         when the type has a runtime representation (it is not
-        zer   o-sized), otherwise the one compile-time value every value of
+        zero-sized), otherwise the one compile-time value every value of
         the type equals - ``Void()`` for the void type, ``Int(0, T)`` for
         a zero-bit integer, an ``AggregateValue`` for a struct whose
         fields are all ZSTs.  A ZST has no runtime representation: its
-        ``mir`` mirror is ``VoidType`` (``to_mir_type`` returns ``VoidType``)."""
+        ``mir`` mirror is the void type (``to_mir_type`` returns
+        ``mir.VOID``)."""
         return None
 
     def is_subtype_of(self, other: Type) -> bool:
@@ -88,15 +89,14 @@ class Type(Value):
     @abstractmethod
     def to_mir_type(self) -> mir.MayBeVoidType | None:
         """The MIR mirror of this spy type: the static type the runtime
-        register of a value of this type has.  The mapping is one-to-one
-        over the types that can cross into runtime code.  A zero-sized
-        type has no runtime representation and mirrors to ``None`` (the
-        MIR's "void": a function whose return type is a ZST returns
-        void); a spy struct type mirrors to one :class:`mir.StructType`
-        object (created lazily and cached on the descriptor), so that all
-        values of one struct share one identity.  Types with no MIR
-        mirror at all (``TypeType``, ``AnyFunction``, ...) are a compile
-        error."""
+        register of a value of this type has.  A zero-sized type has no
+        runtime representation and mirrors to the MIR's void type
+        (:data:`mir.VOID` - a function whose return type is a ZST returns
+        void); a spy struct type mirrors to the one MIR type every value
+        of the struct shares (created lazily and cached on the
+        descriptor, see :meth:`StructType._calculate_mir`).  Types that
+        cannot cross into runtime code at all (``TypeType``,
+        ``AnyFunction``, ...) have no mirror and return ``None``."""
         ...
 
     def is_zst(self) -> bool:
@@ -219,9 +219,9 @@ class VoidType(Type):
     :class:`Void` (``sval.Void()``).  It is the spy type of ``None`` -
     the return type of a function that returns no value (declared as
     ``-> None``, or inferred for a body without value returns) - and it
-    has no runtime representation: its ``mir`` mirror is ``None``
-    (``to_mir_type`` returns ``None``) and no load/store is ever
-    emitted for it."""
+    has no runtime representation: its ``mir`` mirror is the MIR void
+    type (``to_mir_type`` returns ``mir.VOID``) and no load/store is
+    ever emitted for it."""
 
     @override
     def get_type(self) -> Type:
@@ -732,10 +732,10 @@ class StructType(Type):
         # an ``extern_c`` struct is laid out for the C ABI: the mirror holds
         # its fields in declaration order.  A spy struct is laid out by the
         # compiler, which is free to reorder: the least-aligned fields come
-        # first (the mirror then packs tighter), a struct that holds exactly
-        # one field *is* that field - its mirror is the field's own mirror,
-        # with no wrapper struct - and one that holds none is a zero-sized
-        # type, mirroring to the void type
+        # first (the mirror then packs tighter), a non-``extern_c`` struct
+        # that holds exactly one field *is* that field - its mirror is the
+        # field's own mirror, with no wrapper struct - and one that holds
+        # none is a zero-sized type, mirroring to the void type
         if not self.modifiers.extern_c:
             mirrored.sort(key=lambda field: estimated_alignment_of(field[1].type))
 
@@ -793,9 +793,10 @@ class StructType(Type):
 
 @dataclass(frozen=True)
 class AnyFunction(Type):
-    """The type of a function value whose signature is not known: a lazy
-    ``@jit`` function is only typed when a call specializes it.  It has
-    no MIR mirror - such a value never crosses into runtime code."""
+    """The type of a function value whose signature is not known: a
+    lazily compiled ``@func()`` function is only typed when a call
+    specializes it.  It has no MIR mirror - such a value never crosses
+    into runtime code."""
 
     @override
     def get_type(self) -> Type:
@@ -840,7 +841,9 @@ compiled code works with are the host's (see ``lower``)."""
 def estimated_size_of(type: Type) -> int:
     """Returns the estimated size of a type in bytes. The size is obtained
     using ctypes size rule, but is not guaranteed to be the actual size of
-    the type. ZSTs are guaranteed to return 0."""
+    the type. A zero-sized type that has a layout - a zero-bit integer, a
+    struct with no stored field - returns 0; ``void`` and literal types
+    have no layout and raise :class:`SpyError`."""
     match type:
         case BoolType():
             return 1
@@ -853,7 +856,7 @@ def estimated_size_of(type: Type) -> int:
         case StructType():
             offset = 0
             for field in type.fields().values():
-                # a zero-sized fields are handled correctly
+                # a zero-bit field has alignment 1 and occupies no size
                 align = estimated_alignment_of(field.type)
                 offset = (offset + align - 1) // align * align
                 offset += estimated_size_of(field.type)
@@ -864,7 +867,9 @@ def estimated_size_of(type: Type) -> int:
 
 def estimated_alignment_of(type: Type) -> int:
     """Estimated alignment of a type in bytes. Like :func:`estimated_size_of`,
-    this is not guaranteed to be the actual alignment of the type. ZSTs have alignment 1."""
+    this is not guaranteed to be the actual alignment of the type. A zero-bit
+    integer and a struct with no stored field have alignment 1; ``void`` and
+    literal types have no layout and raise :class:`SpyError`."""
     match type:
         case BoolType():
             return 1
@@ -891,15 +896,13 @@ def returns_via_result_ptr(type: Type) -> bool:
     writing into a caller-provided result location (a hidden result
     pointer parameter) instead of returning the value directly.
 
-    The convention is a property of the *return type*, decided here once
-    and consulted everywhere a function's signature is lowered (the
-    function type is the single source of the decision - never the
-    registration entry).  The default policy: aggregates are returned by
-    value while they are small (up to
+    This is the default policy, a property of the *return type*: an
+    aggregate is returned by value while it is small (up to
     :data:`_AGGREGATE_VALUE_RETURN_LIMIT` bytes) and through a result
-    pointer once they outgrow it; a future per-struct override or a new
-    aggregate kind (arrays) only needs to extend this function.  Scalars
-    are always returned by value."""
+    pointer once it outgrows it, and a new aggregate kind (arrays) only
+    needs to extend this function.  Scalars are always returned by
+    value.  A signature may override the default
+    (``fn.Signature.ret_by_ref``)."""
     match type:
         case StructType():
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
@@ -914,9 +917,9 @@ def pass_by_ref(type: Type) -> bool:
 
     The policy mirrors :func:`returns_via_result_ptr`: an aggregate too
     large to be passed in registers (larger than the by-value limit) is
-    passed as a pointer, everything else by value.  A parameter whose
-    formal declares it as a reference (``SignatureFormalArg.by_ref``) is
-    passed by reference regardless of its type."""
+    passed as a pointer, everything else by value.  The caller otherwise
+    passes a parameter by reference when its formal declares it as one
+    (``fn.SignatureFormalArg.by_ref``), whatever its type."""
     match type:
         case StructType():
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
@@ -930,11 +933,10 @@ def pass_by_ref(type: Type) -> bool:
 
 
 def type_of(value: AnyValue, int_literal_bits: int | None = None) -> Type:
-    """The spy type a Python *value* is marshaled to at the call boundary.
-
-    ``None`` is returned for values that have no spy representation (e.g.
-    compile-time objects like type descriptors, which never cross the
-    boundary).
+    """The spy type a Python *value* is marshaled to at the call boundary,
+    or ``None`` for a plain Python object that has no marshaling (a
+    tuple, a class, ...).  A compile-time object is an ``sval.Value`` and
+    reports its own spy type.
     """
     if isinstance(value, Value):
         return value.get_type()
@@ -994,10 +996,10 @@ class _SolvedTypeVar:
     """The solver state of one type parameter.
 
     A parameter is either *solved* - bound to a value (``_value``), with
-    no subtype bounds recorded - or *bounded*: declared a subtype of
-    every value in ``_subtypes`` (its upper bounds), without a solution
-    yet.  Solving the equality constraints of a bounded parameter binds
-    it to a value that must satisfy every recorded bound."""
+    no subtype bounds recorded - or *bounded*: every value in
+    ``_subtypes`` is a subtype of it (its lower bounds), without a
+    solution yet.  Solving the equality constraints of a bounded
+    parameter binds it to the peer type of its recorded bounds."""
 
     def __init__(self) -> None:
         self._value: Value | None = None  # non-None: this type var is solved to this value, in this case _subtypes is None
@@ -1016,13 +1018,15 @@ class TypeVarSolver:
     ``add_constraint`` collects one constraint - an *equality*
     (``lhs == rhs``, the default) or a *subtyping* (``lhs <: rhs``,
     ``is_subtype=True``) - and ``finish`` solves them, binding every
-    constrained type parameter to a value.  Spy types have no
-    structural subtyping (one concrete spy type is a subtype of another
-    only when they are equal), so a subtype constraint is satisfiable
-    exactly when an equality one is; the solver still tracks the bounds
-    of a parameter separately so that ``finish`` can bind a parameter
-    that only ever appears on the left of subtype constraints.  When a
-    constraint cannot be satisfied, ``finish`` raises
+    constrained type parameter to a value.  Spy types have structural
+    subtyping only where the type defines it - integers by range, floats
+    by width, types by level; elsewhere a subtype is equal to its
+    supertype.  The solver tracks the bounds of a parameter separately
+    so that ``finish`` can bind a parameter that only ever appears on the
+    right of subtype constraints (as the supertype of its bounds).  A
+    constraint that cannot be satisfied is recorded in ``_unsatisfied``
+    (and is not reported yet); a generic parameter that stays unsolved
+    makes ``fn.Signature.solve_param_types`` raise
     :class:`TypeMismatchError`.
     """
 
@@ -1145,8 +1149,9 @@ def is_numeric_type(type: Type):
             return False
 
 def coerce_const(value: AnyValue, type: Type) -> AnyValue:
-    """Turn a Python literal into the typed MIR constant that mirrors the
-    spy type ``type``."""
+    """Turn a Python value into the typed spy value of the spy type
+    ``type`` (an ``Int``/``Float``/``Void``/``Type``/``bool``); the
+    interpreter builds the MIR constant from it later."""
     if isinstance(value, AsValue):
         value = value.value
     match type:

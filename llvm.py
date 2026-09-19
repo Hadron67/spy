@@ -57,14 +57,9 @@ class Value:
     def get_children(self) -> list[Value]:
         return []
 
-# def gen_get_children(cls=None, excludes: set[str] | None = None):
-#     def wrapper(cls):
-#         gen_get_children0(cls, Value if issubclass(cls, Value) else Type, excludes)
-#         return cls
-
-#     if cls is not None:
-#         return wrapper(cls)
-#     return wrapper
+# the ``get_children`` methods of the classes in this module are generated
+# by ``util.gen_get_children`` (see the ``@gen_get_children`` decorators
+# below)
 
 @dataclass(frozen=True)
 class FloatType(Type):
@@ -361,11 +356,12 @@ class Module(NameContext):
         self._symbols: StrBiMap[GlobalValue | StructType] = StrBiMap()
 
     def add_recursively(self, types: list[Type] | None = None, values: list[Value] | None = None):
-        """Register the symbols a module must declare: every named value
+        """Collect the symbols the module must declare - every named value
         reachable from ``values`` (their types included) and every struct
-        type reachable from ``types`` - a struct type a body only uses
+        type reachable from ``types``.  ``finish`` then assigns them the
+        names they are emitted under.  A struct type a body only uses
         internally (the slot of a struct-valued local) is not part of any
-        signature, so it has to be registered on its own."""
+        signature, so it has to be passed in ``types`` explicitly."""
         todo_values: list[Value] = [] if values is None else list(values)
         todo_types: list[Type] = [] if types is None else list(types)
 
@@ -445,7 +441,9 @@ class GlobalValue(Value):
 
     @abstractmethod
     def get_default_name_prefix(self) -> tuple[str, bool]:
-        """Returns the name for this value, and whether it could be renamed."""
+        """Returns the default name (a prefix) for this value, and whether
+        the module may pick a different, unique name when this one is
+        already taken."""
         ...
 
 class GlobalValueFlags:
@@ -716,7 +714,8 @@ class Function(GlobalValue, IFunction):
     @override
     def get_children(self) -> list[Value]:
         assert self._type is not None
-        # exclude all Inst when collecting
+        # collect only non-code values: neither the instructions themselves
+        # nor the blocks they branch to
 
         ret: list[Value] = []
         for b in self._entry.collect_blocks():
@@ -1689,9 +1688,10 @@ class Icmp(Inst):
 class Fcmp(Inst):
     """A floating-point comparison, producing an ``i1``.
 
-    The predicate names follow LLVM: ``eq``/``ne`` become ``oeq``/``une`` and
-    the ordering predicates take the ``o`` (ordered) prefix, so that a ``NaN``
-    operand compares false everywhere, matching numpy semantics.
+    The predicate names follow LLVM: ``eq``/``ne`` become ``oeq``/``une``
+    (``une`` is unordered-or-not-equal, so ``NaN != x`` stays true) and the
+    ordering predicates take the ``o`` (ordered) prefix, so a ``NaN`` never
+    satisfies ``==``/``<``/``>`` etc., matching numpy semantics.
     """
 
     op: IcmpOp

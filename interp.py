@@ -2,10 +2,13 @@
 
 The interpreter executes the linear HIR instruction stream of a function
 against the concrete argument types, emitting the typed MIR along the
-way.  Every executed HIR instruction produces a value that is recorded in
-a register table keyed by the instruction object itself, mirroring how
-``symlat.jit.llvm`` registers work: operands of later instructions are
-references to earlier instruction objects.
+way.  Every executed HIR instruction that is used as an operand leaves a
+value in a register table keyed by the instruction object itself,
+mirroring how ``llvm`` registers work: operands of later instructions
+are references to earlier instruction objects.  An instruction that
+writes through a result location (``Binary``, ``Unary``,
+``BinaryAssign``, ``CallInplace``, ``CallMethodInplace``) produces no
+register of its own.
 
 Values in the register table are either
 
@@ -14,19 +17,26 @@ Values in the register table are either
   function to call/inline, ...).  "No value" is the unit value
   ``sval.Void()`` - the unique value of the zero-sized void type - never
   Python ``None``,
+* :class:`ComptimeTuple`/:class:`ComptimeDict` - a compile-time
+  aggregate whose elements are themselves interpreter values,
 * :class:`RuntimeVal` - the object of an already emitted MIR
-  instruction (a typed runtime value), or
-* :class:`PendingSlot` - an executed ``Alloca`` whose typed MIR alloca
-  is emitted by its first store (a slot whose content type is a
-  zero-sized type never gets memory: it only records its unit value).
+  instruction (a typed runtime value),
+* :class:`PendingSlot` - an executed ``Alloca`` that is only committed
+  (into real memory, or into a :class:`ComptimeBox`) when
+  ``hir.CommitSlot`` runs; a slot whose content type is zero-sized never
+  gets memory: it only records its unit value, or
+* :class:`ComptimeBox` - the compile-time memory a committed
+  compile-time slot materializes into (a pointer to a compile-time
+  value).
 
 Instructions whose operands are all compile-time values are evaluated
 eagerly in Python (the comptime semantics of the DSL); instructions
 with runtime operands emit typed MIR.  A compile-time value flows into
 runtime code only by being converted to a typed constant of the type
 the runtime operation expects.  The interpreter types everything in the
-``spy`` type system of ``type.py`` and *mirrors* the spy types into MIR
-only when an instruction is emitted (``type.to_mir_type``): it never reads
+``spy`` type system of ``sval`` and *mirrors* the spy types into MIR
+only when an instruction is emitted (``sval.Type.to_mir_type``): it
+never reads
 the MIR types of the values it produced back for a decision - a valid
 spy type always lowers to a valid MIR type (open loop), exactly like
 ``lower`` maps MIR onto LLVM without reading LLVM types back.
@@ -52,9 +62,10 @@ before its ``End``; a single-path body's store/load round trip is
 cleaned up afterwards by ``opt``.
 
 Both kinds of function calls push a *frame* holding the by-value
-arguments (resolved by ``hir.Arg`` leaves); the addressable parameter
-slots themselves are the ``Alloca``/``Store`` prologue that ``astgen``
-placed at the head of every function body.  The interpreter types an
+arguments (resolved by ``hir.Arg`` leaves): an inlined plain-Python
+callee pushes it on the current runner, and a called spy function gets a
+runner of its own instead (the caller suspends until that runner has
+typed it, see ``Analyser._request_function``).  The interpreter types an
 ``Alloca`` when its first store executes, so the untyped HIR needs no
 type information of its own.
 """
@@ -117,9 +128,9 @@ class ComptimeVal(InterpVal):
 class RuntimeVal(InterpVal):
     """A value of the already emitted typed MIR.  The interpreter's own
     knowledge of the static type of the value lives here in the ``spy``
-    type system (``type.py``) - the MIR type of the value is only ever
-    *produced* from it (``type.to_mir_type``), never read back for a
-decision."""
+    type system (``sval``) - the MIR type of the value is only ever
+    *produced* from it (``sval.Type.to_mir_type``), never read back for a
+    decision."""
 
     value: mir.Value
     type: sval.Type
@@ -299,10 +310,11 @@ def _sval_to_runtime(value: sval.AnyValue) -> mir.Value:
 
 
 def _to_runtime(ev: InterpVal) -> mir.Value:
-    """Materialize a value as a typed runtime value: runtime values must
-    already have the target type, compile-time values adopt it (or,
-    without a target, their Python type mapping).  Returns the typed MIR
-    value and its spy type."""
+    """Materialize a value as a typed MIR value: a runtime value yields
+    its MIR object, a compile-time value a constant built from it
+    (``_sval_to_runtime``), and a committed slot the value it was
+    materialized into; an uncommitted slot or a compile-time box is
+    rejected."""
     match ev:
         case RuntimeVal():
             return ev.value
@@ -400,8 +412,8 @@ def _convert_inst(
     value: mir.Value, from_type: sval.Type, to_type: sval.Type
 ) -> mir.Inst | None:
     """Build (but do not emit) the conversion of ``value`` from
-    ``from_type`` to ``to_type``; returns ``value`` itself when no
-    conversion is needed."""
+    ``from_type`` to ``to_type``; returns ``None`` when no conversion
+    instruction is needed (the types are equal, or both are pointers)."""
     if from_type == to_type:
         return None
     mir_to_type = to_type.to_mir_type()
@@ -447,9 +459,10 @@ class HirRunner:
     time, filling the pre-created typed :class:`mir.Function` of one
     specialization.
 
-    ``resolver`` is the compile-time host, typed as the
+    The compile-time host is reached through the :class:`Analyser`
+    (``analyser``) as ``self._analyser._resolver``: it is typed as the
     :class:`FunctionResolver` interface it implements (``dsl._Context``
-    in practice): it resolves a global object referenced inside a
+    in practice) and resolves a global object referenced inside a
     function body to its spy value (its function entry, or ``None`` for
     anything that is not a spy object).  The nested specializations a
     body calls are requested through ``Analyser._request_function``.
@@ -460,10 +473,10 @@ class HirRunner:
         # the frames of the function bodies under execution: the function
         # proper at the bottom, one frame per inlined plain function
         # above it (see ``_in_function_proper``; each frame carries the
-        # IR of its body, see ``Frame``)
+        # HIR of its body, see ``InlineFrame``)
         self._frames: list[InlineFrame] = []
         # the function proper whose body is currently being typed (see
-        # ``_bind_result_ptr``)
+        # ``_materialize_result_ptr``)
         self._fn_instance = fn_instance
         self._mir_block_stack: list[list[mir.Inst]] = [fn_instance.mir.insts]
         # the ``hir.Ret`` positions of the function proper whose return
@@ -548,13 +561,13 @@ class HirRunner:
 
     def _materialize_result_ptr(self, type: sval.Type, ret_by_ref: bool | None = None) -> None:
         """Fix the return convention of the function proper from the spy
-        type its result location holds (its first return site, or its
-        declared return annotation).  A result delivered through a result
-        pointer appends the hidden result pointer formal to the lowered
-        signature *after* every declared argument and makes the function
-        return void; the location is then the memory of that pointer.  A
-        direct return fixes the MIR return type and leaves the location
-        recording its value.
+        type its result location holds (the peer type of all its store
+        points, or its declared return annotation).  A result delivered
+        through a result pointer appends the hidden result pointer formal
+        to the lowered signature *after* every declared argument and makes
+        the function return void; the location is then the memory of that
+        pointer.  A direct return fixes the MIR return type and leaves the
+        location recording its value.
 
         The convention is a property of the return type
         (``sval.returns_via_result_ptr``) unless the signature declares it.
@@ -612,8 +625,10 @@ class HirRunner:
     def _run_machine(self) -> PollResult:
         """The flat execution loop: walks the instruction list of the
         executing frame (see ``_step``) until the run of the function
-        proper ended (``DONE``) or an inlined/nested callee has to be
-        typed first (``SUSPEND``).  There is no recursion: the walk is
+        proper ended (``DONE``) or a called spy function's specialization
+        was just started and must be typed by a runner of its own
+        (``SUSPEND``, see ``Analyser._run``).  There is no recursion: the
+        walk is
         linear over one flat list per frame; the ``If``/``Else``/``End``
         markers delimit the blocks, and every control state lives in the
         block stacks of the frames."""
@@ -654,7 +669,8 @@ class HirRunner:
         ``if``, or types the branch regions of a runtime ``if``), the
         ``Else``/``End`` markers close the branch being walked, a
         ``return`` cuts the current path (see ``_cut``); every other
-        instruction only updates the register table."""
+        instruction only advances the state of the frame (its register
+        table, and the MIR emitted so far)."""
 
         frame = self._frames[-1]
         regs = frame.regs
@@ -886,11 +902,13 @@ class HirRunner:
             case hir.ConstRef():
                 # a reference to an immutable global.  At compile time a
                 # reference to a global behaves exactly like the value it
-                # refers to (its static type is a ``type.PointerType`` of
-                # the referenced object - ``PointerType(typeof(expr),
-                # True)`` - but nothing dereferences a compile-time
-                # global at runtime yet, so the reference is only ever
-                # consumed as an identity: the callee of a call).  The
+                # refers to (its static type is a ``sval.PointerType`` of
+                # the referenced object - ``sval.PointerType(
+                # sval.type_of(expr), True)`` - but nothing emits a
+                # runtime load of a compile-time global yet: it is
+                # dereferenced only at compile time (see ``load``), so a
+                # reference is otherwise consumed as an identity - the
+                # callee of a call).  The
                 # referenced object is resolved to its entry like a
                 # ``Const`` value.
                 obj = value.value
@@ -1070,11 +1088,13 @@ class HirRunner:
                 raise CompileError(f"cannot take field address of {ptr}")
 
     def _emit(self, inst: mir.Inst, at: int | None = None) -> mir.Value:
-        """Append one instruction to the flat body of the function
-        being typed (``fn.insts``): the interpreter emits the whole MIR
-        of a specialization into one list, delimited by the
-        ``If``/``Else``/``End`` markers (there are no separate
-        regions)."""
+        """Append one instruction to the list currently being filled:
+        the flat body of the function being typed, or a pending action's
+        insertion block while one is delivered.  ``at`` overwrites the
+        reserved position ``at`` instead of appending.  A
+        specialization's MIR lands in one list, delimited by the
+        ``If``/``Else``/``End`` (and ``Block``) markers (there are no
+        separate regions)."""
         assert self._mir_block_stack
         top = self._mir_block_stack[-1]
         if at is not None:
@@ -1096,9 +1116,10 @@ class HirRunner:
     # -- helpers -------------------------------------------------------------
 
     def _coerce(self, ev: InterpVal, target: sval.Type) -> InterpVal:
-        """Materialize a value of the spy type ``target``; numeric
-        widening conversions (int -> float, float32 -> float64) are
-        applied."""
+        """Materialize a value of the spy type ``target``: a compile-time
+        value is converted with ``sval.coerce_const``, a runtime value
+        gets whatever numeric conversion the target needs - widening or
+        narrowing, see ``_convert_inst``."""
         match ev:
             case ComptimeVal(obj):
                 return ComptimeVal(sval.coerce_const(obj, target))
@@ -1287,13 +1308,14 @@ class HirRunner:
         register, plain Python functions are inlined, and the spy
         builtins are evaluated at compile time.  The callee constant of a
         registered spy function already resolved to its entry when the
-        callee operand was evaluated (see ``_operand``).
+        callee operand was evaluated (see ``operand``).
 
-        Returns ``PollResult.AGAIN`` when the call completed here (the
-        caller still hands its result to the result location), or
-        ``PollResult.SUSPEND`` when an inlined callee's frame was pushed
-        and its body is now running under the machine: the call's result
-        is handed to the result location when the run ends."""
+        Returns ``PollResult.AGAIN`` when the call completed here (an
+        inlined callee's body writes into the result location directly),
+        or ``PollResult.SUSPEND`` when the callee's specialization was
+        just started and must be typed first: the call is then completed
+        by ``resume`` when that runner ends (see
+        ``_call_function_entry``)."""
         if isinstance(callee, ComptimeVal):
             obj = callee.obj
             if not isinstance(obj, sval.ConstRef):
@@ -1359,13 +1381,16 @@ class HirRunner:
     def _commit_pending_slot(
         self, val: InterpVal, type: sval.Type | None = None, ptr: mir.Value | None = None
     ) -> None:
-        """Materialize a pending slot: it becomes a :class:`ComptimeBox`
-        when it may inline values and every action is compile-time, and a
-        :class:`RuntimeVal` pointer otherwise.  The type is the pairwise
-        ``resolve_peer_type`` of the action types (or the given one).  The
-        recorded actions are delivered through ``_exec_pending_actions``,
-        which fills in the instructions that must be spliced at their
-        original positions."""
+        """Materialize a pending slot.  It becomes a :class:`ComptimeBox`
+        when it may inline values and every action is compile-time, or
+        when its type is zero-sized (the box then carries the unit value
+        and the recorded actions are dropped); with an explicit result
+        pointer (``ptr``), or otherwise, it becomes a
+        :class:`RuntimeVal` pointer to freshly allocated memory.  The
+        type is the pairwise ``resolve_peer_type`` of the action types
+        (or the given one).  The recorded actions are delivered through
+        ``_exec_pending_actions``, which fills in the instructions that
+        must be spliced at their original positions."""
         if not isinstance(val, PendingSlot):
             raise CompileError('can only commit a pending slot')
         if val.committed is not None:
@@ -1646,8 +1671,11 @@ class HirRunner:
         """Start the inlined body of a plain Python callee: convert its
         bound arguments into addressable values (the callee's ``hir.Arg``
         leaves denote its parameter slots) and push its frame under a
-        fresh ``mir.Block`` (which its ``return`` statements leave with a
-        ``mir.Break``).  The body now runs under the machine; its return
+        fresh ``mir.Block`` (a ``return`` inside a runtime branch leaves
+        it with a ``mir.Break``; a ``return`` on the body's top level
+        just falls off its region, closed by the matching ``mir.End``).
+        An argument that is already a reference is forwarded as the
+        address it is.  The body now runs under the machine; its return
         statements write into ``ret`` directly (it is the body's result
         location), so no result is handed back here."""
         if len(self._frames) - 1 >= _MAX_INLINE_DEPTH:

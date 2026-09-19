@@ -1,6 +1,6 @@
 """The untyped HIR.
 
-Like ``symlat.jit.llvm``, the HIR is a *linear* stream of instructions:
+Like ``llvm``, the HIR is a *linear* stream of instructions:
 every instruction object is also its own result register (instructions
 have identity; operands of later instructions reference earlier
 operand objects).  ``astgen`` flattens expressions into temporary
@@ -11,19 +11,24 @@ interpreter *runs* the instructions with the concrete argument types.
 Calls follow *result location semantics* (RLS): a call writes its
 result into the slot of its ``ret`` operand (:class:`CallInplace`) and
 produces no register of its own.  A caller that needs the value
-allocates a slot and loads it back; the interpreter keeps scalar and
-compile-time results of native calls in the slot without giving it real
-memory (an inlined callee's result is the exception: it is stored into
-the slot on every returning path, see ``interp``).  The
-return of a function is governed by the same semantics: its body ends
-with a write into the function's result location (:class:`ResultLoc`)
-followed by a value-less :class:`Ret` terminator; the interpreter turns
-the write into the return value of a direct-return function, or into a
+allocates a slot and loads it back.  The slot only becomes real memory
+when it is committed (``CommitSlot``): a slot all of whose stores are
+compile-time - an inline temporary, ``Alloca(True)`` - stays a
+compile-time value, a zero-sized slot only records its unit value, and
+anything else is materialized as memory.  The store/load round trip a
+runtime call result leaves behind is folded back into registers
+afterwards by ``opt`` (see ``interp``).  The return of a function is
+governed by the same semantics: each ``return`` writes into the
+function's result location (:class:`ResultLoc`) and is followed by a
+value-less :class:`Ret` terminator, and ``astgen`` appends a trailing
+:class:`StoreVoidRetloc` to every body - the store of the void unit
+value for a path that falls off the end; the interpreter turns the
+write into the return value of a direct-return function, or into a
 store through the result pointer of a result-pointer function.
 
 ``astgen`` performs all name resolution: a read of a variable - a
 parameter or a block-local declaration - becomes a :class:`Load` of
-the variable's :class:`Alloca`.  A global is an *immutable value*: in a
+the variable's storage.  A global is an *immutable value*: in a
 value context the name becomes a :class:`Const` holding the resolved
 Python object (spy types, the ``spy`` module functions, functions to
 call/inline, ...), in a reference context it becomes a
@@ -32,20 +37,17 @@ are passed to :class:`CallInplace`).  Attribute access on such
 compile-time objects is evaluated there as well.  The HIR never
 carries a variable *name*.
 
-Because every parameter is addressable, the instruction list of a
-function body begins with one ``Alloca``/``Store`` pair per parameter::
+At HIR level a parameter is passed by reference (its address): the
+translated body binds the name of the i-th parameter directly to its
+:class:`Arg` leaf, and the interpreter materializes the parameter's
+storage (a MIR alloca holding ``mir.Param``) when the first store runs.
+A local variable is declared with a fresh :class:`Alloca` at its first
+assignment, and a later assignment to it is a plain ``Store`` of its
+slot.
 
-    %a = Alloca();  Store(%a, Arg(0))
-    %b = Alloca();  Store(%b, Arg(1))
-
-A local variable is declared the same way at its first assignment - the
-``Alloca``/``Store`` pair sits at the declaration point instead of in
-the prologue - and a later assignment to it is a plain ``Store`` of
-its slot.
-
-(:class:`Arg` refers to the i-th by-value argument of the function being
-executed.)  The interpreter *types* an ``Alloca`` when its first store
-executes, so the untyped HIR needs no type information.
+(:class:`Arg` is the *address* of the i-th argument of the function
+being executed.)  The interpreter *types* an ``Alloca`` when its first
+store executes, so the untyped HIR needs no type information.
 
 Operands of instructions are therefore either
 
@@ -53,7 +55,8 @@ Operands of instructions are therefore either
   globals,
 * :class:`ConstRef` leaves - references (const pointers) to immutable
   globals,
-* :class:`Arg` leaves - the by-value arguments of the function,
+* :class:`Arg` leaves - the addresses of the arguments of the
+  function (parameters are passed by reference),
 * instruction objects produced by earlier instructions.
 
 Statements: every function body is one *flat* list of instructions
@@ -94,7 +97,7 @@ class ConstRef(Value):
     resolved global (a function entry, a spy type, a captured constant,
     ...) as embedded by ``astgen`` in a reference context (``is_ref``).
     It denotes a const pointer to the global: the interpreter types a
-    ``ConstRef(expr)`` as ``type.PointerType(typeof(expr), True)``.  A
+    ``ConstRef(expr)`` as ``sval.PointerType(sval.type_of(expr), True)``.  A
     function value - whose type is a runtime DST that cannot be used by
     value - is only ever referenced through such a reference (a
     function pointer)."""
@@ -104,7 +107,8 @@ class ConstRef(Value):
 
 @dataclass(frozen=True)
 class Arg(Value):
-    """The index-th by-value argument of the function being executed."""
+    """The address of the index-th argument of the function being
+    executed (parameters are passed by reference at HIR level)."""
 
     index: int
 
@@ -127,12 +131,11 @@ class Inst(Value):
 @dataclass(eq=False)
 class Alloca(Inst):
     """Reserve an addressable slot for one value.  The slot is untyped
-    until it is used: the first ``Store`` that targets it types and
-    allocates it, while a ``CallInplace`` result (RLS) is only recorded
-    in it - scalar and compile-time results of native calls are never
-    given real memory, but an inlined callee's result is stored into it
-    (see ``interp``).
-    Function bodies start with one Alloca/Store pair per parameter."""
+    until it is used: the stores that target it (a plain ``Store``, or a
+    ``CallInplace`` result under RLS) type it, and the ``CommitSlot``
+    that follows then materializes it - a slot all of whose stores are
+    compile-time becomes a compile-time box instead of memory (see
+    ``interp``)."""
     allow_comptime: bool = False
 
 @dataclass(eq=False)
@@ -152,15 +155,16 @@ class Store(Inst):
 
 @dataclass(eq=False)
 class StoreVoidRetloc(Inst):
-    """Equivalent to ``Store(RetLoc(), Const(sval.Void()))``."""
+    """Equivalent to ``Store(ResultLoc(), Const(sval.Void()))``."""
 
 
 @dataclass(eq=False)
 class FieldAddr(Inst):
     """The address of the field ``name`` of the struct ``base`` points
     at.  ``base`` denotes the *storage* of a struct value: the slot of a
-    variable (an ``Alloca``), or the address of a nested field (another
-    ``FieldAddr``); the interpreter resolves it - and the field's type -
+    variable (an ``Alloca``, or the ``Arg`` of a parameter), or the
+    address of a nested field (another ``FieldAddr``); the interpreter
+    resolves it - and the field's type -
     from the static type it has typed ``base`` with (see ``interp``),
     auto-dereferencing a base that points at a pointer (a ``self``
     passed by pointer, a pointer-valued field, ...) first."""
@@ -174,10 +178,12 @@ class CallMethodInplace(Inst):
     """A call of the method ``name`` of the struct ``base`` points at
     (result-location semantics like :class:`CallInplace`).  A method is
     an ordinary function whose first parameter is the struct type of
-    ``base`` (by value) or a pointer to it (``ptr_self``): the
-    interpreter resolves the method from the static type of the struct
-    and runs the call like any other, with the base prepended as that
-    first argument (see ``interp``)."""
+    ``base``: the base's address is prepended as that first argument
+    (passed by reference), unless the method declares ``self`` as a
+    pointer type, in which case the base's address already is the value
+    the parameter expects.  The interpreter resolves the method from the
+    static type of the struct and runs the call like any other (see
+    ``interp``)."""
 
     base: Value
     name: str
