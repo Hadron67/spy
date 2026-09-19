@@ -44,12 +44,12 @@ llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
 
 _ICMP_OPS = {
-    'eq': sllvm.IcmpOp.EQ,
-    'ne': sllvm.IcmpOp.NE,
-    'lt': sllvm.IcmpOp.LT,
-    'le': sllvm.IcmpOp.LE,
-    'gt': sllvm.IcmpOp.GT,
-    'ge': sllvm.IcmpOp.GE,
+    '==': sllvm.IcmpOp.EQ,
+    '!=': sllvm.IcmpOp.NE,
+    '<': sllvm.IcmpOp.LT,
+    '<=': sllvm.IcmpOp.LE,
+    '>': sllvm.IcmpOp.GT,
+    '>=': sllvm.IcmpOp.GE,
 }
 
 _CTYPE_INT = {
@@ -404,15 +404,15 @@ class _Lowerer:
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)
                 match inst.op:
-                    case 'add':
+                    case '+':
                         result = block.add(lhs, rhs)
-                    case 'sub':
+                    case '-':
                         result = block.sub(lhs, rhs)
-                    case 'mul':
+                    case '*':
                         result = block.mul(lhs, rhs)
-                    case 'div':
+                    case '/':
                         result = block.div(lhs, rhs, inst.signed)
-                    case 'rem':
+                    case '%':
                         result = block.rem(lhs, rhs, inst.signed)
                     case _:
                         raise CompileError(f"unsupported MIR operation '{inst.op}'")

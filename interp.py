@@ -62,11 +62,13 @@ type information of its own.
 import operator
 import types as pytypes
 from abc import abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Any, Callable, Self, override
+from typing import Any, Self, override
 
 from . import hir, mir, sval
+from .binop import BinaryOp, BoolOp, CompareOp, UnaryOp
 from .errors import CompileError
 from .fn import (
     ArgEntry,
@@ -102,11 +104,6 @@ _PY_OPS: dict[str, Any] = {
     '>': operator.gt,
     '>=': operator.ge,
 }
-
-_ARITH_OPS = {'+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '%': 'rem'}
-
-_CMP_OPS = {'==': 'eq', '!=': 'ne', '<': 'lt', '<=': 'le', '>': 'gt', '>=': 'ge'}
-
 
 class InterpVal:
     pass
@@ -684,6 +681,10 @@ class HirRunner:
                 else:
                     self._emit(mir.Ret(_to_runtime(self.load(location))))
                 return self._cut()
+            case hir.AsBool():
+                return self.as_bool(self.operand_arg(inst.value), inst)
+            case hir.BinaryAssign():
+                return self.binary_assign(inst.op, self.operand(inst.lhs), self.operand_arg(inst.rhs))
             case hir.If():
                 self._exec_if(inst)
             case hir.Else():
@@ -1093,7 +1094,7 @@ class HirRunner:
 
     # -- operators ------------------------------------------------------------
 
-    def _eval_binary(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
+    def _eval_binary(self, op: BinaryOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
         # what the operation *is* follows from the types of the operands - a
         # primitive arithmetic instruction, or (later) an overload method
         # that takes the operands by reference (``a + b`` becomes
@@ -1144,7 +1145,7 @@ class HirRunner:
             mir_type = type.to_mir_type()
             assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
             value = self._emit(
-                mir.Arith(_ARITH_OPS[op], signed, _to_runtime(lc), _to_runtime(rc), mir_type)
+                mir.Arith(op, signed, _to_runtime(lc), _to_runtime(rc), mir_type)
             )
             self.store(ret, RuntimeVal(value, type))
             return PollResult.AGAIN
@@ -1154,7 +1155,7 @@ class HirRunner:
         else:
             raise CompileError(f"unsupported operator '{op}' for {lhs_type} and {rhs_type}")
 
-    def _eval_cmp(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret_reg: hir.Inst) -> PollResult:
+    def _eval_cmp(self, op: CompareOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret_reg: hir.Inst) -> PollResult:
         lhs_type = _arg_type_of(lhs)
         rhs_type = _arg_type_of(rhs)
 
@@ -1178,7 +1179,7 @@ class HirRunner:
             kind = 'int' if isinstance(type, sval.IntType) else 'float'
             signed = isinstance(type, sval.IntType) and type.signed
             value = self._emit(
-                mir.Cmp(_CMP_OPS[op], signed, kind, _to_runtime(lc), _to_runtime(rc))
+                mir.Cmp(op, signed, kind, _to_runtime(lc), _to_runtime(rc))
             )
             self._frames[-1].regs[ret_reg] = RuntimeVal(value, sval.BoolType())
             return PollResult.AGAIN
@@ -1188,7 +1189,7 @@ class HirRunner:
         else:
             raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
 
-    def _eval_boolop(self, op: str, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret_reg: hir.Inst) -> PollResult:
+    def _eval_boolop(self, op: BoolOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret_reg: hir.Inst) -> PollResult:
         if _is_comptime_val(lhs.value) and _is_comptime_val(rhs.value):
             lv = self._arg_value(lhs)
             rv = self._arg_value(rhs)
@@ -1201,14 +1202,14 @@ class HirRunner:
             '(only compile-time operands)'
         )
 
-    def _eval_unary(self, op: str, operand: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
+    def _eval_unary(self, op: UnaryOp, operand: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
         if _is_comptime_val(operand.value):
             ev = self._arg_value(operand)
             assert isinstance(ev, ComptimeVal)
             obj = ev.obj
             if op == 'not':
                 result: sval.AnyValue = not obj
-            elif op == 'neg':
+            elif op == '-':
                 negated = sval.negate(obj)
                 if negated is None:
                     raise CompileError(f'cannot negate {obj!r} at compile time')
@@ -1226,11 +1227,11 @@ class HirRunner:
                 raise CompileError(f"cannot apply 'not' to a {type} value")
             coerced = self._coerce(self._arg_value(operand), type)
             value = self._emit(
-                mir.Cmp('eq', False, 'int', _to_runtime(coerced), mir.BoolValue(False))
+                mir.Cmp('==', False, 'int', _to_runtime(coerced), mir.BoolValue(False))
             )
             self.store(ret, RuntimeVal(value, sval.BoolType()))
             return PollResult.AGAIN
-        if op == 'neg':
+        if op == '-':
             mir_type = type.to_mir_type()
             assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
             if isinstance(type, sval.FloatType):
@@ -1243,11 +1244,17 @@ class HirRunner:
                 raise CompileError(f'cannot negate a {type} value')
             coerced = self._coerce(self._arg_value(operand), type)
             value = self._emit(
-                mir.Arith('sub', False, zero, _to_runtime(coerced), mir_type)
+                mir.Arith('-', False, zero, _to_runtime(coerced), mir_type)
             )
             self.store(ret, RuntimeVal(value, type))
             return PollResult.AGAIN
         raise CompileError(f"unsupported unary operator '{op}'")
+
+    def binary_assign(self, op: BinaryOp, left: InterpVal, right: ArgEntry[InterpVal]) -> PollResult:
+        # ``x op= y`` is ``x = x op y``: the value the target currently
+        # holds and the right operand feed the operator, and its result is
+        # stored back into the target
+        return self._eval_binary(op, ArgEntry(left, True), right, left)
 
     # -- calls ----------------------------------------------------------------
 
@@ -1404,6 +1411,15 @@ class HirRunner:
         no conversion): it is only needed when the slot's final type and
         the call's return type differ."""
         return ptr
+
+    def as_bool(self, value: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
+        type = _arg_type_of(value)
+        frame = self._frames[-1]
+        if isinstance(type, sval.BoolType):
+            frame.regs[ret] = self._arg_value(value)
+            return PollResult.AGAIN
+
+        raise NotImplementedError
 
     def call_constructor(self, struct: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """Construct a struct: the ``__init__`` of the struct runs if it has

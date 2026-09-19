@@ -3,6 +3,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Self, override
 
+from .binop import BinaryOp, CompareOp
 from .errors import CompileError
 
 # ---------------------------------------------------------------------------
@@ -354,13 +355,12 @@ class Gep(Inst):
 class Arith(Inst):
     """Integer/float arithmetic.
 
-    ``op`` is one of ``'add'``, ``'sub'``, ``'mul'`` (integer or float,
-    chosen by ``type``), ``'div'`` and ``'rem'`` (float division is
-    ``'div'`` with a float result type).  Integer division/remainder
-    honor ``signed``.
+    ``op`` is one of ``'+'``, ``'-'``, ``'*'`` (integer or float,
+    chosen by ``type``), ``'/'`` (float) and ``'%'`` (integer).  Integer
+    division/remainder honor ``signed``.
     """
 
-    op: str
+    op: BinaryOp
     signed: bool
     lhs: Value
     rhs: Value
@@ -404,10 +404,10 @@ class Convert(Inst):
 
 @dataclass(eq=False)
 class Cmp(Inst):
-    """A comparison producing a bool; ``op`` is one of 'eq', 'ne', 'lt',
-    'le', 'gt', 'ge'."""
+    """A comparison producing a bool; ``op`` is one of '==', '!=', '<',
+    '<=', '>', '>='."""
 
-    op: str
+    op: CompareOp
     signed: bool
     kind: str  # 'int' or 'float'
     lhs: Value

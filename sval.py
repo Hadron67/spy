@@ -1056,36 +1056,43 @@ class TypeVarSolver:
                 solved._subtypes = None
             solved._value = bound
 
+    def substitute_solved(self, value: Value):
+        while True:
+            if not isinstance(value, TypeVar):
+                return value
+            solved = self._solved(value)
+            if solved is None or solved._value is None:
+                return value
+            value = solved._value
+
     def add_constraint(self, lhs: Value, rhs: Value, is_subtype: bool = False):
         todo = [(lhs, rhs, is_subtype)]
         while todo:
             lhs, rhs, is_subtype = todo.pop()
+            lhs = self.substitute_solved(lhs)
+            rhs = self.substitute_solved(rhs)
+
             if lhs == rhs:
                 continue
-            if is_subtype:
+
+            if not is_subtype and isinstance(rhs, TypeVar) and not isinstance(lhs, TypeVar):
+                t = lhs
+                lhs = rhs
+                rhs = t
+
+            if isinstance(lhs, TypeVar):
                 # in the case we concern, TypeVar cannot appear on the left side of a subtype constraint
-                assert not isinstance(lhs, TypeVar)
-                if isinstance(rhs, TypeVar):
-                    self._solve_type_var_bound(rhs, lhs, True)
-                if isinstance(lhs, TypeVar) and isinstance(rhs, TypeVar) and not lhs.is_subtype_of(rhs):
-                    self._add_unsatisfied(lhs, rhs, is_subtype)
-                self._add_unsatisfied(lhs, rhs, is_subtype)
-            else:
-                if isinstance(rhs, TypeVar) and not isinstance(lhs, TypeVar):
-                    t = lhs
-                    lhs = rhs
-                    rhs = t
+                assert not is_subtype
+                self._solve_type_var_bound(lhs, rhs, is_subtype)
 
-                if isinstance(lhs, TypeVar):
-                    self._solve_type_var_bound(lhs, rhs, False)
+            if isinstance(rhs, TypeVar):
+                self._solve_type_var_bound(rhs, lhs, is_subtype)
 
-                # only top-level spy values are unified for now: a
-                # constraint between two compound types (an aggregate
-                # containing a type parameter, a pointer to one, ...) is
-                # recorded as unsatisfied and reused once the solver
-                # learns to unify their children
-                if lhs != rhs:
-                    self._add_unsatisfied(lhs, rhs, is_subtype)
+            # fall back to equal constraint
+            if isinstance(lhs, StructType) and isinstance(rhs, StructType) and lhs.head is rhs.head and len(lhs.generic_args) == len(rhs.generic_args):
+                todo.extend((l, r, False) for l, r in zip(reversed(lhs.generic_args), reversed(rhs.generic_args)))
+
+            self._add_unsatisfied(lhs, rhs, is_subtype)
 
     def finish(self):
         for type_var, sv in self._type_var_values.items():

@@ -68,13 +68,12 @@ types both branches (both survive at runtime).  Future block
 instructions (loops, ...) will use the same marker representation.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from spy.fn import ArgEntry, RawArgList
+from .binop import BinaryOp, CompareOp, UnaryOp
+from .binop import BoolOp as BoolOpType
+from .fn import ArgEntry, RawArgList
 
 
 class Value:
@@ -201,19 +200,31 @@ class CallInplace(Inst):
 
 
 @dataclass(eq=False)
+class Subscript(Inst):
+    base: Value
+    index: Value
+
+@dataclass(eq=False)
 class Binary(Inst):
     """Arithmetic: '+', '-', '*', '/', '//', '%', '**'."""
 
-    op: str
+    op: BinaryOp
     lhs: ArgEntry[Value]
     rhs: ArgEntry[Value]
     ret: Value
+
+@dataclass(eq=False, slots=True)
+class BinaryAssign(Inst):
+    op: BinaryOp
+    lhs: Value
+    rhs: ArgEntry[Value]
+
 
 @dataclass(eq=False)
 class Compare(Inst):
     """Comparison: '==', '!=', '<', '<=', '>', '>='."""
 
-    op: str
+    op: CompareOp
     lhs: ArgEntry[Value]
     rhs: ArgEntry[Value]
 
@@ -224,16 +235,16 @@ class BoolOp(Inst):
     supported for now; the operands are evaluated eagerly when the HIR
     runs, so both sides of a compile-time ``and`` are always computed."""
 
-    op: str
+    op: BoolOpType
     lhs: ArgEntry[Value]
     rhs: ArgEntry[Value]
 
 
 @dataclass(eq=False)
 class Unary(Inst):
-    """Unary operator: 'not', 'neg' (unary minus)."""
+    """Unary operator: '-', 'not'."""
 
-    op: str
+    op: UnaryOp
     operand: ArgEntry[Value]
     ret: Value
 
@@ -246,6 +257,11 @@ class Ret(Inst):
     return value (a direct-return function) or leaves it in the result
     pointer (a result-pointer function)."""
 
+
+@dataclass(eq=False)
+class AsBool(Inst):
+    """Converts a value to a boolean."""
+    value: ArgEntry[Value]
 
 @dataclass(eq=False)
 class If(Inst):

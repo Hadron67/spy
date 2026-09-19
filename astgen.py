@@ -70,7 +70,7 @@ from .sval import (
 )
 from .util import IndexedMap, frozendict
 
-_BIN_OPS = {
+_BIN_OPS: dict[type[ast.AST], hir.BinaryOp] = {
     ast.Add: '+',
     ast.Sub: '-',
     ast.Mult: '*',
@@ -80,11 +80,11 @@ _BIN_OPS = {
     ast.Pow: '**',
 }
 
-_BOOL_OPS = {ast.And: 'and', ast.Or: 'or'}
+_BOOL_OPS: dict[type[ast.AST], hir.BoolOpType] = {ast.And: 'and', ast.Or: 'or'}
 
-_UNARY_OPS = {ast.USub: 'neg', ast.Not: 'not'}
+_UNARY_OPS: dict[type[ast.AST], hir.UnaryOp] = {ast.USub: '-', ast.Not: 'not'}
 
-_CMP_OPS = {
+_CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
     ast.Eq: '==',
     ast.NotEq: '!=',
     ast.Lt: '<',
@@ -162,7 +162,7 @@ class _Builder:
             case ast.Pass():
                 pass
             case ast.Expr():
-                self._gen_value(node.value)
+                self._gen_expr(node.value)
             case ast.Assign():
                 if len(node.targets) != 1:
                     raise CompileError(
@@ -174,8 +174,8 @@ class _Builder:
             case ast.If():
                 # the branches are generated into the same flat list,
                 # delimited by the ``Else``/``End`` markers (WASM-style)
-                cond = self._gen_value(node.test)
-                self.add(hir.If(cond))
+                cond = self._gen_expr(node.test)
+                self.add(hir.If(self.add(hir.AsBool(cond))))
                 self._gen_branch(node.body)
                 if len(node.orelse) > 0:
                     self.add(hir.Else())
@@ -219,10 +219,12 @@ class _Builder:
                 slot = self.add(hir.Alloca())
                 self._scope.bindings[target.id] = slot
                 emit_commit = True
-        lhs = self._gen_ref(target)
-        self.add(hir.Store(lhs, self._gen_value(value)))
+        lhs = self._gen_expr(target, False)
+        if not lhs.is_ref:
+            raise CompileError(f"target of augmented assignment must be a variable, got {target}")
+        self.add(hir.Store(lhs.value, self._as_value(self._gen_expr(value))))
         if emit_commit:
-            self.add(hir.CommitSlot(lhs))
+            self.add(hir.CommitSlot(lhs.value))
 
     def _gen_augassign(self, node: ast.AugAssign) -> None:
         """One ``name += expr`` statement: read the value, add ``expr``
@@ -233,9 +235,11 @@ class _Builder:
         if not isinstance(node.op, ast.Add):
             raise CompileError(f"only '+=' is supported yet in spy function {fn_name}")
 
-        lhs = self._gen_ref(node.target)
-        rhs = self._gen_arg(node.value)
-        self.add(hir.Binary('+', ArgEntry(lhs, True), rhs, lhs))
+        lhs = self._gen_expr(node.target, False)
+        if not lhs.is_ref:
+            raise CompileError(f"target of augmented assignment must be a variable, got {node.target}")
+        rhs = self._gen_expr(node.value)
+        self.add(hir.BinaryAssign(_BIN_OPS[type(node.op)], lhs.value, rhs))
 
     # -- expressions ----------------------------------------------------------
 
@@ -285,45 +289,20 @@ class _Builder:
             f"name '{name}' is not defined in the scope of function {self._fn_ir.name}"
         )
 
-    def _gen_expr(
-        self,
-        node: ast.expr,
-        is_ref: bool = False,
-        result_loc: hir.Value | None = None,
-    ) -> hir.Value | None:
-        """Translate one expression, with result-location semantics (RLS).
+    def _as_ref(self, node: ArgEntry[hir.Value]):
+        if node.is_ref:
+            return node.value
+        loc = self.add(hir.Alloca(True))
+        self.add(hir.Store(loc, node.value))
+        self.add(hir.CommitSlot(loc))
+        return loc
 
-        Of the four flag combinations only three are meaningful
-        (``is_ref=True`` together with ``result_loc`` is an error):
+    def _as_value(self, node: ArgEntry[hir.Value]) -> hir.Value:
+        if node.is_ref:
+            return self._make_load(node.value)
+        return node.value
 
-        * ``is_ref=False, result_loc=None`` (the default): produce the
-          expression value in a register and return it;
-        * ``is_ref=False, result_loc=<pointer>``: write the expression's
-          result into the pointer and return ``None`` - the caller
-          already has a slot for it (a local variable, the result slot
-          of an enclosing statement, ...);
-        * ``is_ref=True, result_loc=None``: produce a *reference* to the
-          result - a pointer, not a value.  Addressable names yield
-          their slot; a global is an immutable value and yields a
-          ``hir.ConstRef`` (a const pointer) to it - the callee of a
-          call is generated this way, as a callee must be a reference -
-          and any other expression is evaluated into a fresh slot whose
-          pointer is returned.
-
-        A call in value context therefore allocates a temporary slot,
-        emits a :class:`hir.CallInplace` writing into it and loads the
-        value back; with a ``result_loc`` the call writes straight into
-        it.
-        """
-        assert not (is_ref and result_loc is not None)
-        if is_ref:
-            return self._gen_ref(node)
-        if result_loc is not None:
-            self._gen_result_loc(node, result_loc)
-            return None
-        return self._gen_value(node)
-
-    def _gen_ref(self, node: ast.expr) -> hir.Value:
+    def _gen_expr(self, node: ast.expr, allow_retloc: bool = True) -> ArgEntry[hir.Value]:
         """A reference to the value of ``node`` (see ``_gen_expr``):
         addressable names give their slot, the fields of a runtime
         struct value give their address (a :class:`hir.FieldAddr` chain
@@ -332,70 +311,94 @@ class _Builder:
         a pointer to a freshly allocated slot holding its value."""
         match node:
             case ast.Name():
-                return self._gen_name(node.id, True)
+                return ArgEntry(self._gen_name(node.id), True)
             case ast.Attribute():
-                base = self._gen_ref(node.value)
+                base = self._as_ref(self._gen_expr(node.value))
                 if isinstance(base, hir.ConstRef):
                     if hasattr(base.value, node.attr):
-                        return hir.ConstRef(getattr(base.value, node.attr))
+                        return ArgEntry(hir.ConstRef(getattr(base.value, node.attr)), True)
                     raise AttributeError(f"Attribute '{node.attr}' not found on {base.value}")
-                return self.add(hir.FieldAddr(self._gen_ref(node.value), node.attr))
+                return ArgEntry(self.add(hir.FieldAddr(base, node.attr)), True)
+            case ast.Constant():
+                if isinstance(node.value, (int, float, str, bool)) or node.value is None:
+                    return ArgEntry(hir.Const(node.value), False)
+                raise CompileError(f"unsupported constant {node.value!r}")
+            case ast.BoolOp():
+                op = _BOOL_OPS.get(type(node.op))
+                if op is None:
+                    raise CompileError(
+                        f"unsupported boolean operator {type(node.op).__name__}"
+                    )
+                if len(node.values) != 2:
+                    raise CompileError(
+                        "chained boolean operators are not supported yet"
+                    )
+                lhs = self._gen_expr(node.values[0])
+                rhs = self._gen_expr(node.values[1])
+                return ArgEntry(self.add(hir.BoolOp(op, lhs, rhs)), False)
+            case ast.Compare():
+                if len(node.ops) != 1 or len(node.comparators) != 1:
+                    raise CompileError(
+                        "chained comparisons are not supported yet"
+                    )
+                op = _CMP_OPS.get(type(node.ops[0]))
+                if op is None:
+                    raise CompileError(
+                        f"unsupported comparison {type(node.ops[0]).__name__}"
+                    )
+                lhs = self._gen_expr(node.left)
+                rhs = self._gen_expr(node.comparators[0])
+                return ArgEntry(self.add(hir.Compare(op, lhs, rhs)), False)
             case _:
+                if not allow_retloc:
+                    raise CompileError(f"unexpected expression {node}")
                 loc = self.add(hir.Alloca(True))
-                self._gen_result_loc(node, loc)
+                self._gen_result_loc(node, loc, False)
                 self.add(hir.CommitSlot(loc))
-                return loc
+                return ArgEntry(loc, True)
 
     # -- struct values ---------------------------------------------------------
 
-    def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value) -> None:
+    def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value, allow_fall_back: bool = True) -> None:
         """Evaluate ``node`` writing its result into ``result_loc``
         (result-location semantics); no value register is produced."""
         fn_name = self._fn_ir.name
         match node:
             case ast.Call():
-                if len(node.keywords) > 0:
-                    raise CompileError(
-                        f"calls with keyword arguments inside spy functions are not supported yet "
-                        f"(function {fn_name})"
-                    )
                 self._gen_call(node, result_loc)
+            case ast.Subscript():
+                pass
             case ast.UnaryOp():
                 op = _UNARY_OPS.get(type(node.op))
                 if op is None:
                     raise CompileError(
                         f"unsupported unary operator {type(node.op).__name__} in spy function {fn_name}"
                     )
-                self.add(hir.Unary(op, self._gen_arg(node.operand), result_loc))
+                self.add(hir.Unary(op, self._gen_expr(node.operand), result_loc))
             case ast.BinOp():
                 op = _BIN_OPS.get(type(node.op))
                 if op is None:
                     raise CompileError(
                         f"unsupported binary operator {type(node.op).__name__} in spy function {fn_name}"
                     )
-                lhs = self._gen_arg(node.left)
-                rhs = self._gen_arg(node.right)
+                lhs = self._gen_expr(node.left)
+                rhs = self._gen_expr(node.right)
                 self.add(hir.Binary(op, lhs, rhs, result_loc))
             case _:
                 # every other expression computes a value first; only the
                 # call (and, later, the ``if`` expression) can write
                 # through a result location without materializing a value
-                value = self._gen_value(node)
+                if not allow_fall_back:
+                    raise CompileError(f"unsupported expression {node}")
+                value = self._as_value(self._gen_expr(node))
                 self.add(hir.Store(result_loc, value))
 
-    def _gen_arg(self, node: ast.expr):
-        match node:
-            case ast.Name() | ast.Call() | ast.Attribute():
-                return ArgEntry(self._gen_ref(node), True)
-            case _:
-                return ArgEntry(self._gen_value(node), False)
-
     def _gen_arglist(self, args: list[ast.expr], keywords: list[ast.keyword]) -> RawArgList[ArgEntry[hir.Value]]:
-        positional = tuple(self._gen_arg(a) for a in args)
+        positional = tuple(self._gen_expr(a) for a in args)
         kwargs: dict[str, ArgEntry[hir.Value]] = {}
         for kw in keywords:
             if kw.arg is not None:
-                kwargs[kw.arg] = self._gen_arg(kw.value)
+                kwargs[kw.arg] = self._gen_expr(kw.value)
         return RawArgList(positional, frozendict(kwargs.items()))
 
     def _gen_call(self, node: ast.Call, result_loc: hir.Value) -> None:
@@ -407,87 +410,29 @@ class _Builder:
             # a method of the struct ``base``: the method and its self
             # parameter are resolved by the interpreter from the static
             # type of the base; only the base's address is carried here
-            base = self._gen_ref(node.func.value)
+            base = self._as_ref(self._gen_expr(node.func.value))
             self.add(hir.CallMethodInplace(base, node.func.attr, self._gen_arglist(node.args, node.keywords), result_loc))
             return
         # the callee must be addressable (a reference), the arguments are
         # by-value values
-        callee = self._gen_ref(node.func)
+        callee = self._as_ref(self._gen_expr(node.func))
         self.add(hir.CallInplace(callee, self._gen_arglist(node.args, node.keywords), result_loc))
 
-    def _gen_name(self, name: str, is_ref: bool) -> hir.Value:
-        """One reference to the name ``name``.  A variable (a parameter
-        or a block-local) is addressable: its slot *is* the reference,
-        and a value context reads it back with a :class:`hir.Load`.  A
-        global is an immutable *value*: in a value context the name is
-        embedded as a :class:`hir.Const` of the resolved object; in a
-        reference context it becomes a :class:`hir.ConstRef` - a const
-        reference (pointer) to the global.  A function value, whose type
-        is a runtime DST, is only legal behind such a reference (a
-        function pointer); it is an error to use it as a plain value."""
+    def _gen_name(self, name: str) -> hir.Value:
+        """Always returns a reference to the name ``name``."""
         slot = self._scope.lookup(name)
         if slot is not None:
             # reading a variable (parameter or local): load its slot
-            return slot if is_ref else self.add(hir.Load(slot))
+            return slot
         obj = self._resolve_global(name)
         # a global: its resolved object is the immutable value of the
         # name; a reference to it is a ``ConstRef`` of that object
-        return hir.ConstRef(obj) if is_ref else hir.Const(obj)
+        return hir.ConstRef(obj)
 
     def _make_load(self, value: hir.Value):
         if isinstance(value, hir.ConstRef):
             return hir.Const(value.value)
         return self.add(hir.Load(value))
-
-    def _gen_value(self, node: ast.expr) -> hir.Value:
-        """Evaluate ``node`` producing its value in a register (the plain
-        by-value context)."""
-        fn_name = self._fn_ir.name
-        match node:
-            case ast.Constant():
-                if isinstance(node.value, (int, float, str, bool)) or node.value is None:
-                    return hir.Const(node.value)
-                raise CompileError(f"unsupported constant {node.value!r} in spy function {fn_name}")
-            case ast.Name():
-                return self._gen_name(node.id, False)
-            case ast.BoolOp():
-                op = _BOOL_OPS.get(type(node.op))
-                if op is None:
-                    raise CompileError(
-                        f"unsupported boolean operator {type(node.op).__name__} in spy function {fn_name}"
-                    )
-                if len(node.values) != 2:
-                    raise CompileError(
-                        f"chained boolean operators are not supported yet in spy function {fn_name}"
-                    )
-                lhs = self._gen_arg(node.values[0])
-                rhs = self._gen_arg(node.values[1])
-                return self.add(hir.BoolOp(op, lhs, rhs))
-            case ast.Compare():
-                if len(node.ops) != 1 or len(node.comparators) != 1:
-                    raise CompileError(
-                        f"chained comparisons are not supported yet in spy function {fn_name}"
-                    )
-                op = _CMP_OPS.get(type(node.ops[0]))
-                if op is None:
-                    raise CompileError(
-                        f"unsupported comparison {type(node.ops[0]).__name__} in spy function {fn_name}"
-                    )
-                lhs = self._gen_arg(node.left)
-                rhs = self._gen_arg(node.comparators[0])
-                return self.add(hir.Compare(op, lhs, rhs))
-            case ast.Call() | ast.BinOp() | ast.UnaryOp():
-                loc = self.add(hir.Alloca(True))
-                self._gen_result_loc(node, loc)
-                self.add(hir.CommitSlot(loc))
-                return self._make_load(loc)
-            case ast.Attribute():
-                return self._make_load(self._gen_ref(node))
-            case _:
-                raise CompileError(
-                    f"unsupported expression {type(node).__name__} in spy function {fn_name}"
-                )
-
 
 def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: bool = False) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.

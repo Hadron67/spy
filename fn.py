@@ -25,7 +25,7 @@ from .sval import (
 from .util import IndexedMap, StrBiMap, frozendict, sanitize_name
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SignatureFormalArg:
     # The evaluated annotation of the parameter, in the spy domain (see
     # ``Signature``): a concrete spy type, a generic type parameter of
@@ -47,13 +47,13 @@ class SignatureFormalArg:
             self.default_value,
         )
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ArgEntry[T]:
     value: T
     is_ref: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RawArgList[T]:
     positional: tuple[T, ...]
     kwargs: frozendict[str, T]
@@ -64,7 +64,7 @@ class RawArgList[T]:
             frozendict((k, f(v)) for k, v in self.kwargs.items()),
         )
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ArgList[T]:
     positional: tuple[T, ...]
     varargs: tuple[T, ...]
@@ -85,7 +85,7 @@ class ArgList[T]:
 class SpecializedFormalArg:
     pass
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SpecializedRuntimeArg(SpecializedFormalArg):
     type: Type
     is_ref: bool
@@ -93,19 +93,19 @@ class SpecializedRuntimeArg(SpecializedFormalArg):
     def __str__(self) -> str:
         return f"<{'&' if self.is_ref else ''}{self.type}>"
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SpecializedComptimeArg(SpecializedFormalArg):
     value: Value
 
     def __str__(self) -> str:
         return str(self.value)
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReturnSignature:
     ret_by_ref: bool
     ret_type: Type
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CallSignature:
     generic_args: tuple[Value, ...]
     positional: tuple[tuple[str, SpecializedFormalArg], ...]
