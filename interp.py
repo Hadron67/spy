@@ -231,7 +231,7 @@ class PendingSlot(InterpVal):
 
 @dataclass(frozen=True, slots=True)
 class ComptimeTuple(InterpVal):
-    values: tuple[InterpVal, ...]
+    values: tuple[ArgEntry[InterpVal], ...]
 
 @dataclass
 class ComptimeDict(InterpVal):
@@ -249,7 +249,7 @@ def _is_comptime_val(val: InterpVal) -> bool:
                     return False
                 todo.append(val.committed)
             case ComptimeTuple():
-                todo.extend(val.values)
+                todo.extend(a.value for a in val.values)
             case ComptimeDict():
                 todo.extend(val.value_ptrs.values())
     return True
@@ -553,7 +553,7 @@ class HirRunner:
             arg_values.append(self._init_one_arg(arg[1], mir_args))
 
         if signature.varargs:
-            arg_values.append(ComptimeTuple(tuple(self._init_one_arg(a, mir_args) for a in signature.varargs)))
+            arg_values.append(ComptimeTuple(tuple(ArgEntry(self._init_one_arg(a, mir_args), True) for a in signature.varargs)))
         if signature.kwargs:
             arg_values.append(ComptimeDict({k: self._init_one_arg(v, mir_args) for k, v in signature.kwargs.items()}))
 
@@ -715,7 +715,7 @@ class HirRunner:
             case hir.StoreVoidRetloc():
                 self.store(self._current_result_loc(), ComptimeVal(sval.Void()))
             case hir.Tuple():
-                regs[inst] = ComptimeTuple(tuple(self.operand(v) for v in inst.values))
+                regs[inst] = ComptimeTuple(tuple(self.operand_arg(v) for v in inst.values))
             case hir.Binary():
                 return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self.operand(inst.ret))
             case hir.Compare():
@@ -932,19 +932,10 @@ class HirRunner:
 
     def load(self, ptr: InterpVal) -> InterpVal:
         """Read the value a slot or a pointer holds."""
-        match ptr:
-            case PendingSlot():
-                if ptr.committed is None:
-                    raise CompileError('cannot load from a slot before it is committed')
-                return self.load(ptr.committed)
-            case ComptimeBox():
-                if ptr.value is None:
-                    raise CompileError('cannot load from a compile-time box that was never written')
-                return ptr.value
-            case ComptimeVal(obj) if isinstance(obj, sval.ConstRef):
-                # a reference to an immutable compile-time global behaves like
-                # the value it refers to
-                return ComptimeVal(obj.value)
+        if isinstance(ptr, PendingSlot) and ptr.committed is None:
+            raise CompileError('cannot load from a slot before it is committed')
+
+        ptr = _shallow_normalize(ptr)
         type = _type_of(ptr)
         if not isinstance(type, sval.PointerType):
             raise CompileError(f"cannot load from a {type} value")
@@ -952,6 +943,12 @@ class HirRunner:
         if unit_value is not None:
             return ComptimeVal(unit_value)
         match ptr:
+            case ComptimeBox():
+                return ptr.value
+            case ComptimeVal(obj) if isinstance(obj, sval.ConstRef):
+                # a reference to an immutable compile-time global behaves like
+                # the value it refers to
+                return ComptimeVal(obj.value)
             case RuntimeVal():
                 return RuntimeVal(self._emit(mir.Load(ptr.value)), type.elem)
         raise CompileError('cannot load from a compile-time pointer')
@@ -966,6 +963,7 @@ class HirRunner:
             # per element of the value it is stored with (a nested tuple
             # target pairs with a nested tuple value)
             todo: list[tuple[InterpVal, InterpVal]] = [(ptr, value)]
+            stores: list[tuple[InterpVal, InterpVal]] = []
             while todo:
                 target, source = todo.pop()
                 if isinstance(target, ComptimeTuple):
@@ -978,8 +976,11 @@ class HirRunner:
                             f'cannot unpack {len(source.values)} values into '
                             f'{len(target.values)} targets'
                         )
-                    todo.extend(reversed(list(zip(target.values, source.values))))
+                    assert all(a.is_ref or isinstance(a.value, ComptimeTuple) for a in target.values)
+                    todo.extend(reversed([(t.value, self._arg_value(s)) for t, s in zip(target.values, source.values)]))
                     continue
+                stores.append((target, source))
+            for target, source in stores:
                 self.store(target, source)
             return
 
@@ -998,15 +999,6 @@ class HirRunner:
             return
 
         ptr = _shallow_normalize(ptr)
-        match ptr:
-            case ComptimeBox():
-                # a compile-time writable pointer: the store is evaluated
-                # on the spot.  The box keeps the stored value itself (a
-                # consumer materializes it at the type it needs, see
-                # ``_coerce``), so a value with no runtime type of its own
-                # (an untyped literal) stays usable
-                ptr.value = value
-                return
         ptr_type = _type_of(ptr)
         if not isinstance(ptr_type, sval.PointerType):
             raise CompileError(f"cannot store to a {ptr_type} value")
@@ -1015,6 +1007,8 @@ class HirRunner:
             return
         coerced = self._coerce(value, elem)
         match ptr:
+            case ComptimeBox():
+                ptr.value = coerced
             case RuntimeVal():
                 self._emit(mir.Store(ptr.value, _to_runtime(coerced)))
             case _:

@@ -76,7 +76,7 @@ from typing import Any
 
 from .binop import BinaryOp, CompareOp, UnaryOp
 from .binop import BoolOp as BoolOpType
-from .fn import ArgEntry, RawArgList
+from .fn import ArgEntry, RawArgList, frozendict
 
 
 class Value:
@@ -212,7 +212,11 @@ class Subscript(Inst):
 
 @dataclass(eq=False)
 class Tuple(Inst):
-    values: tuple[Value, ...]
+    values: tuple[ArgEntry[Value], ...]
+
+@dataclass(eq=False)
+class Dict(Inst):
+    values: frozendict[str, ArgEntry[Value]]
 
 @dataclass(eq=False)
 class Binary(Inst):

@@ -240,10 +240,10 @@ class _Builder:
         """The tuple of addresses a destructuring target denotes: a plain
         target contributes the address of its slot (or field), a nested
         tuple target contributes its own tuple of addresses."""
-        elems: list[hir.Value] = []
+        elems: list[ArgEntry[hir.Value]] = []
         for elt in target.elts:
             if isinstance(elt, ast.Tuple):
-                elems.append(self._gen_target_tuple(elt, new_slots))
+                elems.append(ArgEntry(self._gen_target_tuple(elt, new_slots), False))
                 continue
             if isinstance(elt, ast.Name) and elt.id not in self._scope.bindings:
                 slot = self.add(hir.Alloca())
@@ -254,7 +254,7 @@ class _Builder:
                 raise CompileError(
                     f"target of a destructuring assignment must be addressable, got {elt}"
                 )
-            elems.append(ref.value)
+            elems.append(ref)
         return self.add(hir.Tuple(tuple(elems)))
 
     def _gen_augassign(self, node: ast.AugAssign) -> None:
@@ -382,7 +382,7 @@ class _Builder:
                 rhs = self._gen_expr(node.comparators[0])
                 return ArgEntry(self.add(hir.Compare(op, lhs, rhs)), False)
             case ast.Tuple():
-                values = tuple(self._as_value(self._gen_expr(elt)) for elt in node.elts)
+                values = tuple(self._gen_expr(elt) for elt in node.elts)
                 return ArgEntry(self.add(hir.Tuple(values)), False)
             case _:
                 if not allow_retloc:
