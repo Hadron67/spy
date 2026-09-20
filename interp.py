@@ -87,7 +87,6 @@ from .fn import (
     CallSignature,
     CompileBatch,
     FunctionInstance,
-    FunctionResolver,
     FunctionValue,
     NativeFn,
     RawArgList,
@@ -96,6 +95,7 @@ from .fn import (
     SpecializedFormalArg,
     SpecializedRuntimeArg,
 )
+from .sval import GlobalResolver
 from .util import frozendict
 
 _MAX_INLINE_DEPTH = 64
@@ -235,7 +235,7 @@ class ComptimeTuple(InterpVal):
 
 @dataclass
 class ComptimeDict(InterpVal):
-    value_ptrs: dict[str, InterpVal]
+    values: dict[str, ArgEntry[InterpVal]]
 
 def _is_comptime_val(val: InterpVal) -> bool:
     todo = [val]
@@ -251,7 +251,7 @@ def _is_comptime_val(val: InterpVal) -> bool:
             case ComptimeTuple():
                 todo.extend(a.value for a in val.values)
             case ComptimeDict():
-                todo.extend(val.value_ptrs.values())
+                todo.extend(a.value for a in val.values.values())
     return True
 
 class BlockFrameData:
@@ -555,7 +555,7 @@ class HirRunner:
         if signature.varargs:
             arg_values.append(ComptimeTuple(tuple(ArgEntry(self._init_one_arg(a, mir_args), True) for a in signature.varargs)))
         if signature.kwargs:
-            arg_values.append(ComptimeDict({k: self._init_one_arg(v, mir_args) for k, v in signature.kwargs.items()}))
+            arg_values.append(ComptimeDict({k: ArgEntry(self._init_one_arg(v, mir_args), True) for k, v in signature.kwargs.items()}))
 
         return tuple(arg_values)
 
@@ -1463,6 +1463,27 @@ class HirRunner:
 
         raise NotImplementedError
 
+    def subscript(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
+        if isinstance(base, ComptimeVal) and isinstance(base.obj, sval.ConstRef) and isinstance(base.obj.value, sval.StructTypeHead):
+            struct = base.obj.value
+            args = None
+            if isinstance(index.value, ComptimeTuple):
+                assert not index.is_ref
+                args = tuple(self._arg_value(a) for a in index.value.values)
+            else:
+                args = (self._arg_value(index),)
+            arg_values: list[sval.Value] = []
+            for arg in args:
+                if not isinstance(arg, ComptimeVal) or not isinstance(arg.obj, sval.Value):
+                    raise CompileError(f'expected comptime value, got {arg!r}')
+                arg_values.append(arg.obj)
+
+            instance = struct.specialize(tuple(arg_values))
+            frame = self._frames[-1]
+            frame.regs[ret] = ComptimeVal(sval.ConstRef(instance))
+            return PollResult.AGAIN
+        raise NotImplementedError
+
     def call_constructor(self, struct: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """Construct a struct: the ``__init__`` of the struct runs if it has
         one, and otherwise the fields are bound from ``args`` by the default
@@ -1470,7 +1491,7 @@ class HirRunner:
         if isinstance(ret, PendingSlot) and ret.committed is None:
             ret = self._defer_ptr_convertion(ret, struct)
 
-        init = struct.methods.get('__init__')
+        init = struct.get_method('__init__')
         if init is not None:
             init_fn = self._analyser._resolver.resolve_global(init)
             if isinstance(init_fn, FunctionValue):
@@ -1517,7 +1538,7 @@ class HirRunner:
     def _resolve_method(self, type: sval.Type, method_name: str):
         match type:
             case sval.StructType():
-                method = type.methods.get(method_name)
+                method = type.get_method(method_name)
                 if method is None:
                     return None
                 return self._analyser._resolver.resolve_global(method)
@@ -1735,7 +1756,7 @@ class HirRunner:
                     raise CompileError('cannot deliver the return value')
 
 class Analyser:
-    def __init__(self, resolver: FunctionResolver) -> None:
+    def __init__(self, resolver: GlobalResolver) -> None:
         self._resolver = resolver
         self._analyse_stack: list[HirRunner] = []
         self._symbol_table = CompileBatch(

@@ -49,7 +49,6 @@ from .fn import (
     ArgList,
     Backend,
     CallSignature,
-    FunctionResolver,
     FunctionValue,
     RawArgList,
     ReturnSignature,
@@ -58,6 +57,7 @@ from .fn import (
 )
 from .interp import Analyser
 from .lower import LLVMBackend
+from .sval import AsSpyValue, GlobalResolver
 from .util import frozendict
 
 # the ``spy.*`` builtins, by the name the interpreter knows them by
@@ -97,13 +97,16 @@ def _to_py_arg(value: sval.AnyValue) -> Any:
 
 _INT_LITERAL_BITS = 64
 
-class _RegisteredFn:
+class _RegisteredFn(AsSpyValue):
     def __init__(self, fn, cls, meta: FnMetadata, context: _Context) -> None:
         self.fn = fn
         self.cls = cls
         self.meta = meta
         self.entry: FunctionValue | None = None
         self.context = context
+
+        # Generic args from outer context, such as generic class
+        self.context_generic_args: tuple[sval.TypeVar, ...] = ()
 
     def __call__(self, *args, **kwds):
         entry = self.get_entry()
@@ -143,7 +146,11 @@ class _RegisteredFn:
             self.entry = FunctionValue(self.fn.__qualname__, hir)
         return self.entry
 
-class _RegisteredClass:
+    @override
+    def as_spy_value(self) -> sval.AnyValue:
+        return self.get_entry()
+
+class _RegisteredClass(AsSpyValue):
     """One class decorated with ``@struct()``, bound to its name in place of
     the class itself: the declaration of one spy struct.  The struct type the
     class names is built from the class body - the annotated class attributes
@@ -166,7 +173,10 @@ class _RegisteredClass:
             # name the struct itself, or one of its methods ``self``
             self.entry = head
             for name, annotation in self.cls.__annotations__.items():
-                head.add_field(name, self._spy_type(annotation, f"the field '{name}'"))
+                type = sval.as_value(annotation, resolver=self.context)
+                if type is None or not isinstance(type, sval.Type):
+                    raise CompileError(f'cannot convert annotation {annotation!r} to a value')
+                head.add_field(name, type)
             struct = head.specialize(())
             for name, value in self.cls.__dict__.items():
                 if isinstance(value, _RegisteredFn):
@@ -180,6 +190,7 @@ class _RegisteredClass:
                     head.methods[name] = value
         return self.entry
 
+    @override
     def as_spy_value(self) -> sval.AnyValue:
         """The spy value of this class: the struct type it declares (see
         ``sval.as_value``, which asks for it).  The name of a *generic* struct
@@ -189,25 +200,6 @@ class _RegisteredClass:
             return entry.specialize(())
         return entry
 
-    def _spy_type(self, annotation: Any, what: str) -> sval.Type:
-        """The spy type one field annotation of the class denotes: another
-        struct class resolves to the struct it declares, anything else through
-        the ordinary conversion (``sval.as_value``)."""
-        type: sval.AnyValue | None = self.context.resolve_global(annotation)
-        if type is None:
-            try:
-                type = sval.as_value(annotation)
-            except Exception as e:
-                raise CompileError(
-                    f'cannot use {annotation!r} as {what} of struct {self.cls.__name__}: {e}'
-                ) from e
-        if not isinstance(type, sval.Type):
-            raise CompileError(
-                f'cannot use {annotation!r} as {what} of struct {self.cls.__name__}: '
-                'a field needs a type'
-            )
-        return type
-
     def __call__(self, *args: Any, **kwds: Any) -> Any:
         raise SpyError(
             f'struct {self.cls.__name__} cannot be constructed from Python yet: '
@@ -215,7 +207,7 @@ class _RegisteredClass:
         )
 
 
-class _Context(FunctionResolver):
+class _Context(GlobalResolver):
     def __init__(self, backend: Backend) -> None:
         self.backend = backend
         self._fn_anotation_cache: dict[Any, _RegisteredFn] = {}

@@ -208,7 +208,7 @@ class CallInplace(Inst):
 @dataclass(eq=False)
 class Subscript(Inst):
     base: Value
-    index: Value
+    index: ArgEntry[Value]
 
 @dataclass(eq=False)
 class Tuple(Inst):

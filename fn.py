@@ -4,7 +4,7 @@ import ctypes
 from abc import abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, override
+from typing import override
 
 from . import hir, mir, opt
 from .errors import CompileError, TypeMismatchError
@@ -445,21 +445,6 @@ class FunctionValue(Value):
     @override
     def get_type(self) -> Type:
         return self.hir.signature.as_non_generic_fn_type() or AnyFunction()
-
-class FunctionResolver:
-    @abstractmethod
-    def resolve_global(self, value: Any) -> AnyValue | None:
-        """The spy value a global object referenced inside a function
-        body resolves to.  A function registered in this host - reached
-        as the raw function object or through the callable view its
-        decorated name binds to - resolves to its function entry (created
-        lazily when it is not parsed yet).  The host also resolves the
-        ``spy.*`` builtins, the struct classes it declares and the plain
-        Python functions it inlines; any other object is not a spy value
-        of this host and returns ``None`` (the object stays a plain
-        compile-time Python value)."""
-        ...
-
 
 class SymbolTable:
     """The link names of every compiled function of the process, and the

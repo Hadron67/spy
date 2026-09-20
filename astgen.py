@@ -384,6 +384,12 @@ class _Builder:
             case ast.Tuple():
                 values = tuple(self._gen_expr(elt) for elt in node.elts)
                 return ArgEntry(self.add(hir.Tuple(values)), False)
+            case ast.Subscript():
+                base = self._gen_expr(node.value)
+                if not base.is_ref:
+                    raise CompileError(f"subscript of non-reference {base}")
+                index = self._gen_expr(node.slice)
+                return ArgEntry(self.add(hir.Subscript(base.value, index)), False)
             case _:
                 if not allow_retloc:
                     raise CompileError(f"unexpected expression {node}")
@@ -401,8 +407,6 @@ class _Builder:
         match node:
             case ast.Call():
                 self._gen_call(node, result_loc)
-            case ast.Subscript():
-                pass
             case ast.UnaryOp():
                 op = _UNARY_OPS.get(type(node.op))
                 if op is None:

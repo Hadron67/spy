@@ -20,6 +20,7 @@ the compile-time comparisons in ``spy.typeof(a) == spy.u64`` work.
 from __future__ import annotations
 
 import ctypes
+import types as pytypes
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -605,10 +606,8 @@ class StructType(Type):
     def modifiers(self) -> StructModifiers:
         return self.head.modifiers
 
-    @property
-    def methods(self) -> dict[str, Any]:
-        """The methods of the struct, by name (see ``interp.call_method``)."""
-        return self.head.methods
+    def get_method(self, name: str) -> Any | None:
+        return self.head.methods.get(name)
 
     def fields(self) -> IndexedMap[str, StructField]:
         """The fields of this specialization, in declaration order: the
@@ -950,7 +949,12 @@ def type_of(value: AnyValue, int_literal_bits: int | None = None) -> Type:
         case str():
             return PointerType(IntType(8, False), True)
 
-def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None) -> AnyValue:
+class AsSpyValue:
+    @abstractmethod
+    def as_spy_value(self) -> AnyValue:
+        ...
+
+def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, resolver: GlobalResolver | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
     scalars and ``sval.Value`` objects pass through, and ``None`` is the
     unit value of the zero-sized void type (``Void()``).  Class objects
@@ -964,7 +968,7 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None) -
         # zero-sized ``VoidType``
         return Void()
     if value is int:
-        return IntType(32, True)
+        return AnyIntType()
     if value is float:
         return FloatType(64)
     if value is str:
@@ -975,9 +979,8 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None) -
         if type_vars is None:
             raise TypeError(f'cannot convert {value} to a value')
         return type_vars[value]
-    as_spy_value = getattr(value, 'as_spy_value', None)
-    if as_spy_value is not None:
-        return as_spy_value()
+    if isinstance(value, AsSpyValue):
+        return value.as_spy_value()
 
     raise TypeError(f'cannot convert {value} to a value')
 
@@ -1189,3 +1192,17 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             raise CompileError(
                 f"cannot create a constant of type {type} from {value}"
             )
+
+class GlobalResolver:
+    @abstractmethod
+    def resolve_global(self, value: Any) -> AnyValue | None:
+        """The spy value a global object referenced inside a function
+        body resolves to.  A function registered in this host - reached
+        as the raw function object or through the callable view its
+        decorated name binds to - resolves to its function entry (created
+        lazily when it is not parsed yet).  The host also resolves the
+        ``spy.*`` builtins, the struct classes it declares and the plain
+        Python functions it inlines; any other object is not a spy value
+        of this host and returns ``None`` (the object stays a plain
+        compile-time Python value)."""
+        ...
