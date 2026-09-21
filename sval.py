@@ -23,6 +23,7 @@ import ctypes
 import types as pytypes
 import typing
 from abc import abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, override
 
@@ -149,6 +150,11 @@ class TypeVar(Type):
     @override
     def __hash__(self) -> int:
         return object.__hash__(self)
+
+    @override
+    def get_type(self) -> Type:
+        # a type variable stands for a type of its own
+        return TYPE_TYPE
 
     @override
     def to_mir_type(self) -> mir.MayBeVoidType | None:
@@ -557,6 +563,11 @@ class StructTypeHead(Type, IdentityObj):
         """The struct type this head declares for ``generic_args``: the one
         specialization of the head for those arguments (created lazily, so
         that every reference to the same struct type names one object)."""
+        if len(generic_args) != len(self.generic_args):
+            raise CompileError(
+                f'{self.name_base} takes {len(self.generic_args)} generic '
+                f'argument(s) but {len(generic_args)} were given'
+            )
         if generic_args in self._specs:
             return self._specs[generic_args]
         ret = StructType(self, generic_args)
@@ -594,6 +605,9 @@ class StructType(Type):
 
         self._fields: IndexedMap[str, StructField] | None = None
         self._mir: mir.MayBeVoidType | None = None
+        # whether the mirror is the mirror of the struct's own single stored
+        # field rather than a wrapper struct (see ``mirror_is_a_field``)
+        self._mir_is_a_field = False
         # the mirror position of every field, in declaration order (see
         # ``get_field_mir_indices``), computed together with the mirror
         self._field_mir_indices: tuple[int | None, ...] | None = None
@@ -747,6 +761,7 @@ class StructType(Type):
             self._mir = mir.VoidType()
         elif len(mirrored) == 1 and not self.modifiers.extern_c:
             self._mir = mirrored[0][2]
+            self._mir_is_a_field = True
         else:
             self._mir = mir.StructType(
                 self.name_base,
@@ -778,6 +793,17 @@ class StructType(Type):
         assert self._field_mir_indices is not None
         return self._field_mir_indices
 
+    def mirror_is_a_field(self) -> bool:
+        """Whether the MIR mirror of this struct is the mirror of the
+        struct's own single stored field rather than a wrapper struct (see
+        :meth:`_calculate_mir`): that field then sits at the address of the
+        value itself, so taking its address needs no field indirection.
+        Note that the field's mirror may itself be a ``mir.StructType`` -
+        the mirror of a *wrapper* struct and the mirror that *is* the field
+        cannot be told apart by that type alone."""
+        self._calculate_mir()
+        return self._mir_is_a_field
+
     def __eq__(self, value: object, /) -> bool:
         return self is value
 
@@ -807,6 +833,30 @@ class AnyFunction(Type):
 
     def __str__(self) -> str:
         return "anyfn"
+
+@dataclass(frozen=True, slots=True)
+class BoundMethod(Value):
+    """A method of one struct *specialization*: the function value of the
+    method together with the type-argument values of the struct it was
+    resolved on (the struct's generic type parameters -> the values of the
+    specialization).  A method call resolves through the static type of the
+    base - ``a.foo(b)`` behaves like ``typeof(a).foo(a, b)`` - so the method
+    value has to carry those values: the method's signature names the
+    struct's type parameters (its ``self`` is the struct template), and a
+    call substitutes them into it (see ``interp``).
+
+    The field is a ``FunctionValue`` in practice; it stays an
+    :class:`AnyValue` because ``sval`` cannot depend on ``fn``."""
+
+    fn: AnyValue
+    generic_var_values: frozendict[TypeVar, Value]
+
+    @override
+    def get_type(self) -> Type:
+        return AnyFunction()
+
+    def __str__(self) -> str:
+        return f'bound_method({self.fn})'
 
 
 def int_range(type: IntType) -> tuple[int, int]:
@@ -954,6 +1004,28 @@ class AsSpyValue:
     def as_spy_value(self) -> AnyValue:
         ...
 
+# the type parameters of the annotations currently being evaluated, innermost
+# last (see ``annotation_scope``)
+_annotation_type_vars: list[dict[typing.TypeVar, Value]] = []
+
+@contextmanager
+def annotation_scope(type_vars: dict[typing.TypeVar, Value]):
+    """Make ``type_vars`` the type parameters the annotations evaluated
+    inside the block name - the type parameters of the class or function
+    whose annotations are being read (see ``astgen.parse_function`` and
+    ``dsl._RegisteredClass.get_entry``).
+
+    Python evaluates an annotation lazily, in the annotation scope of the
+    annotated function or class, which is what resolves a bare type-
+    parameter name; a *subscripted* struct template (``Foo[T]``) however
+    calls ``__getitem__`` outside that scope, so the mapping is kept here
+    for it to resolve its arguments (``dsl._RegisteredClass.__getitem__``)."""
+    _annotation_type_vars.append(type_vars)
+    try:
+        yield
+    finally:
+        _annotation_type_vars.pop()
+
 def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, resolver: GlobalResolver | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
     scalars and ``sval.Value`` objects pass through, and ``None`` is the
@@ -976,9 +1048,14 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
     if value is bool:
         return BoolType()
     if isinstance(value, typing.TypeVar):
-        if type_vars is None:
-            raise TypeError(f'cannot convert {value} to a value')
-        return type_vars[value]
+        if type_vars is not None and value in type_vars:
+            return type_vars[value]
+        # a type parameter of an enclosing annotation scope (a subscripted
+        # struct template resolves its arguments here)
+        for scope in reversed(_annotation_type_vars):
+            if value in scope:
+                return scope[value]
+        raise TypeError(f'cannot convert {value} to a value')
     if isinstance(value, AsSpyValue):
         return value.as_spy_value()
 
@@ -1129,6 +1206,14 @@ def replace_type_var(value: Value, reps: dict[TypeVar, Value]) -> Value:
             type = replace_type_var(value.elem, reps)
             assert isinstance(type, Type)
             return PointerType(type, value.is_const)
+        case StructType():
+            # a struct type carries its type arguments: substituting into it
+            # rebuilds the specialization (and keeps the identity of the one
+            # the head caches, so equal references stay equal)
+            args = tuple(replace_type_var(a, reps) for a in value.generic_args)
+            if all(new is old for new, old in zip(args, value.generic_args)):
+                return value
+            return value.head.specialize(args)
         case _:
             return value
 

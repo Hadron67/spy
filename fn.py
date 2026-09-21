@@ -3,7 +3,7 @@ from __future__ import annotations
 import ctypes
 from abc import abstractmethod
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import override
 
 from . import hir, mir, opt
@@ -251,7 +251,11 @@ class Signature:
         solver = TypeVarSolver()
         for param, cand in zip(self.positional.by_id, provided.positional):
             declared = param.type
-            if not isinstance(declared, TypeVar):
+            # only an annotation that names a type parameter of this signature
+            # constrains one - directly (``b: T``), or inside a generic type
+            # (``p: Pair[T]``); any other annotation is just the type the
+            # argument is converted to
+            if declared is None or not any(declared.contains(tv) for tv in self.generic_args):
                 continue
             if cand is not None:
                 solver.add_constraint(cand, declared, True)
@@ -296,6 +300,27 @@ class Signature:
             assert arg.type is not None
             formal.append(FormalArg(name, arg.type, arg.default_value))
         return FunctionType(tuple(formal), self.ret_type)
+
+    def substitute_type_vars(self, reps: dict[TypeVar, Value]) -> Signature:
+        """A copy of this signature with every type parameter of ``reps``
+        replaced by its value.  A method of a generic struct names the
+        struct's type parameters in its annotations (its ``self`` is typed as
+        the struct template); a call binds them from the struct
+        specialization the method was resolved on (see ``interp``), and this
+        substitutes them before the signature is specialized."""
+        if len(reps) == 0:
+            return self
+
+        def substitute(type: Type) -> Type:
+            return replace_type_vars_type(type, reps)
+
+        return replace(
+            self,
+            positional=self.positional.map(lambda arg: arg.map_type(substitute)),
+            varargs=None if self.varargs is None else self.varargs.map_type(substitute),
+            kwargs=None if self.kwargs is None else self.kwargs.map_type(substitute),
+            ret_type=None if self.ret_type is None else substitute(self.ret_type),
+        )
 
     def specialize(self, provided: ArgList[Type | None]) -> tuple[CallSignature, ReturnSignature | None]:
         """Specialize one call of this signature: the concrete typing of

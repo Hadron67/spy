@@ -24,10 +24,11 @@ at its call sites).  The decorated name stands for that struct: a spy body
 annotates with it, constructs it (``Foo(a, b)`` - the struct's ``__init__``
 runs if it has one, and its fields are filled otherwise) and calls its
 methods on a value of it (``x.m()``, the object passed as the method's
-``self``).  A struct is a compile-time type only: Python-side construction is
-not supported yet, and neither are generic structs (the fields of a generic
-struct are declared on its :class:`~spy.sval.StructTypeHead`, which a call has
-to specialize first).
+``self``).  A class with type parameters (``class Foo[T]``) declares a struct
+*template*: ``Foo[i32]`` names one specialization of it, and a method call
+carries the specialization's type arguments into the method (``x.m()``
+behaves like ``typeof(x).m(x)``, see ``interp``).  A struct is a compile-time
+type only: Python-side construction is not supported yet.
 
 A decorated function used from inside another spy function body is
 resolved to its function entry when the reference runs (see ``interp``);
@@ -39,7 +40,7 @@ time.
 
 import types as pytypes
 from dataclasses import dataclass
-from typing import Any, cast, dataclass_transform, override
+from typing import Any, TypeVar, cast, dataclass_transform, override
 
 from . import astgen, sval
 from .builtins import spy_as, spy_compile_log, spy_typeof
@@ -73,11 +74,18 @@ class FnMetadata:
     sfv: bool  # self by value
     extern: bool
     linkname: str | None
+    # an undecorated struct method: it is inlined at its call sites like a
+    # plain Python function instead of being compiled into a native call
+    inline: bool = False
 
 
 @dataclass(frozen=True)
 class StructMetadata:
     extern_c: bool
+
+
+# the metadata of an undecorated method (see ``_RegisteredClass.get_entry``)
+_INLINE_META = FnMetadata(sfv=False, extern=False, linkname=None, inline=True)
 
 
 def _to_py_arg(value: sval.AnyValue) -> Any:
@@ -105,8 +113,10 @@ class _RegisteredFn(AsSpyValue):
         self.entry: FunctionValue | None = None
         self.context = context
 
-        # Generic args from outer context, such as generic class
-        self.context_generic_args: tuple[sval.TypeVar, ...] = ()
+        # The type parameters of an enclosing context, such as a generic
+        # class: the Python type parameter object an annotation evaluates to
+        # -> its spy value (see ``astgen.parse_function``)
+        self.context_type_vars: dict[TypeVar, sval.Value] = {}
 
     def __call__(self, *args, **kwds):
         entry = self.get_entry()
@@ -142,8 +152,10 @@ class _RegisteredFn(AsSpyValue):
 
     def get_entry(self):
         if self.entry is None:
-            hir = astgen.parse_function(self.fn, self.cls, self.meta.sfv)
-            self.entry = FunctionValue(self.fn.__qualname__, hir)
+            hir = astgen.parse_function(
+                self.fn, self.cls, self.meta.sfv, self.context_type_vars
+            )
+            self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
         return self.entry
 
     @override
@@ -162,33 +174,92 @@ class _RegisteredClass(AsSpyValue):
         self.context = context
         self.meta = meta
         self.entry: sval.StructTypeHead | None = None
+        # the declared generic type parameters of the class, by the Python
+        # type parameter object their annotations evaluate to (see
+        # ``get_entry``)
+        self.class_type_vars: dict[TypeVar, sval.Value] = {}
 
     def get_entry(self) -> sval.StructTypeHead:
         if self.entry is None:
+            # the declared generic type parameters (PEP 695 ``[T]``): one spy
+            # ``sval.TypeVar`` per parameter, which the annotations of the
+            # class and of its methods name
+            generic_args: list[sval.TypeVar] = []
+            for type_param in getattr(self.cls, '__type_params__', ()):
+                if not isinstance(type_param, TypeVar):
+                    raise CompileError(
+                        f'unsupported type parameter {type_param!r} of struct '
+                        f'{self.cls.__name__}'
+                    )
+                spy_type = sval.TypeVar(type_param.__name__)
+                generic_args.append(spy_type)
+                self.class_type_vars[type_param] = spy_type
             head = sval.StructTypeHead(
                 self.cls.__name__,
+                tuple(generic_args),
                 modifiers=sval.StructModifiers(extern_c=self.meta.extern_c),
             )
             # the head is bound before the class body is read: a field may
             # name the struct itself, or one of its methods ``self``
             self.entry = head
-            for name, annotation in self.cls.__annotations__.items():
-                type = sval.as_value(annotation, resolver=self.context)
+            # the annotations are evaluated lazily by Python, in the
+            # annotation scope of the class: read them under the class' type
+            # parameters, so that a subscripted struct template in one of
+            # them (``inner: Pair[T]``) resolves its arguments
+            with sval.annotation_scope(self.class_type_vars):
+                annotations = list(self.cls.__annotations__.items())
+            for name, annotation in annotations:
+                type = sval.as_value(annotation, self.class_type_vars, resolver=self.context)
                 if type is None or not isinstance(type, sval.Type):
                     raise CompileError(f'cannot convert annotation {annotation!r} to a value')
                 head.add_field(name, type)
-            struct = head.specialize(())
+            # the ``self`` of every method is the struct *template*: a
+            # specialization whose type arguments are the struct's own
+            # parameters, so that a call substitutes the arguments of the
+            # specialization the method was resolved on into it (see
+            # ``interp``)
+            template = head.specialize(tuple(generic_args))
             for name, value in self.cls.__dict__.items():
                 if isinstance(value, _RegisteredFn):
                     # a registered method: ``self`` is the struct it belongs
                     # to (the method is parsed with that type, see astgen)
-                    value.cls = struct
+                    value.cls = template
+                    value.context_type_vars = self.class_type_vars
                     head.methods[name] = value
                 elif isinstance(value, pytypes.FunctionType):
-                    # an undecorated method: a plain Python function, inlined
-                    # at its call sites like any other
-                    head.methods[name] = value
+                    # an undecorated method: inlined at its call sites like a
+                    # plain function.  It is wrapped like a registered one so
+                    # that it is parsed lazily with the struct as its ``self``
+                    # type and the struct's type parameters in scope
+                    method = _RegisteredFn(value, template, _INLINE_META, self.context)
+                    method.context_type_vars = self.class_type_vars
+                    head.methods[name] = method
         return self.entry
+
+    def __getitem__(self, key: Any) -> sval.StructType:
+        """``Foo[i32]``: the struct specialization the generic arguments
+        name.  Python evaluates an annotation lazily (in the annotation scope
+        of the annotated function), so this is what a subscripted struct
+        *annotation* evaluates to (see ``astgen.parse_function``).  A
+        ``Foo[i32]`` used as an expression inside a body is the HIR's
+        ``hir.Subscript`` instead, resolved by the interpreter.
+
+        A future *class-name method access* (``Foo[i32].m(x)``) resolves the
+        same specialization through this path (see ``interp``)."""
+        head = self.get_entry()
+        args = key if isinstance(key, tuple) else (key,)
+        values: list[sval.Value] = []
+        for arg in args:
+            # a type parameter of the enclosing annotation scope resolves
+            # through the annotation scope on the stack (see
+            # ``sval.annotation_scope``)
+            value = sval.as_value(arg, self.class_type_vars, resolver=self.context)
+            if not isinstance(value, sval.Value):
+                raise CompileError(
+                    f'cannot use {arg!r} as a generic argument of {head.name_base}'
+                )
+            values.append(value)
+        return head.specialize(tuple(values))
 
     @override
     def as_spy_value(self) -> sval.AnyValue:

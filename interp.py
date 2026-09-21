@@ -378,6 +378,14 @@ def _arg_type_of(arg: ArgEntry[InterpVal]) -> sval.Type | None:
     assert isinstance(type, sval.PointerType), f"pointer expected, got {type}"
     return type.elem
 
+def _struct_generic_var_values(struct: sval.StructType) -> frozendict[sval.TypeVar, sval.Value]:
+    """The type-argument values of one struct *specialization*: its generic
+    type parameters -> the values this specialization binds them to (empty
+    for a non-generic struct).  A method resolved through the struct carries
+    them, so that a call can substitute them into the method's signature
+    (see :class:`sval.BoundMethod`)."""
+    return frozendict(zip(struct.head.generic_args, struct.generic_args))
+
 def _no_runtime_type(type: sval.Type) -> CompileError:
     """The error for a runtime location whose type has no representation
     of its own.  A compile-time-only type (the type of an untyped integer
@@ -495,6 +503,7 @@ class HirRunner:
         body: tuple[hir.Inst, ...],
         sig: CallSignature,
         ret_sig: ReturnSignature | None,
+        generic_var_values: dict[sval.TypeVar, InterpVal],
     ):
         # reset the per-specialization state; the result location of the
         # function proper is reserved first so its slot sits at a known
@@ -503,7 +512,7 @@ class HirRunner:
         self.resume_info = None
         self._deferred_returns = []
         ret_loc = PendingSlot(self._reserve(), False)
-        frame = InlineFrame({}, (), ret_loc, body)
+        frame = InlineFrame(generic_var_values, (), ret_loc, body)
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
         args = self._init_args_from_signature(sig, mir_args)
@@ -732,6 +741,8 @@ class HirRunner:
                 regs[inst] = self.exec_field_name_addr(self.operand(inst.base), inst.name)
             case hir.CommitSlot():
                 self._commit_pending_slot(self.operand(inst.slot))
+            case hir.Subscript():
+                self.subscript(self.operand(inst.base), self.operand_arg(inst.index), inst)
             case _:
                 raise CompileError(f"unsupported instruction {inst}")
         return PollResult.AGAIN
@@ -882,6 +893,20 @@ class HirRunner:
                     raise AssertionError('unreachable')
             return PollResult.AGAIN
 
+    def _type_var_value(self, obj: sval.AnyValue) -> InterpVal | None:
+        """The value a type parameter stands for in the body currently
+        being executed.  A name that denotes a type parameter of the
+        function (or of the struct a method belongs to) is a compile-time
+        value (see ``astgen``); the frame carries the type the call solved
+        it to, so ``Foo[T]``, ``spy.typeof(x) == T``, ... see the concrete
+        type."""
+        if not isinstance(obj, sval.TypeVar):
+            return None
+        value = self._frames[-1].generic_var_values.get(obj)
+        if value is None:
+            raise CompileError(f'type parameter {obj.name} is not bound here')
+        return value
+
     def operand(self, value: hir.Value) -> InterpVal:
         regs = self._frames[-1].regs
         match value:
@@ -894,6 +919,9 @@ class HirRunner:
                 # here, when the reference runs (see
                 # ``FunctionResolver.resolve_global``)
                 obj = value.value
+                type_var_value = self._type_var_value(obj)
+                if type_var_value is not None:
+                    return type_var_value
                 if not isinstance(obj, (int, float, str, bool, pytypes.NoneType)):
                     resolved = self._analyser._resolver.resolve_global(obj)
                     if resolved is not None:
@@ -1068,15 +1096,15 @@ class HirRunner:
                     'cannot take the address of a field of a compile-time value'
                 )
             case RuntimeVal():
-                if isinstance(container_type.get_mir_type(), mir.StructType):
+                if not container_type.mirror_is_a_field():
                     mir_index = container_type.get_field_mir_indices()[index]
                     assert mir_index is not None, 'a field with storage has a mirror position'
                     return RuntimeVal(
                         self._emit(mir.Gep(ptr.value, mir_index)), field_ptr_type
                     )
                 # the mirror of the struct is the mirror of its own field
-                # (see ``sval.StructType._calculate_mir``): the field is the
-                # value itself, so it takes no address arithmetic
+                # (see ``sval.StructType.mirror_is_a_field``): the field is
+                # the value itself, so it takes no address arithmetic
                 return RuntimeVal(ptr.value, field_ptr_type)
             case _:
                 raise CompileError(f"cannot take field address of {ptr}")
@@ -1296,6 +1324,26 @@ class HirRunner:
 
     # -- calls ----------------------------------------------------------------
 
+    def _callee_object(self, callee: InterpVal) -> sval.AnyValue | None:
+        """The compile-time object a call callee denotes, or None when it
+        denotes none.  A callee is a reference to a function value, a
+        builtin or a struct; a subscripted struct template (``Foo[i32]``)
+        is materialized by ``_as_ref`` into a compile-time box, so a boxed
+        callee is unwrapped here."""
+        todo = [callee]
+        while todo:
+            ev = todo.pop()
+            match ev:
+                case ComptimeVal(obj):
+                    return obj.value if isinstance(obj, sval.ConstRef) else obj
+                case ComptimeBox():
+                    todo.append(ev.value)
+                case PendingSlot() if ev.committed is not None:
+                    todo.append(ev.committed)
+                case _:
+                    return None
+        return None
+
     def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """Resolve one call by its callee value and run it.  Spy
         functions compile to a native ``call`` producing a typed
@@ -1310,13 +1358,17 @@ class HirRunner:
         just started and must be typed first: the call is then completed
         by ``resume`` when that runner ends (see
         ``_call_function_entry``)."""
-        if isinstance(callee, ComptimeVal):
-            obj = callee.obj
-            if not isinstance(obj, sval.ConstRef):
-                raise CompileError("comptime values must be constant references")
-            target = obj.value
+        target = self._callee_object(callee)
+        if target is not None:
             if isinstance(target, FunctionValue):
                 return self._call_function_entry(target, args, ret)
+            if isinstance(target, sval.BoundMethod):
+                # a method of a generic struct resolved from a value: the
+                # struct's type-argument values are substituted into the
+                # method's signature (see ``_call_function_entry``)
+                fn = target.fn
+                assert isinstance(fn, FunctionValue), 'a bound method holds a function value'
+                return self._call_function_entry(fn, args, ret, target.generic_var_values)
             if isinstance(target, sval.BuiltinFn):
                 return self._call_builtin(target, args, ret)
             if isinstance(target, sval.StructType):
@@ -1324,9 +1376,10 @@ class HirRunner:
                 return self.call_constructor(target, args, ret)
             if isinstance(target, sval.StructTypeHead):
                 # the name of a generic struct stands for its template: a
-                # construction of it needs a specialization (not supported yet)
+                # construction of it needs a specialization
                 raise CompileError(
-                    f'{target} is a generic struct: constructing it is not supported yet'
+                    f'{target} is a generic struct template: give its generic '
+                    f'arguments first, e.g. {target.name_base}[T](...)'
                 )
         raise CompileError(
             f"cannot compile a call to {callee!r}; only spy functions, plain Python "
@@ -1464,25 +1517,29 @@ class HirRunner:
         raise NotImplementedError
 
     def subscript(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
-        if isinstance(base, ComptimeVal) and isinstance(base.obj, sval.ConstRef) and isinstance(base.obj.value, sval.StructTypeHead):
-            struct = base.obj.value
-            args = None
-            if isinstance(index.value, ComptimeTuple):
-                assert not index.is_ref
-                args = tuple(self._arg_value(a) for a in index.value.values)
-            else:
-                args = (self._arg_value(index),)
-            arg_values: list[sval.Value] = []
-            for arg in args:
-                if not isinstance(arg, ComptimeVal) or not isinstance(arg.obj, sval.Value):
-                    raise CompileError(f'expected comptime value, got {arg!r}')
-                arg_values.append(arg.obj)
+        """``Foo[i32, f64]``: the specialization of the struct template
+        ``base`` for the generic arguments ``index`` (one type value, or a
+        tuple of them).  The result is the struct *type* itself, a
+        compile-time value - the same one the annotation spelling evaluates
+        to at the Python level (see ``dsl._RegisteredClass.__getitem__``)."""
+        if not (isinstance(base, ComptimeVal) and isinstance(base.obj, sval.ConstRef) and isinstance(base.obj.value, sval.StructTypeHead)):
+            raise CompileError(f'cannot subscript {base!r}')
+        struct = base.obj.value
+        args: tuple[InterpVal, ...]
+        if isinstance(index.value, ComptimeTuple):
+            assert not index.is_ref
+            args = tuple(self._arg_value(a) for a in index.value.values)
+        else:
+            args = (self._arg_value(index),)
+        arg_values: list[sval.Value] = []
+        for arg in args:
+            if not isinstance(arg, ComptimeVal) or not isinstance(arg.obj, sval.Value):
+                raise CompileError(f'expected a compile-time type argument, got {arg!r}')
+            arg_values.append(arg.obj)
 
-            instance = struct.specialize(tuple(arg_values))
-            frame = self._frames[-1]
-            frame.regs[ret] = ComptimeVal(sval.ConstRef(instance))
-            return PollResult.AGAIN
-        raise NotImplementedError
+        instance = struct.specialize(tuple(arg_values))
+        self._frames[-1].regs[ret] = ComptimeVal(instance)
+        return PollResult.AGAIN
 
     def call_constructor(self, struct: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """Construct a struct: the ``__init__`` of the struct runs if it has
@@ -1491,11 +1548,15 @@ class HirRunner:
         if isinstance(ret, PendingSlot) and ret.committed is None:
             ret = self._defer_ptr_convertion(ret, struct)
 
+        # the type-argument values of the struct specialization: the
+        # ``__init__`` of a generic struct names them (its ``self`` is the
+        # struct template), so a call substitutes them into its signature
+        generic_var_values = _struct_generic_var_values(struct)
         init = struct.get_method('__init__')
         if init is not None:
             init_fn = self._analyser._resolver.resolve_global(init)
             if isinstance(init_fn, FunctionValue):
-                return self._call_init(init_fn, struct, args, ret)
+                return self._call_init(init_fn, struct, args, ret, generic_var_values)
 
         fields: list[InterpVal | None] = []
         for field_arg in struct.bind_default_ctor_args(args):
@@ -1521,6 +1582,7 @@ class HirRunner:
         struct: sval.StructType,
         args: RawArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
+        generic_var_values: frozendict[sval.TypeVar, sval.Value],
     ) -> PollResult:
         obj = _shallow_normalize(ret)
         if not isinstance(obj, RuntimeVal):
@@ -1533,20 +1595,48 @@ class HirRunner:
             init,
             RawArgList((self_arg,) + args.positional, args.kwargs),
             result,
+            generic_var_values,
         )
 
-    def _resolve_method(self, type: sval.Type, method_name: str):
+    def _method_of(self, struct: sval.StructType, method_name: str) -> sval.AnyValue | None:
+        """The value of the method ``method_name`` of the struct type
+        ``struct``: its function value - bound with the struct's type-
+        argument values when the struct is generic (see
+        :class:`sval.BoundMethod`).  This is the ``typeof(a).m`` a method
+        call ``a.m(...)`` resolves to.  A future class-name access
+        (``Foo[i32].m(x)``) resolves the same way, through the
+        specialization the class name denotes."""
+        method = struct.get_method(method_name)
+        if method is None:
+            return None
+        resolved = self._analyser._resolver.resolve_global(method)
+        if resolved is None:
+            return None
+        generic_var_values = _struct_generic_var_values(struct)
+        if len(generic_var_values) == 0:
+            return resolved
+        return sval.BoundMethod(resolved, generic_var_values)
+
+    def _resolve_method(self, type: sval.Type, method_name: str) -> sval.AnyValue | None:
         match type:
             case sval.StructType():
-                method = type.get_method(method_name)
-                if method is None:
-                    return None
-                return self._analyser._resolver.resolve_global(method)
+                return self._method_of(type, method_name)
             case _:
                 return None
 
     def call_method(self, ptr: InterpVal, method_name: str, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
-        ptr = self._auto_deref(_shallow_normalize(ptr))
+        base = _shallow_normalize(ptr)
+        # ``Foo[i32].m(x)`` - a method accessed through the class name - is
+        # not supported yet.  Such a base is a compile-time struct *type*
+        # rather than a pointer to a value: the future path resolves the
+        # method through ``_method_of`` and calls it with no implicit
+        # ``self`` (the call passes every argument, ``self`` included).
+        if isinstance(base, ComptimeBox) and isinstance(base.value, ComptimeVal) and isinstance(base.value.obj, sval.StructType):
+            raise CompileError(
+                'calling a method through the class name is not supported yet; '
+                'call it on a value of the struct instead'
+            )
+        ptr = self._auto_deref(base)
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f'cannot call a method on a {type} value')
@@ -1559,9 +1649,10 @@ class HirRunner:
         # reference (the base's address) unless the method declares
         # ``self`` as a pointer type, in which case the base's address is
         # already the pointer value the parameter expects
+        fn = method.fn if isinstance(method, sval.BoundMethod) else method
         self_is_ref = True
-        if isinstance(method, FunctionValue):
-            first = method.hir.signature.positional.by_id[0]
+        if isinstance(fn, FunctionValue):
+            first = fn.hir.signature.positional.by_id[0]
             self_is_ref = first.by_ref or not isinstance(first.type, sval.PointerType)
 
         return self.call(
@@ -1584,6 +1675,7 @@ class HirRunner:
         fn: FunctionValue,
         args: RawArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
+        generic_var_values: frozendict[sval.TypeVar, sval.Value] | None = None,
     ) -> PollResult:
         """A call of a registered spy function with the given (already
         evaluated) argument values - the common tail of an ordinary
@@ -1592,13 +1684,20 @@ class HirRunner:
         marshaled argument types (an annotated parameter fixes its type,
         an unannotated one is typed by its argument); a plain Python
         callee (``force_inline``) is inlined into the current stream
-        instead of being compiled into a native specialization."""
+        instead of being compiled into a native specialization.
+
+        ``generic_var_values`` are the type-argument values of the struct
+        the callee is a method of (see :class:`sval.BoundMethod`): the
+        method's signature names the struct's type parameters, and they are
+        substituted into it before it is specialized."""
         sig = fn.hir.signature
+        if generic_var_values:
+            sig = sig.substitute_type_vars(dict(generic_var_values))
         binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
         if fn.force_inline:
             # an undecorated plain Python function: its body is inlined into
             # the current stream (it has no native specialization of its own)
-            return self._start_inline(fn.hir.body, binded_args, ret)
+            return self._start_inline(fn.hir.body, binded_args, ret, generic_var_values)
         arg_types = binded_args.map(_arg_type_of)
         spec_sig = sig.specialize(arg_types)
 
@@ -1606,7 +1705,7 @@ class HirRunner:
             self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
 
         self._fn_req_resumer = _resumer
-        res = self._analyser._request_function(fn, spec_sig[0], spec_sig[1])
+        res = self._analyser._request_function(fn, spec_sig[0], spec_sig[1], generic_var_values)
         if res is not None:
             fn_mir, ret_sig = res
             self.resume(fn_mir, ret_sig)
@@ -1682,6 +1781,7 @@ class HirRunner:
         body: tuple[hir.Inst, ...],
         args: ArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
+        generic_var_values: frozendict[sval.TypeVar, sval.Value] | None = None,
     ) -> PollResult:
         """Start the inlined body of a plain Python callee: convert its
         bound arguments into addressable values (the callee's ``hir.Arg``
@@ -1692,7 +1792,12 @@ class HirRunner:
         An argument that is already a reference is forwarded as the
         address it is.  The body now runs under the machine; its return
         statements write into ``ret`` directly (it is the body's result
-        location), so no result is handed back here."""
+        location), so no result is handed back here.
+
+        ``generic_var_values`` are the type-argument values of the struct
+        the callee is a method of (see :class:`sval.BoundMethod`): the body
+        names the struct's type parameters, and the frame resolves them
+        (see ``operand``)."""
         if len(self._frames) - 1 >= _MAX_INLINE_DEPTH:
             raise CompileError(
                 f'inline recursion or nesting exceeded '
@@ -1710,7 +1815,10 @@ class HirRunner:
                 self._commit_pending_slot(slot)
                 arg_values.append(slot)
         self._emit(mir.Block())
-        frame = InlineFrame({}, tuple(arg_values), ret, body)
+        frame_values: dict[sval.TypeVar, InterpVal] = {}
+        if generic_var_values is not None:
+            frame_values = {tv: ComptimeVal(v) for tv, v in generic_var_values.items()}
+        frame = InlineFrame(frame_values, tuple(arg_values), ret, body)
         self._frames.append(frame)
         return PollResult.AGAIN
 
@@ -1772,7 +1880,13 @@ class Analyser:
         st.extern_anon_symbols[fn] = ret
         return ret
 
-    def _request_function(self, fn_entry: FunctionValue, call_sig: CallSignature, ret_sig: ReturnSignature | None) -> tuple[mir.Value, ReturnSignature] | None:
+    def _request_function(
+        self,
+        fn_entry: FunctionValue,
+        call_sig: CallSignature,
+        ret_sig: ReturnSignature | None,
+        generic_var_values: frozendict[sval.TypeVar, sval.Value] | None = None,
+    ) -> tuple[mir.Value, ReturnSignature] | None:
         """Make sure the specialization ``call_sig`` of ``fn_entry`` is
         compiled (into the module being built) and return its callee
         value and return signature - or ``None`` when the specialization
@@ -1782,7 +1896,13 @@ class Analyser:
         A specialization that is already compiled is resolved to an
         external symbol (its definition lives in an earlier module); one
         that is still being compiled - a recursive reference - resolves
-        to the in-module function being typed."""
+        to the in-module function being typed.
+
+        ``generic_var_values`` are the type-argument values of the struct
+        the callee is a method of (see :class:`sval.BoundMethod`); they are
+        merged with the values ``call_sig`` solved the function's own type
+        parameters to and handed to the body's frame, so that the body can
+        use them as values (see ``operand``)."""
         st = self._symbol_table
         name = f"{fn_entry.name_base}({call_sig})"
         if call_sig in fn_entry.specs:
@@ -1813,7 +1933,14 @@ class Analyser:
         st.newly_compiled.add(instance)
         fn_entry.specs[call_sig] = instance
         runner = HirRunner(self, instance)
-        runner.run_function(fn_entry.hir.body, call_sig, ret_sig)
+        frame_generic_values: dict[sval.TypeVar, InterpVal] = {}
+        if generic_var_values is not None:
+            frame_generic_values.update((tv, ComptimeVal(v)) for tv, v in generic_var_values.items())
+        frame_generic_values.update(
+            (tv, ComptimeVal(v))
+            for tv, v in zip(fn_entry.hir.signature.generic_args, call_sig.generic_args)
+        )
+        runner.run_function(fn_entry.hir.body, call_sig, ret_sig, frame_generic_values)
         self._analyse_stack.append(runner)
         return None
 

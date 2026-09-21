@@ -66,6 +66,7 @@ from .sval import (
     Value,
     Void,
     VoidType,
+    annotation_scope,
     as_value,
 )
 from .sval import (
@@ -136,10 +137,14 @@ class _Builder:
     of nested blocks look up names through the chain.
     """
 
-    def __init__(self, fn: Any, fn_ir: FunctionIR, scope: _Scope) -> None:
+    def __init__(self, fn: Any, fn_ir: FunctionIR, scope: _Scope, generic_names: dict[str, Value]) -> None:
         self.fn = fn
         self._fn_ir = fn_ir
         self._scope = scope
+        # the type parameters of the function (and of the struct a method
+        # belongs to) by name: a name that denotes one is a compile-time
+        # value, see ``_gen_expr``
+        self._generic_names = generic_names
         self.insts: list[hir.Inst] = []
 
     def add(self, inst: hir.Inst) -> hir.Inst:
@@ -195,7 +200,7 @@ class _Builder:
         and ``End`` markers).  A branch is a lexical scope of its own -
         a child of the enclosing scope - so declarations inside it
         shadow outer bindings and are not visible after the block."""
-        sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope))
+        sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._generic_names)
         for stmt in stmts:
             sub._gen_stmt(stmt)
         self.insts.extend(sub.insts)
@@ -343,6 +348,13 @@ class _Builder:
         pointer to a freshly allocated slot holding its value."""
         match node:
             case ast.Name():
+                generic = self._generic_names.get(node.id)
+                if generic is not None:
+                    # a type parameter of the function (or of the struct a
+                    # method belongs to) used as a value: the interpreter
+                    # resolves it to the type the call solved it to, from
+                    # the frame it runs in (see ``interp.operand``)
+                    return ArgEntry(hir.Const(generic), False)
                 return ArgEntry(self._gen_name(node.id), True)
             case ast.Attribute():
                 base = self._as_ref(self._gen_expr(node.value))
@@ -474,12 +486,23 @@ class _Builder:
             return hir.Const(value.value)
         return self.add(hir.Load(value))
 
-def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: bool = False) -> FunctionIR:
+def parse_function(
+    fn: Callable,
+    self_type: Type | None = None,
+    self_by_value: bool = False,
+    context_type_vars: dict[TypeVar, Value] | None = None,
+) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
     ``self_type`` is the struct a *method* belongs to: the first parameter
     is then typed as that struct itself and passed by reference (its
     address), unless ``self_by_value`` asks for the object's value.
+
+    ``context_type_vars`` are the type parameters of an enclosing context a
+    method may name in its annotations and its body - the generic type
+    parameters of the struct the method belongs to, which Python only makes
+    visible inside the method's annotation scope.  They are keyed by the
+    Python type parameter object the annotations evaluate to.
     """
     try:
         source = inspect.getsource(fn)
@@ -504,6 +527,31 @@ def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: b
     if len(node.args.kwonlyargs) > 0:
         raise CompileError(f"keyword-only arguments are not supported in spy function {node.name}")
 
+    # ``fn.__type_params__`` exposes the declared PEP 695 type parameters
+    # (Python 3.13+); the AST ``[T]`` syntax may parse on 3.12, but the
+    # annotation values of a generic function are only accessible there
+    # through ``__type_params__``.  Each PEP 695 type parameter object is
+    # converted into a spy-domain ``sval.TypeVar`` of its own, which the
+    # annotations that name the parameter refer to by identity (see
+    # ``sval.as_value``).  The type parameters are collected *before* the
+    # annotations are read: reading them evaluates the annotations, which
+    # may name the type parameters in a subscripted struct template.
+    declared_type_params = getattr(fn, '__type_params__', ())
+    if len(node.type_params) > 0 and len(declared_type_params) == 0:
+        raise CompileError(
+            f"generic spy functions require Python 3.13 or newer (function {node.name})"
+        )
+    generic_args: list[SpyTypeVar] = []
+    type_vars: dict[TypeVar, Value] = dict(context_type_vars) if context_type_vars is not None else {}
+    for type_param in declared_type_params:
+        if not isinstance(type_param, TypeVar):
+            raise CompileError(
+                f"unsupported type parameter {type_param!r} in function {node.name}"
+            )
+        spy = SpyTypeVar(type_param.__name__)
+        generic_args.append(spy)
+        type_vars[type_param] = spy
+
     # Read the signature metadata off the function object instead of
     # re-evaluating the source: Python already evaluated the annotations
     # (PEP 695 annotations may evaluate lazily on access) and the default
@@ -513,9 +561,12 @@ def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: b
     # ``None``, and an explicit ``-> None`` becomes the spy ``VoidType``
     # (so that the two can be told apart - the first one lets the return
     # type be inferred from the body, the second declares a void
-    # function).
+    # function).  The annotations are read under the type parameters, so
+    # that a subscripted struct template in one of them resolves its
+    # arguments (see ``sval.annotation_scope``).
     try:
-        annotations = fn.__annotations__
+        with annotation_scope(type_vars):
+            annotations = fn.__annotations__
         defaults = fn.__defaults__ if fn.__defaults__ is not None else ()
     except Exception as e:
         raise CompileError(
@@ -527,29 +578,6 @@ def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: b
         ret_annotation = VoidType()
     else:
         ret_annotation = annotations['return']
-
-    # ``fn.__type_params__`` exposes the declared PEP 695 type parameters
-    # (Python 3.13+); the AST ``[T]`` syntax may parse on 3.12, but the
-    # annotation values of a generic function are only accessible there
-    # through ``__type_params__``.  Each PEP 695 type parameter object is
-    # converted into a spy-domain ``sval.TypeVar`` of its own, which the
-    # annotations that name the parameter refer to by identity (see
-    # ``sval.as_value``).
-    declared_type_params = getattr(fn, '__type_params__', ())
-    if len(node.type_params) > 0 and len(declared_type_params) == 0:
-        raise CompileError(
-            f"generic spy functions require Python 3.13 or newer (function {node.name})"
-        )
-    generic_args: list[SpyTypeVar] = []
-    type_vars: dict[TypeVar, Value] = {}
-    for type_param in declared_type_params:
-        if not isinstance(type_param, TypeVar):
-            raise CompileError(
-                f"unsupported type parameter {type_param!r} in function {node.name}"
-            )
-        spy = SpyTypeVar(type_param.__name__)
-        generic_args.append(spy)
-        type_vars[type_param] = spy
 
     def convert(annotation: Any, what: str) -> AnyValue | None:
         """The spy-domain value of one evaluated annotation or default
@@ -612,7 +640,13 @@ def parse_function(fn: Callable, self_type: Type | None = None, self_by_value: b
     for i, name in enumerate(positional.keys):
         scope.bindings[name] = hir.Arg(i)
 
-    builder = _Builder(fn, ir, scope)
+    # a name that denotes a type parameter (the function's own, or one of the
+    # struct a method belongs to) refers to the compile-time value the call
+    # solved it to; the function's own parameters are added last, so they
+    # shadow a struct's parameter of the same name, like Python scoping
+    generic_names: dict[str, Value] = {tp.__name__: v for tp, v in type_vars.items()}
+
+    builder = _Builder(fn, ir, scope, generic_names)
     for stmt in node.body:
         builder._gen_stmt(stmt)
     builder.add(hir.StoreVoidRetloc())
