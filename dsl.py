@@ -25,10 +25,11 @@ annotates with it, constructs it (``Foo(a, b)`` - the struct's ``__init__``
 runs if it has one, and its fields are filled otherwise) and calls its
 methods on a value of it (``x.m()``, the object passed as the method's
 ``self``).  A class with type parameters (``class Foo[T]``) declares a struct
-*template*: ``Foo[i32]`` names one specialization of it, and a method call
-carries the specialization's type arguments into the method (``x.m()``
-behaves like ``typeof(x).m(x)``, see ``interp``).  A struct is a compile-time
-type only: Python-side construction is not supported yet.
+*template*: ``Foo[i32]`` names one specialization of it - a construction of
+the bare template (``Foo(...)``) infers the arguments from its own - and a
+method call carries the specialization's type arguments into the method
+(``x.m()`` behaves like ``typeof(x).m(x)``, see ``interp``).  A struct is a
+compile-time type only: Python-side construction is not supported yet.
 
 A decorated function used from inside another spy function body is
 resolved to its function entry when the reference runs (see ``interp``);
@@ -249,8 +250,6 @@ class _RegisteredClass(AsSpyValue):
         A future *class-name method access* (``Foo[i32].m(x)``) resolves the
         same specialization through this path (see ``interp``)."""
         head = self.get_entry()
-        # the template of the head: what the application is the application of
-        template = head.specialize(head.generic_args)
         args = key if isinstance(key, tuple) else (key,)
         return sval.StructTypeApplication(head, args)
 

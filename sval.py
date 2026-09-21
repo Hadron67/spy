@@ -736,7 +736,14 @@ class StructType(Type):
         mirrored: list[tuple[int, StructField, mir.Type]] = []
         for index, field in enumerate(fields):
             field_mir = field.type.to_mir_type()
-            assert field_mir is not None, f"field {field.name!r} has no MIR representation"
+            if field_mir is None:
+                # a field has to have a runtime representation: a struct
+                # whose field has none (a compile-time-only type, such as the
+                # type of an untyped literal) has no layout
+                raise CompileError(
+                    f"field '{field.name}' of {self} has type {field.type}, "
+                    f"which has no runtime representation"
+                )
             if not isinstance(field_mir, mir.VoidType):
                 mirrored.append((index, field, field_mir))
 

@@ -1376,10 +1376,12 @@ class HirRunner:
                 return self.call_constructor(target, args, ret)
             if isinstance(target, sval.StructTypeHead):
                 # the name of a generic struct stands for its template: a
-                # construction of it needs a specialization
-                raise CompileError(
-                    f'{target} is a generic struct template: give its generic '
-                    f'arguments first, e.g. {target.name_base}[T](...)'
+                # construction of it infers the generic arguments from its
+                # arguments (see ``_infer_struct_generic_args``)
+                return self.call_constructor(
+                    target.specialize(self._infer_struct_generic_args(target, args)),
+                    args,
+                    ret,
                 )
         raise CompileError(
             f"cannot compile a call to {callee!r}; only spy functions, plain Python "
@@ -1540,6 +1542,55 @@ class HirRunner:
         instance = struct.specialize(tuple(arg_values))
         self._frames[-1].regs[ret] = ComptimeVal(instance)
         return PollResult.AGAIN
+
+    def _infer_struct_generic_args(self, head: sval.StructTypeHead, args: RawArgList[ArgEntry[InterpVal]]) -> tuple[sval.Value, ...]:
+        """Infer the generic arguments of a struct construction that names
+        the bare template (``Foo(...)``) from the construction arguments,
+        exactly like a generic call types its type parameters: a struct with
+        an ``__init__`` is typed by the ``__init__`` parameters it provides,
+        a default construction by the fields it fills.  A parameter the
+        construction leaves out - a field of a zero-sized type - constrains
+        nothing, and the ``self`` of an ``__init__`` is the struct template
+        itself, which constrains nothing either."""
+        solver = sval.TypeVarSolver()
+        init = head.methods.get('__init__')
+        if init is not None:
+            init_fn = self._analyser._resolver.resolve_global(init)
+            if isinstance(init_fn, FunctionValue):
+                sig = init_fn.hir.signature
+                # bind the arguments as a call of the ``__init__`` would: the
+                # leading ``self`` is filled with a placeholder (binding only
+                # places the values, it never looks at them), and its type stays
+                # out of the constraints below (it is the template itself)
+                self_arg: ArgEntry[InterpVal] = ArgEntry(ComptimeVal(sval.Void()), False)
+                bound = sig.bind_arg_pos(
+                    RawArgList((self_arg,) + args.positional, args.kwargs),
+                    lambda e: ArgEntry(ComptimeVal(e), False),
+                )
+                arg_types = bound.map(_arg_type_of)
+                for param, provided_type in zip(sig.positional.by_id, (None,) + arg_types.positional[1:]):
+                    if param.type is not None and provided_type is not None:
+                        solver.add_constraint(provided_type, param.type, True)
+        else:
+            # no ``__init__``: the fields, in declaration order, are the
+            # construction parameters
+            template = head.specialize(head.generic_args)
+            for field, entry in zip(template.fields().values(), template.bind_default_ctor_args(args)):
+                provided_type = None if entry is None else _arg_type_of(entry)
+                if provided_type is not None:
+                    solver.add_constraint(provided_type, field.type, True)
+        solver.finish()
+        solved = solver.get_solved()
+        generic_args: list[sval.Value] = []
+        for type_var in head.generic_args:
+            if type_var not in solved:
+                raise CompileError(
+                    f'cannot infer the generic argument {type_var.name} of struct '
+                    f'{head.name_base} from this construction; give it '
+                    f'explicitly, e.g. {head.name_base}[...](...)'
+                )
+            generic_args.append(solved[type_var])
+        return tuple(generic_args)
 
     def call_constructor(self, struct: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """Construct a struct: the ``__init__`` of the struct runs if it has

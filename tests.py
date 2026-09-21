@@ -690,9 +690,40 @@ def generic_field_of_nongeneric(x: i32) -> i32:
     return h.p.total() + h.extra
 
 
+# a generic struct whose type parameter is used by no field: a construction
+# of the bare template cannot infer it
+@struct()
+class Phantom[T]:
+    v: i32
+
+    def get(self) -> i32:
+        return self.v
+
+
 @func()
-def bare_generic_construction() -> i32:
-    return Pair(1, 2).total()  # pyright: ignore[reportCallIssue]
+def inferred_construction(x: i32) -> i32:
+    # the generic arguments of ``Pair(...)`` are inferred from the arguments
+    return Pair(x, 3).total()
+
+
+@func()
+def inferred_init_construction(x: i32) -> i32:
+    return Box(x).get()
+
+
+@func()
+def inferred_keyword_construction(x: i32) -> i32:
+    return Pair(b=x, a=3).total()
+
+
+@func()
+def inferred_keyword_init_construction(x: i32) -> i32:
+    return Box(v=x).get()
+
+
+@func()
+def uninferable_construction(x: i32) -> i32:
+    return Phantom(x).get()
 
 
 @func()
@@ -964,9 +995,18 @@ class SpyGenericStructTest(TestCase):
     def test_generic_field_of_a_non_generic_struct(self) -> None:
         self.assertEqual(generic_field_of_nongeneric(2), 8)
 
-    def test_missing_generic_arguments(self) -> None:
+    def test_inferred_construction(self) -> None:
+        # the generic arguments of a construction that names the bare
+        # template are inferred from its arguments
+        self.assertEqual(inferred_construction(2), 5)
+        self.assertEqual(inferred_init_construction(7), 7)
+        self.assertEqual(inferred_keyword_construction(2), 5)
+        self.assertEqual(inferred_keyword_init_construction(7), 7)
+
+    def test_uninferable_construction(self) -> None:
+        # a type parameter no argument determines cannot be inferred
         with self.assertRaises(CompileError):
-            bare_generic_construction()
+            uninferable_construction(1)
 
     def test_wrong_generic_arguments(self) -> None:
         with self.assertRaises(CompileError):
