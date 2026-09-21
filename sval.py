@@ -20,10 +20,8 @@ the compile-time comparisons in ``spy.typeof(a) == spy.u64`` work.
 from __future__ import annotations
 
 import ctypes
-import types as pytypes
 import typing
 from abc import abstractmethod
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, override
 
@@ -1004,27 +1002,22 @@ class AsSpyValue:
     def as_spy_value(self) -> AnyValue:
         ...
 
-# the type parameters of the annotations currently being evaluated, innermost
-# last (see ``annotation_scope``)
-_annotation_type_vars: list[dict[typing.TypeVar, Value]] = []
+@dataclass(frozen=True, slots=True)
+class StructTypeApplication:
+    """A struct template applied to generic arguments whose spy value is not
+    known yet: ``Foo[T]`` written in an annotation evaluates to this at the
+    Python level (see ``dsl._RegisteredClass.__getitem__``), because Python
+    evaluates the annotation in the annotation scope of the annotated
+    function or class - the arguments name the type parameters of that
+    scope, which ``__getitem__`` does not see.  :func:`as_value` turns the
+    application into the struct specialization once it is given that scope
+    (its ``type_vars``).
 
-@contextmanager
-def annotation_scope(type_vars: dict[typing.TypeVar, Value]):
-    """Make ``type_vars`` the type parameters the annotations evaluated
-    inside the block name - the type parameters of the class or function
-    whose annotations are being read (see ``astgen.parse_function`` and
-    ``dsl._RegisteredClass.get_entry``).
+    Not a :class:`Value`: it is a transient Python-level object that never
+    denotes a value of the spy domain."""
 
-    Python evaluates an annotation lazily, in the annotation scope of the
-    annotated function or class, which is what resolves a bare type-
-    parameter name; a *subscripted* struct template (``Foo[T]``) however
-    calls ``__getitem__`` outside that scope, so the mapping is kept here
-    for it to resolve its arguments (``dsl._RegisteredClass.__getitem__``)."""
-    _annotation_type_vars.append(type_vars)
-    try:
-        yield
-    finally:
-        _annotation_type_vars.pop()
+    struct: StructTypeHead
+    generic_vars: tuple[Any, ...]
 
 def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, resolver: GlobalResolver | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
@@ -1048,14 +1041,21 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
     if value is bool:
         return BoolType()
     if isinstance(value, typing.TypeVar):
-        if type_vars is not None and value in type_vars:
-            return type_vars[value]
-        # a type parameter of an enclosing annotation scope (a subscripted
-        # struct template resolves its arguments here)
-        for scope in reversed(_annotation_type_vars):
-            if value in scope:
-                return scope[value]
-        raise TypeError(f'cannot convert {value} to a value')
+        if type_vars is None or value not in type_vars:
+            raise TypeError(f'cannot convert {value} to a value')
+        return type_vars[value]
+    if isinstance(value, StructTypeApplication):
+        # ``Foo[T]``: resolve its arguments in the scope it was written in,
+        # then specialize the template for them
+        resolved: list[Value] = []
+        for arg in value.generic_vars:
+            arg_value = as_value(arg, type_vars, resolver)
+            if not isinstance(arg_value, Value):
+                raise TypeError(
+                    f'cannot use {arg!r} as a generic argument of {value.struct}'
+                )
+            resolved.append(arg_value)
+        return value.struct.specialize(tuple(resolved))
     if isinstance(value, AsSpyValue):
         return value.as_spy_value()
 

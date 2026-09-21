@@ -203,12 +203,10 @@ class _RegisteredClass(AsSpyValue):
             # name the struct itself, or one of its methods ``self``
             self.entry = head
             # the annotations are evaluated lazily by Python, in the
-            # annotation scope of the class: read them under the class' type
-            # parameters, so that a subscripted struct template in one of
-            # them (``inner: Pair[T]``) resolves its arguments
-            with sval.annotation_scope(self.class_type_vars):
-                annotations = list(self.cls.__annotations__.items())
-            for name, annotation in annotations:
+            # annotation scope of the class: a subscripted struct template in
+            # one of them (``inner: Pair[T]``) evaluates to an application
+            # that resolves against the class' type parameters here
+            for name, annotation in self.cls.__annotations__.items():
                 type = sval.as_value(annotation, self.class_type_vars, resolver=self.context)
                 if type is None or not isinstance(type, sval.Type):
                     raise CompileError(f'cannot convert annotation {annotation!r} to a value')
@@ -236,30 +234,25 @@ class _RegisteredClass(AsSpyValue):
                     head.methods[name] = method
         return self.entry
 
-    def __getitem__(self, key: Any) -> sval.StructType:
-        """``Foo[i32]``: the struct specialization the generic arguments
-        name.  Python evaluates an annotation lazily (in the annotation scope
-        of the annotated function), so this is what a subscripted struct
-        *annotation* evaluates to (see ``astgen.parse_function``).  A
-        ``Foo[i32]`` used as an expression inside a body is the HIR's
-        ``hir.Subscript`` instead, resolved by the interpreter.
+    def __getitem__(self, key: Any) -> sval.StructTypeApplication:
+        """``Foo[i32]``: an application of the struct template to generic
+        arguments.  Python evaluates an annotation lazily, in the annotation
+        scope of the annotated function or class, so this is what a
+        subscripted struct *annotation* evaluates to; the arguments name the
+        type parameters of that scope, which ``__getitem__`` does not see -
+        ``sval.as_value`` turns the application into the struct
+        specialization once it is given the scope (see
+        :class:`sval.StructTypeApplication`).  A ``Foo[i32]`` used as an
+        expression inside a body is the HIR's ``hir.Subscript`` instead,
+        resolved by the interpreter.
 
         A future *class-name method access* (``Foo[i32].m(x)``) resolves the
         same specialization through this path (see ``interp``)."""
         head = self.get_entry()
+        # the template of the head: what the application is the application of
+        template = head.specialize(head.generic_args)
         args = key if isinstance(key, tuple) else (key,)
-        values: list[sval.Value] = []
-        for arg in args:
-            # a type parameter of the enclosing annotation scope resolves
-            # through the annotation scope on the stack (see
-            # ``sval.annotation_scope``)
-            value = sval.as_value(arg, self.class_type_vars, resolver=self.context)
-            if not isinstance(value, sval.Value):
-                raise CompileError(
-                    f'cannot use {arg!r} as a generic argument of {head.name_base}'
-                )
-            values.append(value)
-        return head.specialize(tuple(values))
+        return sval.StructTypeApplication(head, args)
 
     @override
     def as_spy_value(self) -> sval.AnyValue:

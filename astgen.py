@@ -66,7 +66,6 @@ from .sval import (
     Value,
     Void,
     VoidType,
-    annotation_scope,
     as_value,
 )
 from .sval import (
@@ -561,12 +560,11 @@ def parse_function(
     # ``None``, and an explicit ``-> None`` becomes the spy ``VoidType``
     # (so that the two can be told apart - the first one lets the return
     # type be inferred from the body, the second declares a void
-    # function).  The annotations are read under the type parameters, so
-    # that a subscripted struct template in one of them resolves its
-    # arguments (see ``sval.annotation_scope``).
+    # function).  An annotation that subscripts a struct template evaluates
+    # to a ``sval.StructTypeApplication``; ``convert`` resolves it against
+    # the type parameters (see ``sval.as_value``).
     try:
-        with annotation_scope(type_vars):
-            annotations = fn.__annotations__
+        annotations = fn.__annotations__
         defaults = fn.__defaults__ if fn.__defaults__ is not None else ()
     except Exception as e:
         raise CompileError(
