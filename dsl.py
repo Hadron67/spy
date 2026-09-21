@@ -21,15 +21,17 @@ name: the annotated attributes of its body are the fields, in declaration
 order, and the functions of its body are its methods (a decorated one is a
 registered function, compiled into a native call, and a plain one is inlined
 at its call sites).  The decorated name stands for that struct: a spy body
-annotates with it, constructs it (``Foo(a, b)`` - the struct's ``__init__``
-runs if it has one, and its fields are filled otherwise) and calls its
-methods on a value of it (``x.m()``, the object passed as the method's
-``self``).  A class with type parameters (``class Foo[T]``) declares a struct
-*template*: ``Foo[i32]`` names one specialization of it - a construction of
-the bare template (``Foo(...)``) infers the arguments from its own - and a
-method call carries the specialization's type arguments into the method
-(``x.m()`` behaves like ``typeof(x).m(x)``, see ``interp``).  A struct is a
-compile-time type only: Python-side construction is not supported yet.
+annotates with it, constructs it (``Foo(a, b)`` - the arguments fill the
+fields in place, positional ones in declaration order and keyword ones by
+name; a custom ``__init__`` is not supported) and calls its methods on a
+value of it (``x.m()``, the object passed as the method's ``self``).  A class
+with type parameters (``class Foo[T]``) declares a struct *template*:
+``Foo[i32]`` names one specialization of it, a construction of the bare
+template (``Foo(...)``) takes the arguments of the specialization from the
+type of the location it is built into, and a method call carries the
+specialization's type arguments into the method (``x.m()`` behaves like
+``typeof(x).m(x)``, see ``interp``).  A struct is a compile-time type only:
+Python-side construction is not supported yet.
 
 A decorated function used from inside another spy function body is
 resolved to its function entry when the reference runs (see ``interp``);
@@ -59,7 +61,7 @@ from .fn import (
 )
 from .interp import Analyser
 from .lower import LLVMBackend
-from .sval import AsSpyValue, GlobalResolver
+from .sval import AsSpyValue, GlobalResolver, StructDecl
 from .util import frozendict
 
 # the ``spy.*`` builtins, by the name the interpreter knows them by
@@ -163,7 +165,7 @@ class _RegisteredFn(AsSpyValue):
     def as_spy_value(self) -> sval.AnyValue:
         return self.get_entry()
 
-class _RegisteredClass(AsSpyValue):
+class _RegisteredClass(StructDecl):
     """One class decorated with ``@struct()``, bound to its name in place of
     the class itself: the declaration of one spy struct.  The struct type the
     class names is built from the class body - the annotated class attributes
@@ -182,6 +184,12 @@ class _RegisteredClass(AsSpyValue):
 
     def get_entry(self) -> sval.StructTypeHead:
         if self.entry is None:
+            if '__init__' in self.cls.__dict__:
+                raise CompileError(
+                    f'struct {self.cls.__name__} cannot declare __init__: custom '
+                    f'constructors are not supported; a construction initializes '
+                    f'the fields directly (a keyword argument names one)'
+                )
             # the declared generic type parameters (PEP 695 ``[T]``): one spy
             # ``sval.TypeVar`` per parameter, which the annotations of the
             # class and of its methods name

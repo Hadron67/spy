@@ -347,6 +347,10 @@ class Gep(Inst):
             )
         self.type: Type = PointerType(ptype.elem.fields[index].type)
 
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
     def get_children(self) -> tuple[Any, ...]:
         return (self.ptr,)
 

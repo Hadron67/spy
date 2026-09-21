@@ -23,15 +23,12 @@ import ctypes
 import typing
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, override
+from typing import Any, Literal, override
 
 from spy.util import IdentityObj, IndexedMap, frozendict
 
 from . import mir
 from .errors import CompileError, SpyError
-
-if TYPE_CHECKING:
-    from .fn import RawArgList
 
 INT_DEFAULT_BITS = 32
 """The signedness/width of the default spy integer type: the type a
@@ -630,42 +627,6 @@ class StructType(Type):
             self._fields = self.head.fields.map(lambda f: StructField(f.name, replace_type_vars_type(f.type, reps)))
         return self._fields
 
-    def bind_default_ctor_args[T](self, args: RawArgList[T]) -> tuple[T | None, ...]:
-        """Bind the arguments of a struct construction ``Foo(...)`` to
-        the fields of the default constructor (the fields in declaration
-        order).  Positional arguments bind the leading fields, keyword
-        arguments bind fields by name.  A zero-sized field occupies no
-        storage and needs no argument: binding it yields ``None`` (the
-        caller writes nothing to it).  A missing argument for a field
-        with a runtime representation is a ``TypeError``."""
-        ret: list[T | None] = []
-        positional = args.positional
-        kwargs = args.kwargs
-        fields = self.fields()
-        field_names = fields.keys
-        for key in kwargs:
-            if key not in field_names:
-                raise TypeError(f"got an unexpected keyword argument '{key}'")
-        for i, field in enumerate(fields.values()):
-            if i < len(positional):
-                if field.name in kwargs:
-                    raise TypeError(f"got multiple values for field '{field.name}'")
-                ret.append(positional[i])
-                continue
-            if field.name in kwargs:
-                ret.append(kwargs[field.name])
-                continue
-            if field.type.get_unit_value() is not None:
-                ret.append(None)
-                continue
-            raise TypeError(f"missing a value for field '{field.name}'")
-        if len(positional) > len(fields.by_id):
-            raise TypeError(
-                f"takes {len(fields.by_id)} positional arguments but "
-                f"{len(positional)} were given"
-            )
-        return tuple(ret)
-
     @override
     def is_subtype_of(self, other: Type) -> bool:
         """Structs do not have subtypes yet: a struct type is a subtype of
@@ -1008,6 +969,14 @@ class AsSpyValue:
     @abstractmethod
     def as_spy_value(self) -> AnyValue:
         ...
+
+class StructDecl(AsSpyValue):
+    """A Python-level object that declares a spy struct: the handle a
+    ``@struct()`` class binds to (``dsl._RegisteredClass``).  Its spy value
+    is the struct it declares.  The parser tells a construction from an
+    ordinary call by the *type* of the callee object (see ``astgen``),
+    because asking a function handle for its spy value parses the function
+    body - which may reenter the parser (a recursive function)."""
 
 @dataclass(frozen=True, slots=True)
 class StructTypeApplication:

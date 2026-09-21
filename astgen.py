@@ -62,6 +62,7 @@ from .errors import CompileError
 from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
+    StructDecl,
     Type,
     Value,
     Void,
@@ -95,6 +96,13 @@ _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
     ast.Gt: '>',
     ast.GtE: '>=',
 }
+
+
+def _is_struct_class(obj: Any) -> bool:
+    """Whether the raw global object ``obj`` is a ``@struct()`` class handle
+    (see :class:`sval.StructDecl`): the parser recognizes a construction by
+    its callee at parse time (see ``_Builder._struct_operand``)."""
+    return isinstance(obj, StructDecl)
 
 
 class _Scope:
@@ -236,7 +244,7 @@ class _Builder:
         lhs = self._gen_expr(target, False)
         if not lhs.is_ref:
             raise CompileError(f"target of augmented assignment must be a variable, got {target}")
-        self.add(hir.Store(lhs.value, self._as_value(self._gen_expr(value))))
+        self._gen_result_loc(value, lhs.value)
         if emit_commit:
             self.add(hir.CommitSlot(lhs.value))
 
@@ -452,10 +460,61 @@ class _Builder:
                 kwargs[kw.arg] = self._gen_expr(kw.value)
         return RawArgList(positional, frozendict(kwargs.items()))
 
+    def _struct_operand(self, node: ast.expr) -> hir.Value | None:
+        """When the callee expression ``node`` denotes a struct, the operand
+        the construction names it by: a ``hir.ConstRef`` of the class for a
+        plain name, and the ``hir.Subscript`` that specializes it for
+        ``Foo[i32]``.  ``None`` when the callee is not a struct, in which
+        case the call compiles as an ordinary one.
+
+        The name of a class is a global (a *struct* is only ever named by
+        its decoration binding): a variable of the same name shadows it,
+        and so does a type parameter."""
+        match node:
+            case ast.Name():
+                if self._scope.lookup(node.id) is not None or node.id in self._generic_names:
+                    return None
+                obj = self._resolve_global(node.id)
+                if not _is_struct_class(obj):
+                    return None
+                return hir.ConstRef(obj)
+            case ast.Subscript():
+                # ``Foo[i32]``: the specialization the base names, subscripted
+                # by the generic arguments - the interpreter resolves it while
+                # running the ``hir.Subscript``
+                base = self._struct_operand(node.value)
+                if base is None:
+                    return None
+                return self.add(hir.Subscript(base, self._gen_expr(node.slice)))
+            case _:
+                return None
+
+    def _gen_struct_ctor(self, struct: hir.Value, args: list[ast.expr], keywords: list[ast.keyword], result_loc: hir.Value) -> None:
+        """One construction ``Foo(a1, a2, k=v)``: an ``hir.InitStruct`` opens
+        the struct in the result location, every argument is generated with
+        result-location semantics straight into the address of the field it
+        initializes - a nested construction fills the field in place, with no
+        copy - and ``hir.FinishStruct`` closes the construction, filling the
+        fields that were left out with their defaults."""
+        inst = self.add(hir.InitStruct(struct, result_loc))
+        indices: set[int] = set()
+        for i, arg in enumerate(args):
+            self._gen_result_loc(arg, self.add(hir.FieldIndexAddr(inst, i)))
+            indices.add(i)
+        names: set[str] = set()
+        for kw in keywords:
+            if kw.arg is None:
+                raise CompileError(
+                    f"**kwargs are not supported in spy function {self._fn_ir.name}"
+                )
+            self._gen_result_loc(kw.value, self.add(hir.FieldAddr(inst, kw.arg)))
+            names.add(kw.arg)
+        self.add(hir.FinishStruct(inst, frozenset(indices), frozenset(names)))
+
     def _gen_call(self, node: ast.Call, result_loc: hir.Value) -> None:
-        """One call whose result is written into ``result_loc``: a method
-        call ``x.h(...)`` on a runtime struct value, or an ordinary call
-        (a spy function, a constructor ``Foo(...)``, an inlined plain
+        """One call whose result is written into ``result_loc``: a
+        construction ``Foo(...)``, a method call ``x.h(...)`` on a runtime
+        struct value, or an ordinary call (a spy function, an inlined plain
         function or a spy builtin)."""
         if isinstance(node.func, ast.Attribute):
             # a method of the struct ``base``: the method and its self
@@ -463,6 +522,12 @@ class _Builder:
             # type of the base; only the base's address is carried here
             base = self._as_ref(self._gen_expr(node.func.value))
             self.add(hir.CallMethodInplace(base, node.func.attr, self._gen_arglist(node.args, node.keywords), result_loc))
+            return
+        struct = self._struct_operand(node.func)
+        if struct is not None:
+            # a construction: it writes the fields of the struct in place
+            # instead of producing a value the call site would copy
+            self._gen_struct_ctor(struct, node.args, node.keywords, result_loc)
             return
         # the callee must be addressable (a reference), the arguments are
         # by-value values

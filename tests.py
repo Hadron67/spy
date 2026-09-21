@@ -271,13 +271,10 @@ class Large:
 
 @struct()
 class Counter:
-    """A struct with a constructor and both kinds of method (a registered
-    ``bump``, compiled into a native call, and a plain ``double``, inlined)."""
+    """A struct with both kinds of method (a registered ``bump``, compiled
+    into a native call, and a plain ``double``, inlined)."""
 
     n: i32
-
-    def __init__(self, n: i32) -> None:
-        self.n = n
 
     @func()
     def bump(self, k: i32) -> i32:
@@ -286,21 +283,6 @@ class Counter:
 
     def double(self) -> i32:
         return self.n * 2
-
-
-@struct()
-class Doubled:
-    """A struct whose ``__init__`` is a registered method of its own (built
-    into a native call, like any other registered method)."""
-
-    value: i32
-
-    @func()
-    def __init__(self, k: i32) -> None:
-        self.value = k + k
-
-    def get(self) -> i32:
-        return self.value
 
 
 # a struct of one field mirrors to that field's own type, and the fields of
@@ -410,12 +392,6 @@ def bump_counter(n: i32, k: i32) -> i32:
 
 
 @func()
-def doubled(k: i32) -> i32:
-    d = Doubled(k)
-    return d.get()
-
-
-@func()
 def one_field_local(x: i32) -> i32:
     s = One(x)
     return s.a
@@ -521,26 +497,21 @@ class Pair[T]:
 
 @struct()
 class Box[T]:
-    """A generic struct whose ``__init__`` is a registered method."""
+    """A generic struct with a registered method that returns its type
+    parameter."""
 
     v: T
 
     @func()
-    def __init__(self, v: T) -> None:
-        self.v = v
-
     def get(self) -> T:
         return self.v
 
 
 @struct()
 class PlainBox[T]:
-    """A generic struct whose ``__init__`` is an inlined plain method."""
+    """A generic struct whose method is an inlined plain method."""
 
     v: T
-
-    def __init__(self, v: T) -> None:
-        self.v = v
 
     def get(self) -> T:
         return self.v
@@ -624,12 +595,12 @@ def generic_pair_plain_method(x: i32) -> i32:
 
 
 @func()
-def generic_registered_init(x: i32) -> i32:
+def generic_box_get(x: i32) -> i32:
     return Box[i32](x).get()
 
 
 @func()
-def generic_plain_init(x: i32) -> i32:
+def generic_plain_box_get(x: i32) -> i32:
     return PlainBox[i32](x).get()
 
 
@@ -690,8 +661,9 @@ def generic_field_of_nongeneric(x: i32) -> i32:
     return h.p.total() + h.extra
 
 
-# a generic struct whose type parameter is used by no field: a construction
-# of the bare template cannot infer it
+# a generic struct whose type parameter is used by no field, built into a
+# fresh local slot whose type is not known: a construction of the bare
+# template cannot tell which specialization to build
 @struct()
 class Phantom[T]:
     v: i32
@@ -700,25 +672,37 @@ class Phantom[T]:
         return self.v
 
 
+# the generic arguments of a construction that names the bare template are
+# taken from the type of the location it is built into - here the result
+# location of ``make_pair_inferred``, whose declared return type is known
 @func()
-def inferred_construction(x: i32) -> i32:
-    # the generic arguments of ``Pair(...)`` are inferred from the arguments
-    return Pair(x, 3).total()
-
-
-@func()
-def inferred_init_construction(x: i32) -> i32:
-    return Box(x).get()
+def make_pair_inferred[T](a: T, b: T) -> Pair[T]:
+    return Pair(a, b)
 
 
 @func()
-def inferred_keyword_construction(x: i32) -> i32:
-    return Pair(b=x, a=3).total()
+def inferred_pair_total(x: i32) -> i32:
+    return make_pair_inferred(x, 3).total()
 
 
 @func()
-def inferred_keyword_init_construction(x: i32) -> i32:
-    return Box(v=x).get()
+def inferred_pair_total_f64(x: f64) -> f64:
+    return make_pair_inferred(x, 2.5).total()
+
+
+@func()
+def explicit_generic_construction(x: i32) -> i32:
+    return Pair[i32](x, 3).total()
+
+
+@func()
+def keyword_construction(x: i32) -> i32:
+    return Pair[i32](b=x, a=3).total()
+
+
+@func()
+def mixed_construction(x: i32) -> i32:
+    return Pair[i32](x, b=x).total()
 
 
 @func()
@@ -886,9 +870,10 @@ def div(a: i32, b: i32) -> i32:
 
 
 class SpyStructTest(TestCase):
-    """Struct values: a construction runs the ``__init__`` of the struct or
-    fills its fields in place, the annotations of a spy function name a
-    struct like any other type, and its methods are called on the object."""
+    """Struct values: a construction fills the fields in place - the
+    arguments bind the fields by declaration order and by name - the
+    annotations of a spy function name a struct like any other type, and its
+    methods are called on the object."""
 
     def test_fields_of_a_local(self) -> None:
         self.assertEqual(struct_local(5), 6)
@@ -909,13 +894,10 @@ class SpyStructTest(TestCase):
     def test_plain_method(self) -> None:
         self.assertEqual(total_small(5), 6)
 
-    def test_init_and_methods(self) -> None:
-        # ``Counter(1)`` runs the ``__init__`` and ``bump`` mutates the
+    def test_construction_and_methods(self) -> None:
+        # ``Counter(1)`` fills the field ``n`` and ``bump`` mutates the
         # object through ``self``: 1 + 2 = 3, doubled is 6
         self.assertEqual(bump_counter(1, 2), 6)
-
-    def test_registered_init(self) -> None:
-        self.assertEqual(doubled(3), 6)
 
     def test_one_field_mirror(self) -> None:
         # the field of such a struct is the struct itself: the slot of the
@@ -954,11 +936,11 @@ class SpyGenericStructTest(TestCase):
     def test_inlined_method(self) -> None:
         self.assertEqual(generic_pair_plain_method(2), 4)
 
-    def test_registered_init(self) -> None:
-        self.assertEqual(generic_registered_init(2), 2)
+    def test_registered_method(self) -> None:
+        self.assertEqual(generic_box_get(2), 2)
 
-    def test_plain_init(self) -> None:
-        self.assertEqual(generic_plain_init(2), 2)
+    def test_plain_method(self) -> None:
+        self.assertEqual(generic_plain_box_get(2), 2)
 
     def test_method_with_its_own_type_param(self) -> None:
         # the method's own ``T`` shadows the struct's ``T``
@@ -995,16 +977,23 @@ class SpyGenericStructTest(TestCase):
     def test_generic_field_of_a_non_generic_struct(self) -> None:
         self.assertEqual(generic_field_of_nongeneric(2), 8)
 
-    def test_inferred_construction(self) -> None:
-        # the generic arguments of a construction that names the bare
-        # template are inferred from its arguments
-        self.assertEqual(inferred_construction(2), 5)
-        self.assertEqual(inferred_init_construction(7), 7)
-        self.assertEqual(inferred_keyword_construction(2), 5)
-        self.assertEqual(inferred_keyword_init_construction(7), 7)
+    def test_construction_with_explicit_arguments(self) -> None:
+        # a construction of a generic struct at a site whose specialization
+        # is not known names it explicitly, positionally or by keyword
+        self.assertEqual(explicit_generic_construction(2), 5)
+        self.assertEqual(keyword_construction(2), 5)
+        self.assertEqual(mixed_construction(2), 4)
+
+    def test_result_location_inference(self) -> None:
+        # ``make_pair_inferred`` returns ``Pair(a, b)`` without naming the
+        # specialization: the return type of the function is declared, so the
+        # result location's type decides it
+        self.assertEqual(inferred_pair_total(2), 5)
+        self.assertAlmostEqual(inferred_pair_total_f64(1.5), 4.0)
 
     def test_uninferable_construction(self) -> None:
-        # a type parameter no argument determines cannot be inferred
+        # a construction that names the bare template and whose
+        # construction site has no type cannot pick a specialization
         with self.assertRaises(CompileError):
             uninferable_construction(1)
 

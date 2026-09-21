@@ -739,6 +739,12 @@ class HirRunner:
                 return self.call_method(self.operand(inst.base), inst.name, self.operand_arglist(inst.args), self.operand(inst.ret))
             case hir.FieldAddr():
                 regs[inst] = self.exec_field_name_addr(self.operand(inst.base), inst.name)
+            case hir.InitStruct():
+                regs[inst] = self.init_struct(self.operand(inst.struct), self.operand(inst.dest))
+            case hir.FieldIndexAddr():
+                regs[inst] = self.field_index_addr(self.operand(inst.base), inst.index)
+            case hir.FinishStruct():
+                self.finish_struct(self.operand(inst.struct), inst.indices, inst.names)
             case hir.CommitSlot():
                 self._commit_pending_slot(self.operand(inst.slot))
             case hir.Subscript():
@@ -1084,7 +1090,10 @@ class HirRunner:
         if not isinstance(container_type, sval.StructType):
             raise CompileError(f"cannot take field address of {ptr}")
 
-        field_type = container_type.fields().get_by_id(index).type
+        fields = container_type.fields()
+        if index < 0 or index >= len(fields.by_id):
+            raise CompileError(f'type {container_type} has no field at index {index}')
+        field_type = fields.get_by_id(index).type
         field_ptr_type = sval.PointerType(field_type, type.is_const)
         if field_type.is_zst():
             # a zero-sized field occupies no storage and has no address
@@ -1325,11 +1334,12 @@ class HirRunner:
     # -- calls ----------------------------------------------------------------
 
     def _callee_object(self, callee: InterpVal) -> sval.AnyValue | None:
-        """The compile-time object a call callee denotes, or None when it
-        denotes none.  A callee is a reference to a function value, a
-        builtin or a struct; a subscripted struct template (``Foo[i32]``)
-        is materialized by ``_as_ref`` into a compile-time box, so a boxed
-        callee is unwrapped here."""
+        """The compile-time object a call callee - or the struct operand of a
+        construction - denotes, or None when it denotes none.  A callee is a
+        reference to a function value, a builtin or a struct; a subscripted
+        struct template (``Foo[i32]``) is materialized by ``_as_ref`` into a
+        compile-time box when it is a callee, so a boxed callee is unwrapped
+        here."""
         todo = [callee]
         while todo:
             ev = todo.pop()
@@ -1371,18 +1381,6 @@ class HirRunner:
                 return self._call_function_entry(fn, args, ret, target.generic_var_values)
             if isinstance(target, sval.BuiltinFn):
                 return self._call_builtin(target, args, ret)
-            if isinstance(target, sval.StructType):
-                # a constructor ``Bar(...)``
-                return self.call_constructor(target, args, ret)
-            if isinstance(target, sval.StructTypeHead):
-                # the name of a generic struct stands for its template: a
-                # construction of it infers the generic arguments from its
-                # arguments (see ``_infer_struct_generic_args``)
-                return self.call_constructor(
-                    target.specialize(self._infer_struct_generic_args(target, args)),
-                    args,
-                    ret,
-                )
         raise CompileError(
             f"cannot compile a call to {callee!r}; only spy functions, plain Python "
             "functions and the spy builtins can be called"
@@ -1503,10 +1501,11 @@ class HirRunner:
         return RuntimeVal(output, sval.PointerType(type, is_const=False))
 
     def _convert_result_ptr(self, ptr: mir.Value, from_type: sval.Type, to_type: sval.Type) -> mir.Value:
-        """The pointer a result-location call writes through, converted to
-        the callee's result type.  Not implemented yet (the stub performs
-        no conversion): it is only needed when the slot's final type and
-        the call's return type differ."""
+        """The pointer a result-location operation writes through, converted
+        to the type it delivers - the result type of a call, or the struct
+        type an ``InitStruct`` builds its fields into.  Not implemented yet
+        (the stub performs no conversion): it is only needed when the
+        location's final type and the delivered type differ."""
         return ptr
 
     def as_bool(self, value: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
@@ -1543,111 +1542,83 @@ class HirRunner:
         self._frames[-1].regs[ret] = ComptimeVal(instance)
         return PollResult.AGAIN
 
-    def _infer_struct_generic_args(self, head: sval.StructTypeHead, args: RawArgList[ArgEntry[InterpVal]]) -> tuple[sval.Value, ...]:
-        """Infer the generic arguments of a struct construction that names
-        the bare template (``Foo(...)``) from the construction arguments,
-        exactly like a generic call types its type parameters: a struct with
-        an ``__init__`` is typed by the ``__init__`` parameters it provides,
-        a default construction by the fields it fills.  A parameter the
-        construction leaves out - a field of a zero-sized type - constrains
-        nothing, and the ``self`` of an ``__init__`` is the struct template
-        itself, which constrains nothing either."""
-        solver = sval.TypeVarSolver()
-        init = head.methods.get('__init__')
-        if init is not None:
-            init_fn = self._analyser._resolver.resolve_global(init)
-            if isinstance(init_fn, FunctionValue):
-                sig = init_fn.hir.signature
-                # bind the arguments as a call of the ``__init__`` would: the
-                # leading ``self`` is filled with a placeholder (binding only
-                # places the values, it never looks at them), and its type stays
-                # out of the constraints below (it is the template itself)
-                self_arg: ArgEntry[InterpVal] = ArgEntry(ComptimeVal(sval.Void()), False)
-                bound = sig.bind_arg_pos(
-                    RawArgList((self_arg,) + args.positional, args.kwargs),
-                    lambda e: ArgEntry(ComptimeVal(e), False),
-                )
-                arg_types = bound.map(_arg_type_of)
-                for param, provided_type in zip(sig.positional.by_id, (None,) + arg_types.positional[1:]):
-                    if param.type is not None and provided_type is not None:
-                        solver.add_constraint(provided_type, param.type, True)
-        else:
-            # no ``__init__``: the fields, in declaration order, are the
-            # construction parameters
-            template = head.specialize(head.generic_args)
-            for field, entry in zip(template.fields().values(), template.bind_default_ctor_args(args)):
-                provided_type = None if entry is None else _arg_type_of(entry)
-                if provided_type is not None:
-                    solver.add_constraint(provided_type, field.type, True)
-        solver.finish()
-        solved = solver.get_solved()
-        generic_args: list[sval.Value] = []
-        for type_var in head.generic_args:
-            if type_var not in solved:
+    def init_struct(self, struct: InterpVal, dest: InterpVal) -> InterpVal:
+        """Open a struct value in the storage ``dest`` (``hir.InitStruct``).
+        The result is the address the fields are written through: ``dest``
+        converted to a pointer to the struct type (``_convert_result_ptr``)
+        - or, when ``dest`` is a slot that is not committed yet, the
+        placeholder of a deferred conversion that the slot's commit fills in
+        with the real pointer (see ``_defer_ptr_convertion``)."""
+        struct_type = self._struct_construction_type(self._callee_object(struct), dest)
+        if isinstance(dest, PendingSlot) and dest.committed is None:
+            # the slot has no address yet: the deferred conversion also
+            # records the struct type as the type of the slot
+            return self._defer_ptr_convertion(dest, struct_type)
+        dest = _shallow_normalize(dest)
+        dest_type = _type_of(dest)
+        if dest_type is None or not isinstance(dest_type, sval.PointerType):
+            raise CompileError(f'cannot construct a {struct_type} in this location')
+        ptr = self._convert_result_ptr(_to_runtime(dest), dest_type.elem, struct_type)
+        return RuntimeVal(ptr, sval.PointerType(struct_type, is_const=False))
+
+    def _struct_construction_type(self, struct: sval.AnyValue | None, dest: InterpVal) -> sval.StructType:
+        """The struct type a construction builds: ``struct`` itself when it
+        names a specialization.  A *template* (the bare name ``Foo``) has no
+        type of its own - the generic arguments are the ones the destination
+        was already specialized with - so the type of the construction site
+        has to be known (the result location of a function whose return type
+        is declared, an existing struct value, ...); a fresh local slot
+        carries no type and has to spell the arguments out."""
+        if isinstance(struct, sval.StructType):
+            return struct
+        if isinstance(struct, sval.StructTypeHead):
+            dest_type = _type_of(dest)
+            elem = dest_type.elem if isinstance(dest_type, sval.PointerType) else None
+            if isinstance(elem, sval.StructType) and elem.head is struct:
+                return elem
+            raise CompileError(
+                f'cannot infer the generic arguments of struct {struct.name_base} '
+                f'from this construction: the type of the construction site is '
+                f'not known; write {struct.name_base}[...](...) explicitly'
+            )
+        raise CompileError(f'{struct!r} is not a struct')
+
+    def finish_struct(self, struct: InterpVal, indices: frozenset[int], names: frozenset[str]) -> None:
+        """Close a struct construction (``hir.FinishStruct``).  Every field
+        takes at most one value - a positional argument binds the field of
+        the same declaration index, a keyword one the field of that name -
+        and every field that no argument provides is filled with its default:
+        the unit value of a zero-sized field, which occupies no storage.  A
+        field with a runtime representation that no argument provides is an
+        error."""
+        struct = _shallow_normalize(struct)
+        type = _type_of(struct)
+        if type is None or not isinstance(type, sval.PointerType) or not isinstance(type.elem, sval.StructType):
+            raise CompileError(f'cannot finish the construction of {struct!r}')
+        struct_type = type.elem
+        fields = struct_type.fields()
+        provided: set[int] = set()
+        for index in indices:
+            if index < 0 or index >= len(fields.by_id):
                 raise CompileError(
-                    f'cannot infer the generic argument {type_var.name} of struct '
-                    f'{head.name_base} from this construction; give it '
-                    f'explicitly, e.g. {head.name_base}[...](...)'
+                    f'{struct_type} takes {len(fields.by_id)} positional '
+                    f'argument(s) but {len(indices)} were given'
                 )
-            generic_args.append(solved[type_var])
-        return tuple(generic_args)
-
-    def call_constructor(self, struct: sval.StructType, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
-        """Construct a struct: the ``__init__`` of the struct runs if it has
-        one, and otherwise the fields are bound from ``args`` by the default
-        constructor (see :class:`PendingSlot`/:class:`_PendingPtrConvertion`)."""
-        if isinstance(ret, PendingSlot) and ret.committed is None:
-            ret = self._defer_ptr_convertion(ret, struct)
-
-        # the type-argument values of the struct specialization: the
-        # ``__init__`` of a generic struct names them (its ``self`` is the
-        # struct template), so a call substitutes them into its signature
-        generic_var_values = _struct_generic_var_values(struct)
-        init = struct.get_method('__init__')
-        if init is not None:
-            init_fn = self._analyser._resolver.resolve_global(init)
-            if isinstance(init_fn, FunctionValue):
-                return self._call_init(init_fn, struct, args, ret, generic_var_values)
-
-        fields: list[InterpVal | None] = []
-        for field_arg in struct.bind_default_ctor_args(args):
-            if field_arg is None:
-                # a zero-sized field occupies no storage and takes no value
-                fields.append(None)
+            provided.add(index)
+        for name in names:
+            index = struct_type.field_index(name)
+            if index is None:
+                raise CompileError(f'{struct_type} has no field named {name!r}')
+            if index in provided:
+                raise CompileError(f'got multiple values for field {name!r}')
+            provided.add(index)
+        for index, field0 in enumerate(fields.values()):
+            if index in provided:
                 continue
-            arg = field_arg.value
-            if field_arg.is_ref:
-                arg = self.load(arg)
-            fields.append(arg)
-
-
-        for i, field_value in enumerate(fields):
-            if field_value is None:
-                continue
-            self.store(self.field_index_addr(ret, i), field_value)
-        return PollResult.AGAIN
-
-    def _call_init(
-        self,
-        init: FunctionValue,
-        struct: sval.StructType,
-        args: RawArgList[ArgEntry[InterpVal]],
-        ret: InterpVal,
-        generic_var_values: frozendict[sval.TypeVar, sval.Value],
-    ) -> PollResult:
-        obj = _shallow_normalize(ret)
-        if not isinstance(obj, RuntimeVal):
-            raise CompileError(f'cannot construct a {struct} in this location')
-        result = self.alloca(True)
-        # ``__init__`` returns nothing: its result is a void slot of its own
-        self._commit_pending_slot(result, sval.VoidType())
-        self_arg: ArgEntry[InterpVal] = ArgEntry(obj, True)
-        return self._call_function_entry(
-            init,
-            RawArgList((self_arg,) + args.positional, args.kwargs),
-            result,
-            generic_var_values,
-        )
+            unit = field0.type.get_unit_value()
+            if unit is None:
+                raise CompileError(f'missing a value for field {field0.name!r}')
+            self.store(self.field_index_addr(struct, index), ComptimeVal(unit))
 
     def _method_of(self, struct: sval.StructType, method_name: str) -> sval.AnyValue | None:
         """The value of the method ``method_name`` of the struct type
