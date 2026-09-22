@@ -101,7 +101,7 @@ _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
 def _is_struct_class(obj: Any) -> bool:
     """Whether the raw global object ``obj`` is a ``@struct()`` class handle
     (see :class:`sval.StructDecl`): the parser recognizes a construction by
-    its callee at parse time (see ``_Builder._struct_operand``)."""
+    its callee at parse time (see ``_Builder._gen_expr``)."""
     return isinstance(obj, StructDecl)
 
 
@@ -177,7 +177,7 @@ class _Builder:
             case ast.Pass():
                 pass
             case ast.Expr():
-                self._gen_expr(node.value)
+                self._gen_expr(node.value)[0]
             case ast.Assign():
                 if len(node.targets) != 1:
                     raise CompileError(
@@ -189,7 +189,7 @@ class _Builder:
             case ast.If():
                 # the branches are generated into the same flat list,
                 # delimited by the ``Else``/``End`` markers (WASM-style)
-                cond = self._gen_expr(node.test)
+                cond = self._gen_expr(node.test)[0]
                 self.add(hir.If(self.add(hir.AsBool(cond))))
                 self._gen_branch(node.body)
                 if len(node.orelse) > 0:
@@ -225,7 +225,7 @@ class _Builder:
         if isinstance(target, ast.Tuple):
             new_slots: list[hir.Value] = []
             ptrs = self._gen_target_tuple(target, new_slots)
-            self.add(hir.Store(ptrs, self._as_value(self._gen_expr(value))))
+            self.add(hir.Store(ptrs, self._as_value(self._gen_expr(value)[0])))
             for slot in new_slots:
                 self.add(hir.CommitSlot(slot))
             return
@@ -241,7 +241,7 @@ class _Builder:
                 slot = self.add(hir.Alloca())
                 self._scope.bindings[target.id] = slot
                 emit_commit = True
-        lhs = self._gen_expr(target, False)
+        lhs = self._gen_expr(target, False)[0]
         if not lhs.is_ref:
             raise CompileError(f"target of augmented assignment must be a variable, got {target}")
         self._gen_result_loc(value, lhs.value)
@@ -261,7 +261,7 @@ class _Builder:
                 slot = self.add(hir.Alloca())
                 self._scope.bindings[elt.id] = slot
                 new_slots.append(slot)
-            ref = self._gen_expr(elt, False)
+            ref = self._gen_expr(elt, False)[0]
             if not ref.is_ref:
                 raise CompileError(
                     f"target of a destructuring assignment must be addressable, got {elt}"
@@ -278,10 +278,10 @@ class _Builder:
         if not isinstance(node.op, ast.Add):
             raise CompileError(f"only '+=' is supported yet in spy function {fn_name}")
 
-        lhs = self._gen_expr(node.target, False)
+        lhs = self._gen_expr(node.target, False)[0]
         if not lhs.is_ref:
             raise CompileError(f"target of augmented assignment must be a variable, got {node.target}")
-        rhs = self._gen_expr(node.value)
+        rhs = self._gen_expr(node.value)[0]
         self.add(hir.BinaryAssign(_BIN_OPS[type(node.op)], lhs.value, rhs))
 
     # -- expressions ----------------------------------------------------------
@@ -346,13 +346,19 @@ class _Builder:
             return self._make_load(node.value)
         return node.value
 
-    def _gen_expr(self, node: ast.expr, allow_retloc: bool = True) -> ArgEntry[hir.Value]:
+    def _gen_expr(self, node: ast.expr, allow_retloc: bool = True) -> tuple[ArgEntry[hir.Value], bool]:
         """A reference to the value of ``node``: addressable names give
         their slot, the fields of a runtime struct value give their
         address (a :class:`hir.FieldAddr` chain rooted at the storage of
         the base), globals - immutable values - give a
         :class:`hir.ConstRef` to them, and everything else gives a
-        pointer to a freshly allocated slot holding its value."""
+        pointer to a freshly allocated slot holding its value.
+
+        The flag tells whether the expression denotes a *struct*: the name
+        of a ``@struct()`` class, or a specialization of one (``Foo[i32]``).
+        Only the callee of a call reads it, where ``Foo(...)`` becomes a
+        construction (see ``_gen_call``); every other consumer takes the
+        first element of the pair and drops the flag."""
         match node:
             case ast.Name():
                 generic = self._generic_names.get(node.id)
@@ -361,18 +367,23 @@ class _Builder:
                     # method belongs to) used as a value: the interpreter
                     # resolves it to the type the call solved it to, from
                     # the frame it runs in (see ``interp.operand``)
-                    return ArgEntry(hir.Const(generic), False)
-                return ArgEntry(self._gen_name(node.id), True)
+                    return ArgEntry(hir.Const(generic), False), False
+                ref = self._gen_name(node.id)
+                # the name of a class denotes a struct: calling it constructs
+                # one.  A class is a global (a variable of the same name
+                # shadows it), so the reference to it is a ``ConstRef``
+                is_struct = isinstance(ref, hir.ConstRef) and _is_struct_class(ref.value)
+                return ArgEntry(ref, True), is_struct
             case ast.Attribute():
-                base = self._as_ref(self._gen_expr(node.value))
+                base = self._as_ref(self._gen_expr(node.value)[0])
                 if isinstance(base, hir.ConstRef):
                     if hasattr(base.value, node.attr):
-                        return ArgEntry(hir.ConstRef(getattr(base.value, node.attr)), True)
+                        return ArgEntry(hir.ConstRef(getattr(base.value, node.attr)), True), False
                     raise AttributeError(f"Attribute '{node.attr}' not found on {base.value}")
-                return ArgEntry(self.add(hir.FieldAddr(base, node.attr)), True)
+                return ArgEntry(self.add(hir.FieldAddr(base, node.attr)), True), False
             case ast.Constant():
                 if isinstance(node.value, (int, float, str, bool)) or node.value is None:
-                    return ArgEntry(hir.Const(node.value), False)
+                    return ArgEntry(hir.Const(node.value), False), False
                 raise CompileError(f"unsupported constant {node.value!r}")
             case ast.BoolOp():
                 op = _BOOL_OPS.get(type(node.op))
@@ -384,9 +395,9 @@ class _Builder:
                     raise CompileError(
                         "chained boolean operators are not supported yet"
                     )
-                lhs = self._gen_expr(node.values[0])
-                rhs = self._gen_expr(node.values[1])
-                return ArgEntry(self.add(hir.BoolOp(op, lhs, rhs)), False)
+                lhs = self._gen_expr(node.values[0])[0]
+                rhs = self._gen_expr(node.values[1])[0]
+                return ArgEntry(self.add(hir.BoolOp(op, lhs, rhs)), False), False
             case ast.Compare():
                 if len(node.ops) != 1 or len(node.comparators) != 1:
                     raise CompileError(
@@ -397,25 +408,27 @@ class _Builder:
                     raise CompileError(
                         f"unsupported comparison {type(node.ops[0]).__name__}"
                     )
-                lhs = self._gen_expr(node.left)
-                rhs = self._gen_expr(node.comparators[0])
-                return ArgEntry(self.add(hir.Compare(op, lhs, rhs)), False)
+                lhs = self._gen_expr(node.left)[0]
+                rhs = self._gen_expr(node.comparators[0])[0]
+                return ArgEntry(self.add(hir.Compare(op, lhs, rhs)), False), False
             case ast.Tuple():
-                values = tuple(self._gen_expr(elt) for elt in node.elts)
-                return ArgEntry(self.add(hir.Tuple(values)), False)
+                values = tuple(self._gen_expr(elt)[0] for elt in node.elts)
+                return ArgEntry(self.add(hir.Tuple(values)), False), False
             case ast.Subscript():
-                base = self._gen_expr(node.value)
+                base, base_is_struct = self._gen_expr(node.value)
                 if not base.is_ref:
                     raise CompileError(f"subscript of non-reference {base}")
-                index = self._gen_expr(node.slice)
-                return ArgEntry(self.add(hir.Subscript(base.value, index)), False)
+                index = self._gen_expr(node.slice)[0]
+                # a subscript of a struct specializes it, and the result is a
+                # struct too: ``Foo[i32]`` constructs one when it is called
+                return ArgEntry(self.add(hir.Subscript(base.value, index)), False), base_is_struct
             case _:
                 if not allow_retloc:
                     raise CompileError(f"unexpected expression {node}")
                 loc = self.add(hir.Alloca(True))
                 self._gen_result_loc(node, loc, False)
                 self.add(hir.CommitSlot(loc))
-                return ArgEntry(loc, True)
+                return ArgEntry(loc, True), False
 
     # -- struct values ---------------------------------------------------------
 
@@ -432,15 +445,15 @@ class _Builder:
                     raise CompileError(
                         f"unsupported unary operator {type(node.op).__name__} in spy function {fn_name}"
                     )
-                self.add(hir.Unary(op, self._gen_expr(node.operand), result_loc))
+                self.add(hir.Unary(op, self._gen_expr(node.operand)[0], result_loc))
             case ast.BinOp():
                 op = _BIN_OPS.get(type(node.op))
                 if op is None:
                     raise CompileError(
                         f"unsupported binary operator {type(node.op).__name__} in spy function {fn_name}"
                     )
-                lhs = self._gen_expr(node.left)
-                rhs = self._gen_expr(node.right)
+                lhs = self._gen_expr(node.left)[0]
+                rhs = self._gen_expr(node.right)[0]
                 self.add(hir.Binary(op, lhs, rhs, result_loc))
             case _:
                 # every other expression computes its value first and
@@ -449,45 +462,16 @@ class _Builder:
                 # through the location without materializing a value
                 if not allow_fall_back:
                     raise CompileError(f"unsupported expression {node}")
-                value = self._as_value(self._gen_expr(node))
+                value = self._as_value(self._gen_expr(node)[0])
                 self.add(hir.Store(result_loc, value))
 
     def _gen_arglist(self, args: list[ast.expr], keywords: list[ast.keyword]) -> RawArgList[ArgEntry[hir.Value]]:
-        positional = tuple(self._gen_expr(a) for a in args)
+        positional = tuple(self._gen_expr(a)[0] for a in args)
         kwargs: dict[str, ArgEntry[hir.Value]] = {}
         for kw in keywords:
             if kw.arg is not None:
-                kwargs[kw.arg] = self._gen_expr(kw.value)
+                kwargs[kw.arg] = self._gen_expr(kw.value)[0]
         return RawArgList(positional, frozendict(kwargs.items()))
-
-    def _struct_operand(self, node: ast.expr) -> hir.Value | None:
-        """When the callee expression ``node`` denotes a struct, the operand
-        the construction names it by: a ``hir.ConstRef`` of the class for a
-        plain name, and the ``hir.Subscript`` that specializes it for
-        ``Foo[i32]``.  ``None`` when the callee is not a struct, in which
-        case the call compiles as an ordinary one.
-
-        The name of a class is a global (a *struct* is only ever named by
-        its decoration binding): a variable of the same name shadows it,
-        and so does a type parameter."""
-        match node:
-            case ast.Name():
-                if self._scope.lookup(node.id) is not None or node.id in self._generic_names:
-                    return None
-                obj = self._resolve_global(node.id)
-                if not _is_struct_class(obj):
-                    return None
-                return hir.ConstRef(obj)
-            case ast.Subscript():
-                # ``Foo[i32]``: the specialization the base names, subscripted
-                # by the generic arguments - the interpreter resolves it while
-                # running the ``hir.Subscript``
-                base = self._struct_operand(node.value)
-                if base is None:
-                    return None
-                return self.add(hir.Subscript(base, self._gen_expr(node.slice)))
-            case _:
-                return None
 
     def _gen_struct_ctor(self, struct: hir.Value, args: list[ast.expr], keywords: list[ast.keyword], result_loc: hir.Value) -> None:
         """One construction ``Foo(a1, a2, k=v)``: an ``hir.InitStruct`` opens
@@ -520,19 +504,18 @@ class _Builder:
             # a method of the struct ``base``: the method and its self
             # parameter are resolved by the interpreter from the static
             # type of the base; only the base's address is carried here
-            base = self._as_ref(self._gen_expr(node.func.value))
+            base = self._as_ref(self._gen_expr(node.func.value)[0])
             self.add(hir.CallMethodInplace(base, node.func.attr, self._gen_arglist(node.args, node.keywords), result_loc))
             return
-        struct = self._struct_operand(node.func)
-        if struct is not None:
+        callee, is_struct = self._gen_expr(node.func)
+        if is_struct:
             # a construction: it writes the fields of the struct in place
             # instead of producing a value the call site would copy
-            self._gen_struct_ctor(struct, node.args, node.keywords, result_loc)
+            self._gen_struct_ctor(callee.value, node.args, node.keywords, result_loc)
             return
         # the callee must be addressable (a reference), the arguments are
         # by-value values
-        callee = self._as_ref(self._gen_expr(node.func))
-        self.add(hir.CallInplace(callee, self._gen_arglist(node.args, node.keywords), result_loc))
+        self.add(hir.CallInplace(self._as_ref(callee), self._gen_arglist(node.args, node.keywords), result_loc))
 
     def _gen_name(self, name: str) -> hir.Value:
         """Always returns a reference to the name ``name``."""

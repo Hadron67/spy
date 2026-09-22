@@ -2,7 +2,8 @@ from typing import Any, Literal
 
 
 class Ptr[T, C: bool = Literal[False]]:
-    ...
+    def __getitem__(self, value) -> T:
+        ...
 
 class Array[T, L: int]:
     ...
