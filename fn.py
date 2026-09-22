@@ -114,7 +114,7 @@ class ReturnSignature:
 
 @dataclass(frozen=True, slots=True)
 class CallSignature:
-    generic_args: tuple[Value, ...]
+    generic_args: tuple[AnyValue, ...]
     positional: tuple[tuple[str, SpecializedFormalArg], ...]
     varargs: tuple[SpecializedFormalArg, ...] | None
     kwargs: frozendict[str, SpecializedFormalArg] | None
@@ -229,7 +229,7 @@ class Signature:
 
     def solve_param_types(
         self, provided: ArgList[Type | None]
-    ) -> tuple[Value, ...]:
+    ) -> tuple[AnyValue, ...]:
         """The concrete value of every declared generic type parameter of
         one call.  ``provided`` carries the marshaled type of each
         argument the call provides and ``None`` for a parameter the call
@@ -242,7 +242,9 @@ class Signature:
         its annotation, and the call specialized for it converts the
         argument to that type (see :meth:`specialize`).  A missing
         argument can still solve a type parameter when its default value
-        has a spy type."""
+        has a spy type.  A parameter that stands for something other than
+        a type - the constness of a pointer (``Ptr[T, C]``) - is solved to
+        the value itself (a ``bool``)."""
         assert len(provided.positional) == len(self.positional.by_id), 'argument count mismatch'
         # unify the type parameters over the provided arguments:
         # arguments of parameters annotated with the same type parameter
@@ -273,7 +275,7 @@ class Signature:
                     solver.add_constraint(cand, self.kwargs.type, True)
         solver.finish()
         solved = solver.get_solved()
-        ret: list[Value] = []
+        ret: list[AnyValue] = []
         for type_var in self.generic_args:
             if type_var not in solved:
                 raise TypeMismatchError(f"type variable {type_var.name} not solved")
@@ -343,7 +345,7 @@ class Signature:
         the signature declares no return type (the interpreter infers
         it from the body)."""
         type_var_values = self.solve_param_types(provided)
-        reps: dict[TypeVar, Value] = dict(zip(self.generic_args, type_var_values))
+        reps: dict[TypeVar, AnyValue] = dict(zip(self.generic_args, type_var_values))
 
         def substitute(type: Type) -> Type:
             replaced = replace_type_vars_type(type, reps)

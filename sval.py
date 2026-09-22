@@ -22,12 +22,13 @@ from __future__ import annotations
 import ctypes
 import typing
 from abc import abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, override
 
 from spy.util import IdentityObj, IndexedMap, frozendict
 
-from . import mir
+from . import mir, syntax
 from .errors import CompileError, SpyError
 
 INT_DEFAULT_BITS = 32
@@ -401,7 +402,7 @@ class Float(Type):
 @dataclass(frozen=True)
 class PointerType(Type):
     elem: Type
-    is_const: bool = False
+    is_const: AnyValue = False
 
     @override
     def get_type(self) -> Type:
@@ -410,7 +411,17 @@ class PointerType(Type):
         return TypeType(child.level + 1)
 
     @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        # the pointee type, and the constness while it is still a type
+        # parameter (a pointer type constrains both, see ``TypeVarSolver``)
+        if isinstance(self.is_const, Type):
+            return (self.elem, self.is_const)
+        return (self.elem,)
+
+    @override
     def to_mir_type(self) -> mir.MayBeVoidType | None:
+        if not isinstance(self.is_const, bool):
+            return None
         child = self.elem.to_mir_type()
         if child is None:
             return None
@@ -1034,8 +1045,39 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
         return value.struct.specialize(tuple(resolved))
     if isinstance(value, AsSpyValue):
         return value.as_spy_value()
+    if typing.get_origin(value) is typing.Literal:
+        # ``Literal[X]`` denotes the value ``X``: the default of a type
+        # parameter (the constness of a pointer, ``C: bool = Literal[False]``)
+        # evaluates to one
+        args = typing.get_args(value)
+        if len(args) == 1 and isinstance(args[0], (bool, int, str)):
+            return args[0]
+        raise TypeError(f'cannot convert {value!r} to a value')
+    if typing.get_origin(value) is syntax.Ptr:
+        # ``Ptr[T]``/``Ptr[T, C]``: C's pointer type.  The second argument is
+        # the constness of the pointer (see ``_as_constness``); Python
+        # inserts the default declared by the class when it is left out, so
+        # a ``Ptr[T]`` annotation arrives with a ``Literal[False]``
+        args = typing.get_args(value)
+        if len(args) not in (1, 2):
+            raise TypeError(f'cannot convert {value!r} to a value')
+        elem = as_value(args[0], type_vars, resolver)
+        if not isinstance(elem, Type):
+            raise TypeError(f'{args[0]!r} is not a type')
+        if len(args) == 2:
+            return PointerType(elem, _as_constness(args[1], type_vars, resolver))
+        return PointerType(elem, False)
 
     raise TypeError(f'cannot convert {value} to a value')
+
+def _as_constness(value: Any, type_vars: dict[typing.TypeVar, Value] | None, resolver: GlobalResolver | None) -> AnyValue:
+    """The spy value of the constness argument of a pointer type: a Python
+    ``bool``, or the type parameter it is written as, which a call then
+    solves to one of the two (see ``TypeVarSolver``)."""
+    result = as_value(value, type_vars, resolver)
+    if isinstance(result, (bool, Value)):
+        return result
+    raise TypeError(f'cannot use {value!r} as the constness of a pointer')
 
 def negate(value: AnyValue) -> AnyValue | None:
     if isinstance(value, (int, float)):
@@ -1044,8 +1086,8 @@ def negate(value: AnyValue) -> AnyValue | None:
 
 @dataclass(frozen=True)
 class _Constraint:
-    lhs: Value
-    rhs: Value
+    lhs: AnyValue
+    rhs: AnyValue
     is_subtype: bool = False  # True when lhs is a subtype of rhs
 
 class _SolvedTypeVar:
@@ -1058,10 +1100,10 @@ class _SolvedTypeVar:
     parameter binds it to the peer type of its recorded bounds."""
 
     def __init__(self) -> None:
-        self._value: Value | None = None  # non-None: this type var is solved to this value, in this case _subtypes is None
-        self._subtypes: set[Value] | None = None  # non-None: all values in this set are subtypes of this type var, in this case _value is None
+        self._value: AnyValue | None = None  # non-None: this type var is solved to this value, in this case _subtypes is None
+        self._subtypes: set[Type] | None = None  # non-None: all values in this set are subtypes of this type var, in this case _value is None
 
-    def _add_bound(self, value: Value) -> None:
+    def _add_bound(self, value: Type) -> None:
         if self._subtypes is None:
             self._subtypes = set()
         self._subtypes.add(value)
@@ -1097,26 +1139,26 @@ class TypeVarSolver:
             self._type_var_values[tv] = stv
         return stv
 
-    def _add_unsatisfied(self, lhs: Value, rhs: Value, is_subtype: bool = False) -> None:
+    def _add_unsatisfied(self, lhs: AnyValue, rhs: AnyValue, is_subtype: bool = False) -> None:
         self._unsatisfied.append(_Constraint(lhs, rhs, is_subtype))
 
-    def _solve_type_var_bound(self, v: TypeVar, bound: Value, is_subtype: bool) -> None:
+    def _solve_type_var_bound(self, v: TypeVar, bound: AnyValue, is_subtype: bool) -> None:
         solved = self._solved(v)
         if is_subtype:
             assert solved._value is None
+            assert isinstance(bound, Type)
             if solved._subtypes is None:
                 solved._subtypes = set()
             solved._subtypes.add(bound)
         else:
             if solved._subtypes is not None:
                 for st in solved._subtypes:
-                    assert isinstance(st, Type) and isinstance(bound, Type)
-                    if not st.is_subtype_of(bound):
+                    if isinstance(bound, Type) and not st.is_subtype_of(bound):
                         self._add_unsatisfied(st, bound, True)
                 solved._subtypes = None
             solved._value = bound
 
-    def substitute_solved(self, value: Value):
+    def substitute_solved(self, value: AnyValue) -> AnyValue:
         while True:
             if not isinstance(value, TypeVar):
                 return value
@@ -1125,7 +1167,7 @@ class TypeVarSolver:
                 return value
             value = solved._value
 
-    def add_constraint(self, lhs: Value, rhs: Value, is_subtype: bool = False):
+    def add_constraint(self, lhs: AnyValue, rhs: AnyValue, is_subtype: bool = False):
         todo = [(lhs, rhs, is_subtype)]
         while todo:
             lhs, rhs, is_subtype = todo.pop()
@@ -1151,6 +1193,12 @@ class TypeVarSolver:
             # fall back to equal constraint
             if isinstance(lhs, StructType) and isinstance(rhs, StructType) and lhs.head is rhs.head and len(lhs.generic_args) == len(rhs.generic_args):
                 todo.extend((l, r, False) for l, r in zip(reversed(lhs.generic_args), reversed(rhs.generic_args)))
+            if isinstance(lhs, PointerType) and isinstance(rhs, PointerType):
+                # a pointer constrains its pointee type, and - while it is
+                # still a type parameter - the constness of the pointer
+                todo.append((lhs.elem, rhs.elem, False))
+                if isinstance(lhs.is_const, Value) or isinstance(rhs.is_const, Value):
+                    todo.append((lhs.is_const, rhs.is_const, False))
 
             self._add_unsatisfied(lhs, rhs, is_subtype)
 
@@ -1167,33 +1215,41 @@ class TypeVarSolver:
                     type = pt
                 sv._value = type
 
-    def get_solved(self) -> dict[TypeVar, Value]:
+    def get_solved(self) -> dict[TypeVar, AnyValue]:
         return {
             k: v._value
             for k, v in self._type_var_values.items()
             if v._value is not None
         }
 
-def replace_type_var(value: Value, reps: dict[TypeVar, Value]) -> Value:
+def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyValue:
     match value:
         case TypeVar():
             return reps.get(value, value)
         case PointerType():
-            type = replace_type_var(value.elem, reps)
-            assert isinstance(type, Type)
-            return PointerType(type, value.is_const)
+            # the constness is substituted too: it may be a type parameter
+            # (``Ptr[T, C]``), which a call solves to a ``bool``
+            return PointerType(
+                replace_type_vars_type(value.elem, reps),
+                replace_type_var(value.is_const, reps),
+            )
         case StructType():
             # a struct type carries its type arguments: substituting into it
             # rebuilds the specialization (and keeps the identity of the one
-            # the head caches, so equal references stay equal)
-            args = tuple(replace_type_var(a, reps) for a in value.generic_args)
+            # the head caches, so equal references stay equal).  The
+            # arguments of a struct are always types
+            args: list[Value] = []
+            for arg in value.generic_args:
+                substituted = replace_type_var(arg, reps)
+                assert isinstance(substituted, Value)
+                args.append(substituted)
             if all(new is old for new, old in zip(args, value.generic_args)):
                 return value
-            return value.head.specialize(args)
+            return value.head.specialize(tuple(args))
         case _:
             return value
 
-def replace_type_vars_type(type: Type, reps: dict[TypeVar, Value]) -> Type:
+def replace_type_vars_type(type: Type, reps: Mapping[TypeVar, AnyValue]) -> Type:
     ret = replace_type_var(type, reps)
     assert isinstance(ret, Type)
     return ret

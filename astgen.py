@@ -57,7 +57,7 @@ import textwrap
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
-from . import hir
+from . import hir, syntax
 from .errors import CompileError
 from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
@@ -103,7 +103,6 @@ def _is_struct_class(obj: Any) -> bool:
     (see :class:`sval.StructDecl`): the parser recognizes a construction by
     its callee at parse time (see ``_Builder._gen_expr``)."""
     return isinstance(obj, StructDecl)
-
 
 class _Scope:
     """One lexical block of a spy function: the variable bindings of the
@@ -346,13 +345,36 @@ class _Builder:
             return self._make_load(node.value)
         return node.value
 
+    def _try_resolve_object(self, node: ast.expr) -> Any | None:
+        """The raw Python object a *global* expression denotes, or None when
+        it denotes no global (a variable, a type parameter, a call, ...): a
+        name bound to a global, or an attribute of one (``syntax.ref``)."""
+        match node:
+            case ast.Name():
+                if self._scope.lookup(node.id) is not None or node.id in self._generic_names:
+                    return None
+                return self._resolve_global(node.id)
+            case ast.Attribute():
+                base = self._try_resolve_object(node.value)
+                return None if base is None else getattr(base, node.attr, None)
+            case _:
+                return None
+
+    def _is_syntax_call(self, callee: ast.expr) -> bool:
+        fn = self._try_resolve_object(callee)
+        if fn is None:
+            return False
+        return fn is syntax.ref
+
     def _gen_expr(self, node: ast.expr, allow_retloc: bool = True) -> tuple[ArgEntry[hir.Value], bool]:
         """A reference to the value of ``node``: addressable names give
         their slot, the fields of a runtime struct value give their
         address (a :class:`hir.FieldAddr` chain rooted at the storage of
-        the base), globals - immutable values - give a
-        :class:`hir.ConstRef` to them, and everything else gives a
-        pointer to a freshly allocated slot holding its value.
+        the base), ``ref(a)`` gives the address of ``a`` and ``p[...]`` the
+        address the pointer value ``p`` holds (C's ``&`` and ``*``), globals
+        - immutable values - give a :class:`hir.ConstRef` to them, and
+        everything else gives a pointer to a freshly allocated slot holding
+        its value.
 
         The flag tells whether the expression denotes a *struct*: the name
         of a ``@struct()`` class, or a specialization of one (``Foo[i32]``).
@@ -414,7 +436,16 @@ class _Builder:
             case ast.Tuple():
                 values = tuple(self._gen_expr(elt)[0] for elt in node.elts)
                 return ArgEntry(self.add(hir.Tuple(values)), False), False
+            case ast.Call() if self._is_syntax_call(node.func):
+                callee = self._try_resolve_object(node.func)
+                assert callee is not None
+                return self._gen_syntax_call(callee, node.args)
             case ast.Subscript():
+                if isinstance(node.slice, ast.Constant) and node.slice.value is Ellipsis:
+                    # ``expr[...]`` is C's ``*expr``: the place the pointer value
+                    # points at.  It denotes a *reference* like a name does, so a
+                    # store may target it (``p[...] = v``)
+                    return ArgEntry(self._as_value(self._gen_expr(node.value)[0]), True), False
                 base, base_is_struct = self._gen_expr(node.value)
                 if not base.is_ref:
                     raise CompileError(f"subscript of non-reference {base}")
@@ -430,6 +461,13 @@ class _Builder:
                 self.add(hir.CommitSlot(loc))
                 return ArgEntry(loc, True), False
 
+    def _gen_syntax_call(self, callee: Any, args: list[ast.expr]) -> tuple[ArgEntry[hir.Value], bool]:
+        if callee is syntax.ref:
+            if len(args) != 1:
+                raise CompileError('ref takes exactly one argument')
+            return ArgEntry(self._as_ref(self._gen_expr(args[0])[0]), False), False
+
+        raise CompileError(f'unsupported syntax call {callee}')
     # -- struct values ---------------------------------------------------------
 
     def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value, allow_fall_back: bool = True) -> None:
@@ -437,7 +475,7 @@ class _Builder:
         (result-location semantics); no value register is produced."""
         fn_name = self._fn_ir.name
         match node:
-            case ast.Call():
+            case ast.Call() if not self._is_syntax_call(node.func):
                 self._gen_call(node, result_loc)
             case ast.UnaryOp():
                 op = _UNARY_OPS.get(type(node.op))

@@ -1150,7 +1150,11 @@ class HirRunner:
         """Materialize a value of the spy type ``target``: a compile-time
         value is converted with ``sval.coerce_const``, a runtime value
         gets whatever numeric conversion the target needs - widening or
-        narrowing, see ``_convert_inst``."""
+        narrowing, see ``_convert_inst``.  A committed slot is the address
+        of the value it holds (``_shallow_normalize``), which is what an
+        operation that takes a value without loading it (taking an address,
+        ``ref``) hands over."""
+        ev = _shallow_normalize(ev)
         match ev:
             case ComptimeVal(obj):
                 return ComptimeVal(sval.coerce_const(obj, target))

@@ -18,7 +18,7 @@ function no earlier test has compiled.
 
 import io
 from contextlib import redirect_stdout
-from typing import Any, Protocol, Self
+from typing import Any, Literal, Protocol, Self
 from unittest import TestCase
 
 from spy.dsl import func, struct
@@ -33,12 +33,14 @@ from . import (
     i64,
     mir,
     sval,
+    syntax,
     u64,
     void,
 )
 from . import as_ as spy_as
 from . import bool as spy_bool
 from . import typeof as spy_typeof
+from .syntax import Ptr, ref
 
 # ---------------------------------------------------------------------------
 # functions under test
@@ -733,6 +735,118 @@ def nested_struct_field(x: i64) -> i64:
     o = OuterTwo(TwoI64(x, 1))
     return o.inner.a
 
+
+# ---------------------------------------------------------------------------
+# pointers: ``syntax.Ptr`` is C's pointer type - ``ref(a)`` takes the address
+# of ``a`` (C's ``&a``) and ``p[...]`` denotes the place the pointer value
+# ``p`` points at (C's ``*p``)
+# ---------------------------------------------------------------------------
+
+
+@func()
+def deref_local(x: i32) -> i32:
+    p = ref(x)
+    return p[...]
+
+
+@func()
+def write_through_ptr(x: i32, v: i32) -> i32:
+    p = ref(x)
+    p[...] = v
+    return x
+
+
+@func()
+def add_through_ptr(x: i32) -> i32:
+    p = ref(x)
+    p[...] += 1
+    return x
+
+
+@func()
+def deref_module_qualified(x: i32) -> i32:
+    # ``syntax.ref`` names the same function as a plain import of ``ref``
+    p = syntax.ref(x)
+    return p[...]
+
+
+@func()
+def incr_ptr(p: Ptr[i32]) -> i32:
+    p[...] = p[...] + 1
+    return p[...]
+
+
+@func()
+def call_incr_ptr(x: i32) -> i32:
+    v = x
+    r = incr_ptr(ref(v))
+    return v * 100 + r
+
+
+@func()
+def deref_generic[T](p: Ptr[T]) -> T:
+    # the pointee type is solved from the pointer argument
+    return p[...]
+
+
+@func()
+def call_deref_generic(x: i32) -> i32:
+    return deref_generic(ref(x))
+
+
+@func()
+def ptr_identity[T, C: bool](p: Ptr[T, C]) -> Ptr[T, C]:
+    # the constness is a type parameter too: a call solves it to the
+    # constness of the pointer it is given
+    return p
+
+
+@func()
+def call_ptr_identity(x: i32) -> i32:
+    p = ref(x)
+    q = ptr_identity(p)
+    return q[...]
+
+
+@func()
+def read_const_ptr(p: Ptr[i32, Literal[True]]) -> i32:
+    return p[...]
+
+
+@func()
+def call_read_const_ptr(x: i32) -> i32:
+    # a mutable pointer is accepted where a const one is expected (the
+    # conversion is a spy rule; ``Ptr``'s type parameter does not express it)
+    return read_const_ptr(ref(x))  # pyright: ignore[reportArgumentType]
+
+
+@struct()
+class PtrHolder:
+    p: Ptr[i32]
+
+
+@func()
+def field_read(x: i32) -> i32:
+    h = PtrHolder(ref(x))
+    return h.p[...]
+
+
+@func()
+def field_write(x: i32, v: i32) -> i32:
+    h = PtrHolder(ref(x))
+    h.p[...] = v
+    return x
+
+
+@func()
+def field_through_ptr(a: i32, b: i32) -> i32:
+    # a pointer to a struct: a field of the pointee is written and read
+    # through the pointer
+    s = Small(a, b)
+    p = ref(s)
+    p[...].a = p[...].a + 1
+    return p[...].total()
+
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
@@ -1002,6 +1116,42 @@ class SpyGenericStructTest(TestCase):
             wrong_generic_arguments(1)
 
 
+class SpyPointerTest(TestCase):
+    """Pointers: ``syntax.Ptr`` annotates a pointer type, ``ref`` takes the
+    address of a value and ``p[...]`` dereferences a pointer value."""
+
+    def test_deref_a_local(self) -> None:
+        self.assertEqual(deref_local(5), 5)
+
+    def test_write_through_a_pointer(self) -> None:
+        self.assertEqual(write_through_ptr(1, 9), 9)
+        self.assertEqual(add_through_ptr(1), 2)
+
+    def test_module_qualified_ref(self) -> None:
+        self.assertEqual(deref_module_qualified(6), 6)
+
+    def test_pointer_parameter(self) -> None:
+        # ``incr_ptr(ref(v))`` mutates the caller's local through the pointer:
+        # both the local and the returned pointee value are 6
+        self.assertEqual(call_incr_ptr(5), 606)
+
+    def test_pointee_type_is_solved(self) -> None:
+        self.assertEqual(call_deref_generic(3), 3)
+
+    def test_constness_is_solved(self) -> None:
+        # ``C`` of ``Ptr[T, C]`` is solved from the pointer argument, and a
+        # mutable pointer converts to a const one
+        self.assertEqual(call_ptr_identity(4), 4)
+        self.assertEqual(call_read_const_ptr(8), 8)
+
+    def test_pointer_field(self) -> None:
+        self.assertEqual(field_read(3), 3)
+        self.assertEqual(field_write(3, 7), 7)
+
+    def test_field_through_a_pointer(self) -> None:
+        self.assertEqual(field_through_ptr(1, 2), 4)
+
+
 class SpyStructMirrorTest(TestCase):
     """How a struct lowers to MIR (``sval.StructType._calculate_mir``): a spy
     struct is laid out by the compiler, an ``extern_c`` one for the C ABI."""
@@ -1076,6 +1226,7 @@ all_tests = [
     SpyStructTest,
     SpyStructMirrorTest,
     SpyGenericStructTest,
+    SpyPointerTest,
     SpyTupleTest,
     SpyCompileLogTest,
 ]

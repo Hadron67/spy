@@ -45,6 +45,7 @@ Python 值在调用边界按以下规则映射：
 | `int` | `spy.i64`（见 `dsl._INT_LITERAL_BITS`） |
 | `float` | `spy.f64` |
 | `str` | `const u8*`（只作为常量指针传递，尚不支持运算） |
+| `syntax.Ptr[T]` | `sval.PointerType`（见下） |
 
 可用的类型注解值：`spy.bool`、`spy.u8/u16/u32/u64`、`spy.i8/i16/i32/i64`、`spy.f32/f64`、`spy.void`。想以非默认类型传参时用 `spy.as_(value, T)`：
 
@@ -144,6 +145,32 @@ def use_pair(x: spy.i32) -> spy.i32:
     return p.total()            # 方法携带 {T: i32}
 ```
 
+## 指针
+
+`syntax.Ptr[T]` 是 C 的 `T*`：`Ptr[T, C]` 的 `C` 是 const 性（默认 `False`，const 时写 `Literal[True]`），也可以是一个在调用时求解的类型参数。`syntax.ref(a)` 取 `a` 的地址（C 的 `&a`），`p[...]` 解引用（C 的 `*p`）：
+
+```python
+import spy
+from spy.syntax import Ptr, ref
+
+@spy.func()
+def incr(p: Ptr[spy.i32]) -> spy.i32:
+    p[...] = p[...] + 1         # ``p[...]`` 是一个左值
+    return p[...]
+
+@spy.func()
+def use_incr(x: spy.i32) -> spy.i32:
+    v = x
+    r = incr(ref(v))            # 取局部变量的地址：incr 就地改写了 v
+    return v * 100 + r          # 6 * 100 + 6
+```
+
+- **类型**：注解里的 `Ptr[T]` 被 `sval.as_value` 转成 `sval.PointerType`（元素类型 `T`、const 性 `C`）；未求解的 `C`（还是个类型参数）没有运行时表示。
+- **取地址**：`ref(a)` 是一个值（指针），内容就是 `a` 的地址——`a` 可寻址（变量、形参、字段、`p[...]`）时直接就是它的地址，否则（字面量、算术结果等）先落进一个临时 slot 再取。
+- **解引用**：`p[...]` 表示 `p` 指向的那个位置，和变量一样是一个**引用**（左值）：可读、可赋值（`p[...] = v`）、可 `+=`、可传给按引用传递的形参。`p.x`（自动解引用）与 `p[...].x` 取到的都是同一个字段。
+- **const**：可变指针可以隐式转成 const 指针，反过来不行。
+- **泛型**：指针类型参与类型参数求解——`Ptr[T]` 求解 `T`，`Ptr[T, C]` 连 const 性一起求解（`C` 解成 `True`/`False`）。
+
 ## 模块结构
 
 | 文件 | 作用 |
@@ -159,6 +186,7 @@ def use_pair(x: spy.i32) -> spy.i32:
 | `lower.py` | MIR → LLVM IR → 机器码（llvmlite MCJIT） |
 | `fn.py` | 函数签名（`Signature`：形参绑定、类型参数求解、返回类型推导）、函数值与编译产物、链接名表（`SymbolTable`）与函数入口 thunk |
 | `sval.py` | spy 类型系统（含结构体类型）、编译期值、Python 值 → spy 域的映射（`as_value`）与类型参数约束求解（`TypeVarSolver`） |
+| `syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`、取地址 `ref`（`array` 未来实现） |
 | `errors.py` | `SpyError`、`CompileError`、`TypeMismatchError`（同时是 `TypeError` 子类） |
 | `binop.py` | 运算符的字面量类型 |
 | `builtins.py` | 函数体内使用的 `spy.*` builtin |
@@ -169,9 +197,10 @@ def use_pair(x: spy.i32) -> spy.i32:
 
 - `while`/`for` 循环、运行时 `and`/`or`（目前只支持编译期操作数）。
 - 赋值仅支持 `=`（含元组解包）与 `+=`（无链式赋值 `a = b = e`、其它增强赋值、类型标注赋值 `x: T = ...`、编译期值局部变量）。
-- `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、下标 `x[i]`。
+- `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、下标 `x[i]`（只有解引用 `x[...]` 可用）。
 - 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字符串的运算。
-- 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、通过类名访问方法（如 `Foo[i32].m(x)`）、结构体整体比较、指针类型的注解写法（如 `spy.ptr(T)`）。
+- 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、通过类名访问方法（如 `Foo[i32].m(x)`）、结构体整体比较。
+- 指针：数组（`syntax.Array`/`array`）尚未实现。
 - 普通 Python 函数的内联不支持运行期递归（递归驱动参数是运行期值时会在内联嵌套上限处报错，而非编译期展开）；运行期的函数值调用（把函数存进变量/字段后再调用）也尚未实现。
 
 ## 运行测试
