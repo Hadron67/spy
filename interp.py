@@ -810,10 +810,10 @@ class HirRunner:
         ``if`` without an else, or the else-region - is complete: the
         falling branch continues with the code after the ``End``.  Both
         branches falling through (a join) is fine: the MIR's falling
-        branches already continue at that shared continuation, and block
-        scoping (a branch declaration never escapes its branch) keeps
-        the state crossing the join in memory slots, where it needs no
-        phi."""
+        branches already continue at that shared continuation, and a
+        variable a branch *assigns* lives in an enclosing block's slot -
+        memory, since an assignment in a branch has to be visible after
+        it - so the state crossing the join needs no phi."""
         frame = self._frames[-1]
         data = frame.block_stack[-1].data
         match data:

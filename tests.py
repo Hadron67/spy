@@ -171,6 +171,70 @@ def clamped(n: i32) -> i32:
 
 
 @func()
+def assign_in_branch(c: spy_bool, a: i32, b: i32) -> i32:
+    x = a
+    if c:
+        x = b
+    return x
+
+
+@func()
+def assign_in_both_branches(c: spy_bool, a: i32, b: i32) -> i32:
+    x = a
+    if c:
+        x = b
+    else:
+        x = b + 1
+    return x
+
+
+@func()
+def assign_parameter_in_branch(c: spy_bool, a: i32, b: i32) -> i32:
+    # a parameter is bound in the function body's scope: a branch writes it
+    if c:
+        a = b
+    return a
+
+
+@func()
+def assign_tuple_in_branch(c: spy_bool, a: i32, b: i32) -> i32:
+    # ``x`` is bound outside (written), ``y`` is bound nowhere (declared here)
+    x = a
+    if c:
+        x, y = b, a
+        return x + y
+    return x
+
+
+@func()
+def assign_from_choose(c: spy_bool, d: spy_bool, a: i32, b: i32) -> i32:
+    # the branches of an if-expression write the variable the branch sees
+    x = a
+    if d:
+        x = a if c else b
+    return x
+
+
+@func()
+def branch_declaration(c: spy_bool, a: i32) -> i32:
+    # a name bound nowhere is declared in the branch it is assigned in
+    if c:
+        y = a
+        y = y + 1
+        return y
+    return a
+
+
+@func()
+def use_branch_declaration(c: spy_bool, a: i32) -> i32:
+    if c:
+        y = a
+    # ``y`` was declared inside the branch, so it is not bound here: a spy
+    # compile error (pyright cannot tell, hence the ignore)
+    return y  # pyright: ignore
+
+
+@func()
 def le(a: i32, b: i32) -> spy_bool:
     return a <= b
 
@@ -1025,6 +1089,30 @@ class SpyFunctionCallTest(TestCase):
     def test_runtime_if_fallthrough(self) -> None:
         self.assertEqual(clamped(42), 42)
         self.assertEqual(clamped(101), 100)
+
+    def test_runtime_if_assignment(self) -> None:
+        # an assignment in a branch writes the variable the branch sees
+        self.assertEqual(assign_in_branch(True, 1, 2), 2)
+        self.assertEqual(assign_in_branch(False, 1, 2), 1)
+        self.assertEqual(assign_in_both_branches(True, 1, 2), 2)
+        self.assertEqual(assign_in_both_branches(False, 1, 2), 3)
+        # ... a parameter included
+        self.assertEqual(assign_parameter_in_branch(True, 1, 2), 2)
+        self.assertEqual(assign_parameter_in_branch(False, 1, 2), 1)
+        # a destructuring target written outside, one declared in the branch
+        self.assertEqual(assign_tuple_in_branch(True, 1, 2), 3)
+        self.assertEqual(assign_tuple_in_branch(False, 1, 2), 1)
+        self.assertEqual(assign_from_choose(False, True, 1, 2), 2)
+        self.assertEqual(assign_from_choose(True, True, 1, 2), 1)
+        self.assertEqual(assign_from_choose(True, False, 1, 2), 1)
+
+    def test_branch_declaration(self) -> None:
+        # a name bound nowhere is declared in the branch it is assigned in,
+        # and is invisible after it
+        self.assertEqual(branch_declaration(True, 5), 6)
+        self.assertEqual(branch_declaration(False, 5), 5)
+        with self.assertRaises(CompileError):
+            use_branch_declaration(True, 5)
 
     def test_comparisons(self) -> None:
         self.assertTrue(le(1, 2))

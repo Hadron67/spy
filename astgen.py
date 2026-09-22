@@ -29,14 +29,15 @@ binds the name of a parameter directly to its ``hir.Arg(i)`` leaf and a
 read of it becomes a ``Load`` of that address; the interpreter
 materializes the parameter's storage (a MIR alloca holding
 ``mir.Param``) when the first store runs.
-Local variables are addressable the same way: ``name = expr`` declares a
-block-local variable - a fresh ``Alloca`` - when ``name`` is not yet
-bound in the current block, and stores into the existing slot
-otherwise.  Every ``if`` body is a lexical block of its own (a child of
-the enclosing block): a declaration inside it shadows outer bindings
-within the block and is invisible after it.  Global names - everything
-that is not a variable in scope - are resolved here to their Python
-objects.  Every global is an *immutable value*: in a value context a
+Local variables are addressable the same way: ``name = expr`` stores into
+the slot ``name`` is already bound to - in this block, or in an enclosing
+one - and *declares* the variable - a fresh ``Alloca`` - only when the
+name is bound nowhere.  Every ``if`` body is a lexical block of its own
+(a child of the enclosing block): a declaration inside it is invisible
+after it, while an assignment there writes the variable it sees (the
+outer slot is memory, so the write survives the join).  Global names -
+everything that is not a variable in scope - are resolved here to their
+Python objects.  Every global is an *immutable value*: in a value context a
 read embeds the object as a ``hir.Const`` leaf; in a reference context
 (``is_ref``, e.g. the callee of a call) it embeds a ``hir.ConstRef`` -
 a const reference to the value (see ``_gen_name``).  A name captured
@@ -107,11 +108,12 @@ def _is_struct_class(obj: Any) -> bool:
 class _Scope:
     """One lexical block of a spy function: the variable bindings of the
     block (name -> the Alloca of its slot), chained to the enclosing
-    block.  A *read* resolves through the chain; an assignment binds in
-    the current block: into the slot of a name the block already holds,
-    or - the first ``=`` on a name - into a fresh block-local slot that
-    shadows any outer binding of the same name.  A declaration is never
-    visible outside its block."""
+    block.  A read and an assignment both resolve through the chain: an
+    assignment stores into the slot the name is already bound to - the
+    nearest enclosing binding, so an assignment inside a branch writes
+    the variable it sees - and only a name that is bound *nowhere* is
+    declared: it gets a fresh block-local slot, which is not visible
+    outside its block."""
 
     __slots__ = ('bindings', 'parent')
 
@@ -203,9 +205,10 @@ class _Builder:
     def _gen_branch(self, stmts: list[ast.stmt]) -> None:
         """Translate one branch body of an ``if``, appending its
         instructions to this builder's list (between the ``If``/``Else``
-        and ``End`` markers).  A branch is a lexical scope of its own -
-        a child of the enclosing scope - so declarations inside it
-        shadow outer bindings and are not visible after the block."""
+        and ``End`` markers).  A branch is a lexical scope of its own - a
+        child of the enclosing scope - so a name it *declares* is not
+        visible after the block (an assignment to a name it sees writes
+        that variable, see ``_gen_assign``)."""
         sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._generic_names)
         for stmt in stmts:
             sub._gen_stmt(stmt)
@@ -214,10 +217,16 @@ class _Builder:
     # -- variables ------------------------------------------------------------
 
     def _gen_assign(self, target: ast.expr, value: ast.expr) -> None:
-        """One ``target = expr`` statement.  The first ``=`` on a name
-        declares a block-local variable (a fresh slot, shadowing any
-        outer binding); later assignments in the block only store into
-        its slot.  A call on the right hand side writes its result
+        """One ``target = expr`` statement.  An assignment to a name that
+        is already bound - in this block, or in an enclosing one, a
+        parameter included - stores into that slot, and reads that same
+        variable on the right hand side (``x = x + 1`` uses the value it
+        already has); only a name bound *nowhere* is declared, as a fresh
+        block-local slot that shadows nothing and is invisible after the
+        block.  A declaration is bound before its initializer is
+        generated, so a self-referencing declaration (``y = y + 1``) reads
+        the not-yet-stored slot - a compile error when it runs, like an
+        unbound local.  A call on the right hand side writes its result
         straight into the target slot (result-location semantics): a
         constructor ``x = Bar(...)`` fills the fields of the slot in
         place, and a scalar call result is only recorded in it."""
@@ -229,17 +238,11 @@ class _Builder:
                 self.add(hir.CommitSlot(slot))
             return
         emit_commit = False
-        if isinstance(target, ast.Name):
-            slot = self._scope.bindings.get(target.id)
-            if slot is None:
-                # the slot is bound before the initializer is generated, so
-                # a self-referencing declaration (``y = y + 1``) reads the
-                # not-yet-stored slot - a compile error when it runs, like
-                # an unbound local - instead of silently reading an outer
-                # ``y``
-                slot = self.add(hir.Alloca())
-                self._scope.bindings[target.id] = slot
-                emit_commit = True
+        if isinstance(target, ast.Name) and self._scope.lookup(target.id) is None:
+            # the name is bound nowhere: declare it here, in the current block
+            slot = self.add(hir.Alloca())
+            self._scope.bindings[target.id] = slot
+            emit_commit = True
         lhs = self._gen_expr(target, False)[0]
         if not lhs.is_ref:
             raise CompileError(f"target of augmented assignment must be a variable, got {target}")
@@ -250,13 +253,14 @@ class _Builder:
     def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value]) -> hir.Value:
         """The tuple of addresses a destructuring target denotes: a plain
         target contributes the address of its slot (or field), a nested
-        tuple target contributes its own tuple of addresses."""
+        tuple target contributes its own tuple of addresses.  Only a name
+        that is bound nowhere is declared (see ``_gen_assign``)."""
         elems: list[ArgEntry[hir.Value]] = []
         for elt in target.elts:
             if isinstance(elt, ast.Tuple):
                 elems.append(ArgEntry(self._gen_target_tuple(elt, new_slots), False))
                 continue
-            if isinstance(elt, ast.Name) and elt.id not in self._scope.bindings:
+            if isinstance(elt, ast.Name) and self._scope.lookup(elt.id) is None:
                 slot = self.add(hir.Alloca())
                 self._scope.bindings[elt.id] = slot
                 new_slots.append(slot)
