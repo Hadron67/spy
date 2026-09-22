@@ -201,9 +201,15 @@ class PendingSlot(InterpVal):
 
     ``allow_inline`` marks the slots astgen allocates for an expression
     temporary (``Alloca(True)``): a temporary whose stores are all
-    compile-time becomes a :class:`ComptimeBox` instead of memory."""
+    compile-time becomes a :class:`ComptimeBox` instead of memory.
 
-    mir_alloca_pos: int
+    ``insertion`` is the position the slot's storage is produced at: a
+    :class:`mir.Insertion` emitted where the ``Alloca`` ran, whose
+    instructions the slot's commit fills with the :class:`mir.Alloca` (or,
+    for an element/field place of an aggregate construction, with the
+    ``Gep`` addressing it, see ``finish_array``/``finish_struct``)."""
+
+    insertion: mir.Insertion
     allow_inline: bool
     stores: list[_PendingAction] = field(default_factory=list)
     committed: InterpVal | None = None
@@ -386,6 +392,175 @@ def _struct_generic_var_values(struct: sval.StructType) -> frozendict[sval.TypeV
     (see :class:`sval.BoundMethod`)."""
     return frozendict(zip(struct.head.generic_args, struct.generic_args))
 
+# ---------------------------------------------------------------------------
+# stateless helpers of field/element access and struct/array construction:
+# pure functions over the interpreter values they are given (the struct/array
+# structure is read off those, not off any runner state)
+# ---------------------------------------------------------------------------
+
+
+def _index_value(index: int) -> InterpVal:
+    """A compile-time field/element index as an interpreter value."""
+    return ComptimeVal(sval.Int(index, sval.IntType(64, False)))
+
+def _comptime_index(index: InterpVal) -> int:
+    """The Python integer a compile-time index denotes (a struct field is
+    always named by a compile-time index)."""
+    if isinstance(index, ComptimeVal) and isinstance(index.obj, sval.Int):
+        return index.obj.value
+    raise CompileError('a struct field index must be a compile-time integer')
+
+def _mir_index(index: InterpVal) -> int | mir.Value:
+    """The MIR index an element index denotes: a constant when it is known
+    at compile time, the runtime value otherwise."""
+    if isinstance(index, ComptimeVal) and isinstance(index.obj, sval.Int):
+        return index.obj.value
+    if isinstance(index, RuntimeVal):
+        return index.value
+    raise CompileError('an array element index must be an integer')
+
+def _callee_object(callee: InterpVal) -> sval.AnyValue | None:
+    """The compile-time object a call callee - or the struct operand of a
+    construction - denotes, or None when it denotes none.  A callee is a
+    reference to a function value, a builtin or a struct; a subscripted
+    struct template (``Foo[i32]``) is materialized by ``astgen._as_ref`` into a
+    compile-time box when it is a callee, so a boxed callee is unwrapped
+    here."""
+    todo = [callee]
+    while todo:
+        ev = todo.pop()
+        match ev:
+            case ComptimeVal(obj):
+                return obj.value if isinstance(obj, sval.ConstRef) else obj
+            case ComptimeBox():
+                todo.append(ev.value)
+            case PendingSlot() if ev.committed is not None:
+                todo.append(ev.committed)
+            case _:
+                return None
+    return None
+
+def _place_type(place: InterpVal) -> sval.Type | None:
+    """The type of the value a place holds: a slot whose type is not decided
+    yet reports the peer type of the values stored into it (and None when it
+    holds no value), a place that is materialized the type of the value it
+    holds."""
+    place = _shallow_normalize(place)
+    if isinstance(place, PendingSlot):
+        if place.committed is None:
+            type = place.committed_type()
+            return None if isinstance(type, sval.EmptyType) else type
+        place = place.committed
+    type = _type_of(place)
+    if isinstance(type, sval.PointerType):
+        return type.elem
+    return None
+
+def _array_elem_type_of(value: InterpVal) -> sval.ArrayType | None:
+    """The array type ``value`` points at, or None when it points at
+    something else (or at nothing: a slot whose type is not decided yet)."""
+    type = _type_of(value)
+    if isinstance(type, sval.PointerType) and isinstance(type.elem, sval.ArrayType):
+        return type.elem
+    return None
+
+def _common_element_type(elements: tuple[InterpVal, ...]) -> sval.Type:
+    """The one type all the elements of an array have: the peer type of the
+    type of every element place (see ``_place_type``).  An array is
+    homogeneous, so the elements have to agree; every element is coerced to
+    that type when its value is written."""
+    type: sval.Type | None = None
+    for element in elements:
+        element_type = _place_type(element)
+        if element_type is None:
+            continue
+        peer = element_type if type is None else type.resolve_peer_type(element_type)
+        if peer is None:
+            raise CompileError(
+                f'the elements of an array must have a common type, '
+                f'got {type} and {element_type}'
+            )
+        type = peer
+    if type is None:
+        raise CompileError(
+            'the elements of an array with no element have no type of their '
+            'own: the place it is built in has to declare the array type'
+        )
+    return type
+
+def _array_construction_type(array: InterpVal, elements: tuple[InterpVal, ...]) -> sval.ArrayType:
+    """The array type a construction builds: as many elements as it was
+    given (the constructor has no way to name the length, see ``syntax``),
+    of the element type the storage ``array`` points at declares - a place
+    holds one type, so the array built in it has to agree with it - or else
+    of the common type of the elements themselves."""
+    array_type = _array_elem_type_of(array)
+    if array_type is None:
+        return sval.ArrayType(_common_element_type(elements), len(elements))
+    declared = array_type.length_int
+    if declared is None:
+        raise CompileError(f'cannot tell how many elements {array_type} holds')
+    if declared != len(elements):
+        raise CompileError(
+            f'{array_type} holds {declared} element(s), but {len(elements)} were given'
+        )
+    return array_type
+
+def _infer_struct_generic_args(
+    head: sval.StructTypeHead, fields: dict[int, InterpVal]
+) -> sval.StructType:
+    """Infer the generic arguments of a struct construction that names the
+    bare template (``Foo(...)``) from the values written into its fields,
+    exactly like a generic call types its type parameters: every provided
+    field constrains the (type-parameter-valued) declared type of the field
+    to the type of the value written into it.  A field the construction
+    leaves out - a field of a zero-sized type - constrains nothing."""
+    declared = head.fields
+    solver = sval.TypeVarSolver()
+    for index, place in fields.items():
+        if index < 0 or index >= len(declared.by_id):
+            continue
+        place_type = _place_type(place)
+        if place_type is not None:
+            solver.add_constraint(place_type, declared.get_by_id(index).type, True)
+    solver.finish()
+    solved = solver.get_solved()
+    generic_args: list[sval.Value] = []
+    for type_var in head.generic_args:
+        if type_var not in solved:
+            raise CompileError(
+                f'cannot infer the generic argument {type_var.name} of struct '
+                f'{head.name_base} from this construction; give it '
+                f'explicitly, e.g. {head.name_base}[...](...)'
+            )
+        arg = solved[type_var]
+        assert isinstance(arg, sval.Value), 'a struct type argument is a value'
+        generic_args.append(arg)
+    return head.specialize(tuple(generic_args))
+
+def _struct_construction_type(
+    struct: sval.AnyValue | None,
+    dest: InterpVal,
+    fields: dict[int, InterpVal],
+) -> sval.StructType:
+    """The struct type a construction builds: ``struct`` itself when it
+    names a specialization.  A *template* (the bare name ``Foo``) names a
+    :class:`sval.StructTypeHead`, which has no type of its own: the generic
+    arguments are the ones the destination was already specialized with (the
+    result location of a function whose return type is declared, an existing
+    struct value, ...), or else the ones the provided field values determine
+    (see ``_infer_struct_generic_args``)."""
+    if isinstance(struct, sval.StructType):
+        return struct
+    if isinstance(struct, sval.StructTypeHead):
+        if dest is not None:
+            dest_type = _type_of(dest)
+            elem = dest_type.elem if isinstance(dest_type, sval.PointerType) else None
+            if isinstance(elem, sval.StructType) and elem.head is struct:
+                return elem
+        return _infer_struct_generic_args(struct, fields)
+    raise CompileError(f'{struct!r} is not a struct')
+
 def _no_runtime_type(type: sval.Type) -> CompileError:
     """The error for a runtime location whose type has no representation
     of its own.  A compile-time-only type (the type of an untyped integer
@@ -511,7 +686,7 @@ class HirRunner:
         self.return_sig = None
         self.resume_info = None
         self._deferred_returns = []
-        ret_loc = PendingSlot(self._reserve(), False)
+        ret_loc = self.alloca(False)
         frame = InlineFrame(generic_var_values, (), ret_loc, body)
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
@@ -738,17 +913,18 @@ class HirRunner:
             case hir.CallMethodInplace():
                 return self.call_method(self.operand(inst.base), inst.name, self.operand_arglist(inst.args), self.operand(inst.ret))
             case hir.FieldAddr():
-                regs[inst] = self.exec_field_name_addr(self.operand(inst.base), inst.name)
-            case hir.InitStruct():
-                regs[inst] = self.init_struct(self.operand(inst.struct), self.operand(inst.dest))
+                regs[inst] = self.exec_field_name_addr(self.operand(inst.base), inst.name, inst.is_aggregate_init)
             case hir.FieldIndexAddr():
-                regs[inst] = self.field_index_addr(self.operand(inst.base), inst.index)
+                regs[inst] = self.field_index_addr(
+                    self.operand(inst.base), _index_value(inst.index), inst.is_aggregate_init
+                )
             case hir.FinishStruct():
-                self.finish_struct(self.operand(inst.struct), inst.indices, inst.names)
-            case hir.InitArray():
-                regs[inst] = _shallow_normalize(self.operand(inst.dest))
-            case hir.ElementIndexAddr():
-                regs[inst] = self.element_index_addr(self.operand(inst.array), inst.index)
+                self.finish_struct(
+                    self.operand(inst.struct),
+                    self.operand(inst.dest),
+                    tuple(self.operand(v) for v in inst.indices),
+                    frozendict((k, self.operand(v)) for k, v in inst.names.items()),
+                )
             case hir.FinishArray():
                 self.finish_array(self.operand(inst.array), tuple(self.operand(e) for e in inst.elements))
             case hir.CommitSlot():
@@ -1067,11 +1243,18 @@ class HirRunner:
             return self.load(ev)
         return ev
 
-    # -- struct values ---------------------------------------------------------
+    # -- struct and array values ---------------------------------------------
 
-    def exec_field_name_addr(self, ptr: InterpVal, name: str) -> InterpVal:
-        """Note: has auto deref  """
-        ptr = self._auto_deref(_shallow_normalize(ptr))
+    def exec_field_name_addr(self, ptr: InterpVal, name: str, is_aggregate_init: bool = False) -> InterpVal:
+        """The address of the field ``name`` of the struct ``base`` points at.
+        Auto-dereferences a base that points at a pointer, unlike
+        ``field_index_addr``."""
+        ptr = _shallow_normalize(ptr)
+        if is_aggregate_init and isinstance(ptr, PendingSlot) and ptr.committed is None:
+            # the storage of the aggregate being built has no address yet: the
+            # field gets a pending place of its own (see ``finish_struct``)
+            return self.alloca(False)
+        ptr = self._auto_deref(ptr)
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f"cannot take field address of {ptr}")
@@ -1084,71 +1267,104 @@ class HirRunner:
                 f"type {container_type} has no field named '{name}'"
             )
 
-        return self.field_index_addr(ptr, index)
+        return self.field_index_addr(ptr, _index_value(index))
 
-    def field_index_addr(self, ptr: InterpVal, index: int) -> InterpVal:
-        """Note: no auto deref, unlike ``exec_field_name_addr``"""
+    def field_index_addr(
+        self,
+        ptr: InterpVal,
+        index: InterpVal,
+        is_aggregate_init: bool = False,
+        at: mir.Insertion | None = None,
+    ) -> InterpVal:
+        """The address of the ``index``-th field of the struct - or of the
+        ``index``-th element of the array - the place ``ptr`` denotes.  No auto
+        deref, unlike ``exec_field_name_addr``: the base is the storage itself
+        (a struct field chain, a construction's storage, an array).
+
+        ``is_aggregate_init`` marks a construction's field/element address: when
+        its storage is a slot whose type is not decided yet (the aggregate is
+        still being built), the place gets a pending slot of its own rather than
+        an address, which the ``FinishStruct``/``FinishArray`` closing the
+        construction turns into the address of its field/element (see
+        ``finish_array``/``finish_struct``).  ``at`` produces the address
+        instruction into an insertion block instead of the current position.
+        A zero-sized field/element occupies no storage and has no address."""
         ptr = _shallow_normalize(ptr)
+        if is_aggregate_init and isinstance(ptr, PendingSlot) and ptr.committed is None:
+            # the aggregate's storage has no address yet: a pending place
+            return self.alloca(False)
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
-            raise CompileError(f"cannot take field address of {ptr}")
+            raise CompileError(f'cannot take a field or element address of {ptr}')
         container_type = type.elem
-        if not isinstance(container_type, sval.StructType):
-            raise CompileError(f"cannot take field address of {ptr}")
+        is_const = type.is_const
 
-        fields = container_type.fields()
-        if index < 0 or index >= len(fields.by_id):
-            raise CompileError(f'type {container_type} has no field at index {index}')
-        field_type = fields.get_by_id(index).type
-        field_ptr_type = sval.PointerType(field_type, type.is_const)
-        if field_type.is_zst():
-            # a zero-sized field occupies no storage and has no address
-            return ComptimeVal(sval.Undefined(field_ptr_type))
-
-        match ptr:
-            case ComptimeVal():
-                raise CompileError(
-                    'cannot take the address of a field of a compile-time value'
-                )
-            case RuntimeVal():
-                if not container_type.mirror_is_a_field():
-                    mir_index = container_type.get_field_mir_indices()[index]
-                    assert mir_index is not None, 'a field with storage has a mirror position'
-                    return RuntimeVal(
-                        self._emit(mir.Gep(ptr.value, mir_index)), field_ptr_type
+        if isinstance(container_type, sval.StructType):
+            index_int = _comptime_index(index)
+            fields = container_type.fields()
+            if index_int < 0 or index_int >= len(fields.by_id):
+                raise CompileError(f'type {container_type} has no field at index {index_int}')
+            field_type = fields.get_by_id(index_int).type
+            field_ptr_type = sval.PointerType(field_type, is_const)
+            if field_type.is_zst():
+                # a zero-sized field occupies no storage and has no address
+                return ComptimeVal(sval.Undefined(field_ptr_type))
+            match ptr:
+                case ComptimeVal():
+                    raise CompileError(
+                        'cannot take the address of a field of a compile-time value'
                     )
-                # the mirror of the struct is the mirror of its own field
-                # (see ``sval.StructType.mirror_is_a_field``): the field is
-                # the value itself, so it takes no address arithmetic
-                return RuntimeVal(ptr.value, field_ptr_type)
-            case _:
-                raise CompileError(f"cannot take field address of {ptr}")
+                case RuntimeVal():
+                    if not container_type.mirror_is_a_field():
+                        mir_index = container_type.get_field_mir_indices()[index_int]
+                        assert mir_index is not None, 'a field with storage has a mirror position'
+                        return RuntimeVal(
+                            self._emit(mir.Gep(ptr.value, mir_index), at), field_ptr_type
+                        )
+                    # the mirror of the struct is the mirror of its own field
+                    # (see ``sval.StructType.mirror_is_a_field``): the field is
+                    # the value itself, so it takes no address arithmetic
+                    return RuntimeVal(ptr.value, field_ptr_type)
+                case _:
+                    raise CompileError(f'cannot take field address of {ptr}')
 
-    def _emit(self, inst: mir.Inst, at: int | None = None) -> mir.Value:
+        if isinstance(container_type, sval.ArrayType):
+            elem_ptr_type = sval.PointerType(container_type.elem, is_const=is_const)
+            if container_type.is_zst():
+                # a zero-sized array holds no storage and so has no addresses:
+                # every value of one equals the unit value of its element type
+                return ComptimeVal(sval.Undefined(elem_ptr_type))
+            if not isinstance(ptr, RuntimeVal):
+                raise CompileError(
+                    f'cannot take the address of an element of {container_type}: '
+                    f'the array is a compile-time value'
+                )
+            return RuntimeVal(
+                self._emit(mir.Gep(ptr.value, _mir_index(index)), at), elem_ptr_type
+            )
+
+        raise CompileError(f'cannot take a field or element address of {ptr}')
+
+    def _emit(self, inst: mir.Inst, at: mir.Insertion | None = None) -> mir.Value:
         """Append one instruction to the list currently being filled:
         the flat body of the function being typed, or a pending action's
-        insertion block while one is delivered.  ``at`` overwrites the
-        reserved position ``at`` instead of appending.  A
-        specialization's MIR lands in one list, delimited by the
-        ``If``/``Else``/``End`` (and ``Block``) markers (there are no
-        separate regions)."""
-        assert self._mir_block_stack
-        top = self._mir_block_stack[-1]
+        insertion block while one is delivered.  ``at`` appends to an
+        insertion block instead - the instruction then lands at the
+        position that block sits at (a slot's storage, see
+        ``PendingSlot.insertion``).  A specialization's MIR lands in one
+        list, delimited by the ``If``/``Else``/``End`` (and ``Block``)
+        markers (there are no separate regions)."""
         if at is not None:
-            top[at] = inst
+            at.insts.append(inst)
         else:
-            top.append(inst)
+            assert self._mir_block_stack
+            self._mir_block_stack[-1].append(inst)
         return inst
 
-    def _reserve(self) -> int:
-        assert self._mir_block_stack
-        top = self._mir_block_stack[-1]
-        ret = len(top)
-        top.append(mir.Nop())
-        return ret
-
-    def alloca(self, allow_comptime: bool = False):
-        return PendingSlot(self._reserve(), allow_comptime)
+    def alloca(self, allow_comptime: bool = False) -> PendingSlot:
+        insertion = mir.Insertion([], None)
+        self._emit(insertion)
+        return PendingSlot(insertion, allow_comptime)
 
     # -- helpers -------------------------------------------------------------
 
@@ -1343,27 +1559,6 @@ class HirRunner:
 
     # -- calls ----------------------------------------------------------------
 
-    def _callee_object(self, callee: InterpVal) -> sval.AnyValue | None:
-        """The compile-time object a call callee - or the struct operand of a
-        construction - denotes, or None when it denotes none.  A callee is a
-        reference to a function value, a builtin or a struct; a subscripted
-        struct template (``Foo[i32]``) is materialized by ``_as_ref`` into a
-        compile-time box when it is a callee, so a boxed callee is unwrapped
-        here."""
-        todo = [callee]
-        while todo:
-            ev = todo.pop()
-            match ev:
-                case ComptimeVal(obj):
-                    return obj.value if isinstance(obj, sval.ConstRef) else obj
-                case ComptimeBox():
-                    todo.append(ev.value)
-                case PendingSlot() if ev.committed is not None:
-                    todo.append(ev.committed)
-                case _:
-                    return None
-        return None
-
     def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """Resolve one call by its callee value and run it.  Spy
         functions compile to a native ``call`` producing a typed
@@ -1378,7 +1573,7 @@ class HirRunner:
         just started and must be typed first: the call is then completed
         by ``resume`` when that runner ends (see
         ``_call_function_entry``)."""
-        target = self._callee_object(callee)
+        target = _callee_object(callee)
         if target is not None:
             if isinstance(target, FunctionValue):
                 return self._call_function_entry(target, args, ret)
@@ -1471,7 +1666,8 @@ class HirRunner:
         mir_type = type.to_mir_type()
         if mir_type is None or isinstance(mir_type, mir.VoidType):
             raise _no_runtime_type(type)
-        alloca = self._emit(mir.Alloca(mir_type), val.mir_alloca_pos)
+        alloca = mir.Alloca(mir_type)
+        val.insertion.insts.append(alloca)
         self._bind_slot(val, alloca, type)
 
     def _bind_slot(self, slot: PendingSlot, ptr: mir.Value, type: sval.Type) -> None:
@@ -1529,10 +1725,10 @@ class HirRunner:
 
     def _convert_result_ptr(self, ptr: InterpVal, to_type: sval.Type) -> InterpVal:
         """The pointer a result-location operation writes through, converted
-        to the type it delivers - the result type of a call, or the struct
-        type an ``InitStruct`` builds its fields into.  Not implemented yet
-        (the stub performs no conversion): it is only needed when the
-        location's final type and the delivered type differ."""
+        to the type it delivers - the result type of a call, or the struct/
+        array type a construction builds its fields/elements into.  Not
+        implemented yet (the stub performs no conversion): it is only needed
+        when the location's final type and the delivered type differ."""
         return ptr
 
     def as_bool(self, value: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
@@ -1556,9 +1752,9 @@ class HirRunner:
 
         ``a[i]``: the *place* the i-th element of the array ``base`` points at
         is - a subscript of an array is read and written through like a field
-        of a struct (see ``_element_addr``).  The index is a ``u64`` for now;
+        of a struct (see ``field_index_addr``).  The index is a ``u64`` for now;
         ``usize``, the width of a pointer of the target, will take its place."""
-        array_type = self._array_elem_type_of(base)
+        array_type = _array_elem_type_of(base)
         if array_type is not None:
             index_value = self._coerce(self._arg_value(index), sval.IntType(64, False))
             element_index = _to_comptime(index_value)
@@ -1570,11 +1766,7 @@ class HirRunner:
                     raise CompileError(
                         f'index {element_index.value} is out of bounds for {array_type}'
                     )
-            base_type = _type_of(base)
-            assert isinstance(base_type, sval.PointerType)
-            self._frames[-1].regs[ret] = self._element_addr(
-                base, array_type, _to_runtime(index_value), is_const=base_type.is_const
-            )
+            self._frames[-1].regs[ret] = self.field_index_addr(base, index_value)
             return PollResult.AGAIN
 
         if not (isinstance(base, ComptimeVal) and isinstance(base.obj, sval.ConstRef) and isinstance(base.obj.value, sval.StructTypeHead)):
@@ -1599,108 +1791,89 @@ class HirRunner:
         self._frames[-1].regs[ret] = ComptimeVal(instance)
         return PollResult.AGAIN
 
-    def init_struct(self, struct: InterpVal, dest: InterpVal) -> InterpVal:
-        """Open a struct value in the storage ``dest`` (``hir.InitStruct``).
-        The result is the address the fields are written through: ``dest``
-        converted to a pointer to the struct type (``_convert_result_ptr``)
-        - or, when ``dest`` is a slot that is not committed yet, the
-        placeholder of a deferred conversion that the slot's commit fills in
-        with the real pointer (see ``_defer_ptr_convertion``).  A zero-sized
-        struct has no storage to open: what the construction delivers is the
-        type's unit value, as an ordinary store into ``dest``."""
-        struct_type = self._struct_construction_type(self._callee_object(struct), dest)
+    def finish_struct(
+        self,
+        struct: InterpVal,
+        dest: InterpVal,
+        indices: tuple[InterpVal, ...],
+        names: frozendict[str, InterpVal],
+    ) -> None:
+        """Close a struct construction (``hir.FinishStruct``): decide the
+        struct type, give every field the address it writes through and fill
+        the fields that no argument provides.
+
+        The struct type is the one ``struct`` names, or - when it is a generic
+        template written without its arguments - the one the storage declares
+        or the field values determine (see ``_struct_construction_type``).  A
+        positional argument binds the field of the same declaration index, a
+        keyword one the field of that name, and every field that no argument
+        provides is filled with its default: the unit value of a zero-sized
+        field, which occupies no storage.  A field with a runtime
+        representation that no argument provides is an error.  Just like
+        ``finish_array``, the storage takes the struct type through a deferral,
+        so its type is *recorded* on the slot rather than fixed on it, and
+        every field place that is still pending becomes the address of its
+        field in the storage (its value is written through that address, in
+        place)."""
+        struct_def = _callee_object(struct)
+        if isinstance(struct_def, sval.StructTypeHead):
+            field_indices = struct_def.fields.by_key
+        elif isinstance(struct_def, sval.StructType):
+            field_indices = struct_def.fields().by_key
+        else:
+            raise CompileError(f'cannot finish the construction of {struct!r}')
+
+        # every provided field, by declaration index: the positional ones in
+        # the order they were given, the keyword ones by field name
+        provided: dict[int, InterpVal] = {}
+        for index, place in enumerate(indices):
+            provided[index] = place
+        for name, place in names.items():
+            index = field_indices.get(name)
+            if index is None:
+                raise CompileError(f'{struct_def} has no field named {name!r}')
+            if index in provided:
+                raise CompileError(f'got multiple values for field {name!r}')
+            provided[index] = place
+
+        struct_type = _struct_construction_type(struct_def, dest, provided)
+        fields = struct_type.fields()
+        if len(indices) > len(fields.by_id):
+            raise CompileError(
+                f'{struct_type} takes {len(fields.by_id)} positional '
+                f'argument(s) but {len(indices)} were given'
+            )
+
         if isinstance(dest, PendingSlot) and dest.committed is None:
             # the slot has no address yet: the deferred conversion also
             # records the struct type as the type of the slot
-            return self._defer_ptr_convertion(dest, struct_type)
-        dest = _shallow_normalize(dest)
-        dest_type = _type_of(dest)
-        if dest_type is None or not isinstance(dest_type, sval.PointerType):
-            raise CompileError(f'cannot construct a {struct_type} in this location')
-        return self._convert_result_ptr(dest, struct_type)
+            dest_ptr = self._defer_ptr_convertion(dest, struct_type)
+        else:
+            dest_ptr = self._convert_result_ptr(_shallow_normalize(dest), struct_type)
 
-    def _struct_construction_type(self, struct: sval.AnyValue | None, dest: InterpVal) -> sval.StructType:
-        """The struct type a construction builds: ``struct`` itself when it
-        names a specialization.  A *template* (the bare name ``Foo``) has no
-        type of its own - the generic arguments are the ones the destination
-        was already specialized with - so the type of the construction site
-        has to be known (the result location of a function whose return type
-        is declared, an existing struct value, ...); a fresh local slot
-        carries no type and has to spell the arguments out."""
-        if isinstance(struct, sval.StructType):
-            return struct
-        if isinstance(struct, sval.StructTypeHead):
-            dest_type = _type_of(dest)
-            elem = dest_type.elem if isinstance(dest_type, sval.PointerType) else None
-            if isinstance(elem, sval.StructType) and elem.head is struct:
-                return elem
-            raise CompileError(
-                f'cannot infer the generic arguments of struct {struct.name_base} '
-                f'from this construction: the type of the construction site is '
-                f'not known; write {struct.name_base}[...](...) explicitly'
-            )
-        raise CompileError(f'{struct!r} is not a struct')
+        for index, place in provided.items():
+            field_type = fields.get_by_id(index).type
+            if not (isinstance(place, PendingSlot) and place.committed is None):
+                # the field wrote through the address it was given (see
+                # ``field_index_addr``), which is already final
+                continue
+            if field_type.is_zst():
+                # a zero-sized field occupies no storage: the place is
+                # committed for its value alone, which every value of the
+                # field type equals anyway
+                self._commit_pending_slot(place, field_type)
+                continue
+            addr = self.field_index_addr(dest_ptr, _index_value(index), at=place.insertion)
+            assert isinstance(addr, RuntimeVal), 'a field with storage has an address'
+            self._bind_slot(place, addr.value, field_type)
 
-    def finish_struct(self, struct: InterpVal, indices: frozenset[int], names: frozenset[str]) -> None:
-        """Close a struct construction (``hir.FinishStruct``).  Every field
-        takes at most one value - a positional argument binds the field of
-        the same declaration index, a keyword one the field of that name -
-        and every field that no argument provides is filled with its default:
-        the unit value of a zero-sized field, which occupies no storage.  A
-        field with a runtime representation that no argument provides is an
-        error."""
-        struct = _shallow_normalize(struct)
-        type = _type_of(struct)
-        if type is None or not isinstance(type, sval.PointerType) or not isinstance(type.elem, sval.StructType):
-            raise CompileError(f'cannot finish the construction of {struct!r}')
-        struct_type = type.elem
-        fields = struct_type.fields()
-        provided: set[int] = set()
-        for index in indices:
-            if index < 0 or index >= len(fields.by_id):
-                raise CompileError(
-                    f'{struct_type} takes {len(fields.by_id)} positional '
-                    f'argument(s) but {len(indices)} were given'
-                )
-            provided.add(index)
-        for name in names:
-            index = struct_type.field_index(name)
-            if index is None:
-                raise CompileError(f'{struct_type} has no field named {name!r}')
-            if index in provided:
-                raise CompileError(f'got multiple values for field {name!r}')
-            provided.add(index)
         for index, field0 in enumerate(fields.values()):
             if index in provided:
                 continue
-            unit = field0.type.get_unit_value()
-            if unit is None:
+            if field0.type.get_unit_value() is None:
                 raise CompileError(f'missing a value for field {field0.name!r}')
-            self.store(self.field_index_addr(struct, index), ComptimeVal(unit))
 
     # -- array values ----------------------------------------------------------
-
-    def element_index_addr(self, array: InterpVal, index: int) -> InterpVal:
-        """The address the ``index``-th element of the array being constructed
-        is written into (``hir.ElementIndexAddr``).
-
-        The address of an element is the array's own address offset by the
-        index, which takes the array's *type* - and while an array is being
-        built its element type is not known yet (see ``init_array``).  The
-        element therefore gets a pending place of its own, which the
-        ``FinishArray`` closing the construction turns into the address of an
-        element of the array (or into nothing at all: a zero-sized array has no
-        storage, and so no addresses).  A storage whose type is already decided
-        (an array given to the function, a result location) yields the address
-        right away."""
-        array = _shallow_normalize(array)
-        array_type = self._array_elem_type_of(array)
-        if array_type is None:
-            # the array's type is not decided yet: a pending place
-            return self.alloca(False)
-        base_type = _type_of(array)
-        assert isinstance(base_type, sval.PointerType)
-        return self._element_addr(array, array_type, index, is_const=base_type.is_const)
 
     def finish_array(self, array: InterpVal, elements: tuple[InterpVal, ...]) -> None:
         """Close an array construction (``hir.FinishArray``): decide the type
@@ -1714,7 +1887,7 @@ class HirRunner:
         is *recorded* on the slot rather than fixed on it, and every element
         place that is still pending becomes the address of its element in the
         storage (its value is written through that address, in place)."""
-        array_type = self._array_construction_type(array, elements)
+        array_type = _array_construction_type(array, elements)
         if isinstance(array, PendingSlot) and array.committed is None:
             array_ptr = self._defer_ptr_convertion(array, array_type)
         else:
@@ -1722,7 +1895,7 @@ class HirRunner:
         for index, element in enumerate(elements):
             if not (isinstance(element, PendingSlot) and element.committed is None):
                 # the element wrote through the address it was given (see
-                # ``element_index_addr``), which is already final
+                # ``field_index_addr``), which is already final
                 continue
             if array_type.is_zst():
                 # a zero-sized array has nowhere to write an element: the place
@@ -1730,97 +1903,11 @@ class HirRunner:
                 # element type equals anyway
                 self._commit_pending_slot(element, array_type.elem)
                 continue
-            ptr = self._element_addr(
-                array_ptr, array_type, index, at=element.mir_alloca_pos
+            ptr = self.field_index_addr(
+                array_ptr, _index_value(index), at=element.insertion
             )
             assert isinstance(ptr, RuntimeVal), 'an element of an array with storage has an address'
             self._bind_slot(element, ptr.value, array_type.elem)
-
-    def _array_elem_type_of(self, value: InterpVal) -> sval.ArrayType | None:
-        """The array type ``value`` points at, or None when it points at
-        something else (or at nothing: a slot whose type is not decided yet)."""
-        type = _type_of(value)
-        if isinstance(type, sval.PointerType) and isinstance(type.elem, sval.ArrayType):
-            return type.elem
-        return None
-
-    def _element_addr(
-        self,
-        array: InterpVal,
-        array_type: sval.ArrayType,
-        index: int | mir.Value,
-        is_const: sval.AnyValue = False,
-        at: int | None = None,
-    ) -> InterpVal:
-        """The address of one element of the array ``array`` points at (a
-        pointer to the element).  A zero-sized array holds no storage and so
-        has no addresses: every value of one equals the unit value of the
-        element type, which is what its elements are."""
-        if array_type.is_zst():
-            return ComptimeVal(sval.Undefined(sval.PointerType(array_type.elem, is_const=is_const)))
-        array = _shallow_normalize(array)
-        if not isinstance(array, RuntimeVal):
-            raise CompileError(f'cannot take the address of an element of {array_type}: the array is a compile-time value')
-        gep = self._emit(mir.Gep(array.value, index), at)
-        return RuntimeVal(gep, sval.PointerType(array_type.elem, is_const=is_const))
-
-    def _array_construction_type(self, array: InterpVal, elements: tuple[InterpVal, ...]) -> sval.ArrayType:
-        """The array type a construction builds: as many elements as it was
-        given (the constructor has no way to name the length, see ``syntax``),
-        of the element type the storage ``array`` points at declares - a place
-        holds one type, so the array built in it has to agree with it - or else
-        of the common type of the elements themselves."""
-        array_type = self._array_elem_type_of(array)
-        if array_type is None:
-            return sval.ArrayType(self._common_element_type(elements), len(elements))
-        declared = array_type.length_int
-        if declared is None:
-            raise CompileError(f'cannot tell how many elements {array_type} holds')
-        if declared != len(elements):
-            raise CompileError(
-                f'{array_type} holds {declared} element(s), but {len(elements)} were given'
-            )
-        return array_type
-
-    def _common_element_type(self, elements: tuple[InterpVal, ...]) -> sval.Type:
-        """The one type all the elements of an array have: the peer type of the
-        type of every element place (see ``_place_type``).  An array is
-        homogeneous, so the elements have to agree; every element is coerced to
-        that type when its value is written."""
-        type: sval.Type | None = None
-        for element in elements:
-            element_type = self._place_type(element)
-            if element_type is None:
-                continue
-            peer = element_type if type is None else type.resolve_peer_type(element_type)
-            if peer is None:
-                raise CompileError(
-                    f'the elements of an array must have a common type, '
-                    f'got {type} and {element_type}'
-                )
-            type = peer
-        if type is None:
-            raise CompileError(
-                'the elements of an array with no element have no type of their '
-                'own: the place it is built in has to declare the array type'
-            )
-        return type
-
-    def _place_type(self, place: InterpVal) -> sval.Type | None:
-        """The type of the value a place holds: a slot whose type is not decided
-        yet reports the peer type of the values stored into it (and None when it
-        holds no value), a place that is materialized the type of the value it
-        holds."""
-        place = _shallow_normalize(place)
-        if isinstance(place, PendingSlot):
-            if place.committed is None:
-                type = place.committed_type()
-                return None if isinstance(type, sval.EmptyType) else type
-            place = place.committed
-        type = _type_of(place)
-        if isinstance(type, sval.PointerType):
-            return type.elem
-        return None
 
     def _method_of(self, struct: sval.StructType, method_name: str) -> sval.AnyValue | None:
         """The value of the method ``method_name`` of the struct type

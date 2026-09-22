@@ -167,91 +167,67 @@ class FieldAddr(Inst):
     resolves it - and the field's type -
     from the static type it has typed ``base`` with (see ``interp``),
     auto-dereferencing a base that points at a pointer (a ``self``
-    passed by pointer, a pointer-valued field, ...) first."""
+    passed by pointer, a pointer-valued field, ...) first.
+
+    ``is_aggregate_init`` marks the field addresses a construction
+    writes through: the base is then the storage the aggregate is built
+    in, which may still be an uncommitted slot - the field then gets a
+    pending place of its own (see ``FieldIndexAddr``)."""
 
     base: Value
     name: str
-
-
-@dataclass(eq=False)
-class InitStruct(Inst):
-    """Open the construction of a struct value in the storage ``dest``.
-    ``struct`` is a reference to the struct built - a ``ConstRef`` of a
-    ``@struct()`` class, or the ``Subscript`` that specializes a struct
-    template - and the instruction's own result register is the address
-    the fields are written through: ``dest`` converted to a pointer to the
-    struct type (see ``_convert_result_ptr``).  The fields are named by
-    the addresses the following ``FieldIndexAddr``/``FieldAddr``
-    instructions produce, and the construction is closed by a
-    ``FinishStruct``.
-
-    When ``struct`` names a struct *template* (a generic struct written
-    without its generic arguments, ``Foo(...)``), the specialization is
-    the one the storage ``dest`` already has; it must therefore be known
-    at this point (the result location of a function whose return type is
-    declared, an existing struct value, ...)."""
-
-    struct: Value
-    dest: Value
+    is_aggregate_init: bool = False
 
 @dataclass(eq=False)
 class FieldIndexAddr(Inst):
-    """The address of the i-th declared field of the struct ``base``
-    points at - the address a positional argument of a construction is
-    written into.  Unlike :class:`FieldAddr` the base is never
-    auto-dereferenced (the base of a construction is the
-    :class:`InitStruct` result, already a pointer to the struct)."""
+    """The address of the ``index``-th field of the aggregate ``base``
+    points at - the address a positional argument of a struct
+    construction, or a positional element of an array construction, is
+    written into (the ``index`` names a declaration-ordered field of a
+    struct, an element of an array).  Unlike :class:`FieldAddr` the base
+    is never auto-dereferenced (the base of a construction is the
+    storage it is built in, already a pointer to the aggregate).
+
+    ``is_aggregate_init`` marks the addresses a construction writes
+    through: when the base is a slot that is not committed yet - the
+    type of an aggregate being built is not known until it is closed -
+    the field/element gets a pending place of its own, which the
+    ``FinishStruct``/``FinishArray`` closing the construction turns into
+    the address of its field/element (see ``interp``)."""
 
     base: Value
     index: int
+    is_aggregate_init: bool = False
 
 @dataclass(eq=False)
 class FinishStruct(Inst):
-    """Close the construction opened by the :class:`InitStruct` ``struct``
-    points at: every field that no argument wrote is filled with its
+    """Close the construction of the struct ``struct`` names in the
+    storage ``dest``.  ``struct`` is a reference to the struct built - a
+    ``ConstRef`` of a ``@struct()`` class, or the ``Subscript`` that
+    specializes a struct template - and ``dest`` is the storage the
+    fields were generated into.  ``indices`` are the addresses the
+    positional arguments were written into, in the order they were given,
+    and ``names`` the ones the keyword arguments were written into, by
+    field name; every field that no argument wrote is filled with its
     default (the unit value of a zero-sized field), and a field with a
     runtime representation that no argument provides is an error.  The
-    fields written positionally are named by their declaration index
-    (``indices``) and the ones written by keyword by their name
-    (``names``), so that the parser only has to know the syntax, not the
-    field layout."""
+    parser only has to know the syntax, not the field layout: the
+    interpreter resolves the struct type (inferring the generic arguments
+    a template was not given) from ``struct`` and the field addresses."""
 
     struct: Value
-    indices: frozenset[int]
-    names: frozenset[str]
-
-@dataclass(eq=False)
-class InitArray(Inst):
-    """Open the construction of an array value in the storage ``dest``.  The
-    instruction's own result register is the address the elements are written
-    through - the storage itself, or the pointer it is committed to.
-
-    Unlike a struct construction there is no callee to name the type built:
-    the length is the number of elements the construction is given, and the
-    element type is the one the storage declares - or else the common type of
-    the elements, which the ``FinishArray`` that closes the construction
-    resolves from them (the elements are generated one by one, after this
-    instruction, each writing into an address ``ElementIndexAddr`` doles
-    out)."""
-
     dest: Value
-
-@dataclass(eq=False)
-class ElementIndexAddr(Inst):
-    """The address the ``index``-th element of the array an ``InitArray``
-    opened is written into - the address a positional element of an array
-    construction is written into (arrays have no elements named by keyword)."""
-
-    array: Value
-    index: int
+    indices: tuple[Value, ...]
+    names: frozendict[str, Value]
 
 @dataclass(eq=False)
 class FinishArray(Inst):
-    """Close the construction opened by the :class:`InitArray` ``array`` points
-    at.  The ``elements`` are the addresses the elements were generated into, in
-    the order they were given: their count is the length of the array, and they
-    resolve its element type.  An array has no element omitted (there is no
-    default for one), so an element that is left out is an error."""
+    """Close the construction of an array in the storage ``array`` points
+    at.  The ``elements`` are the addresses the elements were generated into
+    (``FieldIndexAddr`` instructions), in the order they were given: their
+    count is the length of the array, and they resolve its element type.  An
+    array has no element omitted (there is no default for one), so an element
+    that is left out is an error."""
 
     array: Value
     elements: tuple[Value, ...]

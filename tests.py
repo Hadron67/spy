@@ -591,6 +591,15 @@ def construct_nothing(x: i32) -> i32:
     return x if spy_typeof(n) == Nothing else x + 1
 
 
+# a construction that provides no field at all still takes its type from the
+# construction: every field of ``Blank`` is zero-sized, so all of them may be
+# left to their default
+@func()
+def construct_blank(x: i32) -> i32:
+    b = Blank()  # pyright: ignore[reportCallIssue]
+    return x if spy_typeof(b) == Blank else x + 1
+
+
 # a construction delivers its value like any other store point, so the slot's
 # type is still the peer type of everything stored into it: two *different*
 # zero-sized structs have no peer type (rather than the first one silently
@@ -877,6 +886,14 @@ def keyword_construction(x: i32) -> i32:
 @func()
 def mixed_construction(x: i32) -> i32:
     return Pair[i32](x, b=x).total()
+
+
+@func()
+def inferred_from_field_values(x: i32) -> i32:
+    # ``Pair(...)`` built in a fresh local slot whose type is not known: the
+    # generic argument is inferred from the values written into the fields
+    p = Pair(x, x)
+    return p.total()
 
 
 @func()
@@ -1614,6 +1631,11 @@ class SpyGenericStructTest(TestCase):
         self.assertEqual(inferred_pair_total(2), 5)
         self.assertAlmostEqual(inferred_pair_total_f64(1.5), 4.0)
 
+    def test_inference_from_field_values(self) -> None:
+        # ``Pair(x, x)`` built in a fresh local slot whose type is not known:
+        # the generic argument comes from the values written into the fields
+        self.assertEqual(inferred_from_field_values(3), 6)
+
     def test_uninferable_construction(self) -> None:
         # a construction that names the bare template and whose
         # construction site has no type cannot pick a specialization
@@ -1825,6 +1847,7 @@ class SpyZeroSizedResultTest(TestCase):
 
     def test_zero_sized_struct_local(self) -> None:
         self.assertEqual(construct_nothing(7), 7)
+        self.assertEqual(construct_blank(7), 7)
 
     def test_zero_sized_construction_participates_in_peer_resolution(self) -> None:
         # the construction of a zero-sized struct delivers its value as an

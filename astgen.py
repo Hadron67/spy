@@ -530,26 +530,27 @@ class _Builder:
         return RawArgList(positional, frozendict(kwargs.items()))
 
     def _gen_struct_ctor(self, struct: hir.Value, args: list[ast.expr], keywords: list[ast.keyword], result_loc: hir.Value) -> None:
-        """One construction ``Foo(a1, a2, k=v)``: an ``hir.InitStruct`` opens
-        the struct in the result location, every argument is generated with
-        result-location semantics straight into the address of the field it
-        initializes - a nested construction fills the field in place, with no
-        copy - and ``hir.FinishStruct`` closes the construction, filling the
-        fields that were left out with their defaults."""
-        inst = self.add(hir.InitStruct(struct, result_loc))
-        indices: set[int] = set()
+        """One construction ``Foo(a1, a2, k=v)``: every argument is generated
+        with result-location semantics straight into the address of the field
+        it initializes - a nested construction fills the field in place, with
+        no copy - and ``hir.FinishStruct`` closes the construction, resolving
+        the struct type, binding the field addresses and filling the fields
+        that were left out with their defaults."""
+        indices: list[hir.Value] = []
         for i, arg in enumerate(args):
-            self._gen_result_loc(arg, self.add(hir.FieldIndexAddr(inst, i)))
-            indices.add(i)
-        names: set[str] = set()
+            field = self.add(hir.FieldIndexAddr(result_loc, i, is_aggregate_init=True))
+            self._gen_result_loc(arg, field)
+            indices.append(field)
+        names: dict[str, hir.Value] = {}
         for kw in keywords:
             if kw.arg is None:
                 raise CompileError(
                     f"**kwargs are not supported in spy function {self._fn_ir.name}"
                 )
-            self._gen_result_loc(kw.value, self.add(hir.FieldAddr(inst, kw.arg)))
-            names.add(kw.arg)
-        self.add(hir.FinishStruct(inst, frozenset(indices), frozenset(names)))
+            field = self.add(hir.FieldAddr(result_loc, kw.arg, is_aggregate_init=True))
+            self._gen_result_loc(kw.value, field)
+            names[kw.arg] = field
+        self.add(hir.FinishStruct(struct, result_loc, tuple(indices), frozendict(names)))
 
     def _gen_call(self, node: ast.Call, result_loc: hir.Value) -> None:
         """One call whose result is written into ``result_loc``: a
@@ -579,21 +580,19 @@ class _Builder:
         self.add(hir.CallInplace(self._as_ref(callee), self._gen_arglist(node.args, node.keywords), result_loc))
 
     def _gen_array_ctor(self, args: list[ast.expr], keywords: list[ast.keyword], result_loc: hir.Value) -> None:
-        """One construction ``array(a1, a2, ...)``: an ``hir.InitArray`` opens
-        the array in the result location, every element is generated with
-        result-location semantics straight into the place of the element it
-        initializes, and ``hir.FinishArray`` closes the construction, which is
-        where the length of the array (the number of elements) and its element
-        type (the common type of the elements) are resolved.
+        """One construction ``array(a1, a2, ...)``: every element is generated
+        with result-location semantics straight into the place of the element
+        it initializes, and ``hir.FinishArray`` closes the construction, which
+        is where the length of the array (the number of elements) and its
+        element type (the common type of the elements) are resolved.
 
         The signature of ``syntax.array`` takes a ``length`` keyword because
         the Python type system cannot tell the length from the elements; the
         compiler takes it from the number of elements either way and ignores
         the keyword."""
-        inst = self.add(hir.InitArray(result_loc))
         elements: list[hir.Value] = []
         for i, arg in enumerate(args):
-            element = self.add(hir.ElementIndexAddr(inst, i))
+            element = self.add(hir.FieldIndexAddr(result_loc, i, is_aggregate_init=True))
             self._gen_result_loc(arg, element)
             elements.append(element)
         for kw in keywords:
@@ -601,7 +600,7 @@ class _Builder:
                 raise CompileError(
                     f"array takes no keyword argument {kw.arg!r} in spy function {self._fn_ir.name}"
                 )
-        self.add(hir.FinishArray(inst, tuple(elements)))
+        self.add(hir.FinishArray(result_loc, tuple(elements)))
 
     def _gen_name(self, name: str) -> hir.Value:
         """Always returns a reference to the name ``name``."""
