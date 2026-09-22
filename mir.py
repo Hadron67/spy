@@ -184,6 +184,22 @@ class Float(Value):
     def get_children(self) -> tuple[Any, ...]:
         return ()
 
+
+@dataclass(frozen=True)
+class NullValue(Value):
+    """The null pointer constant: the value an absent ``Option[T]`` whose
+    representation is a pointer (or holds one as its tag) has."""
+
+    type: PointerType
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
+
+
 class GlobalValue(Value):
     def __hash__(self) -> int:
         return object.__hash__(self)

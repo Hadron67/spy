@@ -24,6 +24,7 @@ class Array[T, L: int]:
         ...
 
 type Comptime[T = Any] = T
+type Option[T] = T | None
 
 def ref[T](val: T) -> Ptr[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")

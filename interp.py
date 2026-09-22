@@ -16,7 +16,8 @@ Values in the register table are either
   (an ``sval.AnyValue``: a Python scalar, a spy type descriptor, a
   function to call/inline, ...).  "No value" is the unit value
   ``sval.Void()`` - the unique value of the zero-sized void type - never
-  Python ``None``,
+  Python ``None``, and the ``None`` the source writes is the absent value
+  of an option, ``sval.Null()``,
 * :class:`ComptimeTuple`/:class:`ComptimeDict` - a compile-time
   aggregate whose elements are themselves interpreter values,
 * :class:`RuntimeVal` - the object of an already emitted MIR
@@ -374,6 +375,16 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
             return sval.type_of(obj) if not allow_value_type else sval.ValueType(obj)
         case _:
             return None
+
+def _is_null(ev: InterpVal) -> bool:
+    """Whether the value ``ev`` denotes is the ``Null`` value (the absent
+    value of an option).  A store of a ``None`` records the store type
+    :class:`sval.NullType`, which is how an uncommitted slot remembers the
+    delivery is absent (the value has no runtime representation of its own)."""
+    ev = _shallow_normalize(ev)
+    if isinstance(ev, ComptimeVal):
+        return isinstance(ev.obj, sval.Null)
+    return isinstance(_type_of(ev), sval.NullType)
 
 def _arg_type_of(arg: ArgEntry[InterpVal]) -> sval.Type | None:
     """The spy type of the *value* an argument denotes: a reference
@@ -1225,6 +1236,25 @@ class HirRunner:
         elem = ptr_type.elem
         if elem.is_zst():
             return
+        if isinstance(elem, sval.OptionType):
+            # an option (and the ``T``/``Null`` a store delivers) is written
+            # through the representation of ``elem`` (see ``_write_option``)
+            match ptr:
+                case ComptimeBox():
+                    obj = _to_comptime(value)
+                    if obj is None:
+                        ptr.value = self._coerce_option_value(value, elem)
+                    elif isinstance(obj, sval.Value):
+                        # an already spy-typed value (the null value, or a value
+                        # of the child type) carries its own type
+                        ptr.value = ComptimeVal(obj)
+                    else:
+                        ptr.value = ComptimeVal(sval.coerce_const(obj, elem))
+                case RuntimeVal():
+                    self._write_option(ptr.value, value, elem)
+                case _:
+                    raise CompileError('cannot store through a compile-time pointer')
+            return
         coerced = self._coerce(value, elem)
         match ptr:
             case ComptimeBox():
@@ -1233,6 +1263,121 @@ class HirRunner:
                 self._emit(mir.Store(ptr.value, _to_runtime(coerced)))
             case _:
                 raise CompileError('cannot store through a compile-time pointer')
+
+    # -- options ---------------------------------------------------------------
+
+    def _write_option(self, dst: mir.Value, value: InterpVal, option: sval.OptionType) -> None:
+        """Write the ``Option[T]`` value ``value`` into the memory ``dst`` - a
+        MIR pointer to the option's representation (see
+        ``sval.OptionType.to_mir_type``).  A present value is the child's own
+        representation (coerced to the child), and the absent one the null
+        representation: a ``bool`` for a zero-sized child, the tagging pointer
+        nulled (``_write_option_null``) for a child that has one, and the tag
+        ``false`` for the rest."""
+        child = option.child
+        if isinstance(value, RuntimeVal) and _type_of(value) == option:
+            # the value already is an option of this type (a parameter of one,
+            # a load of one): its representation is written as a whole
+            self._emit(mir.Store(dst, _to_runtime(value)))
+            return
+        null = _is_null(value)
+        if child.is_zst():
+            # a zero-sized child carries no value: only whether there is one
+            self._emit(mir.Store(dst, mir.BoolValue(not null)))
+            return
+        if sval.find_first_pointer_type_pos(child) is not None:
+            if null:
+                self._write_option_null(dst, option)
+            else:
+                self._emit(mir.Store(dst, _to_runtime(self._coerce(value, child))))
+            return
+        # a struct of the tag and the value: the tag says whether there is one
+        tag = self._emit(mir.Gep(dst, 0))
+        self._emit(mir.Store(tag, mir.BoolValue(not null)))
+        if not null:
+            payload = self._emit(mir.Gep(dst, 1))
+            self._emit(mir.Store(payload, _to_runtime(self._coerce(value, child))))
+
+    def _option_tag_addr(
+        self, ptr: mir.Value, option: sval.OptionType
+    ) -> tuple[mir.Value, sval.PointerType] | None:
+        """The address of the pointer that tags ``option``, and its type - the
+        pointer whose nullness makes the option absent - or ``None`` when the
+        option's representation carries a ``bool`` tag instead (see
+        ``sval.find_first_pointer_type_pos``).
+
+        The position is the one the spy type names, mapped onto the mirror: the
+        field positions of a struct are its *mirror* positions (a struct of one
+        stored field *is* that field, see ``mirror_is_a_field``), an array
+        element is its own position, and stepping into an option costs no
+        position (an option that still has a free pointer shares the
+        representation of its child)."""
+        path = sval.find_first_pointer_type_pos(option.child)
+        if path is None:
+            return None
+        node: sval.Type = option.child
+        cur = ptr
+        for index in path:
+            if isinstance(node, sval.OptionType):
+                node = node.child
+                continue
+            if isinstance(node, sval.StructType):
+                if not node.mirror_is_a_field():
+                    mir_index = node.get_field_mir_indices()[index]
+                    assert mir_index is not None, 'a field holding a pointer has a mirror position'
+                    cur = self._emit(mir.Gep(cur, mir_index))
+                node = node.fields().get_by_id(index).type
+            elif isinstance(node, sval.ArrayType):
+                cur = self._emit(mir.Gep(cur, index))
+                node = node.elem
+            else:
+                raise CompileError(f'cannot take the tag address of {option}')
+        if not isinstance(node, sval.PointerType):
+            raise CompileError(f'cannot take the tag address of {option}')
+        return cur, node
+
+    def _write_option_null(self, dst: mir.Value, option: sval.OptionType) -> None:
+        """Write the absent value of ``option`` into the memory ``dst``: null
+        the pointer that tags it."""
+        tag = self._option_tag_addr(dst, option)
+        assert tag is not None, 'the option has a pointer tag'
+        tag_ptr, tag_type = tag
+        mir_type = tag_type.to_mir_type()
+        assert isinstance(mir_type, mir.PointerType)
+        self._emit(mir.Store(tag_ptr, mir.NullValue(mir_type)))
+
+    def _coerce_option_value(self, ev: InterpVal, option: sval.OptionType) -> InterpVal:
+        """Materialize ``ev`` as a value of the option type ``option``: a value
+        that already is one passes through, the null value becomes the absent
+        one and anything else a present value of the child type.
+
+        The result is a value of the option: for a child that has a free pointer
+        (whose representation the option shares) the coerced child itself, a
+        ``bool`` or a null pointer for the scalar representations, and the
+        ``mir.Load`` of a fresh temporary for the struct representation (a tag
+        and the value have no constant form of their own)."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, RuntimeVal) and _type_of(ev) == option:
+            return ev
+        child = option.child
+        null = _is_null(ev)
+        if child.is_zst():
+            return RuntimeVal(mir.BoolValue(not null), option)
+        if sval.find_first_pointer_type_pos(child) is not None:
+            if not null:
+                return self._coerce(ev, child)
+            mir_type = option.to_mir_type()
+            assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+            if isinstance(mir_type, mir.PointerType):
+                # the option itself is the tagging pointer: a null pointer is
+                # the absent value
+                return RuntimeVal(mir.NullValue(mir_type), option)
+        # build the representation in a temporary and load it back
+        mir_type = option.to_mir_type()
+        assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+        alloca = self._emit(mir.Alloca(mir_type))
+        self._write_option(alloca, ev, option)
+        return RuntimeVal(self._emit(mir.Load(alloca)), option)
 
     def _arg_value(self, arg: ArgEntry[InterpVal]) -> InterpVal:
         """The value an argument denotes: a reference argument is loaded
@@ -1263,6 +1408,15 @@ class HirRunner:
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f"cannot take field address of {ptr}")
         container_type = type.elem
+        if is_aggregate_init:
+            # the construction may build the child of nested options: its fields
+            # are taken in the payload of each of them
+            while self._is_option_construction(container_type):
+                assert isinstance(container_type, sval.OptionType)
+                ptr = self._option_payload_ptr(ptr, container_type)
+                type = _type_of(ptr)
+                assert isinstance(type, sval.PointerType)
+                container_type = type.elem
         if not isinstance(container_type, sval.StructType):
             raise CompileError(f"cannot take field address of {ptr}")
         index = container_type.field_index(name)
@@ -1302,6 +1456,17 @@ class HirRunner:
             raise CompileError(f'cannot take a field or element address of {ptr}')
         container_type = type.elem
         is_const = type.is_const
+        if is_aggregate_init:
+            # the construction may build the child of nested options: the field
+            # or element address is taken in the payload of each of them, which
+            # marks the option present when its tag is a ``bool``
+            while self._is_option_construction(container_type):
+                assert isinstance(container_type, sval.OptionType)
+                ptr = self._option_payload_ptr(ptr, container_type)
+                type = _type_of(ptr)
+                assert isinstance(type, sval.PointerType)
+                container_type = type.elem
+                is_const = type.is_const
 
         if isinstance(container_type, sval.StructType):
             index_int = _comptime_index(index)
@@ -1417,6 +1582,10 @@ class HirRunner:
         operation that takes a value without loading it (taking an address,
         ``ref``) hands over."""
         ev = _shallow_normalize(ev)
+        if isinstance(target, sval.OptionType):
+            # a ``T``/``Null`` value is coerced through the option's
+            # representation (see ``_coerce_option_value``)
+            return self._coerce_option_value(ev, target)
         match ev:
             case ComptimeVal(obj):
                 return ComptimeVal(sval.coerce_const(obj, target))
@@ -1749,8 +1918,9 @@ class HirRunner:
         the value is recorded as an ordinary store into the slot, which is what
         gives the slot its type in the first place.  The store takes part in the
         peer resolution like any other, so a destination that also receives a
-        wider type (a future ``Option[T]``) widens with it, and the unit value
-        is coerced to the final type at the slot's commit."""
+        wider type (an ``Option[T]``, which the null value peers to) widens
+        with it, and the unit value is coerced to the final type at the
+        slot's commit."""
         unit = type.get_unit_value()
         if unit is not None:
             self.store(slot, ComptimeVal(unit))
@@ -1766,10 +1936,54 @@ class HirRunner:
     def _convert_result_ptr(self, ptr: InterpVal, to_type: sval.Type) -> InterpVal:
         """The pointer a result-location operation writes through, converted
         to the type it delivers - the result type of a call, or the struct/
-        array type a construction builds its fields/elements into.  Not
-        implemented yet (the stub performs no conversion): it is only needed
-        when the location's final type and the delivered type differ."""
-        return ptr
+        array type a construction builds its fields/elements into.  A location
+        whose type is an ``Option[T]`` and a delivery of a ``T`` are what makes
+        the two differ: the delivery writes through the place the value of a
+        present option lives in (``_option_payload_ptr``), which marks the
+        option present."""
+        ptr = _shallow_normalize(ptr)
+        ptr_type = _type_of(ptr)
+        if not isinstance(ptr_type, sval.PointerType):
+            raise CompileError(f'cannot use {ptr!r} as a result location')
+        from_type = ptr_type.elem
+        if from_type == to_type:
+            return ptr
+        if isinstance(from_type, sval.OptionType):
+            # the delivery goes into the payload of the option - and, when the
+            # option's child is an option itself, through each of its layers
+            # (a ``T`` converts to ``Option[T]``, and so on outward)
+            inner = self._option_payload_ptr(ptr, from_type)
+            return self._convert_result_ptr(inner, to_type)
+        raise CompileError(
+            f'cannot deliver a {to_type} into a location of type {from_type}'
+        )
+
+    def _is_option_construction(self, container_type: sval.Type) -> bool:
+        """Whether ``container_type`` is an option whose child a construction
+        builds in place (the child has storage to address: it is not
+        zero-sized)."""
+        return (
+            isinstance(container_type, sval.OptionType)
+            and not container_type.child.is_zst()
+        )
+
+    def _option_payload_ptr(self, ptr: InterpVal, option: sval.OptionType) -> InterpVal:
+        """The place the value of a present ``Option[T]`` lives in - what a
+        delivery of a ``T`` into the option writes through.  The delivery also
+        marks the option present: for a child that still has a free pointer the
+        option *is* the value (that pointer is the tag, and the value itself
+        sets it), and otherwise the tag of the struct representation is set
+        here."""
+        child = option.child
+        if child.is_zst():
+            raise CompileError(f'cannot take the address of the value of {option}')
+        src = _to_runtime(ptr)
+        if sval.find_first_pointer_type_pos(child) is not None:
+            return RuntimeVal(src, sval.PointerType(child, is_const=False))
+        tag = self._emit(mir.Gep(src, 0))
+        self._emit(mir.Store(tag, mir.BoolValue(True)))
+        payload = self._emit(mir.Gep(src, 1))
+        return RuntimeVal(payload, sval.PointerType(child, is_const=False))
 
     def as_bool(self, value: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
         """Use the value as the condition of an ``if`` - a statement's or an

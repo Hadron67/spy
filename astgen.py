@@ -63,10 +63,10 @@ from .errors import CompileError
 from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
+    Null,
     StructDecl,
     Type,
     Value,
-    Void,
     VoidType,
     as_value,
     unwrap_comptime,
@@ -784,11 +784,11 @@ def parse_function(
         return cast(Type | None, convert(annotation, 'the annotation'))
 
     def default_of(value: Any) -> AnyValue | None:
-        # a default value of ``None`` is the unit value of the void type
-        # (see ``sval.as_value``): ``default_value`` being ``None`` means
-        # the parameter has no default
+        # a default value of ``None`` is the null value: the absent value of
+        # an option (see ``sval.as_value``).  ``default_value`` being ``None``
+        # means the parameter has no default, so it cannot be the value itself
         if value is None:
-            return Void()
+            return Null()
         return convert(value, 'a default value')
 
     # the signature: the formal parameters, by declaration position

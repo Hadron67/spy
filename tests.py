@@ -25,6 +25,7 @@ from spy.dsl import func, struct
 
 from . import (
     CompileError,
+    TypeMismatchError,
     compile_log,
     f32,
     f64,
@@ -41,7 +42,7 @@ from . import (
 from . import as_ as spy_as
 from . import bool as spy_bool
 from . import typeof as spy_typeof
-from .syntax import Array, Comptime, Ptr, array, ref
+from .syntax import Array, Comptime, Option, Ptr, array, ref
 
 # ---------------------------------------------------------------------------
 # functions under test
@@ -316,6 +317,13 @@ def struct_type(handle: Any) -> sval.StructType:
     """The struct type a ``@struct()`` class declares."""
     type = handle.as_spy_value()
     assert isinstance(type, sval.StructType)
+    return type
+
+
+def spy_type(annotation: Any) -> sval.Type:
+    """The spy type a Python annotation evaluates to (see ``sval.as_value``)."""
+    type = sval.as_value(annotation)
+    assert isinstance(type, sval.Type)
     return type
 
 
@@ -2049,6 +2057,336 @@ class SpyCompileLogTest(TestCase):
         self.assertIn('add_inline was compiled', out.getvalue())
 
 
+# ---------------------------------------------------------------------------
+# options: ``Option[T]`` holds a ``T`` or the null value, which is what the
+# Python literal ``None`` evaluates to.  Both a ``T`` and the null value
+# convert to ``Option[T]``, so a slot (or a branch) that receives both takes
+# the option type.  The representation is chosen by the child type (see
+# ``sval.OptionType.to_mir_type``): a zero-sized child is a ``bool``, a child
+# that holds a pointer uses its first pointer as the absent tag, and any other
+# child a struct of a tag and the value.
+# ---------------------------------------------------------------------------
+
+# the spy types the tests compare against, as module globals: ``spy.typeof``
+# of an option-typed place is the one ``Option[spy.i32]`` of the compiler
+NULL_TYPE = sval.NullType()
+OPT_I32 = sval.OptionType(spy_type(i32))
+OPT_PTR_I32 = sval.OptionType(spy_type(Ptr[i32]))
+
+
+@struct()
+class OptHolder:
+    """A struct with an option field: an option is an ordinary field."""
+
+    o: Option[i32]
+    n: i32
+
+
+@func()
+def maybe_add(x: i32, y: i32, c: spy_bool) -> Option[i32]:
+    # one path returns a value of the child type, the other the null value:
+    # the result location is the peer type of the two, the option
+    if c:
+        return x + y
+    return None
+
+
+@func()
+def opt_width(o: Option[i32]) -> i32:
+    return 1
+
+
+@func()
+def use_maybe(x: i32, c: spy_bool) -> i32:
+    o = maybe_add(x, 1, c)
+    return x + opt_width(o)
+
+
+@func()
+def null_argument(x: i32) -> i32:
+    # the null value as an argument: it converts to the option of the
+    # parameter's type
+    return x + opt_width(None)
+
+
+@func()
+def maybe_large(x: i64, c: spy_bool) -> Option[Large]:
+    # ``Large`` holds no pointer and is too big for the by-value limit: the
+    # option is returned through a result pointer, and the construction of
+    # ``Large`` is delivered into the payload of the option (the tag is set)
+    if c:
+        return Large(x, 1, 2, 3)
+    return None
+
+
+@func()
+def take_large(o: Option[Large]) -> i64:
+    return 2
+
+
+@func()
+def use_maybe_large(x: i64, c: spy_bool) -> i64:
+    o = maybe_large(x, c)
+    return x + take_large(o)
+
+
+@func()
+def maybe_ptr(p: Ptr[i32], c: spy_bool) -> Option[Ptr[i32]]:
+    # a child that holds a pointer: the option *is* the pointer, a null one
+    # being the absent value
+    if c:
+        return p
+    return None
+
+
+@func()
+def take_ptr(o: Option[Ptr[i32]]) -> i32:
+    return 1
+
+
+@func()
+def use_maybe_ptr(x: i32, c: spy_bool) -> i32:
+    y = x
+    o = maybe_ptr(ref(y), c)
+    return y + take_ptr(o)
+
+
+@struct()
+class PtrMixed:
+    """A struct whose first pointer is not the first field of its mirror: the
+    fields are ordered by alignment (the ``i8`` before the pointer), while
+    ``find_first_pointer_type_pos`` names the declaration order."""
+
+    p: Ptr[i32]
+    b: i8
+
+
+@func()
+def maybe_ptr_mixed(p: Ptr[i32], b: i8, c: spy_bool) -> Option[PtrMixed]:
+    # the option shares the representation of its child, whose first pointer
+    # (in mirror order) is the tag: a constructed value sets it
+    if c:
+        return PtrMixed(p, b)
+    return None
+
+
+@func()
+def take_ptr_mixed(o: Option[PtrMixed]) -> i32:
+    return 4
+
+
+@func()
+def use_maybe_ptr_mixed(x: i32, c: spy_bool) -> i32:
+    y = x
+    o = maybe_ptr_mixed(ref(y), 1, c)
+    return y + take_ptr_mixed(o)
+
+
+@func()
+def option_field(x: i32, c: spy_bool) -> i32:
+    # the two branches of the ``if`` write a value and the null value into
+    # the field place: the field is the option the two peers to
+    h = OptHolder(x if c else None, 1)
+    return h.n + x
+
+
+@func()
+def option_as_null() -> spy_bool:
+    return spy_typeof(None) == NULL_TYPE
+
+
+@func()
+def option_field_is_an_option(x: i32) -> spy_bool:
+    h = OptHolder(x, 1)
+    return spy_typeof(h.o) == OPT_I32
+
+
+@func()
+def option_pointer_is_an_option(x: i32, c: spy_bool) -> spy_bool:
+    y = x
+    o = maybe_ptr(ref(y), c)
+    return spy_typeof(o) == OPT_PTR_I32
+
+
+@func()
+def bad_option_argument(x: i32) -> i32:
+    # a struct is neither the child type nor the null value: it does not
+    # convert to the option
+    return opt_width(Small(x, 1))  # pyright: ignore[reportArgumentType]
+
+
+def opt_inline(x: i32, c: spy_bool):
+    # an inlined body: its result location takes the option type from the
+    # peer type of its two returns
+    if c:
+        return x
+    return None
+
+
+@func()
+def use_opt_inline(x: i32, c: spy_bool) -> i32:
+    o = opt_inline(x, c)
+    return x + opt_width(o)
+
+
+@func()
+def generic_opt_width[T](o: Option[T]) -> i32:
+    # the child of an option parameter is a type parameter: a call solves it
+    # from the type of the argument (which converts to the option)
+    return 3
+
+
+@func()
+def use_generic_opt(x: i32) -> i32:
+    return x + generic_opt_width(x)
+
+
+@func()
+def bad_generic_null(x: i32) -> i32:
+    # the null value is not a ``T``: it cannot solve the child of an option
+    return generic_opt_width(None)
+
+
+class SpyOptionTest(TestCase):
+    def test_null_value(self) -> None:
+        self.assertTrue(option_as_null())
+
+    def test_returning_an_option(self) -> None:
+        # a value on one path, the null value on the other
+        self.assertEqual(use_maybe(10, True), 11)
+        self.assertEqual(use_maybe(10, False), 11)
+
+    def test_null_argument(self) -> None:
+        self.assertEqual(null_argument(10), 11)
+
+    def test_option_through_a_result_pointer(self) -> None:
+        # ``Option[Large]`` is returned through a result pointer, and the
+        # construction is delivered into the payload of the option
+        self.assertEqual(use_maybe_large(10, True), 12)
+        self.assertEqual(use_maybe_large(10, False), 12)
+
+    def test_option_of_a_pointer(self) -> None:
+        self.assertEqual(use_maybe_ptr(10, True), 11)
+        self.assertEqual(use_maybe_ptr(10, False), 11)
+
+    def test_option_of_a_struct_whose_mirror_reorders_the_pointer(self) -> None:
+        self.assertEqual(use_maybe_ptr_mixed(10, True), 14)
+        self.assertEqual(use_maybe_ptr_mixed(10, False), 14)
+
+    def test_option_field(self) -> None:
+        self.assertEqual(option_field(10, True), 11)
+        self.assertEqual(option_field(10, False), 11)
+
+    def test_typeof(self) -> None:
+        self.assertTrue(option_field_is_an_option(1))
+        self.assertTrue(option_pointer_is_an_option(1, True))
+
+    def test_inlined_body(self) -> None:
+        self.assertEqual(use_opt_inline(10, True), 11)
+        self.assertEqual(use_opt_inline(10, False), 11)
+
+    def test_generic_child_is_solved(self) -> None:
+        self.assertEqual(use_generic_opt(10), 13)
+
+    def test_null_does_not_solve_the_child(self) -> None:
+        with self.assertRaises(TypeMismatchError):
+            bad_generic_null(1)
+
+    def test_wrong_argument_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_option_argument(1)
+
+
+# a struct of two pointers: the inner ``Option`` tags on the first one, so the
+# outer one of ``Option[Option[TwoPtrs]]`` has to tag on the second
+@struct()
+class TwoPtrs:
+    a: Ptr[i32]
+    b: Ptr[i32]
+
+
+@func()
+def maybe_deep(x: i32, c: spy_bool) -> Option[Option[Ptr[i32]]]:
+    # the only pointer of ``Ptr[i32]`` is the inner option's tag, so the outer
+    # option has none left and carries a ``bool`` tag instead
+    y = x
+    if c:
+        return ref(y)
+    return None
+
+
+@func()
+def take_deep(o: Option[Option[Ptr[i32]]]) -> i32:
+    return 5
+
+
+@func()
+def use_maybe_deep(x: i32, c: spy_bool) -> i32:
+    o = maybe_deep(x, c)
+    return x + take_deep(o)
+
+
+@func()
+def maybe_two(a: Ptr[i32], b: Ptr[i32], c: spy_bool) -> Option[Option[TwoPtrs]]:
+    # ``TwoPtrs`` has two pointers: the inner option tags on ``a`` (the first),
+    # so the outer one tags on ``b`` (the second)
+    if c:
+        return TwoPtrs(a, b)
+    return None
+
+
+@func()
+def take_two(o: Option[Option[TwoPtrs]]) -> i32:
+    return 6
+
+
+@func()
+def use_maybe_two(x: i32, c: spy_bool) -> i32:
+    y = x
+    z = x + 1
+    o = maybe_two(ref(y), ref(z), c)
+    return x + take_two(o)
+
+
+class SpyOptionNestingTest(TestCase):
+    """The tag of a nested option: an ``Option`` uses one pointer of its child
+    as its tag, so it has one fewer than the child and ``Option[Option[T]]``
+    has to find ``T``'s *second* pointer (see
+    ``sval.find_first_pointer_type_pos``)."""
+
+    def test_the_inner_option_claims_the_only_pointer(self) -> None:
+        ptr = spy_type(Ptr[i32])
+        opt_ptr = sval.OptionType(ptr)
+        self.assertEqual(sval.find_first_pointer_type_pos(ptr), ())
+        # the inner option takes that pointer as its tag ...
+        self.assertIsNone(sval.find_first_pointer_type_pos(opt_ptr))
+        # ... so the outer one has to carry a ``bool`` tag
+        outer = sval.OptionType(opt_ptr)
+        self.assertIsInstance(outer.to_mir_type(), mir.StructType)
+        self.assertEqual(sval.estimated_size_of(outer), 2 * sval.estimated_size_of(ptr))
+
+    def test_the_outer_option_takes_the_second_pointer(self) -> None:
+        two = struct_type(TwoPtrs)
+        inner = sval.OptionType(two)
+        outer = sval.OptionType(inner)
+        # the inner option tags on ``a`` ...
+        self.assertEqual(sval.find_first_pointer_type_pos(two), (0,))
+        # ... so the outer one tags on ``b``
+        self.assertEqual(sval.find_first_pointer_type_pos(inner), (0, 1))
+        # the two share the representation of the child ...
+        self.assertIs(outer.to_mir_type(), two.get_mir_type())
+        # ... and a further level has no pointer left
+        self.assertIsNone(sval.find_first_pointer_type_pos(outer))
+
+    def test_nested_option_of_a_pointer(self) -> None:
+        self.assertEqual(use_maybe_deep(10, True), 15)
+        self.assertEqual(use_maybe_deep(10, False), 15)
+
+    def test_nested_option_of_a_two_pointer_struct(self) -> None:
+        self.assertEqual(use_maybe_two(10, True), 16)
+        self.assertEqual(use_maybe_two(10, False), 16)
+
+
 all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
@@ -2061,4 +2399,6 @@ all_tests = [
     SpyTupleTest,
     SpyZeroSizedResultTest,
     SpyCompileLogTest,
+    SpyOptionTest,
+    SpyOptionNestingTest,
 ]

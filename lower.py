@@ -351,6 +351,10 @@ class _Lowerer:
             return sllvm.IntValue(value.value, sllvm.IntType(value.type.bits))
         if isinstance(value, mir.Float):
             return sllvm.FloatType(value.type.bits).from_float(value.value)
+        if isinstance(value, mir.NullValue):
+            ptr_type = self._to_llvm(value.type)
+            assert isinstance(ptr_type, sllvm.PointerType)
+            return sllvm.NullValue(ptr_type)
         if isinstance(value, mir.GlobalValue):
             return self.lower_global(value)
         raise CompileError(f'cannot lower value {value!r}')

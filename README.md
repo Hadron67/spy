@@ -45,7 +45,9 @@ Python 值在调用边界按以下规则映射：
 | `int` | `spy.i64`（见 `dsl._INT_LITERAL_BITS`） |
 | `float` | `spy.f64` |
 | `str` | `const u8*`（只作为常量指针传递，尚不支持运算） |
+| `None` | `Null`（`sval.Null()`，类型 `NullType`；是 `Option[T]` 的“缺席”值，也可以当 void 值用） |
 | `syntax.Ptr[T]` | `sval.PointerType`（见下） |
+| `syntax.Option[T]` | `sval.OptionType`（见下） |
 
 可用的类型注解值：`spy.bool`、`spy.u8/u16/u32/u64`、`spy.i8/i16/i32/i64`、`spy.f32/f64`、`spy.void`。想以非默认类型传参时用 `spy.as_(value, T)`：
 
@@ -200,6 +202,28 @@ def use_array(x: spy.i32) -> spy.i32:
 - **ZST**：元素是 ZST、或长度为 0 的数组本身是 ZST——没有存储、没有运行时表示：每个元素都等于元素类型的单位值，`a[i]` 不产生地址（`a[i] = v` 也就什么都不写）。
 - **返回与传参**：和结构体同一套规则（`sval.returns_via_result_ptr`/`pass_by_ref`）——不超过 16 字节按值、更大的经 result 指针；数组的值可以整体拷贝（`b = a`）。
 
+## Option
+
+`syntax.Option[T]`（即 PEP 695 的 `type Option[T] = T | None`）的值要么是一个 `T`，要么是 Python 字面量 `None` 求值出的 `Null`：
+
+```python
+import spy
+from spy.syntax import Option
+
+@spy.func()
+def maybe_add(x: spy.i32, y: spy.i32, c: spy.bool) -> Option[spy.i32]:
+    if c:
+        return x + y         # 一个 T 值
+    return None              # 缺席值
+```
+
+- **类型**：注解里的 `Option[T]`（等价写法 `T | None`）被 `sval.as_value` 转成 `sval.OptionType`。`None` 不再是 void 的单位值 `Void()`，而是 `Null()`（类型 `NullType`）；函数返回注解 `-> None` 仍解释为返回 void（`VoidType`）。
+- **自动转换**：`T` 与 `NullType` 都能自动转成 `Option[T]`：`coerce` 把 `T` 值标记为“有值”、把 `Null` 标记为“缺席”，`resolve_peer_type` 把二者统一成 `Option[T]`（`NullType` 与 `T` 的 peer、`Option[T1]` 与 `T2`/`Option[T2]` 的 peer 都会往下递归到 child）。因此一个 result location / slot 同时收到 `T` 和 `None` 时，其类型就是 `Option[T]`；`NullType` 也可以自动转成 `VoidType`（`Holder(None, n)` 里的 void 字段照旧可写）。
+- **泛型**：`Option[T]` 里的类型参数照常求解（`Option[T]` 实参对 `Option[U]` 形参约束 `T` 对 `U`；只给一个 `T` 值也可以解出 `T`）。
+- **内存表示**（`sval.OptionType.to_mir_type` + `find_first_pointer_type_pos`）：如果 `T` 里还有**未被内层 `Option` 占用**的指针（Zig 风格的非空 `Ptr[T]`），就借用它当“是否缺席”的标签，因此 `Option[Ptr[T]]` 的内存布局与 `Ptr[T]` **完全一致**，读到的是空指针即为 `Null`；`T` 是 ZST 时只用一位 `bool`；否则用一个 `(bool, T)` 的结构体（`bool` 是标签，`T` 是值）。**每个 `Option` 层占用一个指针**：`T` 有 `n` 个可用指针，`Option[T]` 就只剩 `n - 1` 个，所以 `Option[Option[T]]` 的外层用 `T` 的**第二个**指针做标签（内存布局仍是 `T` 本身），指针用完后才退回 `bool`/结构体（例：`Option[Option[Ptr[T]]]` 退回 `(bool, Ptr[T])`）。`find_first_pointer_type_pos` 同时决定了有没有可用指针与标签的位置；缺席值 `Null` 落到运行时就是相应的空指针 / `false` 标签。
+- **result location**：往 `Option[T]` 的存储里交付一个 `T`（如构造体、return）时，`HirRunner._convert_result_ptr` 把指针转成此时选项 payload 的地址（并按表示设置标签），构造就地在 payload 上进行。
+- **尚未实现**：还没有解包 / 模式匹配（无法从 `Option[T]` 取出 `T` 或判断是否为 `None`），因此现在只能在编译期拿 `spy.typeof(x)` 观察选项类型，或在函数间传递。
+
 ## 模块结构
 
 | 文件 | 作用 |
@@ -230,7 +254,8 @@ def use_array(x: spy.i32) -> spy.i32:
 - 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字符串的运算。
 - 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、通过类名访问方法（如 `Foo[i32].m(x)`）、结构体整体比较。
 - 数组：运行时长度的数组（`syntax.MultiPtr`）、切片、数组之间的转换（如 `i32[2]` → `i64[2]`）、以及 Python 侧实例表示（带数组参数/返回值的函数还不能从 Python 侧直接调用）。
-- 类型标注：局部变量的标注按函数体内的表达式求值，因此目前只支持能当值求出的类型（具体类型、类型参数、结构体及结构体特化）与 `Comptime` 标记；`Ptr[T]`/`Array[T, N]` 这类 `syntax` 类型标记还只能写在形参注解里（它们在函数体里还不是可用作值的表达式）。
+- 类型标注：局部变量的标注按函数体内的表达式求值，因此目前只支持能当值求出的类型（具体类型、类型参数、结构体及结构体特化）与 `Comptime` 标记；`Ptr[T]`/`Array[T, N]`/`Option[T]` 这类 `syntax` 类型标记还只能写在形参、返回值与结构体字段注解里（它们在函数体里还不是可用作值的表达式）。
+- Option：还不能解包（从 `Option[T]` 取出 `T`、或判断是否为 `None`），因此选项值只能在函数间传递、用 `spy.typeof` 观察类型；以 `T` 的某个指针当标签的表示下，`T` 自身令该指针为空值（或内层选项为缺席）时会被误读为外层缺席（与 Zig/Rust 的 niche 优化同样的局限）。
 - 普通 Python 函数的内联不支持运行期递归（递归驱动参数是运行期值时会在内联嵌套上限处报错，而非编译期展开）；运行期的函数值调用（把函数存进变量/字段后再调用）也尚未实现。
 
 ## 运行测试

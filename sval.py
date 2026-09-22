@@ -25,6 +25,7 @@ from abc import abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum, auto
+from types import NoneType
 from typing import Any, Literal, override
 
 from spy.util import IdentityObj, IndexedMap, frozendict
@@ -83,6 +84,11 @@ class Type(Value):
         return isinstance(other, self.__class__)
 
     def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, NullType):
+            # a type and the null value peer to the option of the type
+            return OptionType(self)
+        if isinstance(other, OptionType):
+            return _resolve_option_peer(self, other)
         return other if self.is_subtype_of(other) else None
 
     @abstractmethod
@@ -220,12 +226,11 @@ class EmptyType(Type):
 @dataclass(frozen=True)
 class VoidType(Type):
     """The unit type: a zero-sized type (ZST) whose unique value is
-    :class:`Void` (``sval.Void()``).  It is the spy type of ``None`` -
-    the return type of a function that returns no value (declared as
-    ``-> None``, or inferred for a body without value returns) - and it
-    has no runtime representation: its ``mir`` mirror is the MIR void
-    type (``to_mir_type`` returns ``mir.VOID``) and no load/store is
-    ever emitted for it."""
+    :class:`Void` (``sval.Void()``).  It is the declared return type of a
+    function that returns no value (``-> None``, or one inferred for a body
+    without value returns), and it has no runtime representation: its
+    ``mir`` mirror is the MIR void type (``to_mir_type`` returns
+    ``mir.VOID``) and no load/store is ever emitted for it."""
 
     @override
     def get_type(self) -> Type:
@@ -238,6 +243,14 @@ class VoidType(Type):
     @override
     def to_mir_type(self) -> mir.VoidType:
         return mir.VOID
+
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        # the null value converts to the void type: the peer of the two is the
+        # void type itself (rather than the option of a void value)
+        if isinstance(other, NullType):
+            return self
+        return super().resolve_peer_type(other)
 
     def __str__(self) -> str:
         return 'void'
@@ -254,6 +267,181 @@ class Void(Value):
 
     def __str__(self) -> str:
         return 'void{{}}'
+
+@dataclass(frozen=True)
+class NullType(Type):
+    """The type of the :class:`Null` value - what the Python literal
+    ``None`` evaluates to: no value of any particular type, which is exactly
+    what a value of an ``Option[T]`` may be.  It is a zero-sized type (its
+    unit value is :class:`Null`) that converts to the void type - so ``None``
+    still works where a void value is expected - and to ``Option[T]`` for
+    every ``T``."""
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def get_unit_value(self) -> Value | None:
+        return Null()
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        return isinstance(other, (NullType, VoidType, OptionType))
+
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        # Null is the absent value: it peers with the void type (it converts
+        # to it), with an option (it is one of its values), and with any other
+        # type by making it optional
+        match other:
+            case NullType() | VoidType() | OptionType():
+                return other
+            case _:
+                return OptionType(other)
+
+    @override
+    def to_mir_type(self) -> mir.VoidType:
+        return mir.VOID
+
+    def __str__(self) -> str:
+        return 'null'
+
+class Null(Value):
+    """The unique value of :class:`NullType`: the compile-time object the
+    Python literal ``None`` denotes.  Its only use is as a value of an
+    ``Option[T]``, where it is the absent one."""
+
+    @override
+    def get_type(self) -> Type:
+        return NullType()
+
+    def __str__(self) -> str:
+        return 'null'
+
+@dataclass(frozen=True)
+class OptionType(Type):
+    """The optional type ``Option[T]``: a value of the type ``T``, or the
+    :class:`Null` value.  Both ``T`` and :class:`NullType` convert to it (see
+    :meth:`resolve_peer_type` and :func:`coerce_const`), so a ``T`` and a
+    ``NullType`` unify to an ``Option[T]``.
+
+    The representation is chosen by :meth:`to_mir_type` from the child type
+    (see :func:`find_first_pointer_type_pos`): a zero-sized ``T`` - which
+    holds no value - only keeps whether a value is there, a ``T`` that still
+    holds a free pointer uses it as the absent tag (the option then *is* the
+    ``T``: ``Option[Ptr[X]]`` has the representation of ``Ptr[X]``), and any
+    other ``T`` a struct of a ``bool`` tag and the ``T`` itself.  An option is
+    therefore never zero-sized."""
+
+    child: Type
+
+    @override
+    def get_type(self) -> Type:
+        child = self.child.get_type()
+        assert isinstance(child, TypeType)
+        return TypeType(child.level + 1)
+
+    @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        return (self.child,)
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        return isinstance(other, OptionType) and self.child.is_subtype_of(other.child)
+
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        match other:
+            case NullType():
+                return self
+            case OptionType():
+                child = self.child.resolve_peer_type(other.child)
+            case _:
+                child = self.child.resolve_peer_type(other)
+        return None if child is None else OptionType(child)
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        child = self.child
+        child_mir = child.to_mir_type()
+        if child_mir is None:
+            return None
+        if isinstance(child_mir, mir.VoidType):
+            # a zero-sized child carries no value: only whether there is one
+            return mir.BoolType()
+        if find_first_pointer_type_pos(child) is not None:
+            # the child holds a pointer, which is null exactly when the option
+            # is: the child itself is the representation
+            return child_mir
+        # no pointer to use as the tag: a struct of the tag and the value
+        return _option_struct_mir(child, child_mir)
+
+    @override
+    def is_copyable(self) -> bool:
+        return self.child.is_copyable()
+
+    def __str__(self) -> str:
+        return f'Option[{self.child}]'
+
+_OPTION_STRUCT_MIRS: dict[Type, mir.StructType] = {}
+
+def _option_struct_mir(child: Type, child_mir: mir.Type) -> mir.StructType:
+    """The MIR mirror of an ``Option[T]`` whose ``T`` has no pointer to be
+    tagged on: a struct of a ``bool`` tag and the value.  The mirror is
+    interned per child type - a MIR struct type is an identity object, so two
+    ``Option[T]`` of the same ``T`` must share one (the module declares one
+    LLVM struct per MIR struct type)."""
+    ret = _OPTION_STRUCT_MIRS.get(child)
+    if ret is None:
+        ret = mir.StructType(
+            'option',
+            (
+                mir.FormalArg('tag', mir.BoolType()),
+                mir.FormalArg('value', child_mir),
+            ),
+        )
+        _OPTION_STRUCT_MIRS[child] = ret
+    return ret
+
+def _resolve_option_peer(type: Type, option: OptionType) -> Type | None:
+    """The peer type of ``type`` and the option ``option``: the peer type of
+    their children, as an option (``Option[resolve_peer_type(type, option.child)]``)."""
+    child = type.resolve_peer_type(option.child)
+    return None if child is None else OptionType(child)
+
+def find_first_pointer_type_pos(type: Type, shift: int = 0) -> tuple[int, ...] | None:
+    """The position of the first pointer of ``type`` that an option wrapping it
+    may use as its absent tag, in the order of ``get_type_children`` (a
+    struct's fields, an array's element, an option's child), or ``None`` when
+    no such pointer is left.  The position of a :class:`PointerType` itself is
+    the empty tuple, and the position of one inside a child is that child's
+    position followed by the position inside it.
+
+    An ``Option`` consumes one pointer for its own tag (see
+    ``OptionType.to_mir_type``), so the pointers it already claims are not
+    available again: with ``n`` pointers ``Option[T]`` still has ``n - 1``, and
+    entering an option while searching skips one (that is what ``shift``
+    starts the count with - the outer ``Option[Option[T]]`` claims ``T``'s
+    second pointer, not its first).  Iterative (an explicit stack and two
+    counters), so nesting costs no Python stack."""
+    pointers = 0
+    claimed = shift
+    todo: list[tuple[Type, tuple[int, ...]]] = [(type, ())]
+    while todo:
+        current, pos = todo.pop()
+        if isinstance(current, PointerType):
+            if claimed == pointers:
+                return pos
+            pointers += 1
+            continue
+        if isinstance(current, OptionType):
+            # this option already uses one pointer of its child as its tag
+            claimed += 1
+        children = current.get_type_children()
+        for index in range(len(children) - 1, -1, -1):
+            todo.append((children[index], pos + (index,)))
+    return None
 
 @dataclass
 class ConstRef(Value):
@@ -297,6 +485,10 @@ class AnyIntType(Type):
     def resolve_peer_type(self, other: Type) -> Type | None:
         if isinstance(other, (IntType, AnyIntType)):
             return other
+        if isinstance(other, NullType):
+            return OptionType(self)
+        if isinstance(other, OptionType):
+            return _resolve_option_peer(self, other)
         return None
 
 @dataclass(frozen=True)
@@ -335,6 +527,10 @@ class IntType(Type):
         return min_int_type(lower, upper)
 
     def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, NullType):
+            return OptionType(self)
+        if isinstance(other, OptionType):
+            return _resolve_option_peer(self, other)
         match other:
             case IntType():
                 self_range = int_range(self)
@@ -986,6 +1182,20 @@ def estimated_size_of(type: Type) -> int:
             if length == 0 or type.elem.is_zst():
                 return 0
             return length * estimated_size_of(type.elem)
+        case OptionType():
+            # an option is laid out like its MIR mirror (see
+            # ``OptionType.to_mir_type``): a ``bool`` when the child is
+            # zero-sized, the child itself when it holds a pointer, and a
+            # struct of the tag and the value otherwise
+            child = type.child
+            if child.is_zst():
+                return 1
+            if find_first_pointer_type_pos(child) is not None:
+                return estimated_size_of(child)
+            align = estimated_alignment_of(child)
+            offset = (1 + align - 1) // align * align
+            size = offset + estimated_size_of(child)
+            return (size + align - 1) // align * align
         case StructType():
             offset = 0
             for field in type.fields().values():
@@ -1023,6 +1233,12 @@ def estimated_alignment_of(type: Type) -> int:
             if length == 0 or type.elem.is_zst():
                 return 1
             return estimated_alignment_of(type.elem)
+        case OptionType():
+            # the tag of a zero-sized child, and a tag next to the value,
+            # impose no alignment of their own; the rest follows the child
+            if type.child.is_zst():
+                return 1
+            return estimated_alignment_of(type.child)
         case StructType():
             return max(
                 (
@@ -1048,7 +1264,7 @@ def returns_via_result_ptr(type: Type) -> bool:
     value.  A signature may override the default
     (``fn.Signature.ret_by_ref``)."""
     match type:
-        case StructType() | ArrayType():
+        case StructType() | ArrayType() | OptionType():
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
@@ -1065,7 +1281,7 @@ def pass_by_ref(type: Type) -> bool:
     passes a parameter by reference when its formal declares it as one
     (``fn.SignatureFormalArg.by_ref``), whatever its type."""
     match type:
-        case StructType() | ArrayType():
+        case StructType() | ArrayType() | OptionType():
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
@@ -1127,16 +1343,16 @@ class StructTypeApplication:
 def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, resolver: GlobalResolver | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
     scalars and ``sval.Value`` objects pass through, and ``None`` is the
-    unit value of the zero-sized void type (``Void()``).  Class objects
-    of the scalar types map to their default spy types, and any object
-    that knows its own spy value (``as_spy_value``, the protocol of a
-    struct class, see ``dsl._RegisteredClass``) is asked for it."""
+    ``Null`` value (the absent value of an option, the unit value of the
+    zero-sized ``NullType``).  Class objects of the scalar types map to their
+    default spy types, and any object that knows its own spy value
+    (``as_spy_value``, the protocol of a struct class, see
+    ``dsl._RegisteredClass``) is asked for it."""
     if isinstance(value, (Value, int, float, str, bool)):
         return value
     if value is None:
-        # ``None`` denotes the void value: the unit value of the
-        # zero-sized ``VoidType``
-        return Void()
+        # ``None`` denotes the null value: the absent value of an option
+        return Null()
     if value is int:
         return AnyIntType()
     if value is float:
@@ -1198,6 +1414,29 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
         if not isinstance(elem, Type):
             raise TypeError(f'{args[0]!r} is not a type')
         return ArrayType(elem, as_value(args[1], type_vars, resolver))
+    if typing.get_origin(value) is syntax.Option:
+        # ``Option[T]``: ``T`` or the ``Null`` value.  The alias
+        # ``type Option[T] = T | None`` evaluates a subscripted use to a
+        # specialization of the alias, whose origin is the alias itself
+        args = typing.get_args(value)
+        if len(args) != 1:
+            raise TypeError(f'cannot convert {value!r} to a value')
+        child = as_value(args[0], type_vars, resolver)
+        if not isinstance(child, Type):
+            raise TypeError(f'{args[0]!r} is not a type')
+        return OptionType(child)
+    if typing.get_origin(value) is typing.Union:
+        # ``T | None``: the same as ``Option[T]`` (the alias is defined that
+        # way), written out directly.  ``None`` in the union is the null
+        # value, never a type of its own
+        args = typing.get_args(value)
+        rest = tuple(a for a in args if a is not NoneType)
+        if len(rest) != len(args) - 1 or len(rest) != 1:
+            raise TypeError(f'cannot convert {value!r} to a value')
+        child = as_value(rest[0], type_vars, resolver)
+        if not isinstance(child, Type):
+            raise TypeError(f'{rest[0]!r} is not a type')
+        return OptionType(child)
 
     raise TypeError(f'cannot convert {value} to a value')
 
@@ -1347,6 +1586,18 @@ class TypeVarSolver:
             # fall back to equal constraint
             if isinstance(lhs, StructType) and isinstance(rhs, StructType) and lhs.head is rhs.head and len(lhs.generic_args) == len(rhs.generic_args):
                 todo.extend((l, r, False) for l, r in zip(reversed(lhs.generic_args), reversed(rhs.generic_args)))
+            # an option constrains its child type: two options constrain their
+            # children with each other, and an option against a plain type
+            # constrains its child with that type (a ``T`` and a ``Null`` both
+            # convert to ``Option[T]``)
+            if isinstance(lhs, OptionType) and isinstance(rhs, OptionType):
+                todo.append((lhs.child, rhs.child, False))
+            elif isinstance(lhs, OptionType) and not isinstance(rhs, (NullType, TypeVar)):
+                # the child is constrained on the right: a subtype constraint
+                # may only put a type parameter on its right side
+                todo.append((rhs, lhs.child, is_subtype))
+            elif isinstance(rhs, OptionType) and not isinstance(lhs, (NullType, TypeVar)):
+                todo.append((lhs, rhs.child, is_subtype))
             if isinstance(lhs, PointerType) and isinstance(rhs, PointerType):
                 # a pointer constrains its pointee type, and - while it is
                 # still a type parameter - the constness of the pointer
@@ -1394,6 +1645,8 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
                 replace_type_vars_type(value.elem, reps),
                 replace_type_var(value.length, reps),
             )
+        case OptionType():
+            return OptionType(replace_type_vars_type(value.child, reps))
         case StructType():
             # a struct type carries its type arguments: substituting into it
             # rebuilds the specialization (and keeps the identity of the one
@@ -1423,6 +1676,10 @@ def is_comptime_only_type(type: Type) -> bool:
             # an array of a compile-time-only type holds no value that could
             # live in memory, whatever its length
             return is_comptime_only_type(type.elem)
+        case OptionType():
+            # an option of a compile-time-only type has no representation
+            # either: it mirrors to nothing (see ``OptionType.to_mir_type``)
+            return is_comptime_only_type(type.child)
         case _:
             return False
 
@@ -1466,10 +1723,18 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             if value.get_type() != type:
                 raise CompileError(f"cannot use {value} as a type constant")
             return value
-        case VoidType():
-            if isinstance(value, Void):
+        case OptionType():
+            # a value of an option is either the null value, or a value of the
+            # child type (which the interpreter then tags as present)
+            if isinstance(value, Null):
                 return value
-            raise CompileError(f"cannot use {value} as a void constant")
+            return coerce_const(value, type.child)
+        case VoidType():
+            # the void type's unit value is what ``None`` used to be: a null
+            # value converts to it (``NullType`` is a subtype of ``VoidType``)
+            if isinstance(value, (Void, Null)):
+                return Void()
+            raise CompileError(f"cannot use {value!r} as a void constant")
         case _:
             raise CompileError(
                 f"cannot create a constant of type {type} from {value}"

@@ -144,8 +144,8 @@ class Signature:
     stored in the *spy domain*: it has been converted with
     ``sval.as_value``, so a generic parameter annotation is the
     signature's own ``TypeVar`` and a default value is an
-    :class:`~spy.sval.AnyValue` (a plain ``None`` default is the unit
-    value of the void type, ``sval.Void()``)."""
+    :class:`~spy.sval.AnyValue` (a plain ``None`` default is the null
+    value, ``sval.Null()``, which is the absent value of an option)."""
 
     # the declared generic type parameters, by name: ``[T]`` declares
     # one entry ``T -> TypeVar('T')``

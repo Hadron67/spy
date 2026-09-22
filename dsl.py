@@ -103,6 +103,8 @@ def _to_py_arg(value: sval.AnyValue) -> Any:
             return value.value
         case sval.Void():
             return None
+        case sval.Null():
+            return None
         case _:
             return value
 
