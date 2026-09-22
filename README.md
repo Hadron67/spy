@@ -55,7 +55,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 
 **形参类型**按以下顺序确定：注解（替换掉已求解的泛型参数后）、实参 marshaled 出的类型、默认值的 spy 类型；形参写了注解时注解生效，实参在调用点转换到该类型。类型注解同时也是**编译期值**：`spy.typeof(x)` 返回 `x` 的静态类型，可以与类型值比较做编译期分发。
 
-**单位类型（ZST）**：`-> None` 的 void 类型 `VoidType` 是一个**零大小类型**（zero-sized type，ZST）；零位整数 `spy.u0`，以及字段全为 ZST、没有字段的结构体同样是 ZST。ZST 没有运行时表示——`to_mir_type` 对 ZST 返回 MIR 的 void 类型（`mir.VOID`，因此返回类型是 ZST 的函数就返回 void）——ZST 的 slot 不落内存、不产生 load/store，结构体里的 ZST 字段不占布局、不进入 MIR 结构体。**ZST 参数同样跳过**：不进入 MIR 签名、调用时不传参，函数体内读到的是该类型的单位值。在编译期，"无值"用其单位值 `sval.Void()` 表示。
+**单位类型（ZST）**：`-> None` 的 void 类型 `VoidType` 是一个**零大小类型**（zero-sized type，ZST）；零位整数 `spy.u0`，以及字段全为 ZST、没有字段的结构体同样是 ZST。ZST 没有运行时表示——`to_mir_type` 对 ZST 返回 MIR 的 void 类型（`mir.VOID`，因此返回类型是 ZST 的函数就返回 void）——ZST 的 slot 不落内存、不产生 load/store，结构体里的 ZST 字段不占布局、不进入 MIR 结构体。**ZST 参数同样跳过**：不进入 MIR 签名、调用时不传参，函数体内读到的是该类型的单位值。**ZST 结果照常交付**：返回类型是 ZST 的调用同样不产生寄存器（callee 返回 void），但调用仍把结果的单位值写进它的 result location——因此 `y = f(x)`（`f` 返回 `None`）会把 `y` 绑定为单位值、类型为该 ZST，丢弃结果的表达式语句也不会留下无类型的临时 slot。估计大小与对齐（`sval.estimated_size_of`、`estimated_alignment_of`，用来决定结构体的返回与传参方式）对 ZST 分别取 0 与 1。在编译期，"无值"用其单位值 `sval.Void()` 表示。
 
 泛型：函数可以用 PEP 695 的 `[T]` 语法（需要 Python 3.13+）。`T` 由实参类型求解；形参注解为同一个 `T` 的实参类型会被统一成一个共同类型，实参再转换到它。**声明了返回注解时，它决定该特化的返回类型**（递归函数必须有，见下）。
 

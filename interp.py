@@ -1491,11 +1491,28 @@ class HirRunner:
                 input_ptr = _shallow_normalize(action.input)
                 if not (isinstance(input_ptr, RuntimeVal) and isinstance(input_ptr.type, sval.PointerType)):
                     raise CompileError('cannot convert a compile-time pointer')
-                action.output.value = self._convert_result_ptr(input_ptr.value, input_ptr.type.elem, action.type)
+                action.output.value = _to_runtime(self._convert_result_ptr(input_ptr, action.type))
             case _:
                 raise CompileError(f'unsupported pending action {action}')
 
-    def _defer_ptr_convertion(self, slot: PendingSlot, type: sval.Type) -> RuntimeVal:
+    def _defer_ptr_convertion(self, slot: PendingSlot, type: sval.Type) -> InterpVal:
+        """The address a delivery into ``slot`` writes through, when the slot
+        has no address of its own yet: a placeholder insertion that the slot's
+        commit fills in with the converted pointer (``_PendingPtrConvertion``),
+        so that what the delivery writes through only exists once the slot's
+        final type is known.
+
+        A zero-sized ``type`` has no address to write through at all - what is
+        delivered is the type's *unit value* - so there is nothing to defer:
+        the value is recorded as an ordinary store into the slot, which is what
+        gives the slot its type in the first place.  The store takes part in the
+        peer resolution like any other, so a destination that also receives a
+        wider type (a future ``Option[T]``) widens with it, and the unit value
+        is coerced to the final type at the slot's commit."""
+        unit = type.get_unit_value()
+        if unit is not None:
+            self.store(slot, ComptimeVal(unit))
+            return ComptimeVal(sval.Undefined(sval.PointerType(type, is_const=False)))
         mir_type = type.to_mir_type()
         if mir_type is None or isinstance(mir_type, mir.VoidType):
             raise _no_runtime_type(type)
@@ -1504,7 +1521,7 @@ class HirRunner:
         slot.stores.append(_PendingAction(output, _PendingPtrConvertion(type, slot, output)))
         return RuntimeVal(output, sval.PointerType(type, is_const=False))
 
-    def _convert_result_ptr(self, ptr: mir.Value, from_type: sval.Type, to_type: sval.Type) -> mir.Value:
+    def _convert_result_ptr(self, ptr: InterpVal, to_type: sval.Type) -> InterpVal:
         """The pointer a result-location operation writes through, converted
         to the type it delivers - the result type of a call, or the struct
         type an ``InitStruct`` builds its fields into.  Not implemented yet
@@ -1555,7 +1572,9 @@ class HirRunner:
         converted to a pointer to the struct type (``_convert_result_ptr``)
         - or, when ``dest`` is a slot that is not committed yet, the
         placeholder of a deferred conversion that the slot's commit fills in
-        with the real pointer (see ``_defer_ptr_convertion``)."""
+        with the real pointer (see ``_defer_ptr_convertion``).  A zero-sized
+        struct has no storage to open: what the construction delivers is the
+        type's unit value, as an ordinary store into ``dest``."""
         struct_type = self._struct_construction_type(self._callee_object(struct), dest)
         if isinstance(dest, PendingSlot) and dest.committed is None:
             # the slot has no address yet: the deferred conversion also
@@ -1565,8 +1584,7 @@ class HirRunner:
         dest_type = _type_of(dest)
         if dest_type is None or not isinstance(dest_type, sval.PointerType):
             raise CompileError(f'cannot construct a {struct_type} in this location')
-        ptr = self._convert_result_ptr(_to_runtime(dest), dest_type.elem, struct_type)
-        return RuntimeVal(ptr, sval.PointerType(struct_type, is_const=False))
+        return self._convert_result_ptr(dest, struct_type)
 
     def _struct_construction_type(self, struct: sval.AnyValue | None, dest: InterpVal) -> sval.StructType:
         """The struct type a construction builds: ``struct`` itself when it
@@ -1796,7 +1814,20 @@ class HirRunner:
         else:
             ret_type = ret_sig.ret_type.to_mir_type()
             if ret_type is None or isinstance(ret_type, mir.VoidType):
+                # a zero-sized result produces no register (the call returns
+                # nothing), but it is still delivered to the result location:
+                # its *unit value*.  The location of a call whose result is
+                # dropped (an expression statement) would otherwise stay
+                # untyped, and the type is what makes its slot a compile-time
+                # box of the unit value (see ``_commit_pending_slot``)
                 self._emit(mir.Call(callee, tuple(mir_args), mir.VOID))
+                unit = ret_sig.ret_type.get_unit_value()
+                if unit is not None:
+                    value = ComptimeVal(unit)
+                    if isinstance(ret, InterpVal):
+                        self.store(ret, value)
+                    else:
+                        self._frames[-1].regs[ret] = value
             else:
                 call_inst = self._emit(mir.Call(callee, tuple(mir_args), ret_type))
                 value = RuntimeVal(call_inst, ret_sig.ret_type)

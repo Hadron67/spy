@@ -34,6 +34,7 @@ from . import (
     mir,
     sval,
     syntax,
+    u0,
     u64,
     void,
 )
@@ -392,6 +393,35 @@ class Holder:
     n: i32
 
 
+# a struct whose fields are all zero-sized is zero-sized itself: it holds no
+# storage at all, and returning one is a call that returns nothing
+@struct()
+class Nothing:
+    v: void
+    z: u0
+
+
+# a second zero-sized struct, a different type than ``Nothing``
+@struct()
+class Blank:
+    v: void
+
+
+# a struct whose void methods are called for their effect alone, one
+# registered (``reset``, compiled into a native call) and one plain
+# (``clear``, inlined)
+@struct()
+class Sink:
+    n: i32
+
+    @func()
+    def reset(self) -> None:
+        self.n = 0
+
+    def clear(self) -> None:
+        self.n = 0
+
+
 # a declaration built by hand: a pointer field has no annotation spelling yet
 # (a pointer is word-aligned, like an integer of that width)
 WithPointer: Any = sval.StructTypeHead('WithPointer')
@@ -491,6 +521,84 @@ def nested_field_local(x: i32) -> i32:
 def nested_method_local(x: i32) -> i32:
     n = Nested(One(x))
     return n.inner.get()
+
+
+# ``nothing`` returns no value: as an expression statement the call is dropped
+# (its result location is a temporary of no further use), and bound to a
+# variable it types that variable as ``void``
+@func()
+def discard_void_call(x: i32) -> i32:
+    nothing(x)
+    return x
+
+
+@func()
+def void_call_type(x: i32) -> spy_bool:
+    y = nothing(x)
+    return spy_typeof(y) == void
+
+
+@func()
+def zero_bits(_: i32) -> u0:
+    return 0
+
+
+@func()
+def discard_zero_bits_call(x: i32) -> i32:
+    zero_bits(x)
+    return x
+
+
+@func()
+def zero_bits_call_type(x: i32) -> spy_bool:
+    y = zero_bits(x)
+    return spy_typeof(y) == u0
+
+
+@func()
+def call_registered_void_method(x: i32) -> i32:
+    s = Sink(x)
+    s.reset()
+    return s.n
+
+
+@func()
+def call_inline_void_method(x: i32) -> i32:
+    s = Sink(x)
+    s.clear()
+    return s.n
+
+
+@func()
+def make_nothing(x: i32) -> Nothing:
+    return Nothing(None, 0)
+
+
+# a call that returns a zero-sized struct delivers no value, but its result
+# location takes the struct type: the variable bound to the call is a
+# compile-time box of the type's unit value, and it is typed as the struct
+@func()
+def use_nothing(x: i32) -> i32:
+    n = make_nothing(x)
+    return x if spy_typeof(n) == Nothing else x + 1
+
+
+# the same struct built where it is declared: the construction writes nothing,
+# so the slot takes its type from the construction itself
+@func()
+def construct_nothing(x: i32) -> i32:
+    n = Nothing(None, 0)
+    return x if spy_typeof(n) == Nothing else x + 1
+
+
+# a construction delivers its value like any other store point, so the slot's
+# type is still the peer type of everything stored into it: two *different*
+# zero-sized structs have no peer type (rather than the first one silently
+# pinning the slot)
+@func()
+def choose_two_zst_structs(c: spy_bool) -> spy_bool:
+    s = Blank(None) if c else Nothing(None, 0)
+    return spy_typeof(s) == Blank
 
 
 @func()
@@ -1476,6 +1584,52 @@ class SpyTupleTest(TestCase):
         self.assertEqual(tuple_nested(4), 456)
 
 
+class SpyZeroSizedResultTest(TestCase):
+    """A call whose result is a zero-sized type.  The callee returns no value
+    (a zero-sized type has no runtime representation, so the call is a MIR call
+    of the void type), but the call still writes the result type's *unit value*
+    into its result location: an expression statement then commits that value
+    into the temporary it drops - the location is left untyped otherwise, and
+    the type is what makes its slot a compile-time box - and a variable bound
+    to the call is a box of the unit value, typed as the result type."""
+
+    def test_void_call_as_a_statement(self) -> None:
+        self.assertEqual(discard_void_call(7), 7)
+
+    def test_void_call_bound_to_a_variable(self) -> None:
+        self.assertTrue(void_call_type(7))
+
+    def test_zero_bits_call_as_a_statement(self) -> None:
+        self.assertEqual(discard_zero_bits_call(7), 7)
+
+    def test_zero_bits_call_bound_to_a_variable(self) -> None:
+        self.assertTrue(zero_bits_call_type(7))
+
+    def test_registered_void_method_as_a_statement(self) -> None:
+        self.assertEqual(call_registered_void_method(7), 0)
+
+    def test_inline_void_method_as_a_statement(self) -> None:
+        self.assertEqual(call_inline_void_method(7), 0)
+
+    def test_zero_sized_struct_result(self) -> None:
+        # every field of ``Nothing`` is zero-sized, so the struct itself is: it
+        # has no layout (the size and alignment estimates of a layoutless type,
+        # ``sval.estimated_size_of``, decide how one is returned) and a call
+        # returning one delivers no value, only the type's unit value
+        self.assertEqual(use_nothing(7), 7)
+
+    def test_zero_sized_struct_local(self) -> None:
+        self.assertEqual(construct_nothing(7), 7)
+
+    def test_zero_sized_construction_participates_in_peer_resolution(self) -> None:
+        # the construction of a zero-sized struct delivers its value as an
+        # ordinary store point, so the slot's type is the peer type of all its
+        # stores - and two unrelated structs have none (the first construction
+        # must not pin the slot's type by itself)
+        with self.assertRaises(CompileError):
+            choose_two_zst_structs(True)
+
+
 class SpyCompileLogTest(TestCase):
     def test_compile_log_prints_at_compile_time(self) -> None:
         out = io.StringIO()
@@ -1492,5 +1646,6 @@ all_tests = [
     SpyGenericStructTest,
     SpyPointerTest,
     SpyTupleTest,
+    SpyZeroSizedResultTest,
     SpyCompileLogTest,
 ]

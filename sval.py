@@ -867,10 +867,12 @@ compiled code works with are the host's (see ``lower``)."""
 def estimated_size_of(type: Type) -> int:
     """Returns the estimated size of a type in bytes. The size is obtained
     using ctypes size rule, but is not guaranteed to be the actual size of
-    the type. A zero-sized type that has a layout - a zero-bit integer, a
-    struct with no stored field - returns 0; ``void`` and literal types
-    have no layout and raise :class:`SpyError`."""
+    the type. A zero-sized type - ``void``, a zero-bit integer, a struct
+    that holds no storage - returns 0; literal types have no layout and
+    raise :class:`SpyError`."""
     match type:
+        case VoidType():
+            return 0
         case BoolType():
             return 1
         case IntType():
@@ -882,7 +884,8 @@ def estimated_size_of(type: Type) -> int:
         case StructType():
             offset = 0
             for field in type.fields().values():
-                # a zero-bit field has alignment 1 and occupies no size
+                # a zero-sized field occupies no storage: it has no size and
+                # imposes no alignment requirement on what follows it
                 align = estimated_alignment_of(field.type)
                 offset = (offset + align - 1) // align * align
                 offset += estimated_size_of(field.type)
@@ -893,10 +896,13 @@ def estimated_size_of(type: Type) -> int:
 
 def estimated_alignment_of(type: Type) -> int:
     """Estimated alignment of a type in bytes. Like :func:`estimated_size_of`,
-    this is not guaranteed to be the actual alignment of the type. A zero-bit
-    integer and a struct with no stored field have alignment 1; ``void`` and
-    literal types have no layout and raise :class:`SpyError`."""
+    this is not guaranteed to be the actual alignment of the type. A
+    zero-sized type - ``void``, a zero-bit integer, a struct that holds no
+    storage - has alignment 1; literal types have no layout and raise
+    :class:`SpyError`."""
     match type:
+        case VoidType():
+            return 1
         case BoolType():
             return 1
         case IntType():
@@ -910,7 +916,7 @@ def estimated_alignment_of(type: Type) -> int:
                 (
                     estimated_alignment_of(f.type)
                     for f in type.fields().values()
-                    if f.type.get_unit_value() is None
+                    if not f.type.is_zst()
                 ),
                 default=1,
             )
