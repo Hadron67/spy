@@ -493,6 +493,13 @@ class _Builder:
                 lhs = self._gen_expr(node.left)[0]
                 rhs = self._gen_expr(node.right)[0]
                 self.add(hir.Binary(op, lhs, rhs, result_loc))
+            case ast.IfExp():
+                cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
+                self.add(hir.If(cond))
+                self._gen_result_loc(node.body, result_loc)
+                self.add(hir.Else())
+                self._gen_result_loc(node.orelse, result_loc)
+                self.add(hir.End())
             case _:
                 # every other expression computes its value first and
                 # stores it into the result location; only a call, a

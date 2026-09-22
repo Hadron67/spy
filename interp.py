@@ -1513,13 +1513,16 @@ class HirRunner:
         return ptr
 
     def as_bool(self, value: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
+        """Use the value as the condition of an ``if`` - a statement's or an
+        if-expression's: a ``spy.bool`` value passes through, as the boolean
+        register the interpreter branches on.  Spy has no truthiness, so
+        nothing else is a condition."""
         type = _arg_type_of(value)
-        frame = self._frames[-1]
         if isinstance(type, sval.BoolType):
-            frame.regs[ret] = self._arg_value(value)
+            self._frames[-1].regs[ret] = self._arg_value(value)
             return PollResult.AGAIN
 
-        raise NotImplementedError
+        raise CompileError(f'an if condition must be a bool value, got {type}')
 
     def subscript(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
         """``Foo[i32, f64]``: the specialization of the struct template
