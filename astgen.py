@@ -69,6 +69,7 @@ from .sval import (
     Void,
     VoidType,
     as_value,
+    unwrap_comptime,
 )
 from .sval import (
     TypeVar as SpyTypeVar,
@@ -145,14 +146,18 @@ class _Builder:
     of nested blocks look up names through the chain.
     """
 
-    def __init__(self, fn: Any, fn_ir: FunctionIR, scope: _Scope, generic_names: dict[str, Value]) -> None:
+    def __init__(self, fn: Any, fn_ir: FunctionIR, scope: _Scope, type_vars: dict[TypeVar, Value]) -> None:
         self.fn = fn
         self._fn_ir = fn_ir
         self._scope = scope
         # the type parameters of the function (and of the struct a method
-        # belongs to) by name: a name that denotes one is a compile-time
-        # value, see ``_gen_expr``
-        self._generic_names = generic_names
+        # belongs to), keyed by the Python type parameter object their
+        # annotations evaluate to: the names are the compile-time type values
+        # a name in the body denotes (see ``_gen_expr``), and the Python
+        # parameters themselves let a local annotation - which Python leaves
+        # unevaluated - be resolved (see ``_gen_ann_assign``)
+        self._type_vars = type_vars
+        self._generic_names: dict[str, Value] = {tp.__name__: v for tp, v in type_vars.items()}
         self.insts: list[hir.Inst] = []
 
     def add(self, inst: hir.Inst) -> hir.Inst:
@@ -185,6 +190,8 @@ class _Builder:
                         f"chained assignments are not supported yet in spy function {fn_name}"
                     )
                 self._gen_assign(node.targets[0], node.value)
+            case ast.AnnAssign():
+                self._gen_ann_assign(node)
             case ast.AugAssign():
                 self._gen_augassign(node)
             case ast.If():
@@ -209,7 +216,7 @@ class _Builder:
         child of the enclosing scope - so a name it *declares* is not
         visible after the block (an assignment to a name it sees writes
         that variable, see ``_gen_assign``)."""
-        sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._generic_names)
+        sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
         for stmt in stmts:
             sub._gen_stmt(stmt)
         self.insts.extend(sub.insts)
@@ -249,6 +256,53 @@ class _Builder:
         self._gen_result_loc(value, lhs.value)
         if emit_commit:
             self.add(hir.CommitSlot(lhs.value))
+
+    def _gen_ann_assign(self, node: ast.AnnAssign) -> None:
+        """One annotated declaration ``name: T`` or ``name: T = expr``.  The
+        annotation declares the type of the variable: ``name: T`` declares the
+        type ``T``, ``name: Comptime`` a compile-time variable whose type its
+        value determines, and ``name: Comptime[T]`` a compile-time variable of
+        the declared type ``T`` (see ``hir.Alloca``).  The variable gets a
+        fresh slot - the annotation's type is the compile-time value
+        ``_gen_expr`` produces for it, which the interpreter resolves against
+        the call's type arguments - and, when a value is written, is
+        initialized with it (result-location semantics, like a plain
+        declaration; see ``_gen_assign``)."""
+        fn_name = self._fn_ir.name
+        target = node.target
+        if not isinstance(target, ast.Name):
+            raise CompileError(
+                f"only a name can be annotated in spy function {fn_name}, "
+                f"got {ast.unparse(target)!r}"
+            )
+        if self._scope.lookup(target.id) is not None:
+            raise CompileError(
+                f"'{target.id}' is already bound in spy function {fn_name}; "
+                f"an annotated declaration introduces a new variable"
+            )
+        is_comptime, type_node = self._split_comptime(node.annotation)
+        declared = None if type_node is None else self._as_value(self._gen_expr(type_node)[0])
+        slot = self.add(hir.Alloca(is_comptime, declared))
+        self._scope.bindings[target.id] = slot
+        if node.value is not None:
+            self._gen_result_loc(node.value, slot)
+        self.add(hir.CommitSlot(slot))
+
+    def _split_comptime(self, node: ast.expr) -> tuple[bool, ast.expr | None]:
+        """Split a *local* variable's annotation into its ``Comptime`` marker
+        and the type it wraps (the annotation counterpart of the parameter
+        path, see ``sval.unwrap_comptime``): the bare ``Comptime`` splits to
+        ``(True, None)`` and ``Comptime[T]`` to ``(True, T)``, anything else to
+        ``(False, node)``.  The marker is recognized by the global name it is
+        written as, so a variable of the same name shadows it like any
+        global."""
+        if self._try_resolve_object(node) is syntax.Comptime:
+            return True, None
+        if isinstance(node, ast.Subscript) and self._try_resolve_object(node.value) is syntax.Comptime:
+            if isinstance(node.slice, ast.Tuple):
+                raise CompileError('Comptime takes exactly one type argument')
+            return True, node.slice
+        return False, node
 
     def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value]) -> hir.Value:
         """The tuple of addresses a destructuring target denotes: a plain
@@ -744,7 +798,11 @@ def parse_function(
     for i, arg in enumerate(all_args):
         has_default = i >= offset
         default_value = default_of(defaults[i - offset]) if has_default else None
-        arg_type = annotation_of(annotations.get(arg.arg))
+        # ``Comptime``/``Comptime[T]`` annotate a compile-time parameter (see
+        # ``SignatureFormalArg``): the marker is split off the annotation and
+        # the type it wraps is the parameter's declared type
+        is_comptime, annotated = unwrap_comptime(annotations.get(arg.arg))
+        arg_type = annotation_of(annotated)
         by_ref = False
         if i == 0 and self_type is not None:
             # the ``self`` of a method: the object is passed by reference
@@ -753,7 +811,7 @@ def parse_function(
             arg_type = self_type
             by_ref = not self_by_value
         positional.add(
-            arg.arg, SignatureFormalArg(arg_type, False, by_ref, default_value)
+            arg.arg, SignatureFormalArg(arg_type, is_comptime, by_ref, default_value)
         )
 
     # ``*args``/``**kwargs`` are rejected above (a spy function definition
@@ -775,9 +833,7 @@ def parse_function(
     # struct a method belongs to) refers to the compile-time value the call
     # solved it to; the function's own parameters are added last, so they
     # shadow a struct's parameter of the same name, like Python scoping
-    generic_names: dict[str, Value] = {tp.__name__: v for tp, v in type_vars.items()}
-
-    builder = _Builder(fn, ir, scope, generic_names)
+    builder = _Builder(fn, ir, scope, type_vars)
     for stmt in node.body:
         builder._gen_stmt(stmt)
     builder.add(hir.StoreVoidRetloc())

@@ -1201,6 +1201,29 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
 
     raise TypeError(f'cannot convert {value} to a value')
 
+def unwrap_comptime(annotation: Any) -> tuple[bool, Any]:
+    """Split an *evaluated* annotation into its ``Comptime`` marker and the
+    type it wraps: ``(True, None)`` for the bare ``Comptime`` (a compile-time
+    variable whose type its value determines), ``(True, T)`` for
+    ``Comptime[T]`` (a compile-time variable of the declared type ``T``) and
+    ``(False, annotation)`` for any other annotation (an ordinary declared
+    type).  ``None`` (no annotation written) splits to ``(False, None)``.
+
+    ``syntax.Comptime`` is a PEP 695 type alias (``type Comptime[T] = T``),
+    which Python keeps on the evaluated annotation: the bare alias is the
+    marker itself and ``Comptime[T]`` a generic alias whose origin is it (see
+    :func:`as_value`, which converts the type it wraps)."""
+    if annotation is None:
+        return False, None
+    if annotation is syntax.Comptime:
+        return True, None
+    if typing.get_origin(annotation) is syntax.Comptime:
+        args = typing.get_args(annotation)
+        if len(args) != 1:
+            raise TypeError(f'Comptime takes exactly one type argument, got {annotation!r}')
+        return True, args[0]
+    return False, annotation
+
 def _as_constness(value: Any, type_vars: dict[typing.TypeVar, Value] | None, resolver: GlobalResolver | None) -> AnyValue:
     """The spy value of the constness argument of a pointer type: a Python
     ``bool``, or the type parameter it is written as, which a call then

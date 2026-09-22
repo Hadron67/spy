@@ -1,5 +1,5 @@
 from types import EllipsisType
-from typing import Literal
+from typing import Any, Literal
 
 
 class Ptr[T, C: bool = Literal[False]]:
@@ -22,6 +22,8 @@ class Array[T, L: int]:
 
     def __setitem__(self, value: int, val: T) -> None:
         ...
+
+type Comptime[T = Any] = T
 
 def ref[T](val: T) -> Ptr[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")

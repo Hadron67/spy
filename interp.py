@@ -254,6 +254,10 @@ def _is_comptime_val(val: InterpVal) -> bool:
                 if val.committed is None:
                     return False
                 todo.append(val.committed)
+            case ComptimeBox():
+                # a compile-time box is comptime only when the value it holds
+                # is (it may hold a runtime value, see ``ComptimeBox``)
+                todo.append(val.value)
             case ComptimeTuple():
                 todo.extend(a.value for a in val.values)
             case ComptimeDict():
@@ -893,7 +897,7 @@ class HirRunner:
             case hir.Load():
                 regs[inst] = self.load(self.operand(inst.ptr))
             case hir.Alloca():
-                regs[inst] = self.alloca(inst.allow_comptime)
+                regs[inst] = self.alloca(inst.allow_comptime, self._declared_type(inst.type))
             case hir.Store():
                 self.store(self.operand(inst.ptr), self.operand(inst.value))
             case hir.StoreVoidRetloc():
@@ -1361,10 +1365,46 @@ class HirRunner:
             self._mir_block_stack[-1].append(inst)
         return inst
 
-    def alloca(self, allow_comptime: bool = False) -> PendingSlot:
+    def alloca(self, allow_comptime: bool = False, declared: sval.Type | None = None) -> PendingSlot:
+        """Reserve a fresh slot.  ``allow_comptime`` marks a ``Comptime``
+        variable, which may hold its value compile-time; a ``declared`` type
+        (an annotated variable, see ``_declared_type``) fixes the slot's
+        storage right away - a :class:`ComptimeBox` for a ``Comptime``
+        variable or a zero-sized type, memory (a :class:`RuntimeVal`) for
+        anything else (see ``hir.Alloca``)."""
         insertion = mir.Insertion([], None)
         self._emit(insertion)
-        return PendingSlot(insertion, allow_comptime)
+        slot = PendingSlot(insertion, allow_comptime)
+        if declared is not None:
+            if allow_comptime and declared.get_unit_value() is None:
+                # a compile-time variable of a declared type: a box the value
+                # it is assigned is written into
+                slot.committed = ComptimeBox(declared, ComptimeVal(sval.Undefined(declared)))
+            else:
+                self._commit_pending_slot(slot, declared)
+        return slot
+
+    def _declared_type(self, node: hir.Value | None) -> sval.Type | None:
+        """The spy type a variable's annotation declares (the ``type`` operand
+        of a typed ``hir.Alloca``), or None when the variable declares none.
+        The annotation is a compile-time type value, into which the executing
+        frame's type parameters are substituted - a local annotation may name
+        them, exactly like a parameter annotation (see ``astgen``)."""
+        if node is None:
+            return None
+        obj = _to_comptime(_shallow_normalize(self.operand(node)))
+        if isinstance(obj, sval.ConstRef):
+            obj = obj.value
+        if not isinstance(obj, sval.Type):
+            raise CompileError(f'{obj!r} is not a type')
+        reps: dict[sval.TypeVar, sval.AnyValue] = {
+            tv: value.obj
+            for tv, value in self._frames[-1].generic_var_values.items()
+            if isinstance(value, ComptimeVal)
+        }
+        if len(reps) > 0:
+            obj = sval.replace_type_vars_type(obj, reps)
+        return obj
 
     # -- helpers -------------------------------------------------------------
 

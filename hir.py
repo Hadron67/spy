@@ -135,8 +135,17 @@ class Alloca(Inst):
     ``CallInplace`` result under RLS) type it, and the ``CommitSlot``
     that follows then materializes it - a slot all of whose stores are
     compile-time becomes a compile-time box instead of memory (see
-    ``interp``)."""
+    ``interp``).
+
+    An annotated local variable (``x: T``/``x: Comptime[T]``) declares its
+    type here instead: ``type`` is the compile-time type value of the
+    annotation (``None`` for the bare ``Comptime``, whose type is left to
+    the stores), and the interpreter materializes the slot right away -
+    memory for a runtime type, a compile-time box for a ``Comptime`` or a
+    zero-sized one.  ``allow_comptime`` marks a ``Comptime`` variable: it
+    may hold its value compile-time even when its type is not zero-sized."""
     allow_comptime: bool = False
+    type: Value | None = None
 
 @dataclass(eq=False)
 class Load(Inst):
