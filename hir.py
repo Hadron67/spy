@@ -221,6 +221,42 @@ class FinishStruct(Inst):
     names: frozenset[str]
 
 @dataclass(eq=False)
+class InitArray(Inst):
+    """Open the construction of an array value in the storage ``dest``.  The
+    instruction's own result register is the address the elements are written
+    through - the storage itself, or the pointer it is committed to.
+
+    Unlike a struct construction there is no callee to name the type built:
+    the length is the number of elements the construction is given, and the
+    element type is the one the storage declares - or else the common type of
+    the elements, which the ``FinishArray`` that closes the construction
+    resolves from them (the elements are generated one by one, after this
+    instruction, each writing into an address ``ElementIndexAddr`` doles
+    out)."""
+
+    dest: Value
+
+@dataclass(eq=False)
+class ElementIndexAddr(Inst):
+    """The address the ``index``-th element of the array an ``InitArray``
+    opened is written into - the address a positional element of an array
+    construction is written into (arrays have no elements named by keyword)."""
+
+    array: Value
+    index: int
+
+@dataclass(eq=False)
+class FinishArray(Inst):
+    """Close the construction opened by the :class:`InitArray` ``array`` points
+    at.  The ``elements`` are the addresses the elements were generated into, in
+    the order they were given: their count is the length of the array, and they
+    resolve its element type.  An array has no element omitted (there is no
+    default for one), so an element that is left out is an error."""
+
+    array: Value
+    elements: tuple[Value, ...]
+
+@dataclass(eq=False)
 class CallMethodInplace(Inst):
     """A call of the method ``name`` of the struct ``base`` points at
     (result-location semantics like :class:`CallInplace`).  A method is

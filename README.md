@@ -55,7 +55,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 
 **形参类型**按以下顺序确定：注解（替换掉已求解的泛型参数后）、实参 marshaled 出的类型、默认值的 spy 类型；形参写了注解时注解生效，实参在调用点转换到该类型。类型注解同时也是**编译期值**：`spy.typeof(x)` 返回 `x` 的静态类型，可以与类型值比较做编译期分发。
 
-**单位类型（ZST）**：`-> None` 的 void 类型 `VoidType` 是一个**零大小类型**（zero-sized type，ZST）；零位整数 `spy.u0`，以及字段全为 ZST、没有字段的结构体同样是 ZST。ZST 没有运行时表示——`to_mir_type` 对 ZST 返回 MIR 的 void 类型（`mir.VOID`，因此返回类型是 ZST 的函数就返回 void）——ZST 的 slot 不落内存、不产生 load/store，结构体里的 ZST 字段不占布局、不进入 MIR 结构体。**ZST 参数同样跳过**：不进入 MIR 签名、调用时不传参，函数体内读到的是该类型的单位值。**ZST 结果照常交付**：返回类型是 ZST 的调用同样不产生寄存器（callee 返回 void），但调用仍把结果的单位值写进它的 result location——因此 `y = f(x)`（`f` 返回 `None`）会把 `y` 绑定为单位值、类型为该 ZST，丢弃结果的表达式语句也不会留下无类型的临时 slot。估计大小与对齐（`sval.estimated_size_of`、`estimated_alignment_of`，用来决定结构体的返回与传参方式）对 ZST 分别取 0 与 1。在编译期，"无值"用其单位值 `sval.Void()` 表示。
+**单位类型（ZST）**：`-> None` 的 void 类型 `VoidType` 是一个**零大小类型**（zero-sized type，ZST）；零位整数 `spy.u0`，字段全为 ZST、没有字段的结构体，以及元素为 ZST 或长度为 0 的数组同样是 ZST。ZST 没有运行时表示——`to_mir_type` 对 ZST 返回 MIR 的 void 类型（`mir.VOID`，因此返回类型是 ZST 的函数就返回 void）——ZST 的 slot 不落内存、不产生 load/store，结构体里的 ZST 字段不占布局、不进入 MIR 结构体。**ZST 参数同样跳过**：不进入 MIR 签名、调用时不传参，函数体内读到的是该类型的单位值。**ZST 结果照常交付**：返回类型是 ZST 的调用同样不产生寄存器（callee 返回 void），但调用仍把结果的单位值写进它的 result location——因此 `y = f(x)`（`f` 返回 `None`）会把 `y` 绑定为单位值、类型为该 ZST，丢弃结果的表达式语句也不会留下无类型的临时 slot。估计大小与对齐（`sval.estimated_size_of`、`estimated_alignment_of`，用来决定结构体的返回与传参方式）对 ZST 分别取 0 与 1。在编译期，"无值"用其单位值 `sval.Void()` 表示。
 
 泛型：函数可以用 PEP 695 的 `[T]` 语法（需要 Python 3.13+）。`T` 由实参类型求解；形参注解为同一个 `T` 的实参类型会被统一成一个共同类型，实参再转换到它。**声明了返回注解时，它决定该特化的返回类型**（递归函数必须有，见下）。
 
@@ -172,6 +172,32 @@ def use_incr(x: spy.i32) -> spy.i32:
 - **const**：可变指针可以隐式转成 const 指针，反过来不行。
 - **泛型**：指针类型参与类型参数求解——`Ptr[T]` 求解 `T`，`Ptr[T, C]` 连 const 性一起求解（`C` 解成 `True`/`False`）。
 
+## 数组
+
+`syntax.Array[T, N]` 是 `N` 个 `T` 排成一行构成的数组类型，`syntax.array(a1, a2, ...)` 构造数组：
+
+```python
+import spy
+from typing import Literal
+from spy.syntax import Array, array
+
+@spy.func()
+def total(a: Array[spy.i32, Literal[2]]) -> spy.i32:
+    return a[0] + a[1]
+
+@spy.func()
+def use_array(x: spy.i32) -> spy.i32:
+    a = array(x, x + 1, length=2)   # ``length`` 只给类型检查看
+    a[0] = 7
+    return total(a) + a[0]
+```
+
+- **类型**：注解里的 `Array[T, N]` 被 `sval.as_value` 转成 `sval.ArrayType`（元素类型 `T`、长度 `N`）。长度是一个**值**类型参数，所以写的时候要用 `Literal[N]`（和指针的 const 性写 `Literal[True]` 一样）；元素类型也可以是未求解的类型参数。
+- **构造**：`array(a1, a2, ...)` 与结构体构造一样是 result-location 构造调用——元素按顺序直接写进数组的存储，嵌套构造（数组套数组、结构体里的数组字段）不产生拷贝。**长度取实参的个数**；元素类型取目标位置已声明的类型，否则取所有元素的共同类型（每个元素都得有一个能落地的类型，所以 `array(1, 2)` 这种没写类型的整数字面量会报错）。因为 Python 类型系统无法从实参推出长度，`array` 签名里带一个**只为类型检查**服务的 `length: N = 0` 关键字（不写时 pyright 认为长度是 0）；编译以实参个数为准，并且忽略这个关键字。
+- **下标**：`a[i]` 是第 `i` 个元素的**位置**（左值）——可读、可赋值、可 `+=`，也可以继续取字段（`a[0].x`）或继续下标（`a[0][1]`）。下标类型暂时固定为 `u64`（将来的 `usize` 会按目标平台取具体整数类型）；编译期常量下标会检查越界，运行期下标不检查。指向数组的指针同样可以下标：`p[...][i]`。
+- **ZST**：元素是 ZST、或长度为 0 的数组本身是 ZST——没有存储、没有运行时表示：每个元素都等于元素类型的单位值，`a[i]` 不产生地址（`a[i] = v` 也就什么都不写）。
+- **返回与传参**：和结构体同一套规则（`sval.returns_via_result_ptr`/`pass_by_ref`）——不超过 16 字节按值、更大的经 result 指针；数组的值可以整体拷贝（`b = a`）。
+
 ## 模块结构
 
 | 文件 | 作用 |
@@ -187,7 +213,7 @@ def use_incr(x: spy.i32) -> spy.i32:
 | `lower.py` | MIR → LLVM IR → 机器码（llvmlite MCJIT） |
 | `fn.py` | 函数签名（`Signature`：形参绑定、类型参数求解、返回类型推导）、函数值与编译产物、链接名表（`SymbolTable`）与函数入口 thunk |
 | `sval.py` | spy 类型系统（含结构体类型）、编译期值、Python 值 → spy 域的映射（`as_value`）与类型参数约束求解（`TypeVarSolver`） |
-| `syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`、取地址 `ref`（`array` 未来实现） |
+| `syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`、取地址 `ref`、数组类型 `Array` 与构造 `array` |
 | `errors.py` | `SpyError`、`CompileError`、`TypeMismatchError`（同时是 `TypeError` 子类） |
 | `binop.py` | 运算符的字面量类型 |
 | `builtins.py` | 函数体内使用的 `spy.*` builtin |
@@ -198,10 +224,10 @@ def use_incr(x: spy.i32) -> spy.i32:
 
 - `while`/`for` 循环、运行时 `and`/`or`（目前只支持编译期操作数）。
 - 赋值仅支持 `=`（含元组解包）与 `+=`（无链式赋值 `a = b = e`、其它增强赋值、类型标注赋值 `x: T = ...`、编译期值局部变量）。
-- `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、下标 `x[i]`（只有解引用 `x[...]` 可用）。
+- `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、对**指针**的下标 `p[i]`（指针只有解引用 `p[...]` 可用；数组的 `a[i]` 已实现）。
 - 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字符串的运算。
 - 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、通过类名访问方法（如 `Foo[i32].m(x)`）、结构体整体比较。
-- 指针：数组（`syntax.Array`/`array`）尚未实现。
+- 数组：运行时长度的数组（`syntax.MultiPtr`）、切片、数组之间的转换（如 `i32[2]` → `i64[2]`）、以及 Python 侧实例表示（带数组参数/返回值的函数还不能从 Python 侧直接调用）。
 - 普通 Python 函数的内联不支持运行期递归（递归驱动参数是运行期值时会在内联嵌套上限处报错，而非编译期展开）；运行期的函数值调用（把函数存进变量/字段后再调用）也尚未实现。
 
 ## 运行测试

@@ -146,6 +146,8 @@ def simplify(fn: mir.Function) -> None:
                 inst.value = resolve(inst.value)
             case mir.Gep():
                 inst.ptr = resolve(inst.ptr)
+                if not isinstance(inst.index, int):
+                    inst.index = resolve(inst.index)
             case mir.Arith():
                 inst.lhs = resolve(inst.lhs)
                 inst.rhs = resolve(inst.rhs)
@@ -227,7 +229,9 @@ def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
         case mir.Store():
             return ((inst.ptr, 'store'), (inst.value, 'use'))
         case mir.Gep():
-            return ((inst.ptr, 'use'),)
+            if isinstance(inst.index, int):
+                return ((inst.ptr, 'use'),)
+            return ((inst.ptr, 'use'), (inst.index, 'use'))
         case mir.Arith():
             return ((inst.lhs, 'use'), (inst.rhs, 'use'))
         case mir.Convert():

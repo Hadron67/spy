@@ -24,6 +24,7 @@ import typing
 from abc import abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import IntEnum, auto
 from typing import Any, Literal, override
 
 from spy.util import IdentityObj, IndexedMap, frozendict
@@ -399,10 +400,15 @@ class Float(Type):
     def __str__(self) -> str:
         return f"{self.value}{self.type}"
 
+class PointerVariant(IntEnum):
+    SINGLE = auto()
+    MULTI = auto()
+
 @dataclass(frozen=True)
 class PointerType(Type):
     elem: Type
-    is_const: AnyValue = False
+    is_const: AnyValue = False # bool
+    variant: PointerVariant = PointerVariant.SINGLE
 
     @override
     def get_type(self) -> Type:
@@ -430,7 +436,97 @@ class PointerType(Type):
     def __str__(self) -> str:
         return f"{'ptr' if not self.is_const else 'cptr'}({self.elem})"
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class ArrayType(Type):
+    """A spy array type: ``length`` values of the element type ``elem``, in a
+    row.  The length is a *value* (a Python ``int``, or an ``Int``): a signature
+    that takes or returns an array spells it out, since the Python type system
+    cannot infer it from the arguments of ``array(...)`` (see ``syntax``)."""
+
+    elem: Type
+    length: AnyValue # int
+
+    @property
+    def length_int(self) -> int | None:
+        """The length as a Python ``int``, or None when it is not one - a
+        length written as a type parameter that no call has solved yet."""
+        match self.length:
+            case int():
+                return self.length
+            case Int():
+                return self.length.value
+            case _:
+                return None
+
+    @override
+    def get_type(self) -> Type:
+        child = self.elem.get_type()
+        assert isinstance(child, TypeType)
+        return TypeType(child.level + 1)
+
+    @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        # the element type, and the length while it is still a type parameter
+        # (a length that is a type constrains it, see ``TypeVarSolver``)
+        if isinstance(self.length, Type):
+            return (self.elem, self.length)
+        return (self.elem,)
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        """An array is a subtype of an array of the same length and the same
+        element type, and of nothing else: the two have to share their layout,
+        so the element type is compared for equality rather than subtyped
+        (widening the elements of an array is a conversion, not a subtype -
+        the element types of one construction are unified one level down).
+        Note that the base rule would take any array for any array."""
+        return (
+            isinstance(other, ArrayType)
+            and self.length_int is not None
+            and self.length_int == other.length_int
+            and self.elem == other.elem
+        )
+
+    @override
+    def get_unit_value(self) -> AnyValue | None:
+        """The unit value of a zero-sized array: the aggregate of the unit
+        values of its elements - an array is zero-sized when it has no
+        elements at all, or when its element type is (see
+        :meth:`to_mir_type`)."""
+        length = self.length_int
+        if length is None:
+            return None
+        unit = self.elem.get_unit_value()
+        if unit is None:
+            # a zero-length array holds no storage whatever its element type
+            return AggregateValue((), self) if length == 0 else None
+        return AggregateValue((unit,) * length, self)
+
+    @override
+    def is_copyable(self) -> bool:
+        """An array is copyable when its element type is."""
+        return self.length == 0 or self.elem.is_copyable()
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        length = self.length_int
+        if length is None:
+            return None
+        if length == 0 or self.elem.is_zst():
+            # a zero-sized array holds no storage whatever its length: it has
+            # no mirror of its own
+            return mir.VOID
+        elem = self.elem.to_mir_type()
+        if elem is None or isinstance(elem, mir.VoidType):
+            # an element with no mirror of its own (the zero-sized case is
+            # already handled above) leaves the array without one either
+            return None
+        return mir.ArrayType(elem, length)
+
+    def __str__(self) -> str:
+        return f"{self.elem}[{self.length}]"
+
+@dataclass(frozen=True, slots=True)
 class Undefined(Value):
     type: Type
 
@@ -881,6 +977,15 @@ def estimated_size_of(type: Type) -> int:
             return (type.bits + 7) // 8
         case PointerType():
             return _POINTER_BYTES
+        case ArrayType():
+            # an array is as big as its elements together, and holds no
+            # storage at all when it has no element
+            length = type.length_int
+            if length is None:
+                raise SpyError(f"array {type} has no constant length")
+            if length == 0 or type.elem.is_zst():
+                return 0
+            return length * estimated_size_of(type.elem)
         case StructType():
             offset = 0
             for field in type.fields().values():
@@ -911,6 +1016,13 @@ def estimated_alignment_of(type: Type) -> int:
             return type.bits // 8
         case PointerType():
             return _POINTER_BYTES
+        case ArrayType():
+            length = type.length_int
+            if length is None:
+                raise SpyError(f"array {type} has no constant length")
+            if length == 0 or type.elem.is_zst():
+                return 1
+            return estimated_alignment_of(type.elem)
         case StructType():
             return max(
                 (
@@ -936,7 +1048,7 @@ def returns_via_result_ptr(type: Type) -> bool:
     value.  A signature may override the default
     (``fn.Signature.ret_by_ref``)."""
     match type:
-        case StructType():
+        case StructType() | ArrayType():
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
@@ -953,7 +1065,7 @@ def pass_by_ref(type: Type) -> bool:
     passes a parameter by reference when its formal declares it as one
     (``fn.SignatureFormalArg.by_ref``), whatever its type."""
     match type:
-        case StructType():
+        case StructType() | ArrayType():
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
@@ -1073,6 +1185,19 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
         if len(args) == 2:
             return PointerType(elem, _as_constness(args[1], type_vars, resolver))
         return PointerType(elem, False)
+    if typing.get_origin(value) is syntax.Array:
+        # ``Array[T, L]``: ``L`` values of type ``T``.  The length is a *value*
+        # (a Python ``int``, or the type parameter it is written as); the
+        # constructor ``array(...)`` takes it from the number of elements it is
+        # given, which the Python type system cannot express, so an annotation
+        # that names the element type alone has to write the length out
+        args = typing.get_args(value)
+        if len(args) != 2:
+            raise TypeError(f'cannot convert {value!r} to a value')
+        elem = as_value(args[0], type_vars, resolver)
+        if not isinstance(elem, Type):
+            raise TypeError(f'{args[0]!r} is not a type')
+        return ArrayType(elem, as_value(args[1], type_vars, resolver))
 
     raise TypeError(f'cannot convert {value} to a value')
 
@@ -1239,6 +1364,13 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
                 replace_type_vars_type(value.elem, reps),
                 replace_type_var(value.is_const, reps),
             )
+        case ArrayType():
+            # the length is substituted too: it may be a type parameter
+            # (``Array[T, N]``)
+            return ArrayType(
+                replace_type_vars_type(value.elem, reps),
+                replace_type_var(value.length, reps),
+            )
         case StructType():
             # a struct type carries its type arguments: substituting into it
             # rebuilds the specialization (and keeps the identity of the one
@@ -1264,6 +1396,10 @@ def is_comptime_only_type(type: Type) -> bool:
     match type:
         case AnyIntType() | TypeType():
             return True
+        case ArrayType():
+            # an array of a compile-time-only type holds no value that could
+            # live in memory, whatever its length
+            return is_comptime_only_type(type.elem)
         case _:
             return False
 

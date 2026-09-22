@@ -745,6 +745,12 @@ class HirRunner:
                 regs[inst] = self.field_index_addr(self.operand(inst.base), inst.index)
             case hir.FinishStruct():
                 self.finish_struct(self.operand(inst.struct), inst.indices, inst.names)
+            case hir.InitArray():
+                regs[inst] = _shallow_normalize(self.operand(inst.dest))
+            case hir.ElementIndexAddr():
+                regs[inst] = self.element_index_addr(self.operand(inst.array), inst.index)
+            case hir.FinishArray():
+                self.finish_array(self.operand(inst.array), tuple(self.operand(e) for e in inst.elements))
             case hir.CommitSlot():
                 self._commit_pending_slot(self.operand(inst.slot))
             case hir.Subscript():
@@ -1546,9 +1552,36 @@ class HirRunner:
         ``base`` for the generic arguments ``index`` (one type value, or a
         tuple of them).  The result is the struct *type* itself, a
         compile-time value - the same one the annotation spelling evaluates
-        to at the Python level (see ``dsl._RegisteredClass.__getitem__``)."""
+        to at the Python level (see ``dsl._RegisteredClass.__getitem__``).
+
+        ``a[i]``: the *place* the i-th element of the array ``base`` points at
+        is - a subscript of an array is read and written through like a field
+        of a struct (see ``_element_addr``).  The index is a ``u64`` for now;
+        ``usize``, the width of a pointer of the target, will take its place."""
+        array_type = self._array_elem_type_of(base)
+        if array_type is not None:
+            index_value = self._coerce(self._arg_value(index), sval.IntType(64, False))
+            element_index = _to_comptime(index_value)
+            if isinstance(element_index, sval.Int):
+                # a compile-time index is checked here: the MIR address of an
+                # element is taken with no bounds information at runtime
+                length = array_type.length_int
+                if length is not None and not 0 <= element_index.value < length:
+                    raise CompileError(
+                        f'index {element_index.value} is out of bounds for {array_type}'
+                    )
+            base_type = _type_of(base)
+            assert isinstance(base_type, sval.PointerType)
+            self._frames[-1].regs[ret] = self._element_addr(
+                base, array_type, _to_runtime(index_value), is_const=base_type.is_const
+            )
+            return PollResult.AGAIN
+
         if not (isinstance(base, ComptimeVal) and isinstance(base.obj, sval.ConstRef) and isinstance(base.obj.value, sval.StructTypeHead)):
-            raise CompileError(f'cannot subscript {base!r}')
+            raise CompileError(
+                f'cannot subscript {base!r}: a subscript is a place in an array, '
+                f'or a specialization of a struct template'
+            )
         struct = base.obj.value
         args: tuple[InterpVal, ...]
         if isinstance(index.value, ComptimeTuple):
@@ -1644,6 +1677,150 @@ class HirRunner:
             if unit is None:
                 raise CompileError(f'missing a value for field {field0.name!r}')
             self.store(self.field_index_addr(struct, index), ComptimeVal(unit))
+
+    # -- array values ----------------------------------------------------------
+
+    def element_index_addr(self, array: InterpVal, index: int) -> InterpVal:
+        """The address the ``index``-th element of the array being constructed
+        is written into (``hir.ElementIndexAddr``).
+
+        The address of an element is the array's own address offset by the
+        index, which takes the array's *type* - and while an array is being
+        built its element type is not known yet (see ``init_array``).  The
+        element therefore gets a pending place of its own, which the
+        ``FinishArray`` closing the construction turns into the address of an
+        element of the array (or into nothing at all: a zero-sized array has no
+        storage, and so no addresses).  A storage whose type is already decided
+        (an array given to the function, a result location) yields the address
+        right away."""
+        array = _shallow_normalize(array)
+        array_type = self._array_elem_type_of(array)
+        if array_type is None:
+            # the array's type is not decided yet: a pending place
+            return self.alloca(False)
+        base_type = _type_of(array)
+        assert isinstance(base_type, sval.PointerType)
+        return self._element_addr(array, array_type, index, is_const=base_type.is_const)
+
+    def finish_array(self, array: InterpVal, elements: tuple[InterpVal, ...]) -> None:
+        """Close an array construction (``hir.FinishArray``): decide the type
+        of the array and give every element the address it writes through.
+
+        The length of the array is the number of elements, and its element type
+        the one the storage already has - what is built in a place has to agree
+        with the type of the place - or else the common type of the elements
+        (see ``_array_construction_type``).  The storage then takes the array
+        type through the same deferral a struct construction uses, so its type
+        is *recorded* on the slot rather than fixed on it, and every element
+        place that is still pending becomes the address of its element in the
+        storage (its value is written through that address, in place)."""
+        array_type = self._array_construction_type(array, elements)
+        if isinstance(array, PendingSlot) and array.committed is None:
+            array_ptr = self._defer_ptr_convertion(array, array_type)
+        else:
+            array_ptr = self._convert_result_ptr(_shallow_normalize(array), array_type)
+        for index, element in enumerate(elements):
+            if not (isinstance(element, PendingSlot) and element.committed is None):
+                # the element wrote through the address it was given (see
+                # ``element_index_addr``), which is already final
+                continue
+            if array_type.is_zst():
+                # a zero-sized array has nowhere to write an element: the place
+                # is committed for its value alone, which every value of the
+                # element type equals anyway
+                self._commit_pending_slot(element, array_type.elem)
+                continue
+            ptr = self._element_addr(
+                array_ptr, array_type, index, at=element.mir_alloca_pos
+            )
+            assert isinstance(ptr, RuntimeVal), 'an element of an array with storage has an address'
+            self._bind_slot(element, ptr.value, array_type.elem)
+
+    def _array_elem_type_of(self, value: InterpVal) -> sval.ArrayType | None:
+        """The array type ``value`` points at, or None when it points at
+        something else (or at nothing: a slot whose type is not decided yet)."""
+        type = _type_of(value)
+        if isinstance(type, sval.PointerType) and isinstance(type.elem, sval.ArrayType):
+            return type.elem
+        return None
+
+    def _element_addr(
+        self,
+        array: InterpVal,
+        array_type: sval.ArrayType,
+        index: int | mir.Value,
+        is_const: sval.AnyValue = False,
+        at: int | None = None,
+    ) -> InterpVal:
+        """The address of one element of the array ``array`` points at (a
+        pointer to the element).  A zero-sized array holds no storage and so
+        has no addresses: every value of one equals the unit value of the
+        element type, which is what its elements are."""
+        if array_type.is_zst():
+            return ComptimeVal(sval.Undefined(sval.PointerType(array_type.elem, is_const=is_const)))
+        array = _shallow_normalize(array)
+        if not isinstance(array, RuntimeVal):
+            raise CompileError(f'cannot take the address of an element of {array_type}: the array is a compile-time value')
+        gep = self._emit(mir.Gep(array.value, index), at)
+        return RuntimeVal(gep, sval.PointerType(array_type.elem, is_const=is_const))
+
+    def _array_construction_type(self, array: InterpVal, elements: tuple[InterpVal, ...]) -> sval.ArrayType:
+        """The array type a construction builds: as many elements as it was
+        given (the constructor has no way to name the length, see ``syntax``),
+        of the element type the storage ``array`` points at declares - a place
+        holds one type, so the array built in it has to agree with it - or else
+        of the common type of the elements themselves."""
+        array_type = self._array_elem_type_of(array)
+        if array_type is None:
+            return sval.ArrayType(self._common_element_type(elements), len(elements))
+        declared = array_type.length_int
+        if declared is None:
+            raise CompileError(f'cannot tell how many elements {array_type} holds')
+        if declared != len(elements):
+            raise CompileError(
+                f'{array_type} holds {declared} element(s), but {len(elements)} were given'
+            )
+        return array_type
+
+    def _common_element_type(self, elements: tuple[InterpVal, ...]) -> sval.Type:
+        """The one type all the elements of an array have: the peer type of the
+        type of every element place (see ``_place_type``).  An array is
+        homogeneous, so the elements have to agree; every element is coerced to
+        that type when its value is written."""
+        type: sval.Type | None = None
+        for element in elements:
+            element_type = self._place_type(element)
+            if element_type is None:
+                continue
+            peer = element_type if type is None else type.resolve_peer_type(element_type)
+            if peer is None:
+                raise CompileError(
+                    f'the elements of an array must have a common type, '
+                    f'got {type} and {element_type}'
+                )
+            type = peer
+        if type is None:
+            raise CompileError(
+                'the elements of an array with no element have no type of their '
+                'own: the place it is built in has to declare the array type'
+            )
+        return type
+
+    def _place_type(self, place: InterpVal) -> sval.Type | None:
+        """The type of the value a place holds: a slot whose type is not decided
+        yet reports the peer type of the values stored into it (and None when it
+        holds no value), a place that is materialized the type of the value it
+        holds."""
+        place = _shallow_normalize(place)
+        if isinstance(place, PendingSlot):
+            if place.committed is None:
+                type = place.committed_type()
+                return None if isinstance(type, sval.EmptyType) else type
+            place = place.committed
+        type = _type_of(place)
+        if isinstance(type, sval.PointerType):
+            return type.elem
+        return None
 
     def _method_of(self, struct: sval.StructType, method_name: str) -> sval.AnyValue | None:
         """The value of the method ``method_name`` of the struct type

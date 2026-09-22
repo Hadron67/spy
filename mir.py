@@ -326,37 +326,57 @@ class Store(Inst):
 
 @dataclass(eq=False)
 class Gep(Inst):
-    """The address of a struct field: ``ptr`` must point at a struct
-    value and ``index`` is the field's position in the *mirror* of the
-    struct (the declaration index mapped by
-    ``sval.StructType.get_field_mir_indices``).  The result is a pointer
-    to the field; its type is computed here from the static type of
-    ``ptr`` (mirroring LLVM's ``getelementptr``)."""
+    """The address of a struct field or of an array element: ``ptr`` must
+    point at a struct or an array value and ``index`` names what the address is
+    taken of - the position of a field in the *mirror* of the struct (the
+    declaration index mapped by ``sval.StructType.get_field_mir_indices``,
+    always a constant), or the position of an element of an array (a constant,
+    or a value when the index is only known at runtime).  The result is a
+    pointer to the field/the element; its type is computed here from the static
+    type of ``ptr`` (mirroring LLVM's ``getelementptr``)."""
 
     ptr: Value
-    index: int
+    index: int | Value
 
-    def __init__(self, ptr: Value, index: int) -> None:
+    def __init__(self, ptr: Value, index: int | Value) -> None:
         self.ptr = ptr
         self.index = index
         ptype = ptr.get_type()
-        if not isinstance(ptype, PointerType) or not isinstance(ptype.elem, StructType):
-            raise CompileError(
-                f'cannot take a field of a {ptype} value '
-                '(field access requires a struct value)'
-            )
-        self.type: Type = PointerType(ptype.elem.fields[index].type)
+        if not isinstance(ptype, PointerType):
+            raise CompileError(f'cannot take an element of a {ptype} value')
+        elem = ptype.elem
+        if isinstance(elem, StructType):
+            if not isinstance(index, int):
+                raise CompileError(f'a field of {elem} is taken by a constant index')
+            if index < 0 or index >= len(elem.fields):
+                raise CompileError(f'field index {index} is out of bounds for {elem}')
+            self.type: Type = PointerType(elem.fields[index].type)
+            return
+        if isinstance(elem, ArrayType):
+            if isinstance(index, int) and not 0 <= index < elem.length:
+                raise CompileError(f'element index {index} is out of bounds for {elem}')
+            self.type = PointerType(elem.elem)
+            return
+        raise CompileError(
+            f'cannot take an element of a {ptype} value '
+            '(element access requires a struct or array value)'
+        )
 
     @override
     def get_type(self) -> Type:
         return self.type
 
     def get_children(self) -> tuple[Any, ...]:
-        return (self.ptr,)
+        if isinstance(self.index, int):
+            return (self.ptr,)
+        return (self.ptr, self.index)
 
     def map_values(self, f: Callable[[Value], Value]) -> Self:
         ptr = f(self.ptr)
-        return self if ptr is self.ptr else replace(self, ptr=ptr)
+        index = self.index if isinstance(self.index, int) else f(self.index)
+        if ptr is self.ptr and index is self.index:
+            return self
+        return replace(self, ptr=ptr, index=index)
 
 
 @dataclass(eq=False)

@@ -454,9 +454,16 @@ class _Builder:
                 if not base.is_ref:
                     raise CompileError(f"subscript of non-reference {base}")
                 index = self._gen_expr(node.slice)[0]
-                # a subscript of a struct specializes it, and the result is a
-                # struct too: ``Foo[i32]`` constructs one when it is called
-                return ArgEntry(self.add(hir.Subscript(base.value, index)), False), base_is_struct
+                sub = self.add(hir.Subscript(base.value, index))
+                if isinstance(base.value, hir.ConstRef):
+                    # a subscript of a *global* names a type: a specialization of
+                    # a struct template (``Foo[i32]``, which constructs a struct
+                    # when it is called) or a ``syntax`` type marker such as
+                    # ``Array[i32, 3]``
+                    return ArgEntry(sub, False), base_is_struct
+                # the i-th element of the array the base is: a *place*, written
+                # and read through like a field of a struct
+                return ArgEntry(sub, True), False
             case _:
                 if not allow_retloc:
                     raise CompileError(f"unexpected expression {node}")
@@ -546,9 +553,14 @@ class _Builder:
 
     def _gen_call(self, node: ast.Call, result_loc: hir.Value) -> None:
         """One call whose result is written into ``result_loc``: a
-        construction ``Foo(...)``, a method call ``x.h(...)`` on a runtime
-        struct value, or an ordinary call (a spy function, an inlined plain
-        function or a spy builtin)."""
+        construction ``Foo(...)`` or ``array(...)``, a method call ``x.h(...)``
+        on a runtime struct value, or an ordinary call (a spy function, an
+        inlined plain function or a spy builtin)."""
+        if self._try_resolve_object(node.func) is syntax.array:
+            # an array construction: like a struct one, the elements are
+            # generated straight into the array's storage
+            self._gen_array_ctor(node.args, node.keywords, result_loc)
+            return
         if isinstance(node.func, ast.Attribute):
             # a method of the struct ``base``: the method and its self
             # parameter are resolved by the interpreter from the static
@@ -565,6 +577,31 @@ class _Builder:
         # the callee must be addressable (a reference), the arguments are
         # by-value values
         self.add(hir.CallInplace(self._as_ref(callee), self._gen_arglist(node.args, node.keywords), result_loc))
+
+    def _gen_array_ctor(self, args: list[ast.expr], keywords: list[ast.keyword], result_loc: hir.Value) -> None:
+        """One construction ``array(a1, a2, ...)``: an ``hir.InitArray`` opens
+        the array in the result location, every element is generated with
+        result-location semantics straight into the place of the element it
+        initializes, and ``hir.FinishArray`` closes the construction, which is
+        where the length of the array (the number of elements) and its element
+        type (the common type of the elements) are resolved.
+
+        The signature of ``syntax.array`` takes a ``length`` keyword because
+        the Python type system cannot tell the length from the elements; the
+        compiler takes it from the number of elements either way and ignores
+        the keyword."""
+        inst = self.add(hir.InitArray(result_loc))
+        elements: list[hir.Value] = []
+        for i, arg in enumerate(args):
+            element = self.add(hir.ElementIndexAddr(inst, i))
+            self._gen_result_loc(arg, element)
+            elements.append(element)
+        for kw in keywords:
+            if kw.arg != 'length':
+                raise CompileError(
+                    f"array takes no keyword argument {kw.arg!r} in spy function {self._fn_ir.name}"
+                )
+        self.add(hir.FinishArray(inst, tuple(elements)))
 
     def _gen_name(self, name: str) -> hir.Value:
         """Always returns a reference to the name ``name``."""
