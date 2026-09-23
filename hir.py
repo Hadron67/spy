@@ -279,6 +279,18 @@ class Subscript(Inst):
     index: ArgEntry[Value]
 
 @dataclass(eq=False)
+class InitTuple(Inst):
+    tuple_ptr: Value
+    length: int
+
+
+@dataclass(eq=False)
+class TuplePtrElement(Inst):
+    tuple_ptr: Value
+    index: int
+
+
+@dataclass(eq=False)
 class Tuple(Inst):
     values: tuple[ArgEntry[Value], ...]
 

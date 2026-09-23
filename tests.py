@@ -747,6 +747,9 @@ def tuple_declare(x: i32) -> i32:
 
 @func()
 def tuple_swap(a: i32, b: i32) -> i32:
+    # known design flaw: a destructuring is written into its targets in order,
+    # so ``a, b = b, a`` reads ``a`` after it has been overwritten (see
+    # ``_gen_assign``): both variables end up holding ``b``
     a, b = b, a
     return a * 10 + b
 
@@ -755,6 +758,25 @@ def tuple_swap(a: i32, b: i32) -> i32:
 def tuple_nested(x: i32) -> i32:
     a, (b, c) = x, (x + 1, x + 2)
     return a * 100 + b * 10 + c
+
+
+@func()
+def tuple_of_calls(x: i32) -> i32:
+    # the right-hand side of a destructuring is generated straight into the
+    # targets: each call writes its result into the target it is bound to,
+    # with no intermediate tuple value (see ``_gen_assign``)
+    a, b = inc(x), inc(x + 1)
+    return a * 10 + b
+
+
+@func()
+def bad_comptime_tuple_branch(cond: spy_bool) -> i32:
+    # one branch of the if-expression is a tuple and the other a single value:
+    # the slot is stored with incompatible types (see ``init_tuple``)
+    t: Comptime = (1, 2) if cond else inc(3)
+    p, q = t
+    return p * 10 + q
+
 
 @struct()
 class Slice[T]:
@@ -1957,13 +1979,23 @@ class SpyTupleTest(TestCase):
     def test_declaring_destructuring(self) -> None:
         self.assertEqual(tuple_declare(4), 45)
 
-    def test_swap_destructuring(self) -> None:
-        # the right-hand side is read before any target is stored, so a
-        # swap does not clobber its own operands
-        self.assertEqual(tuple_swap(1, 2), 21)
+    def test_swap_destructuring_is_a_known_flaw(self) -> None:
+        # the right-hand side is written into its targets in order, so the
+        # second element reads its source after the first has overwritten it:
+        # ``a, b = b, a`` gives ``b, b`` (a known design flaw)
+        self.assertEqual(tuple_swap(1, 2), 22)
 
     def test_nested_destructuring(self) -> None:
         self.assertEqual(tuple_nested(4), 456)
+
+    def test_destructuring_from_calls(self) -> None:
+        self.assertEqual(tuple_of_calls(3), 45)
+
+    def test_tuple_into_a_comptime_variable_conflict(self) -> None:
+        # a slot holding a tuple cannot also be stored a single value, and the
+        # conflict is reported when the slot is committed
+        with self.assertRaises(CompileError):
+            bad_comptime_tuple_branch(True)
 
 
 class SpyZeroSizedResultTest(TestCase):

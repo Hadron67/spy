@@ -240,9 +240,12 @@ class _Builder:
         constructor ``x = Bar(...)`` fills the fields of the slot in
         place, and a scalar call result is only recorded in it."""
         if isinstance(target, ast.Tuple):
+            # a destructuring target is a tuple of addresses, one per element:
+            # the right-hand side is generated straight into them (result-
+            # location semantics), so no intermediate tuple value is built
             new_slots: list[hir.Value] = []
             ptrs = self._gen_target_tuple(target, new_slots)
-            self.add(hir.Store(ptrs, self._as_value(self._gen_expr(value)[0])))
+            self._gen_result_loc(value, ptrs)
             for slot in new_slots:
                 self.add(hir.CommitSlot(slot))
             return
@@ -560,6 +563,10 @@ class _Builder:
                 lhs = self._gen_expr(node.left)[0]
                 rhs = self._gen_expr(node.right)[0]
                 self.add(hir.Binary(op, lhs, rhs, result_loc))
+            case ast.Tuple():
+                self.add(hir.InitTuple(result_loc, len(node.elts)))
+                for i, elt in enumerate(node.elts):
+                    self._gen_result_loc(elt, self.add(hir.TuplePtrElement(result_loc, i)))
             case ast.IfExp():
                 cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
                 self.add(hir.If(cond))

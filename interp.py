@@ -191,6 +191,22 @@ class _PendingPtrConvertion(_PendingActionData):
     def info(self) -> tuple[sval.Type, bool]:
         return self.type, False
 
+@dataclass
+class _PendingTuple(_PendingActionData):
+    # one tuple initialization recorded by a PendingSlot (see ``init_tuple``):
+    # the places the tuple's elements are written into.  A tuple has no
+    # representation of its own, so the slot holds the tuple of places itself
+    # (see ``ComptimeTuple``), and its type - the tuple of the types of those
+    # places - is read when the slot is committed, once the elements have been
+    # written.  Recording it as an action (rather than committing the slot
+    # right away) keeps the slot's type resolution - and the conflict it
+    # reports against any other store into the slot - intact.
+    places: tuple[ArgEntry[InterpVal], ...]
+
+    @override
+    def info(self) -> tuple[sval.Type, bool]:
+        return _tuple_places_type(self.places), True
+
 @dataclass(slots=True)
 class PendingSlot(InterpVal):
     """The value of an executed ``hir.Alloca`` before it is *committed*.
@@ -506,6 +522,18 @@ def _place_type(place: InterpVal) -> sval.Type | None:
         return type.elem
     return None
 
+def _tuple_places_type(places: tuple[ArgEntry[InterpVal], ...]) -> sval.Type:
+    # the type of a tuple of element places (see ``init_tuple``): a tuple has
+    # no representation of its own, so this is the tuple of the types of the
+    # places themselves
+    types: list[sval.Type] = []
+    for place in places:
+        type = _place_type(place.value)
+        if type is None:
+            raise CompileError('a tuple element has no type yet')
+        types.append(type)
+    return sval.TupleType(tuple(types), False)
+
 
 def _result_slots(location: InterpVal) -> tuple[InterpVal, ...]:
     """The slots one result value each is delivered into: the result location
@@ -687,6 +715,25 @@ def _convert_inst(
     raise CompileError(
         f"cannot convert a {from_type} value to {to_type}"
     )
+
+def _check_comptime_args(
+    sig: Signature, args: ArgList[ArgEntry[InterpVal]]
+) -> None:
+    """Require a *deeply* compile-time value for every parameter declared
+    compile-time (``Comptime``/``Comptime[T]``): the callee reads such a
+    parameter as a compile-time value whatever it is given, so a runtime
+    argument would be silently dropped (see ``SpecializedComptimeArg``).
+    Every other parameter may be given a runtime value - a zero-sized one
+    is delivered as its unit value whatever it is given (see
+    ``Signature.specialize``)."""
+    for (name, formal), arg in zip(sig.positional.items(), args.positional):
+        if not formal.is_comptime:
+            continue
+        if not _is_comptime_val(arg.value):
+            raise CompileError(
+                f"the argument of compile-time parameter '{name}' must be "
+                f"a compile-time value"
+            )
 
 # ---------------------------------------------------------------------------
 # the compile-time host interface
@@ -986,6 +1033,10 @@ class HirRunner:
                 self.store_void_retloc()
             case hir.Tuple():
                 regs[inst] = ComptimeTuple(tuple(self.operand_arg(v) for v in inst.values))
+            case hir.InitTuple():
+                self.init_tuple(self.operand(inst.tuple_ptr), inst.length)
+            case hir.TuplePtrElement():
+                regs[inst] = self.tuple_ptr_element(self.operand(inst.tuple_ptr), inst.index)
             case hir.Binary():
                 return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self.operand(inst.ret))
             case hir.Compare():
@@ -1985,6 +2036,14 @@ class HirRunner:
         match action:
             case _PendingStore():
                 self.store(ptr, action.value)
+            case _PendingTuple():
+                # a tuple location: the element places are committed together
+                # with the slot (no ``hir.CommitSlot`` names them), and the slot
+                # holds the tuple of places itself (see ``init_tuple``)
+                self._commit_tuple_places(ComptimeTuple(action.places))
+                if not isinstance(ptr, ComptimeBox):
+                    raise CompileError('cannot deliver a tuple into storage')
+                ptr.value = ComptimeTuple(action.places)
             case _PendingPtrConvertion():
                 input_ptr = _shallow_normalize(action.input)
                 if not (isinstance(input_ptr, RuntimeVal) and isinstance(input_ptr.type, sval.PointerType)):
@@ -2250,6 +2309,69 @@ class HirRunner:
             assert isinstance(ptr, RuntimeVal), 'an element of an array with storage has an address'
             self._bind_slot(element, ptr.value, array_type.elem)
 
+    def init_tuple(self, location: InterpVal, length: int) -> None:
+        # a tuple has no storage of its own, so initializing one is building the
+        # tuple of the *places* its elements are written into.  A location that
+        # already is such a tuple - the target tuple of a destructuring, an
+        # element of a tuple being initialized - is used as it is; any other
+        # location (a ``Comptime`` variable's slot) records a fresh tuple of
+        # element places as a pending action, so that the slot's type - and the
+        # conflict another store into it would be - is resolved at its commit
+        # (see ``_PendingTuple``).  That tuple of places is what
+        # ``hir.TuplePtrElement`` then takes the element addresses of.
+        location = _shallow_normalize(location)
+        if isinstance(location, ComptimeTuple):
+            if len(location.values) != length:
+                raise CompileError(
+                    f'cannot initialize a tuple of {length} element(s) in a '
+                    f'location of {len(location.values)} place(s)'
+                )
+            return
+        if isinstance(location, PendingSlot) and location.allow_inline and location.committed is None:
+            self._record_pending_action(
+                location,
+                _PendingTuple(tuple(ArgEntry(self.alloca(True), True) for _ in range(length))),
+            )
+            return
+        raise CompileError(f'cannot initialize a tuple in {location!r}')
+
+    def tuple_ptr_element(self, location: InterpVal, index: int) -> InterpVal:
+        # the place the index-th element of the tuple being initialized in
+        # ``location`` is written through (see ``init_tuple``)
+        location = _shallow_normalize(location)
+        places: tuple[ArgEntry[InterpVal], ...] | None = None
+        if isinstance(location, ComptimeTuple):
+            places = location.values
+        elif isinstance(location, PendingSlot):
+            # a slot InitTuple gave a fresh tuple of element places: the tuple is
+            # the initialization it recorded
+            for action in reversed(location.stores):
+                if isinstance(action.data, _PendingTuple):
+                    places = action.data.places
+                    break
+        if places is None:
+            raise CompileError(f'cannot take an element of {location!r}')
+        if index < 0 or index >= len(places):
+            raise CompileError(f'the tuple has no element at index {index}')
+        place = places[index]
+        assert place.is_ref or isinstance(place.value, ComptimeTuple)
+        return place.value
+
+    def _commit_tuple_places(self, tuple_value: ComptimeTuple) -> None:
+        # the element places of a tuple location are committed with the
+        # location: no ``hir.CommitSlot`` of its own names them
+        # (see ``init_tuple``)
+        todo: list[InterpVal] = [tuple_value]
+        while todo:
+            value = todo.pop()
+            match value:
+                case ComptimeTuple():
+                    todo.extend(entry.value for entry in value.values)
+                case PendingSlot():
+                    self._commit_pending_slot(value)
+                case _:
+                    raise CompileError(f'unsupported tuple element place {value!r}')
+
     def _method_of(self, struct: sval.StructType, method_name: str) -> sval.AnyValue | None:
         """The value of the method ``method_name`` of the struct type
         ``struct``: its function value - bound with the struct's type-
@@ -2322,25 +2444,6 @@ class HirRunner:
     def operand_arg(self, arg: ArgEntry[hir.Value]) -> ArgEntry[InterpVal]:
         return ArgEntry(self.operand(arg.value), arg.is_ref)
 
-    def _check_comptime_args(
-        self, sig: Signature, args: ArgList[ArgEntry[InterpVal]]
-    ) -> None:
-        """Require a *deeply* compile-time value for every parameter declared
-        compile-time (``Comptime``/``Comptime[T]``): the callee reads such a
-        parameter as a compile-time value whatever it is given, so a runtime
-        argument would be silently dropped (see ``SpecializedComptimeArg``).
-        Every other parameter may be given a runtime value - a zero-sized one
-        is delivered as its unit value whatever it is given (see
-        ``Signature.specialize``)."""
-        for (name, formal), arg in zip(sig.positional.items(), args.positional):
-            if not formal.is_comptime:
-                continue
-            if not _is_comptime_val(self._arg_value(arg)):
-                raise CompileError(
-                    f"the argument of compile-time parameter '{name}' must be "
-                    f"a compile-time value"
-                )
-
     def _call_function_entry(
         self,
         fn: FunctionValue,
@@ -2365,7 +2468,7 @@ class HirRunner:
         if generic_var_values:
             sig = sig.substitute_type_vars(dict(generic_var_values))
         binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
-        self._check_comptime_args(sig, binded_args)
+        _check_comptime_args(sig, binded_args)
         if fn.force_inline:
             # an undecorated plain Python function: its body is inlined into
             # the current stream (it has no native specialization of its own)
