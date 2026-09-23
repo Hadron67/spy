@@ -65,10 +65,12 @@ from .sval import (
     AnyValue,
     Null,
     StructDecl,
+    TupleType,
     Type,
     Value,
     VoidType,
     as_value,
+    make_ret_spec,
     unwrap_comptime,
 )
 from .sval import (
@@ -783,6 +785,28 @@ def parse_function(
         # specialized (``fn.Signature.specialize``)
         return cast(Type | None, convert(annotation, 'the annotation'))
 
+    def ret_spec_of(annotation: Any) -> tuple[tuple[Type, bool], ...] | None:
+        """The return spec the annotation declares: one result value per
+        element of a ``tuple[...]`` annotation, and exactly one for any
+        other annotation.  ``None`` (no ``->`` written) declares nothing
+        and lets the interpreter infer the return from the body."""
+        ret_type = annotation_of(annotation)
+        if ret_type is None:
+            return None
+        types: tuple[Type, ...]
+        if isinstance(ret_type, TupleType):
+            if ret_type.has_ellipsis:
+                raise CompileError(
+                    f"function {node.name} cannot return tuple[..., ...]: "
+                    f"a varying number of values has no fixed shape"
+                )
+            types = ret_type.types
+        else:
+            types = (ret_type,)
+        if len(types) == 0:
+            raise CompileError(f"the return annotation of {node.name} declares no value")
+        return make_ret_spec(types)
+
     def default_of(value: Any) -> AnyValue | None:
         # a default value of ``None`` is the null value: the absent value of
         # an option (see ``sval.as_value``).  ``default_value`` being ``None``
@@ -819,7 +843,7 @@ def parse_function(
     # signature are always None; the signature model and ``bind_arg_pos``
     # already support them for the calls the parser will allow later.
     signature = Signature(
-        tuple(generic_args), positional, None, None, annotation_of(ret_annotation), None,
+        tuple(generic_args), positional, None, None, ret_spec_of(ret_annotation),
     )
 
     ir = FunctionIR(node.name, signature, ())

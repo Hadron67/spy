@@ -23,6 +23,16 @@ class Array[T, L: int]:
     def __setitem__(self, value: int, val: T) -> None:
         ...
 
+class Slice[T, C: bool = Literal[False]]:
+    ptr: MultiPtr[T, C]
+    len: int
+
+    def __getitem__(self, value: int) -> T:
+        ...
+
+    def __setitem__(self, value: int, val: T) -> None:
+        ...
+
 type Comptime[T = Any] = T
 type Option[T] = T | None
 
@@ -30,4 +40,7 @@ def ref[T](val: T) -> Ptr[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
 def array[T, Len: int](*elems: T, length: Len = 0) -> Array[T, Len]:
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+def comptime[T](val: T) -> Comptime[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")

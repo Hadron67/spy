@@ -92,6 +92,7 @@ from .fn import (
     NativeFn,
     RawArgList,
     ReturnSignature,
+    Signature,
     SpecializedComptimeArg,
     SpecializedFormalArg,
     SpecializedRuntimeArg,
@@ -150,11 +151,11 @@ class _PendingActionData:
     """One action recorded by a :class:`PendingSlot`: how it is delivered
     once the slot has an address is decided by the runner (see
     ``HirRunner._exec_pending_action``), the slot itself only asks for the
-    type it contributes and whether it is compile-time."""
+    type it contributes and whether it is inline."""
 
     @abstractmethod
     def info(self) -> tuple[sval.Type, bool]:
-        """Returns (type, is_comptime)"""
+        """Returns (type, is_inline)"""
         ...
 
 @dataclass
@@ -169,16 +170,16 @@ class _PendingAction:
 @dataclass
 class _PendingStore(_PendingActionData):
     """One store point recorded by a :class:`PendingSlot`: the spy type of
-    the stored value and whether it is compile-time.  The store itself is
+    the stored value and whether it may be inlined.  The store itself is
     delivered once the slot's final type is known (the stored value is
     coerced to it then)."""
 
     type: sval.Type
-    is_comptime: bool
+    is_inline: bool
     value: InterpVal
 
     def info(self) -> tuple[sval.Type, bool]:
-        return self.type, self.is_comptime
+        return self.type, self.is_inline
 
 @dataclass
 class _PendingPtrConvertion(_PendingActionData):
@@ -201,8 +202,9 @@ class PendingSlot(InterpVal):
     :class:`ComptimeBox` (see ``HirRunner._commit_pending_slot``).
 
     ``allow_inline`` marks the slots astgen allocates for an expression
-    temporary (``Alloca(True)``): a temporary whose stores are all
-    compile-time becomes a :class:`ComptimeBox` instead of memory.
+    temporary (``Alloca(True)``) or for a ``Comptime`` variable: a slot
+    whose stores may all be inlined becomes a :class:`ComptimeBox` instead
+    of memory.
 
     ``insertion`` is the position the slot's storage is produced at: a
     :class:`mir.Insertion` emitted where the ``Alloca`` ran, whose
@@ -232,7 +234,10 @@ class PendingSlot(InterpVal):
             type = sval.EmptyType()
         return type
 
-    def is_comptime(self) -> bool:
+    def is_inline(self) -> bool:
+        """Whether the slot may hold its value inline (in a
+        :class:`ComptimeBox`) rather than in memory: it allows inlining and
+        every store into it is of an inline value (see ``_is_inline_val``)."""
         return self.allow_inline and all(store.data.info()[1] for store in self.stores)
 
 
@@ -245,6 +250,14 @@ class ComptimeDict(InterpVal):
     values: dict[str, ArgEntry[InterpVal]]
 
 def _is_comptime_val(val: InterpVal) -> bool:
+    """Whether the value is *deeply* compile-time: it is known in full while
+    the HIR runs, so a computation over it can be folded in Python (see
+    ``_eval_binary`` and friends) and a call may take it for a compile-time
+    parameter.  A container is deeply compile-time when everything it holds
+    is, so a box or a tuple holding a runtime value is not.
+
+    Not to be confused with ``_is_inline_val``, the *shallow* property that
+    decides whether a value may live in a :class:`ComptimeBox`."""
     todo = [val]
     while todo:
         val = todo.pop()
@@ -264,6 +277,16 @@ def _is_comptime_val(val: InterpVal) -> bool:
             case ComptimeDict():
                 todo.extend(a.value for a in val.values.values())
     return True
+
+def _is_inline_val(val: InterpVal) -> bool:
+    """Whether the value may be *inlined* - kept in a :class:`ComptimeBox`
+    rather than written into memory.  This is the *shallow* property of the
+    value itself: it is not a runtime value.  A container counts as inline
+    even when what it holds is a runtime value - a tuple, a box, ... has no
+    runtime representation of its own, so it only exists while the HIR runs
+    (a ``Comptime`` variable may hold one, see ``_is_comptime_val`` for the
+    deep property)."""
+    return not isinstance(_shallow_normalize(val), RuntimeVal)
 
 class BlockFrameData:
     pass
@@ -373,6 +396,17 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
             return type
         case ComptimeVal(obj):
             return sval.type_of(obj) if not allow_value_type else sval.ValueType(obj)
+        case ComptimeTuple():
+            # a tuple of values: its type is the tuple of the types of the
+            # values its entries denote, with no runtime representation of
+            # its own (see ``sval.TupleType``)
+            types: list[sval.Type] = []
+            for entry in ev.values:
+                entry_type = _arg_type_of(entry)
+                if entry_type is None:
+                    return None
+                types.append(entry_type)
+            return sval.TupleType(tuple(types), False)
         case _:
             return None
 
@@ -408,9 +442,10 @@ def _struct_generic_var_values(struct: sval.StructType) -> frozendict[sval.TypeV
     return frozendict(zip(struct.head.generic_args, struct.generic_args))
 
 # ---------------------------------------------------------------------------
-# stateless helpers of field/element access and struct/array construction:
-# pure functions over the interpreter values they are given (the struct/array
-# structure is read off those, not off any runner state)
+# stateless helpers of field/element access, struct/array construction and the
+# result location of a function that returns several values: pure functions
+# over the interpreter values they are given (the struct/array structure is
+# read off those, not off any runner state)
 # ---------------------------------------------------------------------------
 
 
@@ -470,6 +505,16 @@ def _place_type(place: InterpVal) -> sval.Type | None:
     if isinstance(type, sval.PointerType):
         return type.elem
     return None
+
+
+def _result_slots(location: InterpVal) -> tuple[InterpVal, ...]:
+    """The slots one result value each is delivered into: the result location
+    of a function whose annotation declares several results is a tuple of
+    slots, one per result; every other function has a single result slot."""
+    if isinstance(location, ComptimeTuple):
+        return tuple(entry.value for entry in location.values)
+    return (location,)
+
 
 def _array_elem_type_of(value: InterpVal) -> sval.ArrayType | None:
     """The array type ``value`` points at, or None when it points at
@@ -586,6 +631,11 @@ def _no_runtime_type(type: sval.Type) -> CompileError:
             f'{type} is the type of an untyped literal: a runtime location '
             f'cannot hold it and must declare its type'
         )
+    if isinstance(type, sval.TupleType):
+        return CompileError(
+            'a multi-value result must be destructured (``a, b = f()``) or held '
+            'by a compile-time variable (``a: Comptime = f()``)'
+        )
     return CompileError(f'cannot give a value of type {type} a runtime representation')
 
 # ---------------------------------------------------------------------------
@@ -701,7 +751,7 @@ class HirRunner:
         self.return_sig = None
         self.resume_info = None
         self._deferred_returns = []
-        ret_loc = self.alloca(False)
+        ret_loc = self._new_result_loc(ret_sig)
         frame = InlineFrame(generic_var_values, (), ret_loc, body)
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
@@ -710,7 +760,7 @@ class HirRunner:
             assert arg is not None
         frame.arg_values = args
         if ret_sig is not None:
-            self._materialize_result_ptr(ret_sig.ret_type, ret_sig.ret_by_ref)
+            self._materialize_ret_sig(ret_sig.ret_spec)
 
     def _init_one_arg(self, node: SpecializedFormalArg, mir_args: list[mir.Type]) -> InterpVal:
         match node:
@@ -758,50 +808,67 @@ class HirRunner:
 
         return tuple(arg_values)
 
-    def _materialize_result_ptr(self, type: sval.Type, ret_by_ref: bool | None = None) -> None:
-        """Fix the return convention of the function proper from the spy
-        type its result location holds (the peer type of all its store
-        points, or its declared return annotation).  A result delivered
-        through a result pointer appends the hidden result pointer formal
-        to the lowered signature *after* every declared argument and makes
-        the function return void; the location is then the memory of that
-        pointer.  A direct return fixes the MIR return type and leaves the
-        location recording its value.
+    def _new_result_loc(self, ret_sig: ReturnSignature | None) -> InterpVal:
+        """Reserve the result location of the function proper: one slot whose
+        type is only decided when a value is delivered into it, or - for a
+        function whose annotation declares several results - a tuple of
+        slots, one per declared result."""
+        if ret_sig is None or len(ret_sig.ret_spec) <= 1:
+            return self.alloca(False)
+        return ComptimeTuple(
+            tuple(ArgEntry(self.alloca(False), True) for _ in ret_sig.ret_spec)
+        )
 
-        The convention is a property of the return type
-        (``sval.returns_via_result_ptr``) unless the signature declares it.
+    def _materialize_ret_sig(
+        self, spec: tuple[tuple[sval.Type, bool], ...]
+    ) -> None:
+        """Fix the return convention of the function proper from the spy
+        types of the values it returns (its declared annotation, or the peer
+        type of all its store points for an inferred single result).  A
+        result delivered through a result pointer appends the hidden result
+        pointer formal to the lowered signature *after* every declared
+        argument and makes the result location the memory of that pointer; a
+        result returned by value fixes the MIR return type and leaves its
+        location recording the value.  A function whose every result goes
+        through a pointer returns void.
+
+        The convention is a property of the result types
+        (``sval.make_ret_spec``) unless the signature declares it.
         """
         if self.return_sig is not None:
-            if self.return_sig.ret_type != type:
+            if self.return_sig.ret_spec != spec:
                 raise CompileError(
                     f"function returns values of conflicting types "
-                    f"{self.return_sig.ret_type} and {type}"
+                    f"{[t for t, _ in self.return_sig.ret_spec]} and "
+                    f"{[t for t, _ in spec]}"
                 )
             return
-        if ret_by_ref is None:
-            ret_by_ref = sval.returns_via_result_ptr(type)
+        self.return_sig = ReturnSignature(spec)
+        self._fn_instance.ret_sig = self.return_sig
         mir_fn = self._fn_instance.mir
         location = self._current_result_loc()
-        if ret_by_ref:
-            mir_type = type.to_mir_type()
-            if mir_type is None or isinstance(mir_type, mir.VoidType):
-                raise CompileError(f'cannot return {type} through a result pointer')
-            ptr_type = mir.PointerType(mir_type, False)
-            index = len(mir_fn.args)
-            mir_fn.args.append(ptr_type)
-            mir_fn.arg_names.append('$result')
-            self._fn_instance.ret_sig = ReturnSignature(True, type)
-            self.return_sig = self._fn_instance.ret_sig
-            assert isinstance(location, PendingSlot)
-            self._commit_pending_slot(location, type, ptr=mir.Param(index, ptr_type))
-            mir_fn.ret_type = mir.VOID
-        else:
+        slots = _result_slots(location)
+        assert len(slots) == len(spec)
+        mir_fn.ret_type = mir.VOID
+        for (type, via_result_ptr), slot in zip(spec, slots):
+            if via_result_ptr:
+                mir_type = type.to_mir_type()
+                if mir_type is None or isinstance(mir_type, mir.VoidType):
+                    raise CompileError(f'cannot return {type} through a result pointer')
+                ptr_type = mir.PointerType(mir_type, False)
+                index = len(mir_fn.args)
+                mir_fn.args.append(ptr_type)
+                mir_fn.arg_names.append('$result')
+                self._commit_pending_slot(slot, type, ptr=mir.Param(index, ptr_type))
+                continue
             mir_ret = type.to_mir_type()
             if mir_ret is None:
                 raise _no_runtime_type(type)
-            mir_fn.ret_type = mir_ret
-            self.return_sig = ReturnSignature(False, type)
-            self._commit_pending_slot(location, type)
+            if not isinstance(mir_ret, mir.VoidType):
+                # a zero-sized result is delivered as its unit value; only a
+                # result with storage fixes the MIR return type
+                mir_fn.ret_type = mir_ret
+            self._commit_pending_slot(slot, type)
 
     # -- return statements ------------------------------------------------
 
@@ -890,10 +957,14 @@ class HirRunner:
                     self._deferred_returns.append(block)
                     return self._cut()
                 location = self._current_result_loc()
-                if self.return_sig.ret_by_ref or self.return_sig.ret_type.is_zst():
+                slots = _result_slots(location)
+                index = self.return_sig.by_value_index()
+                if index is None:
+                    # every result is delivered through its result pointer (or
+                    # is zero-sized): the lowered function returns void
                     self._emit(mir.Ret(None))
                 else:
-                    self._emit(mir.Ret(_to_runtime(self.load(location))))
+                    self._emit(mir.Ret(_to_runtime(self.load(slots[index]))))
                 return self._cut()
             case hir.AsBool():
                 return self.as_bool(self.operand_arg(inst.value), inst)
@@ -908,11 +979,11 @@ class HirRunner:
             case hir.Load():
                 regs[inst] = self.load(self.operand(inst.ptr))
             case hir.Alloca():
-                regs[inst] = self.alloca(inst.allow_comptime, self._declared_type(inst.type))
+                regs[inst] = self.alloca(inst.allow_inline, self._declared_type(inst.type))
             case hir.Store():
                 self.store(self.operand(inst.ptr), self.operand(inst.value))
             case hir.StoreVoidRetloc():
-                self.store(self._current_result_loc(), ComptimeVal(sval.Void()))
+                self.store_void_retloc()
             case hir.Tuple():
                 regs[inst] = ComptimeTuple(tuple(self.operand_arg(v) for v in inst.values))
             case hir.Binary():
@@ -1223,7 +1294,7 @@ class HirRunner:
                 ptr,
                 _PendingStore(
                     type=value_type,
-                    is_comptime=_is_comptime_val(value),
+                    is_inline=_is_inline_val(value),
                     value=value,
                 ),
             )
@@ -1263,6 +1334,15 @@ class HirRunner:
                 self._emit(mir.Store(ptr.value, _to_runtime(coerced)))
             case _:
                 raise CompileError('cannot store through a compile-time pointer')
+
+    def store_void_retloc(self) -> None:
+        """Deliver the void unit value into the result location (see
+        ``hir.StoreVoidRetloc``): the value a body that falls off its end
+        returns."""
+        location = self._current_result_loc()
+        if isinstance(location, ComptimeTuple):
+            raise CompileError('a function that returns several values must return them')
+        self.store(location, ComptimeVal(sval.Void()))
 
     # -- options ---------------------------------------------------------------
 
@@ -1530,18 +1610,19 @@ class HirRunner:
             self._mir_block_stack[-1].append(inst)
         return inst
 
-    def alloca(self, allow_comptime: bool = False, declared: sval.Type | None = None) -> PendingSlot:
-        """Reserve a fresh slot.  ``allow_comptime`` marks a ``Comptime``
-        variable, which may hold its value compile-time; a ``declared`` type
+    def alloca(self, allow_inline: bool = False, declared: sval.Type | None = None) -> PendingSlot:
+        """Reserve a fresh slot.  ``allow_inline`` marks a ``Comptime``
+        variable or an expression temporary, whose value may be kept inline
+        (in a :class:`ComptimeBox`) rather than in memory; a ``declared`` type
         (an annotated variable, see ``_declared_type``) fixes the slot's
         storage right away - a :class:`ComptimeBox` for a ``Comptime``
         variable or a zero-sized type, memory (a :class:`RuntimeVal`) for
         anything else (see ``hir.Alloca``)."""
         insertion = mir.Insertion([], None)
         self._emit(insertion)
-        slot = PendingSlot(insertion, allow_comptime)
+        slot = PendingSlot(insertion, allow_inline)
         if declared is not None:
-            if allow_comptime and declared.get_unit_value() is None:
+            if allow_inline and declared.get_unit_value() is None:
                 # a compile-time variable of a declared type: a box the value
                 # it is assigned is written into
                 slot.committed = ComptimeBox(declared, ComptimeVal(sval.Undefined(declared)))
@@ -1586,6 +1667,12 @@ class HirRunner:
             # a ``T``/``Null`` value is coerced through the option's
             # representation (see ``_coerce_option_value``)
             return self._coerce_option_value(ev, target)
+        if isinstance(target, sval.TupleType):
+            # a tuple has no runtime representation to convert to: the
+            # compile-time tuple itself is what a location of the type holds
+            if not isinstance(ev, ComptimeTuple):
+                raise CompileError(f'cannot materialize a {target} from {ev!r}')
+            return ev
         match ev:
             case ComptimeVal(obj):
                 return ComptimeVal(sval.coerce_const(obj, target))
@@ -1843,7 +1930,7 @@ class HirRunner:
         self, val: InterpVal, type: sval.Type | None = None, ptr: mir.Value | None = None
     ) -> None:
         """Materialize a pending slot.  It becomes a :class:`ComptimeBox`
-        when it may inline values and every action is compile-time, or
+        when it may inline values and every action may be inlined, or
         when its type is zero-sized (the box then carries the unit value
         and the recorded actions are dropped); with an explicit result
         pointer (``ptr``), or otherwise, it becomes a
@@ -1863,7 +1950,7 @@ class HirRunner:
             self._bind_slot(val, ptr, type)
             return
 
-        if len(val.stores) > 0 and val.is_comptime():
+        if len(val.stores) > 0 and val.is_inline():
             box = ComptimeBox(type, ComptimeVal(sval.Undefined(type)))
             val.committed = box
             self._exec_pending_actions(val, type)
@@ -2235,6 +2322,25 @@ class HirRunner:
     def operand_arg(self, arg: ArgEntry[hir.Value]) -> ArgEntry[InterpVal]:
         return ArgEntry(self.operand(arg.value), arg.is_ref)
 
+    def _check_comptime_args(
+        self, sig: Signature, args: ArgList[ArgEntry[InterpVal]]
+    ) -> None:
+        """Require a *deeply* compile-time value for every parameter declared
+        compile-time (``Comptime``/``Comptime[T]``): the callee reads such a
+        parameter as a compile-time value whatever it is given, so a runtime
+        argument would be silently dropped (see ``SpecializedComptimeArg``).
+        Every other parameter may be given a runtime value - a zero-sized one
+        is delivered as its unit value whatever it is given (see
+        ``Signature.specialize``)."""
+        for (name, formal), arg in zip(sig.positional.items(), args.positional):
+            if not formal.is_comptime:
+                continue
+            if not _is_comptime_val(self._arg_value(arg)):
+                raise CompileError(
+                    f"the argument of compile-time parameter '{name}' must be "
+                    f"a compile-time value"
+                )
+
     def _call_function_entry(
         self,
         fn: FunctionValue,
@@ -2259,6 +2365,7 @@ class HirRunner:
         if generic_var_values:
             sig = sig.substitute_type_vars(dict(generic_var_values))
         binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
+        self._check_comptime_args(sig, binded_args)
         if fn.force_inline:
             # an undecorated plain Python function: its body is inlined into
             # the current stream (it has no native specialization of its own)
@@ -2319,18 +2426,24 @@ class HirRunner:
             for name, arg in args.kwargs.items():
                 convert_one(arg, call_sig.kwargs[name])
 
-        if ret_sig.ret_by_ref:
+        spec = ret_sig.ret_spec
+        if len(spec) != 1:
+            self._deliver_multi_result(callee, mir_args, ret, spec)
+            return
+
+        type, ret_by_ref = spec[0]
+        if ret_by_ref:
             assert isinstance(ret, InterpVal)
             if ret is None:
                 raise CompileError('a result-pointer call needs a result location')
             if isinstance(ret, PendingSlot) and ret.committed is None:
                 # the result pointer of the slot is not known yet: the call
                 # writes through a placeholder the slot's commit fills in
-                ret = self._defer_ptr_convertion(ret, ret_sig.ret_type)
+                ret = self._defer_ptr_convertion(ret, type)
             ptr = _to_runtime(_shallow_normalize(ret))
             self._emit(mir.Call(callee, (*mir_args, ptr), mir.VOID))
         else:
-            ret_type = ret_sig.ret_type.to_mir_type()
+            ret_type = type.to_mir_type()
             if ret_type is None or isinstance(ret_type, mir.VoidType):
                 # a zero-sized result produces no register (the call returns
                 # nothing), but it is still delivered to the result location:
@@ -2339,7 +2452,7 @@ class HirRunner:
                 # untyped, and the type is what makes its slot a compile-time
                 # box of the unit value (see ``_commit_pending_slot``)
                 self._emit(mir.Call(callee, tuple(mir_args), mir.VOID))
-                unit = ret_sig.ret_type.get_unit_value()
+                unit = type.get_unit_value()
                 if unit is not None:
                     value = ComptimeVal(unit)
                     if isinstance(ret, InterpVal):
@@ -2348,11 +2461,82 @@ class HirRunner:
                         self._frames[-1].regs[ret] = value
             else:
                 call_inst = self._emit(mir.Call(callee, tuple(mir_args), ret_type))
-                value = RuntimeVal(call_inst, ret_sig.ret_type)
+                value = RuntimeVal(call_inst, type)
                 if isinstance(ret, InterpVal):
                     self.store(ret, value)
                 else:
                     self._frames[-1].regs[ret] = value
+
+    def _deliver_multi_result(
+        self,
+        callee: mir.Value,
+        mir_args: list[mir.Value],
+        ret: InterpVal | hir.Inst,
+        spec: tuple[tuple[sval.Type, bool], ...],
+    ) -> None:
+        """Emit the native call of a callee that returns several values and
+        hand every result to its place.
+
+        The results are delivered either into the places a destructuring (or
+        a multi-value ``return``) already reserved - ``ret`` is then the
+        tuple of addresses the results are written into - or, when the caller
+        has a single place for them (a temporary slot, or a ``Comptime``
+        variable), into fresh slots whose tuple is then stored in that place
+        (a tuple may be inlined, so the place becomes a compile-time box).
+        A zero-sized result occupies no place of its own: its unit value is
+        written into the slot."""
+        packed = not isinstance(ret, ComptimeTuple)
+        places: list[InterpVal] = []
+        if isinstance(ret, ComptimeTuple):
+            if len(ret.values) != len(spec):
+                raise CompileError(
+                    f'cannot unpack {len(spec)} values into {len(ret.values)} targets'
+                )
+            for entry in ret.values:
+                if not entry.is_ref:
+                    raise CompileError(
+                        'the target of a multi-value result must be addressable'
+                    )
+                places.append(entry.value)
+        else:
+            if not isinstance(ret, InterpVal):
+                raise CompileError('a multi-value call needs a result location')
+            places = [self.alloca(True) for _ in spec]
+
+        result_args: list[mir.Value] = []
+        ret_type: mir.MayBeVoidType = mir.VOID
+        by_value: tuple[InterpVal, sval.Type] | None = None
+        for (type, via_result_ptr), place in zip(spec, places):
+            if via_result_ptr:
+                target = place
+                if isinstance(target, PendingSlot) and target.committed is None:
+                    # the slot has no address yet: the call writes through a
+                    # placeholder its commit fills in (see ``_defer_ptr_convertion``)
+                    target = self._defer_ptr_convertion(target, type)
+                result_args.append(_to_runtime(_shallow_normalize(target)))
+                continue
+            mir_type = type.to_mir_type()
+            if mir_type is None:
+                raise _no_runtime_type(type)
+            if isinstance(mir_type, mir.VoidType):
+                # a zero-sized result produces no register: deliver its unit value
+                unit = type.get_unit_value()
+                if unit is not None:
+                    self.store(place, ComptimeVal(unit))
+                continue
+            ret_type = mir_type
+            by_value = (place, type)
+
+        call_inst = self._emit(mir.Call(callee, (*mir_args, *result_args), ret_type))
+        if by_value is not None:
+            place, type = by_value
+            self.store(place, RuntimeVal(call_inst, type))
+
+        if not packed:
+            return
+        for place in places:
+            self._commit_pending_slot(place)
+        self.store(ret, ComptimeTuple(tuple(ArgEntry(place, True) for place in places)))
 
     def _start_inline(
         self,
@@ -2419,25 +2603,26 @@ class HirRunner:
             assert isinstance(location, PendingSlot)
             if len(location.stores) == 0:
                 self._fn_instance.mir.ret_type = mir.VOID
-                self.return_sig = ReturnSignature(False, sval.VoidType())
+                self.return_sig = ReturnSignature(((sval.VoidType(), False),))
             else:
-                self._materialize_result_ptr(location.committed_type(), None)
+                self._materialize_ret_sig(sval.make_ret_spec((location.committed_type(),)))
         ret_sig = self.return_sig
         assert ret_sig is not None
         location = self._current_result_loc()
+        slots = _result_slots(location)
+        index = ret_sig.by_value_index()
         for block in self._deferred_returns:
-            if ret_sig.ret_by_ref or ret_sig.ret_type.is_zst():
+            if index is None:
                 block.insts.append(mir.Ret(None))
             else:
-                assert isinstance(location, PendingSlot)
-                committed = location.committed
-                if isinstance(committed, RuntimeVal):
-                    load = mir.Load(committed.value)
+                slot = _shallow_normalize(slots[index])
+                if isinstance(slot, RuntimeVal):
+                    load = mir.Load(slot.value)
                     block.insts.append(load)
                     block.insts.append(mir.Ret(load))
-                elif isinstance(committed, ComptimeBox):
-                    assert committed.value is not None
-                    block.insts.append(mir.Ret(_to_runtime(committed.value)))
+                elif isinstance(slot, ComptimeBox):
+                    assert slot.value is not None
+                    block.insts.append(mir.Ret(_to_runtime(slot.value)))
                 else:
                     raise CompileError('cannot deliver the return value')
 

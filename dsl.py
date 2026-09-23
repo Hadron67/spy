@@ -41,11 +41,12 @@ builtins (``spy.typeof``, ``spy.compile_log``) are evaluated at compile
 time.
 """
 
+import ctypes
 import types as pytypes
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast, dataclass_transform, override
 
-from . import astgen, sval
+from . import astgen, mir, sval
 from .builtins import spy_as, spy_compile_log, spy_typeof
 from .errors import CompileError, SpyError
 from .fn import (
@@ -54,13 +55,14 @@ from .fn import (
     Backend,
     CallSignature,
     FunctionValue,
+    NativeFn,
     RawArgList,
     ReturnSignature,
     SpecializedComptimeArg,
     SymbolTable,
 )
 from .interp import Analyser
-from .lower import LLVMBackend
+from .lower import LLVMBackend, to_ctype
 from .sval import AsSpyValue, GlobalResolver, StructDecl
 from .util import frozendict
 
@@ -108,6 +110,56 @@ def _to_py_arg(value: sval.AnyValue) -> Any:
         case _:
             return value
 
+
+def _call_multi_value(
+    native_fn: NativeFn,
+    py_args: list[Any],
+    ret_sig: ReturnSignature,
+) -> tuple[Any, ...]:
+    """Call a native artifact that returns several values from Python.  The
+    lowered function returns one result directly and delivers every other
+    one through a caller-provided result pointer, so a ctypes buffer is
+    allocated for each of those pointers and the values are gathered into
+    a tuple, in declaration order.  A zero-sized result is ``None``.
+
+    A by-value aggregate result would need the Python-entry thunk's trailing
+    out pointer, which this path does not build; like passing an aggregate
+    from Python, that is not supported yet."""
+    by_value = ret_sig.returned_type()
+    if by_value is not None:
+        mir_ret = by_value.to_mir_type()
+        if isinstance(mir_ret, (mir.StructType, mir.ArrayType)):
+            raise SpyError(
+                'cannot call a function that returns several values from Python '
+                'when one result is a by-value aggregate yet'
+            )
+    buffers: list[Any] = []
+    call_args: list[Any] = list(py_args)
+    for type, via_result_ptr in ret_sig.ret_spec:
+        if not via_result_ptr:
+            continue
+        mir_type = type.to_mir_type()
+        assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+        buffer = to_ctype(mir_type)()
+        buffers.append(buffer)
+        call_args.append(ctypes.c_void_p(ctypes.addressof(buffer)))
+    result = native_fn.call(*call_args)
+    values: list[Any] = []
+    pending = iter(buffers)
+    for type, via_result_ptr in ret_sig.ret_spec:
+        if type.get_unit_value() is not None:
+            values.append(None)
+        elif via_result_ptr:
+            buffer = next(pending)
+            # a scalar buffer reads back through ``.value``; an aggregate one
+            # stays the ctypes object (Python-side struct values are not
+            # supported yet)
+            values.append(getattr(buffer, 'value', buffer))
+        else:
+            values.append(result)
+    return tuple(values)
+
+
 _INT_LITERAL_BITS = 64
 
 class _RegisteredFn(AsSpyValue):
@@ -145,6 +197,8 @@ class _RegisteredFn(AsSpyValue):
         # Python-entry thunk (see ``fn._fn_thunk``); call that instead
         native_fn = instance.wrapper_fn or instance.native_fn
         assert native_fn is not None
+        ret_sig = instance.ret_sig
+        assert ret_sig is not None
 
         # the native call takes the arguments of the *lowered* signature:
         # a zero-sized (compile-time) parameter is not passed
@@ -153,7 +207,9 @@ class _RegisteredFn(AsSpyValue):
             for (_, sig_arg), value in zip(call_sig.positional, arglist.positional)
             if not isinstance(sig_arg, SpecializedComptimeArg)
         ]
-        return native_fn.call(*py_args)
+        if len(ret_sig.ret_spec) == 1:
+            return native_fn.call(*py_args)
+        return _call_multi_value(native_fn, py_args, ret_sig)
 
     def get_entry(self):
         if self.entry is None:

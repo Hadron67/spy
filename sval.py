@@ -168,8 +168,25 @@ class TypeVar(Type):
 
 @dataclass(frozen=True)
 class TupleType(Type):
+    """A Python ``tuple[T1, T2, ...]``: the return annotation of a function
+    that returns several values.  It is a compile-time type only - a tuple
+    of values has no runtime representation of its own; every function that
+    returns one delivers its elements separately (see ``make_ret_spec``)."""
+
     types: tuple[Type, ...]
     has_ellipsis: bool
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        """A tuple is a subtype of a tuple of the same element types (with
+        the same fixed-or-varying shape) and of nothing else: like an array,
+        the element types are compared for equality rather than subtyped, as
+        the base rule would take any tuple for any tuple."""
+        return isinstance(other, TupleType) and self == other
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
 
     @override
     def to_mir_type(self) -> mir.MayBeVoidType | None:
@@ -774,14 +791,15 @@ class FormalArg:
 @dataclass(frozen=True)
 class FunctionType(Type):
     args: tuple[FormalArg, ...]
-    return_type: Type
+    # the spy types of the values the function returns: one entry per result
+    # (a single-return function has exactly one)
+    return_type: tuple[Type, ...]
 
     @property
-    def via_result_ptr(self) -> bool:
-        """Whether a call of a function of this signature delivers its
-        result by writing into a caller-provided result location (see
-        :func:`returns_via_result_ptr`)."""
-        return returns_via_result_ptr(self.return_type)
+    def ret_spec(self) -> tuple[tuple[Type, bool], ...]:
+        """How a call of a function of this signature delivers its result
+        (see :func:`make_ret_spec`)."""
+        return make_ret_spec(self.return_type)
 
     @override
     def get_type(self) -> Type:
@@ -790,9 +808,10 @@ class FunctionType(Type):
             child = arg.type.get_type()
             assert isinstance(child, TypeType)
             level = max(level, child.level)
-        child = self.return_type.get_type()
-        assert isinstance(child, TypeType)
-        level = max(level, child.level)
+        for ret in self.return_type:
+            child = ret.get_type()
+            assert isinstance(child, TypeType)
+            level = max(level, child.level)
         return TypeType(level)
 
     @override
@@ -804,13 +823,25 @@ class FunctionType(Type):
                 return None
             if not isinstance(mir_type, mir.VoidType):
                 args.append(mir_type)
-        ret_type = self.return_type.to_mir_type()
-        if ret_type is None:
-            return None
+        ret_type: mir.MayBeVoidType = mir.VOID
+        for type, via_result_ptr in self.ret_spec:
+            mir_type = type.to_mir_type()
+            if mir_type is None:
+                return None
+            if via_result_ptr:
+                if isinstance(mir_type, mir.VoidType):
+                    return None
+                args.append(mir.PointerType(mir_type, False))
+            else:
+                ret_type = mir_type
         return mir.FunctionType(tuple(args), ret_type)
 
     def __str__(self) -> str:
-        return f"fn({', '.join(str(arg.type) for arg in self.args)}) -> {self.return_type}"
+        if len(self.return_type) == 1:
+            ret = str(self.return_type[0])
+        else:
+            ret = f'tuple[{", ".join(str(t) for t in self.return_type)}]'
+        return f"fn({', '.join(str(arg.type) for arg in self.args)}) -> {ret}"
 
 
 @dataclass(frozen=True)
@@ -1251,6 +1282,19 @@ def estimated_alignment_of(type: Type) -> int:
         case _:
             raise SpyError(f"type {type} has no layout")
 
+def _mentions_type_var(type: Type) -> bool:
+    """Whether ``type`` still names a type parameter somewhere inside it,
+    so that its layout - and with it its calling convention - is not known
+    until a call substitutes the parameter."""
+    todo: list[Type] = [type]
+    while todo:
+        current = todo.pop()
+        if isinstance(current, TypeVar):
+            return True
+        todo.extend(current.get_type_children())
+    return False
+
+
 def returns_via_result_ptr(type: Type) -> bool:
     """Whether a function returning ``type`` delivers its result by
     writing into a caller-provided result location (a hidden result
@@ -1262,12 +1306,41 @@ def returns_via_result_ptr(type: Type) -> bool:
     pointer once it outgrows it, and a new aggregate kind (arrays) only
     needs to extend this function.  Scalars are always returned by
     value.  A signature may override the default
-    (``fn.Signature.ret_by_ref``)."""
+    (``fn.Signature.ret_spec``)."""
     match type:
         case StructType() | ArrayType() | OptionType():
+            if _mentions_type_var(type):
+                # the layout is not known until the call substitutes the
+                # type parameter: assumed small now, re-decided on substitution
+                return False
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
+
+
+def make_ret_spec(types: tuple[Type, ...]) -> tuple[tuple[Type, bool], ...]:
+    """The return convention of a function that returns the values of the
+    spy types ``types``: one ``(type, via_result_ptr)`` entry per result,
+    in declaration order.  At most one result is returned *by value* - the
+    first one that fits in registers (``returns_via_result_ptr`` says so)
+    - and every other result is delivered by writing through a hidden
+    result pointer (a ``True`` entry); when no result qualifies the
+    function returns void.  A zero-sized type has no value to return: it
+    is delivered as its unit value and never takes the by-value slot."""
+    chosen: int | None = None
+    for index, type in enumerate(types):
+        if type.get_unit_value() is not None:
+            # a zero-sized value is delivered as its unit value, not
+            # through the by-value slot
+            continue
+        if not returns_via_result_ptr(type):
+            chosen = index
+            break
+    spec: list[tuple[Type, bool]] = []
+    for index, type in enumerate(types):
+        via = type.get_unit_value() is None and index != chosen
+        spec.append((type, via))
+    return tuple(spec)
 
 
 def pass_by_ref(type: Type) -> bool:
@@ -1379,6 +1452,22 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
         return value.struct.specialize(tuple(resolved))
     if isinstance(value, AsSpyValue):
         return value.as_spy_value()
+    if typing.get_origin(value) is tuple:
+        # ``tuple[T1, T2, ...]``: the return annotation of a function that
+        # returns several values.  ``tuple[T, ...]`` is the variable-length
+        # form Python allows; it names no fixed set of results, so it is
+        # kept as-is (a ``TupleType`` with ``has_ellipsis``) and rejected by
+        # the signatures that cannot use it
+        raw = typing.get_args(value)
+        has_ellipsis = len(raw) > 0 and raw[-1] is Ellipsis
+        elems = raw[:-1] if has_ellipsis else raw
+        types: list[Type] = []
+        for arg in elems:
+            type = as_value(arg, type_vars, resolver)
+            if not isinstance(type, Type):
+                raise TypeError(f'{arg!r} is not a type')
+            types.append(type)
+        return TupleType(tuple(types), has_ellipsis)
     if typing.get_origin(value) is typing.Literal:
         # ``Literal[X]`` denotes the value ``X``: the default of a type
         # parameter (the constness of a pointer, ``C: bool = Literal[False]``)

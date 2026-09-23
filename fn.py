@@ -17,9 +17,9 @@ from .sval import (
     TypeVar,
     TypeVarSolver,
     Value,
+    make_ret_spec,
     pass_by_ref,
     replace_type_vars_type,
-    returns_via_result_ptr,
     type_of,
 )
 from .util import IndexedMap, StrBiMap, frozendict, sanitize_name
@@ -109,8 +109,29 @@ class SpecializedComptimeArg(SpecializedFormalArg):
 
 @dataclass(frozen=True, slots=True)
 class ReturnSignature:
-    ret_by_ref: bool
-    ret_type: Type
+    """The return convention of one specialization: one ``(type, bool)``
+    entry per value the function returns, in declaration order - the spy
+    type of the value and whether it is delivered through a hidden result
+    pointer (``True``) rather than returned by value (``False``).  At most
+    one value is returned by value (see ``sval.make_ret_spec``)."""
+
+    ret_spec: tuple[tuple[Type, bool], ...]
+
+    def returned_type(self) -> Type | None:
+        """The spy type of the value the lowered function returns directly
+        (the by-value result), or ``None`` when it returns void - every
+        value then goes through a result pointer, or is zero-sized."""
+        index = self.by_value_index()
+        return None if index is None else self.ret_spec[index][0]
+
+    def by_value_index(self) -> int | None:
+        """The position of the one result returned by value (its value has
+        storage and fits in registers), or ``None`` when the lowered
+        function returns void."""
+        for index, (type, via_result_ptr) in enumerate(self.ret_spec):
+            if not via_result_ptr and type.get_unit_value() is None:
+                return index
+        return None
 
 @dataclass(frozen=True, slots=True)
 class CallSignature:
@@ -157,12 +178,13 @@ class Signature:
     # model - and ``bind_arg_pos`` - already does)
     varargs: SignatureFormalArg | None
     kwargs: SignatureFormalArg | None
-    # the evaluated return annotation, in the spy domain (a concrete spy
-    # type, a type parameter, or the void type for an explicit
-    # ``-> None``); None when no return annotation is written and the
-    # return type is inferred from the body
-    ret_type: Type | None
-    ret_by_ref: bool | None
+    # the evaluated return annotation, in the spy domain: one
+    # ``(type, via_result_ptr)`` entry per value the function returns (a
+    # plain annotation declares one value, a ``tuple[...]`` annotation one
+    # per element, an explicit ``-> None`` the void type); None when no
+    # return annotation is written and the return type is inferred from
+    # the body (see ``sval.make_ret_spec``)
+    ret_spec: tuple[tuple[Type, bool], ...] | None
 
     def bind_arg_pos[T](
         self,
@@ -286,7 +308,7 @@ class Signature:
     def is_generic(self) -> bool:
         if len(self.generic_args) > 0 or self.varargs is not None or self.kwargs is not None:
             return True
-        if self.ret_type is None:
+        if self.ret_spec is None:
             return True
         for arg in self.positional.by_id:
             if arg.type is None:
@@ -296,12 +318,12 @@ class Signature:
     def as_non_generic_fn_type(self) -> FunctionType | None:
         if self.is_generic():
             return None
-        assert self.ret_type is not None
+        assert self.ret_spec is not None
         formal: list[FormalArg] = []
         for name, arg in self.positional.items():
             assert arg.type is not None
             formal.append(FormalArg(name, arg.type, arg.default_value))
-        return FunctionType(tuple(formal), self.ret_type)
+        return FunctionType(tuple(formal), tuple(t for t, _ in self.ret_spec))
 
     def substitute_type_vars(self, reps: dict[TypeVar, Value]) -> Signature:
         """A copy of this signature with every type parameter of ``reps``
@@ -321,8 +343,15 @@ class Signature:
             positional=self.positional.map(lambda arg: arg.map_type(substitute)),
             varargs=None if self.varargs is None else self.varargs.map_type(substitute),
             kwargs=None if self.kwargs is None else self.kwargs.map_type(substitute),
-            ret_type=None if self.ret_type is None else substitute(self.ret_type),
+            ret_spec=self.map_ret_spec(substitute) if self.ret_spec is not None else None,
         )
+
+    def map_ret_spec(self, f: Callable[[Type], Type]) -> tuple[tuple[Type, bool], ...]:
+        """The return spec of this signature with every declared result type
+        replaced by ``f`` of it, re-resolving the by-value/result-pointer
+        convention for the substituted types."""
+        assert self.ret_spec is not None
+        return make_ret_spec(tuple(f(type) for type, _ in self.ret_spec))
 
     def specialize(self, provided: ArgList[Type | None]) -> tuple[CallSignature, ReturnSignature | None]:
         """Specialize one call of this signature: the concrete typing of
@@ -399,13 +428,9 @@ class Signature:
             tuple(type_var_values), positional, varargs, kwargs
         )
 
-        if self.ret_type is None:
+        if self.ret_spec is None:
             return call_sig, None
-        ret_type = substitute(self.ret_type)
-        ret_by_ref = self.ret_by_ref
-        if ret_by_ref is None:
-            ret_by_ref = returns_via_result_ptr(ret_type)
-        return call_sig, ReturnSignature(ret_by_ref, ret_type)
+        return call_sig, ReturnSignature(self.map_ret_spec(substitute))
 
 
 @dataclass

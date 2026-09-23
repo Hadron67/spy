@@ -133,8 +133,8 @@ class Alloca(Inst):
     """Reserve an addressable slot for one value.  The slot is untyped
     until it is used: the stores that target it (a plain ``Store``, or a
     ``CallInplace`` result under RLS) type it, and the ``CommitSlot``
-    that follows then materializes it - a slot all of whose stores are
-    compile-time becomes a compile-time box instead of memory (see
+    that follows then materializes it - a slot whose stores may all be
+    inlined becomes a compile-time box instead of memory (see
     ``interp``).
 
     An annotated local variable (``x: T``/``x: Comptime[T]``) declares its
@@ -142,9 +142,9 @@ class Alloca(Inst):
     annotation (``None`` for the bare ``Comptime``, whose type is left to
     the stores), and the interpreter materializes the slot right away -
     memory for a runtime type, a compile-time box for a ``Comptime`` or a
-    zero-sized one.  ``allow_comptime`` marks a ``Comptime`` variable: it
-    may hold its value compile-time even when its type is not zero-sized."""
-    allow_comptime: bool = False
+    zero-sized one.  ``allow_inline`` marks a ``Comptime`` variable: its
+    value may be kept inline even when its type is not zero-sized."""
+    allow_inline: bool = False
     type: Value | None = None
 
 @dataclass(eq=False)
