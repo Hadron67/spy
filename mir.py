@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Self, override
 
 from .binop import BinaryOp, CompareOp
@@ -291,7 +291,9 @@ class Inst(Value):
 
 @dataclass(eq=False)
 class Alloca(Inst):
-    """Allocate a slot for one value; produces a pointer to ``type``."""
+    """Allocate a slot for one value; produces a pointer to ``type``.  An
+    ``Alloca`` may sit in any block; the lowerer hoists every one of them
+    into the function's entry block, so its position carries no meaning."""
 
     type: Type
 
@@ -500,13 +502,122 @@ class Call(Inst):
         return replace(self, callee=callee, args=args)
 
 
+# ---------------------------------------------------------------------------
+# basic blocks
+# ---------------------------------------------------------------------------
+
+class BasicBlock:
+    """A basic block of the MIR: a straight-line run of instructions that
+    ends with a :class:`Terminator` (a ``jmp``, a ``br`` or a ``ret``).
+
+    Like ``llvm.BasicBlock`` it is *not* a value and is *not* registered
+    anywhere: the blocks of a function are reached by walking the outgoing
+    edges from its entry block (see :meth:`collect_blocks`), and a block
+    that no path reaches is simply never lowered.
+    """
+
+    def __init__(self) -> None:
+        self.insts: list[Inst] = []
+        # set once the terminator of the block has been emitted; a block
+        # whose path ends in a pending return insertion is finished too
+        self.is_finished = False
+
+    def emit(self, inst: Inst) -> Inst:
+        """Append one instruction to this block.  A terminator ends the
+        block, so nothing may follow it - the assertion catches an
+        instruction that would end up on a dead path."""
+        assert not self.is_finished, 'cannot emit into a finished basic block'
+        self.insts.append(inst)
+        if isinstance(inst, Terminator):
+            self.is_finished = True
+        return inst
+
+    def get_outgoing_blocks(self) -> tuple[BasicBlock, ...]:
+        """The successors of this block: the targets of its terminator.
+        A block that is still being built - or whose path ends in a
+        pending insertion - has none."""
+        if len(self.insts) == 0:
+            return ()
+        last = self.insts[-1]
+        if isinstance(last, Terminator):
+            return last.get_targets()
+        return ()
+
+    def collect_blocks(self) -> list[BasicBlock]:
+        """Every block reachable from this one - this block first, then
+        its successors in the order a depth-first walk reaches them."""
+        ret: list[BasicBlock] = []
+        seen: set[BasicBlock] = set()
+        todo: list[BasicBlock] = [self]
+        while len(todo) > 0:
+            block = todo.pop()
+            if block in seen:
+                continue
+            seen.add(block)
+            ret.append(block)
+            children = list(block.get_outgoing_blocks())
+            children.reverse()
+            todo.extend(children)
+        return ret
+
+
+class Terminator(Inst):
+    """The transfer instruction that ends a basic block: a :class:`Jmp`, a
+    :class:`Br` or a :class:`Ret`.  It produces no value, and its targets
+    are blocks rather than values, so ``get_children`` never returns
+    them."""
+
+    @abstractmethod
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        """The blocks this terminator transfers control to."""
+        ...
+
+
 @dataclass(eq=False)
-class Ret(Inst):
-    """Return from the enclosing function; ends its path (no code of
-    the enclosing block after a return is emitted).  ``value`` is None
-    for a void return (a ``ret void``)."""
+class Jmp(Terminator):
+    """An unconditional jump to ``target``."""
+
+    target: BasicBlock
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return (self.target,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
+
+
+@dataclass(eq=False)
+class Br(Terminator):
+    """A two-way conditional branch: control goes to ``if_true`` when
+    ``cond`` holds and to ``if_false`` otherwise."""
+
+    cond: Value
+    if_true: BasicBlock
+    if_false: BasicBlock
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return (self.if_true, self.if_false)
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.cond,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        cond = f(self.cond)
+        return self if cond is self.cond else replace(self, cond=cond)
+
+
+@dataclass(eq=False)
+class Ret(Terminator):
+    """Return from the enclosing function; ends the path of its block.
+    ``value`` is None for a void return (a ``ret void``)."""
 
     value: Value | None
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return ()
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.value,) if self.value is not None else ()
@@ -519,89 +630,14 @@ class Ret(Inst):
 
 
 @dataclass(eq=False)
-class Nop(Inst):
-    """A no-op instruction; used to reserve space in the MIR body for
-    a future instruction to be emitted at a known position."""
-
-    def map_values(self, f: Callable[[Value], Value]) -> Self:
-        return self
-
-
-
-@dataclass(eq=False)
-class If(Inst):
-    """A runtime branch typed by the interpreter (WASM-style marker):
-    the instructions of the two branches follow it in the same list,
-    delimited by the matching :class:`Else` (when the ``if`` has an
-    else branch) and :class:`End` markers.  A branch that ends in a
-    :class:`Ret` (or a :class:`Break` that leaves it) returns on that
-    path; a branch that does not return falls through to the code after
-    the matching ``End`` (the interpreter only emits code after an
-    ``If`` that is reachable)."""
-
-    cond: Value
-
-    def get_children(self) -> tuple[Any, ...]:
-        return (self.cond,)
-
-    def map_values(self, f: Callable[[Value], Value]) -> Self:
-        cond = f(self.cond)
-        return self if cond is self.cond else replace(self, cond=cond)
-
-
-@dataclass(eq=False)
-class Block(Inst):
-    """An anonymous code block (WASM-style marker), opened by the
-    interpreter around the body of every inlined function: the body
-    follows it in the same list, closed by the matching :class:`End`
-    marker.  Unlike an :class:`If`, a ``Block`` is entered
-    unconditionally - it produces no branch of its own - but a
-    :class:`Break` may leave it early (the way an inlined ``return``
-    leaves the inlined body before it ends)."""
-
-    def map_values(self, f: Callable[[Value], Value]) -> Self:
-        return self
-
-
-@dataclass(eq=False)
-class Else(Inst):
-    """The marker that starts the else branch of an :class:`If` (absent
-    when the ``if`` has no else branch).  It produces no value; it only
-    delimits the flat instruction list."""
-
-    def map_values(self, f: Callable[[Value], Value]) -> Self:
-        return self
-
-
-@dataclass(eq=False)
-class End(Inst):
-    """The marker that closes a block opened by an :class:`If` or a
-    :class:`Block`.  It produces no value; it only delimits the flat
-    instruction list."""
-
-    def map_values(self, f: Callable[[Value], Value]) -> Self:
-        return self
-
-
-@dataclass(eq=False)
-class Break(Inst):
-    """Leave ``level`` enclosing blocks (a :class:`Block` or an
-    :class:`If` each count as one block, the innermost enclosing block
-    being ``level`` 1 - the WASM ``br level - 1``) and continue with
-    the code just after the ``End`` of the last block left, skipping
-    any code of the exited blocks in between.  Like a :class:`Ret`, a
-    ``Break`` ends the path of the region it sits in: the interpreter
-    emits no code of the same region after it (the regions of the
-    exited blocks - sibling branches, code after their ``End`` - are
-    emitted after the ``Break`` and are still lowered)."""
-
-    level: int
-
-    def map_values(self, f: Callable[[Value], Value]) -> Self:
-        return self
-
-@dataclass(eq=False)
 class Insertion(Inst):
+    """A placeholder standing for the instructions that deliver a slot's
+    pending action (or its storage), and, when ``value`` is set, for the
+    value those instructions define.  It is emitted at a position of the
+    body before its type is known and is *spliced* there - into the block
+    it sits in - once it has been filled in; :func:`normalize` does the
+    flattening and substitutes every reference to it."""
+
     insts: list[Inst]
     value: Value | None
     type: MayBeVoidType = VOID
@@ -617,13 +653,37 @@ class Insertion(Inst):
         return self if value is self.value else replace(self, value=value)
 
 
-def normalize(block: list[Inst]) -> list[Inst]:
-    """Eliminate :class:`Insertion` nodes from the block by flattening them and substituting their values."""
-    # every value that is replaced by another one: an insertion stands for
-    # its value, and an instruction whose operands changed is replaced by
-    # the mapped instruction ``map_values`` builds
+def _flatten(insts: list[Inst]) -> list[Inst]:
+    """Replace every :class:`Insertion` of ``insts`` by its instructions
+    (recursively), preserving the order - iteratively, so that a deep
+    nesting cannot exhaust the Python stack."""
+    out: list[Inst] = []
+    pending: list[tuple[list[Inst], int]] = [(insts, 0)]
+    while pending:
+        cur, index = pending.pop()
+        while index < len(cur):
+            inst = cur[index]
+            index += 1
+            if isinstance(inst, Insertion):
+                if index < len(cur):
+                    pending.append((cur, index))
+                cur = inst.insts
+                index = 0
+                continue
+            out.append(inst)
+    return out
+
+
+def normalize(fn: Function) -> None:
+    """Eliminate the :class:`Insertion` placeholders of every block of
+    ``fn`` by flattening them and substituting their values, then check
+    that every block ends with a terminator."""
+    blocks = fn.entry.collect_blocks()
+
+    # every insertion that stands for a value maps to that value, so that
+    # the operands referring to the insertion are rewritten to it
     repl: dict[Value, Value] = {}
-    todo: list[list[Inst]] = [block]
+    todo: list[list[Inst]] = [block.insts for block in blocks]
     while todo:
         insts = todo.pop()
         for inst in insts:
@@ -645,40 +705,47 @@ def normalize(block: list[Inst]) -> list[Inst]:
             raise CompileError('a MIR insertion is referenced before it is resolved')
         return value
 
-    # flatten iteratively: an insertion is replaced by its instructions at
-    # its own position, and every operand referring to a replaced value is
-    # rewritten by ``Inst.map_values``
-    result: list[Inst] = []
-    pending: list[tuple[list[Inst], int]] = [(block, 0)]
-    while pending:
-        insts, index = pending.pop()
-        while index < len(insts):
-            inst = insts[index]
-            index += 1
-            if isinstance(inst, Insertion):
-                if index < len(insts):
-                    pending.append((insts, index))
-                insts = inst.insts
-                index = 0
-                continue
-            mapped = inst.map_values(resolve)
-            if mapped is not inst:
-                repl[inst] = mapped
-            result.append(mapped)
-    return result
+    for block in blocks:
+        block.insts = _flatten(block.insts)
+
+    # an operand that resolves to another instruction replaces that
+    # instruction everywhere it is used, so the rewrite is iterated to a
+    # fixpoint (a value is always defined before the instructions it feeds)
+    changed = True
+    while changed:
+        changed = False
+        for block in blocks:
+            for index, inst in enumerate(block.insts):
+                mapped = inst.map_values(resolve)
+                if mapped is not inst:
+                    block.insts[index] = mapped
+                    repl[inst] = mapped
+                    changed = True
+
+    for block in blocks:
+        if len(block.insts) == 0 or not isinstance(block.insts[-1], Terminator):
+            raise CompileError(
+                'every basic block must end with a jump, a branch or a return'
+            )
+        block.is_finished = True
+
 
 @dataclass(eq=False)
 class Function(GlobalValue):
     """One compiled MIR function.  As a value it is the in-module
     function value of a call target: a call whose callee is this object
     is lowered to a call of the ``define``d function (functions of one
-    module are compiled together)."""
+    module are compiled together).
+
+    ``entry`` is the entry basic block; the rest of the body is reached
+    from it (``entry.collect_blocks()``).  Every block ends with a
+    terminator, so the CFG is complete."""
 
     name_base: str
     args: list[Type]
     arg_names: list[str | None]
     ret_type: MayBeVoidType
-    insts: list[Inst]
+    entry: BasicBlock = field(default_factory=BasicBlock)
     is_complete: bool = False
     impose_linkname: bool = False
 
@@ -699,16 +766,18 @@ class Function(GlobalValue):
         """Everything this function references: the argument and return
         types of its lowered signature, and the operands of its
         instructions.  Instruction operands (registers) are flattened
-        away - the instructions that define them are part of ``insts``
-        and are traversed on their own - so the result holds only the
-        values and types the module must also declare."""
+        away - the instructions that define them are part of the body and
+        are traversed on their own - and so are the blocks a terminator
+        branches to, so the result holds only the values and types the
+        module must also declare."""
         ret: list[Type] = list(self.args)
         if not isinstance(self.ret_type, VoidType):
             ret.append(self.ret_type)
-        for inst in self.insts:
-            for child in inst.get_children():
-                if not isinstance(child, Inst):
-                    ret.append(child)
+        for block in self.entry.collect_blocks():
+            for inst in block.insts:
+                for child in inst.get_children():
+                    if not isinstance(child, Inst):
+                        ret.append(child)
         return tuple(ret)
 
 def collect_symbols(entry: list[GlobalValue]) -> set[GlobalValue | StructType]:

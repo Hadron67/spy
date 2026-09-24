@@ -16,15 +16,10 @@ The fold is deliberately conservative.  A slot (its ``mir.Alloca``) is
 folded only when
 
 * its address never escapes (its uses are exactly one ``Store`` of it
-  and ``Load``s of it),
-* the store textually precedes every load with no control construct in
-  between that could bypass the store (no ``If``/``Block``/``Else``/
-  ``Break``/``Ret`` between them, and no ``If`` whose region contains
-  the store but not the load - the other arm of such an ``If`` reaches
-  the load without the store), and
-* no ``Break`` jumps over the store into a load (a ``Break`` from
-  before the store that lands between the store and a load would also
-  reach the load without the store).
+  and ``Load``s of it), and
+* the store's block *dominates* every load's block (for a load in the
+  same block, the store precedes it): every runtime path to a load then
+  passes the store, so the load can never read an uninitialized slot.
 
 A slot that fails these conditions is left in memory and folded no
 further; one that is never read (together with the store that writes it)
@@ -33,57 +28,34 @@ or is never referenced at all is deleted instead.
 
 from . import mir
 
-_CTRL = (mir.If, mir.Block, mir.Else, mir.End, mir.Break, mir.Ret)
-
 
 def simplify(fn: mir.Function) -> None:
-    """Fold the single-store slots of the body of ``fn`` (rewrites
-    ``fn.insts`` in place)."""
-    insts = fn.insts
-    if len(insts) < 2:
+    """Fold the single-store slots of the body of ``fn`` (rewrites the
+    blocks of ``fn`` in place)."""
+    blocks = fn.entry.collect_blocks()
+    all_insts = [inst for block in blocks for inst in block.insts]
+    if len(all_insts) < 2:
         return
 
-    # pass 1: the balanced block structure - for every If/Block opener
-    # its own position and the (Else, End) marker positions (Else is
-    # None for a Block, or for an If without an else branch)
-    ends: dict[object, tuple[int, int | None, int]] = {}
-    else_at: dict[object, int] = {}
-    stack: list[tuple[object, int]] = []
-    for i, inst in enumerate(insts):
-        if isinstance(inst, (mir.If, mir.Block)):
-            stack.append((inst, i))
-        elif isinstance(inst, mir.Else):
-            else_at[stack[-1][0]] = i
-        elif isinstance(inst, mir.End):
-            opener, opener_idx = stack.pop()
-            ends[opener] = (opener_idx, else_at.get(opener), i)
-    assert not stack, 'unbalanced block markers in the MIR'
-
-    # pass 2: the jump target of every Break - the index just past the
-    # ``End`` of the level-th enclosing block (innermost (1) first); all
-    # End positions are known now
-    jumps: list[tuple[int, int]] = []
-    openers: list[object] = []
-    for i, inst in enumerate(insts):
-        if isinstance(inst, (mir.If, mir.Block)):
-            openers.append(inst)
-        elif isinstance(inst, mir.End):
-            openers.pop()
-        elif isinstance(inst, mir.Break):
-            target = ends[openers[-inst.level]][2] + 1
-            jumps.append((i, target))
+    # the block and the position in it of every instruction - the blocks
+    # of one function hold each instruction exactly once
+    index_of: dict[mir.Inst, tuple[mir.BasicBlock, int]] = {}
+    for block in blocks:
+        for i, inst in enumerate(block.insts):
+            index_of[inst] = (block, i)
 
     # every use of every alloca pointer, by its role in the using
     # instruction: 'store'/'load' - the two uses a foldable slot may
     # have - or anything else (a value use, an escaping address, ...)
     roles: dict[mir.Alloca, list[tuple[mir.Inst, str]]] = {}
-    for inst in insts:
+    for inst in all_insts:
         for operand, role in _operands(inst):
             if isinstance(operand, mir.Alloca):
                 roles.setdefault(operand, []).append((inst, role))
-    idx_of = {inst: i for i, inst in enumerate(insts)}
 
-    remove: set[int] = set()
+    dominators = _dominators(blocks)
+
+    remove: set[mir.Inst] = set()
     # a folded load and the value that replaces its uses
     repl: dict[mir.Load, mir.Value] = {}
     for slot, uses in roles.items():
@@ -105,26 +77,24 @@ def simplify(fn: mir.Function) -> None:
             # a slot that is never written is never read either (an
             # uninitialized read is rejected at compile time): dead
             if not loads:
-                remove.add(idx_of[slot])
+                remove.add(slot)
             continue
         store = stores[0]
-        store_idx = idx_of[store]
         if not all(
-            _foldable(insts, ends, jumps, store_idx, idx_of[load])
-            for load in loads
+            _foldable(dominators, index_of, store, load) for load in loads
         ):
             continue
         # fold: the stored value replaces every load, and the slot, its
         # store and the loads disappear
         for load in loads:
-            remove.add(idx_of[load])
+            remove.add(load)
             repl[load] = store.value
-        remove.add(store_idx)
-        remove.add(idx_of[slot])
+        remove.add(store)
+        remove.add(slot)
     # an alloca that nothing references at all is dead
-    for i, inst in enumerate(insts):
+    for inst in all_insts:
         if isinstance(inst, mir.Alloca) and inst not in roles:
-            remove.add(i)
+            remove.add(inst)
     if not remove and not repl:
         return
 
@@ -162,61 +132,66 @@ def simplify(fn: mir.Function) -> None:
             case mir.Ret():
                 if inst.value is not None:
                     inst.value = resolve(inst.value)
-            case mir.If():
+            case mir.Br():
                 inst.cond = resolve(inst.cond)
             case _:
                 pass
 
-    out: list[mir.Inst] = []
-    for i, inst in enumerate(insts):
-        if i in remove:
-            continue
-        rewrite(inst)
-        out.append(inst)
-    fn.insts[:] = out
+    for block in blocks:
+        out: list[mir.Inst] = []
+        for inst in block.insts:
+            if inst in remove:
+                continue
+            rewrite(inst)
+            out.append(inst)
+        block.insts = out
+
+
+def _dominators(blocks: list[mir.BasicBlock]) -> dict[mir.BasicBlock, set[mir.BasicBlock]]:
+    """The dominator set of every block: ``dominators[b]`` holds ``b`` and
+    every block that lies on every path from the entry to ``b``.  Computed
+    by the classic iterative dataflow fixpoint (the graph is small and,
+    without loops, converges quickly)."""
+    entry = blocks[0]
+    preds: dict[mir.BasicBlock, list[mir.BasicBlock]] = {block: [] for block in blocks}
+    for block in blocks:
+        for successor in block.get_outgoing_blocks():
+            preds[successor].append(block)
+
+    all_blocks = set(blocks)
+    dominators: dict[mir.BasicBlock, set[mir.BasicBlock]] = {
+        block: ({block} if block is entry else set(all_blocks))
+        for block in blocks
+    }
+    changed = True
+    while changed:
+        changed = False
+        for block in blocks:
+            if block is entry:
+                continue
+            new: set[mir.BasicBlock] = set(all_blocks)
+            for pred in preds[block]:
+                new &= dominators[pred]
+            new.add(block)
+            if new != dominators[block]:
+                dominators[block] = new
+                changed = True
+    return dominators
 
 
 def _foldable(
-    insts: list[mir.Inst],
-    ends: dict[object, tuple[int, int | None, int]],
-    jumps: list[tuple[int, int]],
-    store_idx: int,
-    load_idx: int,
+    dominators: dict[mir.BasicBlock, set[mir.BasicBlock]],
+    index_of: dict[mir.Inst, tuple[mir.BasicBlock, int]],
+    store: mir.Store,
+    load: mir.Load,
 ) -> bool:
-    """Whether every runtime path to the load at ``load_idx`` passes the
-    store at ``store_idx`` (the conservative conditions listed in the
-    module docstring)."""
-    if store_idx >= load_idx:
-        return False
-    # between the store and the load only plain instructions and ``End``
-    # markers (of blocks opened before the store) may sit: anything that
-    # opens, branches or terminates a region could bypass the store
-    for i in range(store_idx + 1, load_idx):
-        if isinstance(insts[i], _CTRL) and not isinstance(insts[i], mir.End):
-            return False
-    for (opener_idx, else_idx, end_idx) in ends.values():
-        if not isinstance(insts[opener_idx], mir.If):
-            continue
-        if not opener_idx < store_idx < end_idx:
-            continue
-        # the store sits inside this ``If``: a path through another arm
-        # reaches the load without the store unless the load sits in the
-        # same arm, after the store
-        if else_idx is None:
-            if not store_idx < load_idx < end_idx:
-                return False
-        elif store_idx < else_idx:
-            if not store_idx < load_idx < else_idx:
-                return False
-        else:
-            if not else_idx < store_idx < load_idx < end_idx:
-                return False
-    for break_idx, target in jumps:
-        # a ``Break`` before the store that lands between the store and
-        # the load reaches the load without the store
-        if break_idx < store_idx < target <= load_idx:
-            return False
-    return True
+    """Whether every runtime path to the load passes the store: the store
+    is earlier in the same block, or its block dominates the load's."""
+    store_block, store_idx = index_of[store]
+    load_block, load_idx = index_of[load]
+    if store_block is load_block:
+        return store_idx < load_idx
+    return store_block in dominators[load_block]
 
 
 def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
@@ -244,7 +219,7 @@ def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
             )
         case mir.Ret():
             return ((inst.value, 'use'),) if inst.value is not None else ()
-        case mir.If():
+        case mir.Br():
             return ((inst.cond, 'use'),)
         case _:
             return ()

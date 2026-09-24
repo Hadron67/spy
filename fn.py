@@ -591,7 +591,7 @@ def _make_thunk(fn: mir.Function) -> mir.Function:
         ret_type = mir.VOID
 
     thunk = mir.Function(
-        f'{fn.name_base}.thunk', arg_types, arg_names, ret_type, [],
+        f'{fn.name_base}.thunk', arg_types, arg_names, ret_type,
         is_complete=True,
     )
 
@@ -599,7 +599,7 @@ def _make_thunk(fn: mir.Function) -> mir.Function:
     for i, (arg_type, by_ref) in enumerate(zip(arg_types, by_refs)):
         if by_ref:
             value = mir.Load(mir.Param(i, arg_type))
-            thunk.insts.append(value)
+            thunk.entry.emit(value)
             call_args.append(value)
         else:
             call_args.append(mir.Param(i, arg_type))
@@ -607,16 +607,16 @@ def _make_thunk(fn: mir.Function) -> mir.Function:
     if out_arg is not None:
         assert not isinstance(fn.ret_type, mir.VoidType)
         value = mir.Call(fn, tuple(call_args), fn.ret_type)
-        thunk.insts.append(value)
-        thunk.insts.append(mir.Store(out_arg, value))
-        thunk.insts.append(mir.Ret(None))
+        thunk.entry.emit(value)
+        thunk.entry.emit(mir.Store(out_arg, value))
+        thunk.entry.emit(mir.Ret(None))
     elif isinstance(fn.ret_type, mir.VoidType):
-        thunk.insts.append(mir.Call(fn, tuple(call_args), mir.VOID))
-        thunk.insts.append(mir.Ret(None))
+        thunk.entry.emit(mir.Call(fn, tuple(call_args), mir.VOID))
+        thunk.entry.emit(mir.Ret(None))
     else:
         value = mir.Call(fn, tuple(call_args), fn.ret_type)
-        thunk.insts.append(value)
-        thunk.insts.append(mir.Ret(value))
+        thunk.entry.emit(value)
+        thunk.entry.emit(mir.Ret(value))
 
     return thunk
 

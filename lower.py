@@ -194,15 +194,14 @@ class _Lowerer:
         return self._types.to_llvm(type)
 
     def _lower_function_no_cache(self, fn: mir.Function) -> sllvm.Function:
-        """Lower the flat instruction list of ``fn`` into its
-        pre-created ``sllvm.Function``.
+        """Lower the basic blocks of ``fn`` into its pre-created
+        ``sllvm.Function``: every MIR block becomes one LLVM block and its
+        terminator becomes the ``ret``/``jmp``/``br`` ending it.
 
         Every ``mir.Alloca`` is lowered into the function's entry block
-        first, whatever position the interpreter emitted it at: a slot
-        may first be stored inside a runtime branch (an inlined body
-        whose result is delivered per path, see ``interp``), and its
-        address must then be defined on every path that stores to it or
-        reads it later."""
+        first, whatever block the interpreter emitted it in: a slot may
+        first be stored inside a runtime branch, and its address must then
+        be defined on every path that stores to it or reads it later."""
         assert fn not in self.lowered_globals
         llvm_fn = sllvm.Function(self._globals.get_key(fn))
         # register the definition before lowering the body: a call to this
@@ -212,130 +211,25 @@ class _Lowerer:
         llvm_fn.set_return_type(self._to_llvm(fn.ret_type))
 
         arg_values = llvm_fn.get_args()
-        for inst in fn.insts:
-            if isinstance(inst, mir.Alloca):
-                self._lower_inst(llvm_fn.entry, inst, arg_values)
-        self._lower_region(
-            llvm_fn, llvm_fn.entry, fn.insts, 0, len(fn.insts), arg_values, None, ()
-        )
+        blocks = fn.entry.collect_blocks()
+        # the MIR entry block *is* the LLVM entry block, so that the
+        # hoisted slots have a unique home; every other block is fresh
+        block_map: dict[int, sllvm.BasicBlock] = {
+            id(block): (llvm_fn.entry if block is fn.entry else sllvm.BasicBlock())
+            for block in blocks
+        }
+        for block in blocks:
+            for inst in block.insts:
+                if isinstance(inst, mir.Alloca):
+                    self._lower_inst(llvm_fn.entry, inst, arg_values, block_map)
+        for block in blocks:
+            target = block_map[id(block)]
+            for inst in block.insts:
+                if isinstance(inst, mir.Alloca):
+                    # already lowered into the entry block
+                    continue
+                self._lower_inst(target, inst, arg_values, block_map)
         return llvm_fn
-
-    def _scan_block(
-        self, insts: list[mir.Inst], i: int, has_else: bool
-    ) -> tuple[int | None, int]:
-        """The positions of the ``Else`` (only when ``has_else``, i.e.
-        the opener at ``i`` is an ``mir.If``; ``None`` when the block has
-        no else branch) and ``End`` markers that close the block opened
-        at ``i``, found by a balanced scan forward (nested blocks - both
-        ``If`` and ``Block`` - close their own markers first)."""
-        depth = 0
-        p_else: int | None = None
-        for j in range(i + 1, len(insts)):
-            inst = insts[j]
-            if isinstance(inst, (mir.If, mir.Block)):
-                depth += 1
-            elif isinstance(inst, mir.End):
-                if depth == 0:
-                    return p_else, j
-                depth -= 1
-            elif isinstance(inst, mir.Else) and depth == 0:
-                if not has_else:
-                    raise CompileError('internal error: an Else marker inside a Block')
-                p_else = j
-        raise CompileError('internal error: unclosed block in the MIR')
-
-    def _lower_region(
-        self,
-        llvm_fn: sllvm.Function,
-        block: sllvm.BasicBlock,
-        insts: list[mir.Inst],
-        start: int,
-        end: int,
-        arg_values: tuple[sllvm.Value, ...],
-        cont: sllvm.BasicBlock | None,
-        exits: tuple[sllvm.BasicBlock | None, ...],
-    ) -> None:
-        """Lower the instructions ``insts[start:end]`` - one branch body
-        of the flat stream, delimited by its enclosing markers - into LLVM
-        blocks.  ``cont`` is the block the code jumps to when it runs off
-        the end of its region; it is ``None`` only for the top-level region,
-        which then ends with an implicit ``ret void``.  ``exits`` holds the jump target of a
-        ``mir.Break`` per enclosing block, innermost last:
-        ``exits[-level]`` is the block just after the ``End`` of the
-        ``level``-th enclosing block (a ``mir.Block`` or ``mir.If``)."""
-        i = start
-        while i < end:
-            inst = insts[i]
-            if isinstance(inst, mir.Ret):
-                if inst.value is None:
-                    block.ret(None)
-                else:
-                    block.ret(self._value(inst.value, arg_values))
-                return
-            if isinstance(inst, mir.Break):
-                level = inst.level
-                if level < 1 or level > len(exits):
-                    raise CompileError(f'internal error: break level {level} out of range')
-                target = exits[-level]
-                assert target is not None
-                block.jmp(target)
-                return
-            if isinstance(inst, (mir.If, mir.Block)):
-                has_else = isinstance(inst, mir.If)
-                p_else, p_end = self._scan_block(insts, i, has_else)
-                after = p_end + 1
-                cont_block = sllvm.BasicBlock() if after < end else cont
-                inner_exits = exits + (cont_block,)
-                if has_else:
-                    cond = self._value(inst.cond, arg_values)
-                    then_block = sllvm.BasicBlock()
-                    if p_else is None:
-                        # no else branch: a false condition goes to
-                        # the code after the ``If``
-                        assert cont_block is not None
-                        block.br(cond, then_block, cont_block)
-                        self._lower_region(
-                            llvm_fn, then_block, insts, i + 1, p_end,
-                            arg_values, cont_block, inner_exits,
-                        )
-                    else:
-                        else_block = sllvm.BasicBlock()
-                        block.br(cond, then_block, else_block)
-                        self._lower_region(
-                            llvm_fn, then_block, insts, i + 1, p_else,
-                            arg_values, cont_block, inner_exits,
-                        )
-                        self._lower_region(
-                            llvm_fn, else_block, insts, p_else + 1, p_end,
-                            arg_values, cont_block, inner_exits,
-                        )
-                else:
-                    # a ``Block`` is entered unconditionally
-                    self._lower_region(
-                        llvm_fn, block, insts, i + 1, p_end,
-                        arg_values, cont_block, inner_exits,
-                    )
-                if after < end:
-                    assert cont_block is not None
-                    self._lower_region(
-                        llvm_fn, cont_block, insts, after, end,
-                        arg_values, cont, exits,
-                    )
-                return
-            if isinstance(inst, mir.Alloca):
-                # already lowered into the entry block (see
-                # ``_lower_function_no_cache``)
-                i += 1
-                continue
-            self._lower_inst(block, inst, arg_values)
-            i += 1
-        if not block._finished:
-            if cont is None:
-                # the body of the function proper fell off its end: an
-                # implicit ``ret void`` (only a void function may do so)
-                block.ret(None)
-            else:
-                block.jmp(cont)
 
     def _value(self, value: mir.Value, arg_values: tuple[sllvm.Value, ...]) -> sllvm.Value:
         if isinstance(value, mir.Param):
@@ -389,11 +283,10 @@ class _Lowerer:
         block: sllvm.BasicBlock,
         inst: mir.Inst,
         arg_values: tuple[sllvm.Value, ...],
+        block_map: dict[int, sllvm.BasicBlock],
     ) -> None:
         result: sllvm.Value | None = None
         match inst:
-            case mir.Nop():
-                return
             case mir.Alloca():
                 result = block.alloca(self._to_llvm(inst.type))
             case mir.Store():
@@ -461,6 +354,18 @@ class _Lowerer:
                 callee = self._value(inst.callee, arg_values)
                 result = block.call(
                     callee, *(self._value(a, arg_values) for a in inst.args)
+                )
+            case mir.Jmp():
+                block.jmp(block_map[id(inst.target)])
+            case mir.Br():
+                block.br(
+                    self._value(inst.cond, arg_values),
+                    block_map[id(inst.if_true)],
+                    block_map[id(inst.if_false)],
+                )
+            case mir.Ret():
+                block.ret(
+                    None if inst.value is None else self._value(inst.value, arg_values)
                 )
             case _:
                 raise CompileError(f'unsupported MIR instruction {type(inst).__name__}')
