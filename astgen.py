@@ -64,8 +64,8 @@ from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
     Null,
+    RetSpec,
     StructDecl,
-    TupleType,
     Type,
     Value,
     VoidType,
@@ -792,27 +792,16 @@ def parse_function(
         # specialized (``fn.Signature.specialize``)
         return cast(Type | None, convert(annotation, 'the annotation'))
 
-    def ret_spec_of(annotation: Any) -> tuple[tuple[Type, bool], ...] | None:
-        """The return spec the annotation declares: one result value per
-        element of a ``tuple[...]`` annotation, and exactly one for any
-        other annotation.  ``None`` (no ``->`` written) declares nothing
-        and lets the interpreter infer the return from the body."""
+    def ret_spec_of(annotation: Any) -> RetSpec | None:
+        """The return spec the annotation declares: the whole return type as
+        one :class:`sval.RetSpec` tree - a ``tuple[...]`` (nested at whatever
+        depth it is written) is several values.  ``None`` (no ``->`` written)
+        declares nothing and lets the interpreter infer the return from the
+        body (see ``sval.make_ret_spec``)."""
         ret_type = annotation_of(annotation)
         if ret_type is None:
             return None
-        types: tuple[Type, ...]
-        if isinstance(ret_type, TupleType):
-            if ret_type.has_ellipsis:
-                raise CompileError(
-                    f"function {node.name} cannot return tuple[..., ...]: "
-                    f"a varying number of values has no fixed shape"
-                )
-            types = ret_type.types
-        else:
-            types = (ret_type,)
-        if len(types) == 0:
-            raise CompileError(f"the return annotation of {node.name} declares no value")
-        return make_ret_spec(types)
+        return make_ret_spec(ret_type)
 
     def default_of(value: Any) -> AnyValue | None:
         # a default value of ``None`` is the null value: the absent value of

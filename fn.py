@@ -13,10 +13,13 @@ from .sval import (
     AnyValue,
     FormalArg,
     FunctionType,
+    RetSpec,
+    RetValue,
     Type,
     TypeVar,
     TypeVarSolver,
     Value,
+    iter_ret_leaves,
     make_ret_spec,
     pass_by_ref,
     replace_type_vars_type,
@@ -109,29 +112,40 @@ class SpecializedComptimeArg(SpecializedFormalArg):
 
 @dataclass(frozen=True, slots=True)
 class ReturnSignature:
-    """The return convention of one specialization: one ``(type, bool)``
-    entry per value the function returns, in declaration order - the spy
-    type of the value and whether it is delivered through a hidden result
-    pointer (``True``) rather than returned by value (``False``).  At most
-    one value is returned by value (see ``sval.make_ret_spec``)."""
+    """The return convention of one specialization: the whole return type as
+    one :class:`sval.RetSpec` tree - a leaf (:class:`sval.RetValue`) carries
+    the spy type of one value and whether it is delivered through a hidden
+    result pointer, and a group (:class:`sval.RetTuple`) the ``tuple[...]`` a
+    function (or a nested element of its annotation) returns, whose values the
+    caller regroups.  At most one leaf is returned by value (see
+    ``sval.make_ret_spec``)."""
 
-    ret_spec: tuple[tuple[Type, bool], ...]
+    ret_spec: RetSpec
 
     def returned_type(self) -> Type | None:
         """The spy type of the value the lowered function returns directly
         (the by-value result), or ``None`` when it returns void - every
         value then goes through a result pointer, or is zero-sized."""
-        index = self.by_value_index()
-        return None if index is None else self.ret_spec[index][0]
+        for leaf in iter_ret_leaves(self.ret_spec):
+            if not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
+                return leaf.type
+        return None
 
     def by_value_index(self) -> int | None:
-        """The position of the one result returned by value (its value has
-        storage and fits in registers), or ``None`` when the lowered
-        function returns void."""
-        for index, (type, via_result_ptr) in enumerate(self.ret_spec):
-            if not via_result_ptr and type.get_unit_value() is None:
+        """The position of the one leaf returned by value (its value has
+        storage and fits in registers) among all the leaves, in depth-first
+        declaration order, or ``None`` when the lowered function returns
+        void."""
+        for index, leaf in enumerate(iter_ret_leaves(self.ret_spec)):
+            if not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
                 return index
         return None
+
+    def is_single_value(self) -> bool:
+        """Whether the function returns exactly one value - the trivial case
+        whose lowered signature is one plain result rather than a result
+        pointer or a regrouped tuple."""
+        return isinstance(self.ret_spec, RetValue)
 
 @dataclass(frozen=True, slots=True)
 class CallSignature:
@@ -178,13 +192,12 @@ class Signature:
     # model - and ``bind_arg_pos`` - already does)
     varargs: SignatureFormalArg | None
     kwargs: SignatureFormalArg | None
-    # the evaluated return annotation, in the spy domain: one
-    # ``(type, via_result_ptr)`` entry per value the function returns (a
-    # plain annotation declares one value, a ``tuple[...]`` annotation one
-    # per element, an explicit ``-> None`` the void type); None when no
-    # return annotation is written and the return type is inferred from
+    # the evaluated return annotation, in the spy domain: the whole return
+    # type as one ``RetSpec`` tree (a ``RetValue`` for a single value, a
+    # ``RetTuple`` - possibly nested - when it is a ``tuple[...]``); None when
+    # no return annotation is written and the return type is inferred from
     # the body (see ``sval.make_ret_spec``)
-    ret_spec: tuple[tuple[Type, bool], ...] | None
+    ret_spec: RetSpec | None
 
     def bind_arg_pos[T](
         self,
@@ -323,7 +336,7 @@ class Signature:
         for name, arg in self.positional.items():
             assert arg.type is not None
             formal.append(FormalArg(name, arg.type, arg.default_value))
-        return FunctionType(tuple(formal), tuple(t for t, _ in self.ret_spec))
+        return FunctionType(tuple(formal), self.ret_spec.type)
 
     def substitute_type_vars(self, reps: dict[TypeVar, Value]) -> Signature:
         """A copy of this signature with every type parameter of ``reps``
@@ -346,12 +359,14 @@ class Signature:
             ret_spec=self.map_ret_spec(substitute) if self.ret_spec is not None else None,
         )
 
-    def map_ret_spec(self, f: Callable[[Type], Type]) -> tuple[tuple[Type, bool], ...]:
+    def map_ret_spec(self, f: Callable[[Type], Type]) -> RetSpec:
         """The return spec of this signature with every declared result type
         replaced by ``f`` of it, re-resolving the by-value/result-pointer
-        convention for the substituted types."""
+        convention for the substituted types.  ``f`` is applied to the whole
+        return type (a nested ``tuple[...]`` included), so it must substitute
+        inside it (see ``replace_type_vars_type``)."""
         assert self.ret_spec is not None
-        return make_ret_spec(tuple(f(type) for type, _ in self.ret_spec))
+        return make_ret_spec(f(self.ret_spec.type))
 
     def specialize(self, provided: ArgList[Type | None]) -> tuple[CallSignature, ReturnSignature | None]:
         """Specialize one call of this signature: the concrete typing of

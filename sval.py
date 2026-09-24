@@ -22,7 +22,7 @@ from __future__ import annotations
 import ctypes
 import typing
 from abc import abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from types import NoneType
@@ -187,6 +187,10 @@ class TupleType(Type):
     @override
     def get_type(self) -> Type:
         return TYPE_TYPE
+
+    @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        return self.types
 
     @override
     def to_mir_type(self) -> mir.MayBeVoidType | None:
@@ -791,12 +795,13 @@ class FormalArg:
 @dataclass(frozen=True)
 class FunctionType(Type):
     args: tuple[FormalArg, ...]
-    # the spy types of the values the function returns: one entry per result
-    # (a single-return function has exactly one)
-    return_type: tuple[Type, ...]
+    # the spy type of the values the function returns: the type of a single
+    # result, or a ``tuple[...]`` when it returns several (see
+    # :func:`make_ret_spec`)
+    return_type: Type
 
     @property
-    def ret_spec(self) -> tuple[tuple[Type, bool], ...]:
+    def ret_spec(self) -> RetSpec:
         """How a call of a function of this signature delivers its result
         (see :func:`make_ret_spec`)."""
         return make_ret_spec(self.return_type)
@@ -808,8 +813,8 @@ class FunctionType(Type):
             child = arg.type.get_type()
             assert isinstance(child, TypeType)
             level = max(level, child.level)
-        for ret in self.return_type:
-            child = ret.get_type()
+        for leaf in iter_ret_leaves(self.ret_spec):
+            child = leaf.type.get_type()
             assert isinstance(child, TypeType)
             level = max(level, child.level)
         return TypeType(level)
@@ -824,11 +829,11 @@ class FunctionType(Type):
             if not isinstance(mir_type, mir.VoidType):
                 args.append(mir_type)
         ret_type: mir.MayBeVoidType = mir.VOID
-        for type, via_result_ptr in self.ret_spec:
-            mir_type = type.to_mir_type()
+        for leaf in iter_ret_leaves(self.ret_spec):
+            mir_type = leaf.type.to_mir_type()
             if mir_type is None:
                 return None
-            if via_result_ptr:
+            if leaf.via_result_ptr:
                 if isinstance(mir_type, mir.VoidType):
                     return None
                 args.append(mir.PointerType(mir_type, False))
@@ -837,11 +842,7 @@ class FunctionType(Type):
         return mir.FunctionType(tuple(args), ret_type)
 
     def __str__(self) -> str:
-        if len(self.return_type) == 1:
-            ret = str(self.return_type[0])
-        else:
-            ret = f'tuple[{", ".join(str(t) for t in self.return_type)}]'
-        return f"fn({', '.join(str(arg.type) for arg in self.args)}) -> {ret}"
+        return f"fn({', '.join(str(arg.type) for arg in self.args)}) -> {self.return_type}"
 
 
 @dataclass(frozen=True)
@@ -1318,29 +1319,122 @@ def returns_via_result_ptr(type: Type) -> bool:
             return False
 
 
-def make_ret_spec(types: tuple[Type, ...]) -> tuple[tuple[Type, bool], ...]:
-    """The return convention of a function that returns the values of the
-    spy types ``types``: one ``(type, via_result_ptr)`` entry per result,
-    in declaration order.  At most one result is returned *by value* - the
-    first one that fits in registers (``returns_via_result_ptr`` says so)
-    - and every other result is delivered by writing through a hidden
-    result pointer (a ``True`` entry); when no result qualifies the
-    function returns void.  A zero-sized type has no value to return: it
-    is delivered as its unit value and never takes the by-value slot."""
+@dataclass(frozen=True, slots=True)
+class RetValue:
+    """One *leaf* result value of a function: the spy type of the value and
+    whether it is delivered through a hidden result pointer rather than
+    returned by value.  The type is always a runtime type - a ``tuple[...]``
+    annotation nests a :class:`RetTuple` instead."""
+
+    type: Type
+    via_result_ptr: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RetTuple:
+    """A group of results: the ``tuple[...]`` a function returns (or one
+    written as an element of that annotation).  The whole return type is one
+    :class:`RetSpec` - a :class:`RetValue` for a single value, a
+    :class:`RetTuple` when it is a ``tuple[...]`` - so a single result is just
+    the trivial case and the nesting mirrors the annotation.
+
+    The group is a *compile-time* regrouping of the values of its elements: a
+    tuple has no runtime representation of its own, so the lowered signature
+    delivers its leaves (see :func:`make_ret_spec`) and the caller regroups
+    them (see ``interp``)."""
+
+    # the ``tuple[...]`` the group was written as (its ``types`` are the
+    # element types, one per entry of ``values``)
+    type: TupleType
+    values: tuple[RetSpec, ...]
+
+
+type RetSpec = RetValue | RetTuple
+
+
+def iter_ret_leaves(spec: RetSpec) -> Iterator[RetValue]:
+    """The leaf values of a return spec, in declaration order (depth first)."""
+    work: list[RetSpec] = [spec]
+    while work:
+        node = work.pop()
+        match node:
+            case RetValue():
+                yield node
+            case RetTuple(values=values):
+                work.extend(reversed(values))
+
+
+def make_ret_spec(type: Type) -> RetSpec:
+    """The return convention of a function whose return annotation is the spy
+    type ``type`` (a ``tuple[...]`` for several values, nested at whatever
+    depth it is written): the annotation as one :class:`RetSpec` tree.  A
+    ``tuple[...]`` - at the top level or nested - becomes a :class:`RetTuple`
+    of its elements, and every other type a :class:`RetValue` leaf.
+
+    At most one leaf is returned *by value* - the first one that fits in
+    registers (``returns_via_result_ptr`` says so) - and every other leaf is
+    delivered by writing through a hidden result pointer; when no leaf
+    qualifies the function returns void.  A zero-sized leaf has no value to
+    return: it is delivered as its unit value and never takes the by-value
+    slot."""
+    # the leaf types, in declaration order (depth first)
+    leaves: list[Type] = []
+    work: list[Type] = [type]
+    while work:
+        item = work.pop()
+        match item:
+            case TupleType():
+                if item.has_ellipsis:
+                    raise CompileError(
+                        'a varying number of return values has no fixed shape'
+                    )
+                work.extend(reversed(item.types))
+            case _:
+                leaves.append(item)
     chosen: int | None = None
-    for index, type in enumerate(types):
-        if type.get_unit_value() is not None:
+    for index, leaf_type in enumerate(leaves):
+        if leaf_type.get_unit_value() is not None:
             # a zero-sized value is delivered as its unit value, not
             # through the by-value slot
             continue
-        if not returns_via_result_ptr(type):
+        if not returns_via_result_ptr(leaf_type):
             chosen = index
             break
-    spec: list[tuple[Type, bool]] = []
-    for index, type in enumerate(types):
-        via = type.get_unit_value() is None and index != chosen
-        spec.append((type, via))
-    return tuple(spec)
+    via = tuple(
+        leaf_type.get_unit_value() is None and index != chosen
+        for index, leaf_type in enumerate(leaves)
+    )
+    # rebuild the tree of the annotation, marking every leaf with how it is
+    # delivered (a ``None`` on the work stack closes the group it opened; the
+    # whole type is itself a group when it is a ``tuple[...]``)
+    index = 0
+    groups: list[list[RetSpec]] = [[]]
+    group_types: list[TupleType] = []
+    if isinstance(type, TupleType):
+        build_work: list[Type | None] = list(reversed(type.types))
+    else:
+        build_work = [type]
+    while build_work:
+        item = build_work.pop()
+        if item is None:
+            group_type = group_types.pop()
+            values = tuple(groups.pop())
+            groups[-1].append(RetTuple(group_type, values))
+            continue
+        match item:
+            case TupleType():
+                build_work.append(None)
+                build_work.extend(reversed(item.types))
+                groups.append([])
+                group_types.append(item)
+            case _:
+                groups[-1].append(RetValue(item, via[index]))
+                index += 1
+    assert index == len(leaves) and len(groups) == 1
+    if isinstance(type, TupleType):
+        return RetTuple(type, tuple(groups[0]))
+    assert len(groups[0]) == 1
+    return groups[0][0]
 
 
 def pass_by_ref(type: Type) -> bool:
@@ -1736,6 +1830,11 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
             )
         case OptionType():
             return OptionType(replace_type_vars_type(value.child, reps))
+        case TupleType():
+            return TupleType(
+                tuple(replace_type_vars_type(t, reps) for t in value.types),
+                value.has_ellipsis,
+            )
         case StructType():
             # a struct type carries its type arguments: substituting into it
             # rebuilds the specialization (and keeps the identity of the one

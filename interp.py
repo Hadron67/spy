@@ -97,7 +97,13 @@ from .fn import (
     SpecializedFormalArg,
     SpecializedRuntimeArg,
 )
-from .sval import GlobalResolver
+from .sval import (
+    GlobalResolver,
+    RetSpec,
+    RetTuple,
+    RetValue,
+    iter_ret_leaves,
+)
 from .util import frozendict
 
 _MAX_INLINE_DEPTH = 64
@@ -535,13 +541,20 @@ def _tuple_places_type(places: tuple[ArgEntry[InterpVal], ...]) -> sval.Type:
     return sval.TupleType(tuple(types), False)
 
 
-def _result_slots(location: InterpVal) -> tuple[InterpVal, ...]:
-    """The slots one result value each is delivered into: the result location
-    of a function whose annotation declares several results is a tuple of
-    slots, one per result; every other function has a single result slot."""
-    if isinstance(location, ComptimeTuple):
-        return tuple(entry.value for entry in location.values)
-    return (location,)
+def _result_places(location: InterpVal) -> tuple[InterpVal, ...]:
+    """The leaf places one result value each is delivered into, in depth-first
+    declaration order: the result location of a function whose annotation
+    declares several results is a tuple of slots (nested exactly like the
+    results), every other function has a single result slot."""
+    places: list[InterpVal] = []
+    work: list[InterpVal] = [location]
+    while work:
+        place = work.pop()
+        if isinstance(place, ComptimeTuple):
+            work.extend(reversed([entry.value for entry in place.values]))
+        else:
+            places.append(place)
+    return tuple(places)
 
 
 def _array_elem_type_of(value: InterpVal) -> sval.ArrayType | None:
@@ -858,16 +871,28 @@ class HirRunner:
     def _new_result_loc(self, ret_sig: ReturnSignature | None) -> InterpVal:
         """Reserve the result location of the function proper: one slot whose
         type is only decided when a value is delivered into it, or - for a
-        function whose annotation declares several results - a tuple of
-        slots, one per declared result."""
-        if ret_sig is None or len(ret_sig.ret_spec) <= 1:
+        function that returns the values of a ``tuple[...]`` - a tuple of slots
+        mirroring the (possibly nested) shape of the results, one slot per
+        declared value.  An unannotated (inferred) return has one slot."""
+        if ret_sig is None:
             return self.alloca(False)
-        return ComptimeTuple(
-            tuple(ArgEntry(self.alloca(False), True) for _ in ret_sig.ret_spec)
-        )
+        return self._ret_spec_place(ret_sig.ret_spec)
+
+    def _ret_spec_place(self, node: RetSpec) -> InterpVal:
+        """The result place one declared result is delivered into: a fresh slot
+        for a value, a tuple of the places of its elements for a group."""
+        match node:
+            case RetValue():
+                return self.alloca(False)
+            case RetTuple(values=values):
+                entries: list[ArgEntry[InterpVal]] = []
+                for child in values:
+                    place = self._ret_spec_place(child)
+                    entries.append(ArgEntry(place, isinstance(child, RetValue)))
+                return ComptimeTuple(tuple(entries))
 
     def _materialize_ret_sig(
-        self, spec: tuple[tuple[sval.Type, bool], ...]
+        self, spec: RetSpec
     ) -> None:
         """Fix the return convention of the function proper from the spy
         types of the values it returns (its declared annotation, or the peer
@@ -886,36 +911,41 @@ class HirRunner:
             if self.return_sig.ret_spec != spec:
                 raise CompileError(
                     f"function returns values of conflicting types "
-                    f"{[t for t, _ in self.return_sig.ret_spec]} and "
-                    f"{[t for t, _ in spec]}"
+                    f"{[leaf.type for leaf in iter_ret_leaves(self.return_sig.ret_spec)]} and "
+                    f"{[leaf.type for leaf in iter_ret_leaves(spec)]}"
                 )
             return
         self.return_sig = ReturnSignature(spec)
         self._fn_instance.ret_sig = self.return_sig
         mir_fn = self._fn_instance.mir
         location = self._current_result_loc()
-        slots = _result_slots(location)
-        assert len(slots) == len(spec)
+        places = _result_places(location)
+        leaves = tuple(iter_ret_leaves(spec))
+        if len(places) != len(leaves):
+            raise CompileError(
+                f'the return annotation declares {len(leaves)} value(s) but the '
+                f'result location holds {len(places)} place(s)'
+            )
         mir_fn.ret_type = mir.VOID
-        for (type, via_result_ptr), slot in zip(spec, slots):
-            if via_result_ptr:
-                mir_type = type.to_mir_type()
+        for leaf, place in zip(leaves, places):
+            if leaf.via_result_ptr:
+                mir_type = leaf.type.to_mir_type()
                 if mir_type is None or isinstance(mir_type, mir.VoidType):
-                    raise CompileError(f'cannot return {type} through a result pointer')
+                    raise CompileError(f'cannot return {leaf.type} through a result pointer')
                 ptr_type = mir.PointerType(mir_type, False)
                 index = len(mir_fn.args)
                 mir_fn.args.append(ptr_type)
                 mir_fn.arg_names.append('$result')
-                self._commit_pending_slot(slot, type, ptr=mir.Param(index, ptr_type))
+                self._commit_pending_slot(place, leaf.type, ptr=mir.Param(index, ptr_type))
                 continue
-            mir_ret = type.to_mir_type()
+            mir_ret = leaf.type.to_mir_type()
             if mir_ret is None:
-                raise _no_runtime_type(type)
+                raise _no_runtime_type(leaf.type)
             if not isinstance(mir_ret, mir.VoidType):
                 # a zero-sized result is delivered as its unit value; only a
                 # result with storage fixes the MIR return type
                 mir_fn.ret_type = mir_ret
-            self._commit_pending_slot(slot, type)
+            self._commit_pending_slot(place, leaf.type)
 
     # -- return statements ------------------------------------------------
 
@@ -1004,14 +1034,14 @@ class HirRunner:
                     self._deferred_returns.append(block)
                     return self._cut()
                 location = self._current_result_loc()
-                slots = _result_slots(location)
+                places = _result_places(location)
                 index = self.return_sig.by_value_index()
                 if index is None:
                     # every result is delivered through its result pointer (or
                     # is zero-sized): the lowered function returns void
                     self._emit(mir.Ret(None))
                 else:
-                    self._emit(mir.Ret(_to_runtime(self.load(slots[index]))))
+                    self._emit(mir.Ret(_to_runtime(self.load(places[index]))))
                 return self._cut()
             case hir.AsBool():
                 return self.as_bool(self.operand_arg(inst.value), inst)
@@ -2493,9 +2523,9 @@ class HirRunner:
         self._fn_req_resumer = None
         resumer(self, fn_mir, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal | hir.Inst, call_sig: CallSignature, ret_sig: ReturnSignature) -> None:
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature) -> None:
         """Emit the native call of an already-resolved callee and hand its
-        result to the call's result location (or register)."""
+        result to the call's result location."""
         mir_args: list[mir.Value] = []
 
         def convert_one(arg: ArgEntry[InterpVal], sig_arg: SpecializedFormalArg) -> None:
@@ -2529,117 +2559,127 @@ class HirRunner:
             for name, arg in args.kwargs.items():
                 convert_one(arg, call_sig.kwargs[name])
 
-        spec = ret_sig.ret_spec
-        if len(spec) != 1:
-            self._deliver_multi_result(callee, mir_args, ret, spec)
-            return
+        self._deliver_result(callee, mir_args, ret, ret_sig.ret_spec)
 
-        type, ret_by_ref = spec[0]
-        if ret_by_ref:
-            assert isinstance(ret, InterpVal)
-            if ret is None:
-                raise CompileError('a result-pointer call needs a result location')
-            if isinstance(ret, PendingSlot) and ret.committed is None:
-                # the result pointer of the slot is not known yet: the call
-                # writes through a placeholder the slot's commit fills in
-                ret = self._defer_ptr_convertion(ret, type)
-            ptr = _to_runtime(_shallow_normalize(ret))
-            self._emit(mir.Call(callee, (*mir_args, ptr), mir.VOID))
-        else:
-            ret_type = type.to_mir_type()
-            if ret_type is None or isinstance(ret_type, mir.VoidType):
-                # a zero-sized result produces no register (the call returns
-                # nothing), but it is still delivered to the result location:
-                # its *unit value*.  The location of a call whose result is
-                # dropped (an expression statement) would otherwise stay
-                # untyped, and the type is what makes its slot a compile-time
-                # box of the unit value (see ``_commit_pending_slot``)
-                self._emit(mir.Call(callee, tuple(mir_args), mir.VOID))
-                unit = type.get_unit_value()
-                if unit is not None:
-                    value = ComptimeVal(unit)
-                    if isinstance(ret, InterpVal):
-                        self.store(ret, value)
-                    else:
-                        self._frames[-1].regs[ret] = value
-            else:
-                call_inst = self._emit(mir.Call(callee, tuple(mir_args), ret_type))
-                value = RuntimeVal(call_inst, type)
-                if isinstance(ret, InterpVal):
-                    self.store(ret, value)
-                else:
-                    self._frames[-1].regs[ret] = value
-
-    def _deliver_multi_result(
+    def _deliver_result(
         self,
         callee: mir.Value,
         mir_args: list[mir.Value],
-        ret: InterpVal | hir.Inst,
-        spec: tuple[tuple[sval.Type, bool], ...],
+        ret: InterpVal,
+        spec: RetSpec,
     ) -> None:
-        """Emit the native call of a callee that returns several values and
-        hand every result to its place.
+        """Emit the native call of a callee returning the value(s) of ``spec``
+        and hand every result to its place.
 
-        The results are delivered either into the places a destructuring (or
-        a multi-value ``return``) already reserved - ``ret`` is then the
-        tuple of addresses the results are written into - or, when the caller
-        has a single place for them (a temporary slot, or a ``Comptime``
-        variable), into fresh slots whose tuple is then stored in that place
-        (a tuple may be inlined, so the place becomes a compile-time box).
+        The results go either into the places the caller reserved - ``ret`` is
+        the place of a single result, or a tuple of places nested exactly like
+        the results (see ``_pair_places``) - or, when a result (or a group of
+        them) is given a single place of its own, into fresh places whose tuple
+        is then stored in that place.  A tuple may be inlined, so such a place
+        has to be able to hold its value inline (a ``Comptime`` variable); a
+        plain slot rejects the tuple when it is committed (see
+        ``_no_runtime_type``).
+
         A zero-sized result occupies no place of its own: its unit value is
-        written into the slot."""
-        packed = not isinstance(ret, ComptimeTuple)
+        written into its place."""
         places: list[InterpVal] = []
-        if isinstance(ret, ComptimeTuple):
-            if len(ret.values) != len(spec):
-                raise CompileError(
-                    f'cannot unpack {len(spec)} values into {len(ret.values)} targets'
-                )
-            for entry in ret.values:
-                if not entry.is_ref:
-                    raise CompileError(
-                        'the target of a multi-value result must be addressable'
-                    )
-                places.append(entry.value)
-        else:
-            if not isinstance(ret, InterpVal):
-                raise CompileError('a multi-value call needs a result location')
-            places = [self.alloca(True) for _ in spec]
+        packed: list[tuple[InterpVal, ComptimeTuple]] = []
+        self._pair_places(spec, ArgEntry(ret, True), places, packed)
 
         result_args: list[mir.Value] = []
         ret_type: mir.MayBeVoidType = mir.VOID
         by_value: tuple[InterpVal, sval.Type] | None = None
-        for (type, via_result_ptr), place in zip(spec, places):
-            if via_result_ptr:
+        for leaf, place in zip(iter_ret_leaves(spec), places):
+            if leaf.via_result_ptr:
                 target = place
                 if isinstance(target, PendingSlot) and target.committed is None:
                     # the slot has no address yet: the call writes through a
                     # placeholder its commit fills in (see ``_defer_ptr_convertion``)
-                    target = self._defer_ptr_convertion(target, type)
+                    target = self._defer_ptr_convertion(target, leaf.type)
                 result_args.append(_to_runtime(_shallow_normalize(target)))
                 continue
-            mir_type = type.to_mir_type()
+            mir_type = leaf.type.to_mir_type()
             if mir_type is None:
-                raise _no_runtime_type(type)
+                raise _no_runtime_type(leaf.type)
             if isinstance(mir_type, mir.VoidType):
-                # a zero-sized result produces no register: deliver its unit value
-                unit = type.get_unit_value()
+                # a zero-sized result produces no register: deliver its unit
+                # value.  The location of a call whose result is dropped (an
+                # expression statement) would otherwise stay untyped, and the
+                # type is what makes its slot a compile-time box of the unit
+                # value (see ``_commit_pending_slot``)
+                unit = leaf.type.get_unit_value()
                 if unit is not None:
                     self.store(place, ComptimeVal(unit))
                 continue
             ret_type = mir_type
-            by_value = (place, type)
+            by_value = (place, leaf.type)
 
         call_inst = self._emit(mir.Call(callee, (*mir_args, *result_args), ret_type))
         if by_value is not None:
             place, type = by_value
             self.store(place, RuntimeVal(call_inst, type))
 
-        if not packed:
+        if len(packed) == 0:
             return
-        for place in places:
-            self._commit_pending_slot(place)
-        self.store(ret, ComptimeTuple(tuple(ArgEntry(place, True) for place in places)))
+        for _, tree in packed:
+            self._commit_tuple_places(tree)
+        for target, tree in packed:
+            self.store(target, tree)
+
+    def _pair_places(
+        self,
+        node: RetSpec,
+        entry: ArgEntry[InterpVal],
+        places: list[InterpVal],
+        packed: list[tuple[InterpVal, ComptimeTuple]],
+    ) -> None:
+        """Pair the results of ``node`` with the place tree the caller
+        reserved: a single result takes the place ``entry`` denotes, a group
+        takes a tuple of places nested exactly like the results (see
+        ``astgen._gen_target_tuple``), and the leaves are appended to
+        ``places`` in depth-first order.  A group the caller gives a single
+        non-tuple place is *packed*: fresh places are reserved and their
+        (nested) tuple is stored in that place after the call (see
+        ``_deliver_result``)."""
+        target = entry.value
+        match node:
+            case RetValue():
+                if isinstance(target, ComptimeTuple):
+                    raise CompileError('cannot unpack one value into a tuple target')
+                if not entry.is_ref:
+                    raise CompileError(
+                        'the target of a multi-value result must be addressable'
+                    )
+                places.append(target)
+            case RetTuple(values=values):
+                if isinstance(target, ComptimeTuple):
+                    if len(target.values) != len(values):
+                        raise CompileError(
+                            f'cannot unpack {len(values)} value(s) into '
+                            f'{len(target.values)} target(s)'
+                        )
+                    for child, sub_entry in zip(values, target.values):
+                        self._pair_places(child, sub_entry, places, packed)
+                    return
+                tree = self._fresh_places(node, places)
+                assert isinstance(tree, ComptimeTuple)
+                packed.append((target, tree))
+
+    def _fresh_places(self, node: RetSpec, places: list[InterpVal]) -> InterpVal:
+        """Fresh places for a group packed into a single location: a tuple of
+        places mirroring the (possibly nested) shape of the results, with the
+        leaf places appended to ``places`` in depth-first order."""
+        match node:
+            case RetValue():
+                place = self.alloca(True)
+                places.append(place)
+                return place
+            case RetTuple(values=values):
+                entries: list[ArgEntry[InterpVal]] = []
+                for child in values:
+                    place = self._fresh_places(child, places)
+                    entries.append(ArgEntry(place, isinstance(child, RetValue)))
+                return ComptimeTuple(tuple(entries))
 
     def _start_inline(
         self,
@@ -2706,19 +2746,19 @@ class HirRunner:
             assert isinstance(location, PendingSlot)
             if len(location.stores) == 0:
                 self._fn_instance.mir.ret_type = mir.VOID
-                self.return_sig = ReturnSignature(((sval.VoidType(), False),))
+                self.return_sig = ReturnSignature(sval.make_ret_spec(sval.VoidType()))
             else:
-                self._materialize_ret_sig(sval.make_ret_spec((location.committed_type(),)))
+                self._materialize_ret_sig(sval.make_ret_spec(location.committed_type()))
         ret_sig = self.return_sig
         assert ret_sig is not None
         location = self._current_result_loc()
-        slots = _result_slots(location)
+        places = _result_places(location)
         index = ret_sig.by_value_index()
         for block in self._deferred_returns:
             if index is None:
                 block.insts.append(mir.Ret(None))
             else:
-                slot = _shallow_normalize(slots[index])
+                slot = _shallow_normalize(places[index])
                 if isinstance(slot, RuntimeVal):
                     load = mir.Load(slot.value)
                     block.insts.append(load)

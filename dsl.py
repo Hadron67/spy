@@ -119,8 +119,10 @@ def _call_multi_value(
     """Call a native artifact that returns several values from Python.  The
     lowered function returns one result directly and delivers every other
     one through a caller-provided result pointer, so a ctypes buffer is
-    allocated for each of those pointers and the values are gathered into
-    a tuple, in declaration order.  A zero-sized result is ``None``.
+    allocated for each of those pointers and the values are gathered into a
+    tuple, in declaration order.  A nested ``tuple[...]`` result is gathered
+    into a tuple of its own, so the Python value mirrors the annotation.  A
+    zero-sized result is ``None``.
 
     A by-value aggregate result would need the Python-entry thunk's trailing
     out pointer, which this path does not build; like passing an aggregate
@@ -135,29 +137,46 @@ def _call_multi_value(
             )
     buffers: list[Any] = []
     call_args: list[Any] = list(py_args)
-    for type, via_result_ptr in ret_sig.ret_spec:
-        if not via_result_ptr:
+    for leaf in sval.iter_ret_leaves(ret_sig.ret_spec):
+        if not leaf.via_result_ptr:
             continue
-        mir_type = type.to_mir_type()
+        mir_type = leaf.type.to_mir_type()
         assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
         buffer = to_ctype(mir_type)()
         buffers.append(buffer)
         call_args.append(ctypes.c_void_p(ctypes.addressof(buffer)))
     result = native_fn.call(*call_args)
-    values: list[Any] = []
     pending = iter(buffers)
-    for type, via_result_ptr in ret_sig.ret_spec:
-        if type.get_unit_value() is not None:
-            values.append(None)
-        elif via_result_ptr:
+
+    def leaf_value(leaf: sval.RetValue) -> Any:
+        if leaf.type.get_unit_value() is not None:
+            return None
+        if leaf.via_result_ptr:
             buffer = next(pending)
             # a scalar buffer reads back through ``.value``; an aggregate one
             # stays the ctypes object (Python-side struct values are not
             # supported yet)
-            values.append(getattr(buffer, 'value', buffer))
-        else:
-            values.append(result)
-    return tuple(values)
+            return getattr(buffer, 'value', buffer)
+        return result
+
+    # regroup the leaves into the (possibly nested) tuple of the annotation
+    assert isinstance(ret_sig.ret_spec, sval.RetTuple)
+    groups: list[list[Any]] = [[]]
+    work: list[sval.RetSpec | None] = list(reversed(ret_sig.ret_spec.values))
+    while work:
+        node = work.pop()
+        if node is None:
+            nested = tuple(groups.pop())
+            groups[-1].append(nested)
+            continue
+        match node:
+            case sval.RetValue():
+                groups[-1].append(leaf_value(node))
+            case sval.RetTuple(values=values):
+                work.append(None)
+                work.extend(reversed(values))
+                groups.append([])
+    return tuple(groups[0])
 
 
 _INT_LITERAL_BITS = 64
@@ -207,7 +226,7 @@ class _RegisteredFn(AsSpyValue):
             for (_, sig_arg), value in zip(call_sig.positional, arglist.positional)
             if not isinstance(sig_arg, SpecializedComptimeArg)
         ]
-        if len(ret_sig.ret_spec) == 1:
+        if ret_sig.is_single_value():
             return native_fn.call(*py_args)
         return _call_multi_value(native_fn, py_args, ret_sig)
 

@@ -2559,10 +2559,74 @@ def python_pair(a: i64, b: i64) -> tuple[i64, i64]:
 
 
 @func()
+def nested_multi(x: i32) -> tuple[i32, tuple[i32, Large], Small]:
+    return x, (x + 1, Large(x, x, x, x)), Small(x, x + 2)
+
+
+@func()
+def use_nested_multi(x: i32) -> i32:
+    n, (m, large), small = nested_multi(x)
+    return n * 100000 + m * 10000 + large.d * 100 + small.b
+
+
+@func()
+def forward_nested_multi(x: i32) -> tuple[i32, tuple[i32, Large], Small]:
+    return nested_multi(x)
+
+
+@func()
+def use_forward_nested_multi(x: i32) -> i32:
+    n, (m, large), small = forward_nested_multi(x)
+    return n * 100000 + m * 10000 + large.d * 100 + small.b
+
+
+@func()
+def comptime_nested_multi(x: i32) -> i32:
+    packed: Comptime = nested_multi(x)
+    n, (m, large), small = packed
+    return n * 100000 + m * 10000 + large.d * 100 + small.b
+
+
+@func()
+def nested_group_first(x: i32) -> tuple[tuple[Large, i32], i32]:
+    return (Large(x, x, x, x), x + 1), x + 2
+
+
+@func()
+def use_nested_group_first(x: i32) -> i32:
+    (large, n), m = nested_group_first(x)
+    return large.d * 1000 + n * 100 + m
+
+
+@func()
+def python_nested_pair(a: i64, b: i64) -> tuple[i64, tuple[i64, i64], i64]:
+    return a, (b, a + b), b
+
+
+@func()
+def bad_group_target(x: i32) -> i32:
+    # a group the caller does not unpack into a tuple target: packing it into
+    # a single place of its own is not supported yet (pyright cannot tell)
+    _n, _inner, _small = nested_multi(x)
+    return x
+
+
+@func()
+def bad_nested_arity(x: i32) -> i32:
+    _n, (_m, _large), _small, _extra = nested_multi(x)  # pyright: ignore
+    return x
+
+
+@func()
+def bad_nested_ellipsis(x: i32) -> tuple[i32, tuple[i32, ...]]:
+    return x  # pyright: ignore[reportReturnType]
+
+
+@func()
 def bad_multi_assign(x: i32) -> i32:
     # a packed result into a variable that is not ``Comptime``: pyright cannot
     # tell, hence the ignore
-    _packed = min_max(x, x + 1)  # pyright: ignore
+    _packed = min_max(x, x + 1)
     return x
 
 
@@ -2609,6 +2673,62 @@ class SpyMultiReturnTest(TestCase):
         # the Python side allocates the storage of the result pointers and
         # returns the values as a tuple
         self.assertEqual(python_pair(2, 7), (7, 2))
+
+    def test_nested_destructuring(self) -> None:
+        # the middle result is a ``tuple[...]`` of its own: the leaves are
+        # delivered separately and the caller regroups them
+        self.assertEqual(use_nested_multi(3), 340305)
+
+    def test_lowered_signature_of_a_nested_return(self) -> None:
+        # the leaves are delivered depth first: the first scalar returns by
+        # value, the other scalar and both aggregates through a pointer each
+        self.assertEqual(use_nested_multi(3), 340305)
+        args, ret = mir_signature(nested_multi)
+        i32_mir = mir.IntType(32, True)
+        self.assertEqual(ret, i32_mir)
+        self.assertEqual(args[0], i32_mir)
+        self.assertEqual(
+            args[1:],
+            (
+                mir.PointerType(i32_mir, False),
+                mir.PointerType(struct_type(Large).get_mir_type(), False),
+                mir.PointerType(struct_type(Small).get_mir_type(), False),
+            ),
+        )
+
+    def test_a_leading_group_still_returns_a_scalar_by_value(self) -> None:
+        self.assertEqual(use_nested_group_first(3), 3405)
+        args, ret = mir_signature(nested_group_first)
+        i32_mir = mir.IntType(32, True)
+        self.assertEqual(ret, i32_mir)
+        self.assertEqual(
+            args[1:],
+            (
+                mir.PointerType(struct_type(Large).get_mir_type(), False),
+                mir.PointerType(i32_mir, False),
+            ),
+        )
+
+    def test_forwarding_a_nested_multi_value_call(self) -> None:
+        self.assertEqual(use_forward_nested_multi(3), 340305)
+
+    def test_nested_packed_into_a_comptime_variable(self) -> None:
+        self.assertEqual(comptime_nested_multi(3), 340305)
+
+    def test_python_side_call_of_a_nested_return(self) -> None:
+        self.assertEqual(python_nested_pair(2, 7), (2, (7, 9), 7))
+
+    def test_a_group_target_that_is_not_a_tuple_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_group_target(3)
+
+    def test_nested_arity_mismatch_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_nested_arity(3)
+
+    def test_a_nested_varying_number_of_results_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_nested_ellipsis(3)
 
     def test_aggregates_go_through_result_pointers(self) -> None:
         # a scalar returns by value, a large struct and a small one through a
