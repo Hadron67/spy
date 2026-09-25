@@ -64,13 +64,11 @@ from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
     Null,
-    RetSpec,
     StructDecl,
     Type,
     Value,
     VoidType,
     as_value,
-    make_ret_spec,
     unwrap_comptime,
 )
 from .sval import (
@@ -792,17 +790,6 @@ def parse_function(
         # specialized (``fn.Signature.specialize``)
         return cast(Type | None, convert(annotation, 'the annotation'))
 
-    def ret_spec_of(annotation: Any) -> RetSpec | None:
-        """The return spec the annotation declares: the whole return type as
-        one :class:`sval.RetSpec` tree - a ``tuple[...]`` (nested at whatever
-        depth it is written) is several values.  ``None`` (no ``->`` written)
-        declares nothing and lets the interpreter infer the return from the
-        body (see ``sval.make_ret_spec``)."""
-        ret_type = annotation_of(annotation)
-        if ret_type is None:
-            return None
-        return make_ret_spec(ret_type)
-
     def default_of(value: Any) -> AnyValue | None:
         # a default value of ``None`` is the null value: the absent value of
         # an option (see ``sval.as_value``).  ``default_value`` being ``None``
@@ -839,7 +826,7 @@ def parse_function(
     # signature are always None; the signature model and ``bind_arg_pos``
     # already support them for the calls the parser will allow later.
     signature = Signature(
-        tuple(generic_args), positional, None, None, ret_spec_of(ret_annotation),
+        tuple(generic_args), positional, None, None, annotation_of(ret_annotation),
     )
 
     ir = FunctionIR(node.name, signature, ())

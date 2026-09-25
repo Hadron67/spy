@@ -1307,7 +1307,7 @@ def returns_via_result_ptr(type: Type) -> bool:
     pointer once it outgrows it, and a new aggregate kind (arrays) only
     needs to extend this function.  Scalars are always returned by
     value.  A signature may override the default
-    (``fn.Signature.ret_spec``)."""
+    (``fn.ReturnSignature.ret_spec``)."""
     match type:
         case StructType() | ArrayType() | OptionType():
             if _mentions_type_var(type):
