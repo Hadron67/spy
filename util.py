@@ -81,6 +81,34 @@ class StrBiMap[V]:
     def values(self):
         return self._k2v.values()
 
+class ArraySet[T]:
+    def __init__(self) -> None:
+        self.values: list[T] = []
+        self.ids: dict[T, int] = {}
+
+    def add(self, value: T) -> int:
+        """Insert ``value`` if it is not held yet, keeping insertion order;
+        returns its index."""
+        index = self.ids.get(value)
+        if index is not None:
+            return index
+        index = len(self.values)
+        self.values.append(value)
+        self.ids[value] = index
+        return index
+
+    def index_of(self, value: T) -> int | None:
+        return self.ids.get(value)
+
+    def __contains__(self, value: T) -> bool:
+        return value in self.ids
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
 class PtrObject:
     @override
     def __eq__(self, value: object, /) -> bool:

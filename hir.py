@@ -118,6 +118,14 @@ class ResultLoc(Value):
     """The result location of the function whose body is being executed"""
 
 
+@dataclass(frozen=True)
+class ErrorLoc(Value):
+    """The error location of the function whose body is being executed: the
+    place a ``raise`` delivers its exception into (the error code and the
+    payload).  Like :class:`ResultLoc` it is a leaf the interpreter resolves
+    to the state of the function proper, not a register of its own."""
+
+
 class Inst(Value):
     """An instruction; the object itself acts as its result register."""
 
@@ -353,6 +361,15 @@ class Ret(Inst):
 
 
 @dataclass(eq=False)
+class Raise(Inst):
+    """End one path of the function with an error; a path is terminated by a
+    ``raise`` statement, whose exception was already delivered into the
+    function's error location (:class:`ErrorLoc`) by the result-location
+    evaluation that precedes it - like a ``Ret``, whose value the result
+    location already holds.  The instruction therefore carries nothing."""
+
+
+@dataclass(eq=False)
 class AsBool(Inst):
     """Converts a value to a boolean."""
     value: ArgEntry[Value]
@@ -381,6 +398,30 @@ class Else(Inst):
 
 
 @dataclass(eq=False)
+class Try(Inst):
+    """Open a ``try`` block: the instructions of the try body follow, then one
+    :class:`Except` marker per ``except`` clause (each followed by its clause
+    body), and the matching :class:`End`.  ``binds`` holds the ``as`` name's
+    slot of every clause (None when the clause names none), created *before*
+    the ``Try`` so that the clause body can read it - the interpreter fills it
+    with the caught exception when the clause runs (see ``interp``)."""
+
+    binds: tuple[Value | None, ...]
+
+
+@dataclass(eq=False)
+class Except(Inst):
+    """The marker that starts one ``except`` clause of the innermost open
+    :class:`Try` block: ``type`` names the exception struct the clause catches
+    (None for a bare ``except:``), and ``index`` is the clause's position among
+    the try's clauses (its handler and ``as`` slot are held by the enclosing
+    block's ``TryExceptBlockData``)."""
+
+    type: Value | None
+    index: int
+
+
+@dataclass(eq=False)
 class End(Inst):
     """The marker that closes a block opened by an :class:`If` (or a
     future block instruction): everything between the ``If`` (or its
@@ -404,7 +445,7 @@ def scan_block(insts: tuple[Inst, ...], entry: int) -> tuple[int | None, int]:
     p_else: int | None = None
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, If):
+        if isinstance(inst, (If, Try)):
             depth += 1
         elif isinstance(inst, End):
             if depth == 0:
@@ -412,4 +453,24 @@ def scan_block(insts: tuple[Inst, ...], entry: int) -> tuple[int | None, int]:
             depth -= 1
         elif isinstance(inst, Else) and depth == 0:
             p_else = i
+    assert False, 'unclosed block in the HIR'
+
+
+def scan_try(insts: tuple[Inst, ...], entry: int) -> tuple[list[int], int]:
+    """The positions of the ``Except`` markers and of the closing ``End`` of the
+    ``hir.Try`` block opened at ``entry``, of the executing frame's flat
+    instruction list (found by a balanced scan forward, like
+    :func:`scan_block`)."""
+    depth = 0
+    excepts: list[int] = []
+    for i in range(entry + 1, len(insts)):
+        inst = insts[i]
+        if isinstance(inst, (If, Try)):
+            depth += 1
+        elif isinstance(inst, End):
+            if depth == 0:
+                return excepts, i
+            depth -= 1
+        elif isinstance(inst, Except) and depth == 0:
+            excepts.append(i)
     assert False, 'unclosed block in the HIR'

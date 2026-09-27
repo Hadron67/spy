@@ -44,7 +44,7 @@ time.
 import ctypes
 import types as pytypes
 from dataclasses import dataclass
-from typing import Any, TypeVar, cast, dataclass_transform, override
+from typing import Any, Literal, TypeVar, cast, dataclass_transform, override
 
 from . import astgen, mir, sval
 from .builtins import spy_as, spy_compile_log, spy_typeof
@@ -82,6 +82,10 @@ class FnMetadata:
     # an undecorated struct method: it is inlined at its call sites like a
     # plain Python function instead of being compiled into a native call
     inline: bool = False
+    # the exceptions the function may raise: ``None`` (the default) means it
+    # raises nothing, ``"infer"`` that they are inferred from the body, and a
+    # set of spy struct classes the exceptions it may raise
+    exceptions: set[type] | Literal["infer"] | None = None
 
 
 @dataclass(frozen=True)
@@ -114,7 +118,7 @@ def _to_py_arg(value: sval.AnyValue) -> Any:
 def _call_multi_value(
     native_fn: NativeFn,
     py_args: list[Any],
-    ret_sig: ReturnSignature,
+    ret_spec: sval.RetSpec,
 ) -> tuple[Any, ...]:
     """Call a native artifact that returns several values from Python.  The
     lowered function returns one result directly and delivers every other
@@ -127,7 +131,7 @@ def _call_multi_value(
     A by-value aggregate result would need the Python-entry thunk's trailing
     out pointer, which this path does not build; like passing an aggregate
     from Python, that is not supported yet."""
-    by_value = ret_sig.returned_type()
+    by_value = sval.ret_returned_type(ret_spec)
     if by_value is not None:
         mir_ret = by_value.to_mir_type()
         if isinstance(mir_ret, (mir.StructType, mir.ArrayType)):
@@ -137,7 +141,7 @@ def _call_multi_value(
             )
     buffers: list[Any] = []
     call_args: list[Any] = list(py_args)
-    for leaf in sval.iter_ret_leaves(ret_sig.ret_spec):
+    for leaf in sval.iter_ret_leaves(ret_spec):
         if not leaf.via_result_ptr:
             continue
         mir_type = leaf.type.to_mir_type()
@@ -160,9 +164,9 @@ def _call_multi_value(
         return result
 
     # regroup the leaves into the (possibly nested) tuple of the annotation
-    assert isinstance(ret_sig.ret_spec, sval.RetTuple)
+    assert isinstance(ret_spec, sval.RetTuple)
     groups: list[list[Any]] = [[]]
-    work: list[sval.RetSpec | None] = list(reversed(ret_sig.ret_spec.values))
+    work: list[sval.RetSpec | None] = list(reversed(ret_spec.values))
     while work:
         node = work.pop()
         if node is None:
@@ -218,6 +222,10 @@ class _RegisteredFn(AsSpyValue):
         assert native_fn is not None
         ret_sig = instance.ret_sig
         assert ret_sig is not None
+        if ret_sig.exceptions is not None and len(ret_sig.exceptions) > 0:
+            raise SpyError(
+                'calling a function that may raise from Python is not supported yet'
+            )
 
         # the native call takes the arguments of the *lowered* signature:
         # a zero-sized (compile-time) parameter is not passed
@@ -228,12 +236,17 @@ class _RegisteredFn(AsSpyValue):
         ]
         if ret_sig.is_single_value():
             return native_fn.call(*py_args)
-        return _call_multi_value(native_fn, py_args, ret_sig)
+        # no exception part here (a raising function is rejected above): the
+        # values alone, which never include the zero-sized empty error union
+        value_spec = ret_sig.ret_type_spec
+        assert value_spec is not None
+        return _call_multi_value(native_fn, py_args, value_spec)
 
     def get_entry(self):
         if self.entry is None:
             hir = astgen.parse_function(
-                self.fn, self.cls, self.meta.sfv, self.context_type_vars
+                self.fn, self.cls, self.meta.sfv, self.context_type_vars,
+                self.meta.exceptions,
             )
             self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
         return self.entry
@@ -396,8 +409,8 @@ class _Context(GlobalResolver):
         sym = analyser.finish()
         sym.compile(self._symbol_table, self.backend)
 
-    def func(self, sfv: bool = False, extern: bool = False, linkname: str | None = None):
-        meta = FnMetadata(sfv=sfv, extern=extern, linkname=linkname)
+    def func(self, sfv: bool = False, extern: bool = False, linkname: str | None = None, exceptions: set[type] | Literal["infer"] | None = None):
+        meta = FnMetadata(sfv=sfv, extern=extern, linkname=linkname, exceptions=exceptions)
 
         def wrapper[T](fn: T) -> T:
             if fn in self._fn_anotation_cache:

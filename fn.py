@@ -11,21 +11,22 @@ from .errors import CompileError, TypeMismatchError
 from .sval import (
     AnyFunction,
     AnyValue,
+    ErrorUnionType,
     FormalArg,
     FunctionType,
     RetSpec,
     RetValue,
+    TupleType,
     Type,
     TypeVar,
     TypeVarSolver,
     Value,
-    iter_ret_leaves,
     make_ret_spec,
     pass_by_ref,
     replace_type_vars_type,
     type_of,
 )
-from .util import IndexedMap, StrBiMap, frozendict, sanitize_name
+from .util import ArraySet, IndexedMap, StrBiMap, frozendict, sanitize_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,40 +113,35 @@ class SpecializedComptimeArg(SpecializedFormalArg):
 
 @dataclass(frozen=True, slots=True)
 class ReturnSignature:
-    """The return convention of one specialization: the whole return type as
-    one :class:`sval.RetSpec` tree - a leaf (:class:`sval.RetValue`) carries
-    the spy type of one value and whether it is delivered through a hidden
-    result pointer, and a group (:class:`sval.RetTuple`) the ``tuple[...]`` a
-    function (or a nested element of its annotation) returns, whose values the
-    caller regroups.  At most one leaf is returned by value (see
-    ``sval.make_ret_spec``)."""
+    """The logical return convention of one specialization, *before* the error
+    part is added: the return spec of the declared return type
+    (``ret_type_spec``) and the exceptions the function may raise
+    (``exceptions``, in error-code order; empty for a function that raises
+    nothing, ``None`` while they still have to be inferred).
 
-    ret_spec: RetSpec
+    The *effective* spec - the one the lowered function and its callers work
+    with, in which the error union is spread into its error code and its
+    payload (see ``sval.make_ret_spec``) - is :meth:`ret_spec`."""
 
-    def returned_type(self) -> Type | None:
-        """The spy type of the value the lowered function returns directly
-        (the by-value result), or ``None`` when it returns void - every
-        value then goes through a result pointer, or is zero-sized."""
-        for leaf in iter_ret_leaves(self.ret_spec):
-            if not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
-                return leaf.type
-        return None
+    ret_type_spec: RetSpec | None
+    exceptions: ArraySet[Type] | None
 
-    def by_value_index(self) -> int | None:
-        """The position of the one leaf returned by value (its value has
-        storage and fits in registers) among all the leaves, in depth-first
-        declaration order, or ``None`` when the lowered function returns
-        void."""
-        for index, leaf in enumerate(iter_ret_leaves(self.ret_spec)):
-            if not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
-                return index
-        return None
+    def ret_spec(self) -> RetSpec:
+        """The effective return spec: the declared return spec with the error
+        code and the payload union appended.  The error part is always present -
+        a function that raises nothing has the empty ``ErrorUnion[]``, whose code
+        and payload are zero-sized and so never reach the MIR."""
+        assert self.ret_type_spec is not None and self.exceptions is not None
+        return make_ret_spec(TupleType(
+            (self.ret_type_spec.type, ErrorUnionType(tuple(self.exceptions.values))), False,
+        ))
 
     def is_single_value(self) -> bool:
         """Whether the function returns exactly one value - the trivial case
         whose lowered signature is one plain result rather than a result
-        pointer or a regrouped tuple."""
-        return isinstance(self.ret_spec, RetValue)
+        pointer or a regrouped tuple.  It is decided by the *declared* return
+        spec: an error part never makes a single value a group."""
+        return isinstance(self.ret_type_spec, RetValue)
 
 @dataclass(frozen=True, slots=True)
 class CallSignature:
@@ -199,6 +195,10 @@ class Signature:
     # one ``sval.RetSpec`` tree - is resolved from it when a call is
     # specialized (see ``sval.make_ret_spec``)
     ret_type: Type | None
+    # the exceptions the function may raise, in error-code order (tag ``i+1``
+    # corresponds to the i-th one); an empty set for a function that raises
+    # nothing, and None when the set is inferred from the body
+    exceptions: ArraySet[Type] | None
 
     def bind_arg_pos[T](
         self,
@@ -358,6 +358,7 @@ class Signature:
             varargs=None if self.varargs is None else self.varargs.map_type(substitute),
             kwargs=None if self.kwargs is None else self.kwargs.map_type(substitute),
             ret_type=None if self.ret_type is None else substitute(self.ret_type),
+            exceptions=None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute),
         )
 
     def specialize(self, provided: ArgList[Type | None]) -> tuple[CallSignature, ReturnSignature | None]:
@@ -435,9 +436,21 @@ class Signature:
             tuple(type_var_values), positional, varargs, kwargs
         )
 
-        if self.ret_type is None:
+        if self.ret_type is None or self.exceptions is None:
+            # no declared return type, or an inferred exception set: the
+            # interpreter infers the missing part from the body
             return call_sig, None
-        return call_sig, ReturnSignature(make_ret_spec(substitute(self.ret_type)))
+        exceptions = _substitute_exceptions(self.exceptions, substitute)
+        return call_sig, ReturnSignature(make_ret_spec(substitute(self.ret_type)), exceptions)
+
+
+def _substitute_exceptions(exceptions: ArraySet[Type], substitute: Callable[[Type], Type]) -> ArraySet[Type]:
+    """A copy of an exception set with every type substituted, keeping the
+    error-code order."""
+    ret: ArraySet[Type] = ArraySet()
+    for exception in exceptions.values:
+        ret.add(substitute(exception))
+    return ret
 
 
 @dataclass

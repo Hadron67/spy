@@ -121,6 +121,33 @@ class ArrayType(Type):
     def get_children(self) -> tuple[Any, ...]:
         return (self.elem,)
 
+
+class UnionType(Type):
+    """The static type of an untagged union value - the payload of an error
+    union: exactly one variant is stored, and the largest one occupies the
+    storage.  The union carries no tag of its own (the tag lives next to it,
+    as the error code), so a variant value is written and read through a
+    reinterpretation (:class:`BitCast`) of the address of a union value.
+
+    The type is an identity object mirroring one ``sval.UnionType``: two
+    unions are equal only when they are the same object."""
+
+    def __init__(self, name_base: str | None, payload: Type) -> None:
+        self.name_base = name_base
+        self.payload = payload
+
+    def __eq__(self, value: object, /) -> bool:
+        return self is value
+
+    def __hash__(self) -> int:
+        return object.__hash__(self)
+
+    def __repr__(self) -> str:
+        return f'<union {self.payload!r}>'
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.payload,)
+
 @dataclass(frozen=True)
 class FunctionType(Type):
     """The signature of a function value (the element type of its
@@ -449,6 +476,30 @@ class Convert(Inst):
 
 
 @dataclass(eq=False)
+class BitCast(Inst):
+    """Reinterpret a value of one type as a value of another type of the same
+    size.  It is how a union variant is written and read through the address of
+    the union's storage: the address of the union is reinterpreted as the
+    address of the variant.  A pointer-to-pointer cast has no representation of
+    its own: the LLVM IR pointers are untyped (``ptr``), so it lowers to the
+    address it is given (see ``lower``)."""
+
+    value: Value
+    type: Type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
+
+
+@dataclass(eq=False)
 class Cmp(Inst):
     """A comparison producing a bool; ``op`` is one of '==', '!=', '<',
     '<=', '>', '>='."""
@@ -606,6 +657,28 @@ class Br(Terminator):
     def map_values(self, f: Callable[[Value], Value]) -> Self:
         cond = f(self.cond)
         return self if cond is self.cond else replace(self, cond=cond)
+
+
+@dataclass(eq=False)
+class Switch(Terminator):
+    """A multi-way branch on an integer value (the error code of a call):
+    control goes to the target of the case whose constant matches ``value``, or
+    to ``default`` when no case matches."""
+
+    value: Value
+    default: BasicBlock
+    cases: tuple[tuple[int, BasicBlock], ...]
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return (self.default, *(block for _, block in self.cases))
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
 
 
 @dataclass(eq=False)

@@ -16,6 +16,7 @@ compiled functions; a test that needs a fresh compilation calls a
 function no earlier test has compiled.
 """
 
+import ctypes
 import io
 from contextlib import redirect_stdout
 from typing import Any, Literal, Protocol, Self
@@ -25,6 +26,7 @@ from spy.dsl import func, struct
 
 from . import (
     CompileError,
+    SpyError,
     TypeMismatchError,
     compile_log,
     f32,
@@ -42,7 +44,9 @@ from . import (
 from . import as_ as spy_as
 from . import bool as spy_bool
 from . import typeof as spy_typeof
+from .lower import LLVMBackend
 from .syntax import Array, Comptime, Option, Ptr, array, ref
+from .util import StrBiMap
 
 # ---------------------------------------------------------------------------
 # functions under test
@@ -2781,6 +2785,456 @@ class SpyMultiReturnTest(TestCase):
             bad_ellipsis_return(3)
 
 
+# ---------------------------------------------------------------------------
+# the primitives of error handling: the payload union and the error union in
+# the spy type system (``sval``), and their lowering (``mir``/``lower``)
+# ---------------------------------------------------------------------------
+
+
+def _union_lowering_fn() -> mir.Function:
+    """A hand-built MIR function that writes an ``i32`` through a ``BitCast``
+    of a union's address and branches on it with a ``Switch``:
+    ``f(n) = 10 if n == 0, 20 if n == 1, else 30``."""
+    i32_mir = mir.IntType(32, True)
+    payload = mir.StructType(
+        'union_payload',
+        (mir.FormalArg('a', i32_mir), mir.FormalArg('b', i32_mir)),
+    )
+    union = mir.UnionType('union', payload)
+    fn = mir.Function('union_lowering_test', [i32_mir], [None], i32_mir)
+    entry = fn.entry
+    slot = entry.emit(mir.Alloca(union))
+    cell = entry.emit(mir.BitCast(slot, mir.PointerType(i32_mir)))
+    entry.emit(mir.Store(cell, mir.Param(0, i32_mir)))
+    value = entry.emit(mir.Load(cell))
+    case0 = mir.BasicBlock()
+    case1 = mir.BasicBlock()
+    other = mir.BasicBlock()
+    entry.emit(mir.Switch(value, other, ((0, case0), (1, case1))))
+    case0.emit(mir.Ret(mir.Int(10, i32_mir)))
+    case1.emit(mir.Ret(mir.Int(20, i32_mir)))
+    other.emit(mir.Ret(mir.Int(30, i32_mir)))
+    mir.normalize(fn)
+    fn.is_complete = True
+    return fn
+
+
+class SpyErrorUnionPrimitiveTest(TestCase):
+    """The type-system and lowering primitives of error handling: the error
+    union spreads into an error code and a payload union (see
+    ``sval.make_ret_spec``), and the payload union is an untagged union read and
+    written through a ``BitCast``."""
+
+    def test_empty_error_union_is_the_unit_type(self) -> None:
+        empty = sval.ErrorUnionType(())
+        self.assertEqual(empty.tag_bits, 0)
+        self.assertEqual(empty.code_type, sval.IntType(0, False))
+        self.assertIsNotNone(empty.get_unit_value())
+        self.assertIsNone(empty.to_mir_type())
+
+    def test_error_code_width_is_the_smallest(self) -> None:
+        small = struct_type(Small)
+        large = struct_type(Large)
+        self.assertEqual(sval.ErrorUnionType((small,)).tag_bits, 1)
+        self.assertEqual(sval.ErrorUnionType((small, large)).tag_bits, 2)
+        self.assertEqual(sval.ErrorUnionType((small, large, small)).tag_bits, 2)
+        self.assertEqual(sval.ErrorUnionType((small, large, small, large)).tag_bits, 3)
+
+    def test_payload_union_uses_the_largest_variant_and_is_interned(self) -> None:
+        small = struct_type(Small)
+        large = struct_type(Large)
+        one = sval.UnionType((small, large))
+        two = sval.UnionType((small, large))
+        self.assertIs(one.storage_variant(), large)
+        self.assertIs(one.to_mir_type(), two.to_mir_type())
+        self.assertIs(sval.UnionType(()).to_mir_type(), mir.VOID)
+
+    def test_make_ret_spec_spreads_the_error_union(self) -> None:
+        small = struct_type(Small)
+        i32_type = sval.IntType(32, True)
+        type = sval.TupleType((i32_type, sval.ErrorUnionType((small,))), False)
+        spec = sval.make_ret_spec(type)
+        assert isinstance(spec, sval.RetTuple)
+        result, error = spec.values
+        assert isinstance(result, sval.RetValue)
+        self.assertIs(result.type, i32_type)
+        assert isinstance(error, sval.RetTuple)
+        self.assertIsInstance(error.type, sval.ErrorUnionType)
+        code, payload = error.values
+        assert isinstance(code, sval.RetValue)
+        assert isinstance(payload, sval.RetValue)
+        self.assertEqual(code.type, sval.IntType(1, False))
+        self.assertIsInstance(payload.type, sval.UnionType)
+        # the i32 is returned by value; its code and payload through pointers
+        self.assertFalse(result.via_result_ptr)
+        self.assertTrue(code.via_result_ptr)
+        self.assertTrue(payload.via_result_ptr)
+        self.assertEqual(len(list(sval.iter_ret_leaves(spec))), 3)
+
+    def test_error_union_subtyping_is_set_inclusion(self) -> None:
+        small = struct_type(Small)
+        large = struct_type(Large)
+        empty = sval.ErrorUnionType(())
+        one = sval.ErrorUnionType((small,))
+        both = sval.ErrorUnionType((small, large))
+        self.assertTrue(empty.is_subtype_of(one))
+        self.assertTrue(one.is_subtype_of(both))
+        self.assertFalse(both.is_subtype_of(one))
+        self.assertFalse(one.is_subtype_of(sval.ErrorUnionType((large,))))
+
+    def test_error_union_peer_is_the_union_in_delivery_order(self) -> None:
+        small = struct_type(Small)
+        large = struct_type(Large)
+        peer = sval.ErrorUnionType((small,)).resolve_peer_type(sval.ErrorUnionType((large, small)))
+        self.assertEqual(peer, sval.ErrorUnionType((small, large)))
+        self.assertEqual(
+            sval.ErrorUnionType(()).resolve_peer_type(sval.ErrorUnionType((small,))),
+            sval.ErrorUnionType((small,)),
+        )
+
+    def test_success_is_the_value_of_the_empty_error_union(self) -> None:
+        empty = sval.ErrorUnionType(())
+        success = empty.get_unit_value()
+        assert success is not None
+        self.assertIsInstance(success, sval.Success)
+        self.assertEqual(sval.type_of(success), empty)
+
+    def test_lowering_a_bitcast_and_a_switch(self) -> None:
+        fn = _union_lowering_fn()
+        globals: StrBiMap[mir.GlobalValue] = StrBiMap()
+        globals.add('union_lowering_test', fn)
+        backend = LLVMBackend()
+        native = backend.compile(set(), globals)[fn]
+        self.assertEqual(native.call(ctypes.c_int32(0)), 10)
+        self.assertEqual(native.call(ctypes.c_int32(1)), 20)
+        self.assertEqual(native.call(ctypes.c_int32(7)), 30)
+        text = '\n'.join(native.print_all())
+        # the LLVM IR pointers are untyped (``ptr``), so reinterpreting a
+        # pointer type as another lowers to nothing
+        self.assertNotIn('bitcast', text)
+        self.assertIn('switch', text)
+
+
+# ---------------------------------------------------------------------------
+# raising and propagating exceptions: a function that may raise returns an
+# error code and a payload next to its result (see ``sval.ErrorUnionType``),
+# and a call carries the error to its caller (remapping the tag)
+# ---------------------------------------------------------------------------
+
+
+@struct()
+class ErrorA(Exception):
+    code: i32
+
+
+@struct()
+class ErrorB(Exception):
+    n: i32
+
+
+@func(exceptions={ErrorA})
+def raise_a(n: i32) -> i32:
+    if n < 0:
+        raise ErrorA(7)
+    return n + 1
+
+
+@func(exceptions={ErrorB})
+def raise_b(n: i32) -> i32:
+    if n < 0:
+        raise ErrorB(9)
+    return n + 2
+
+
+@func(exceptions={ErrorA, ErrorB})
+def forward_raise(n: i32) -> i32:
+    return raise_a(n) + 10
+
+
+@func(exceptions={ErrorA})
+def catch_bound(n: i32) -> i32:
+    try:
+        return raise_a(n)
+    except ErrorA as e:
+        return e.code + 100
+
+
+@func(exceptions={ErrorA, ErrorB})
+def catch_multi(n: i32) -> i32:
+    try:
+        return raise_a(n)
+    except ErrorB:
+        return 1
+    except ErrorA as e:
+        return e.code + 200
+    except:  # noqa: E722
+        return -1
+
+
+@func(exceptions={ErrorA, ErrorB})
+def escape_through(n: i32) -> i32:
+    try:
+        return raise_a(n)
+    except ErrorB:
+        return 1
+
+
+@func()
+def catch_without_declaring(n: i32) -> i32:
+    # the try catches ``ErrorA`` in its own error space, so the function itself
+    # never raises and declares nothing
+    try:
+        return raise_a(n)
+    except ErrorA as e:
+        return e.code + 500
+
+
+@func()
+def raise_undeclared(n: i32) -> i32:
+    # the function declares no exception, so raising one is rejected when the
+    # error is tagged (see ``HirRunner._tag_of``)
+    if n < 0:
+        raise ErrorA(7)
+    return n + 1
+
+
+@struct()
+class ErrorC(Exception):
+    code: i32
+
+
+@func(exceptions="infer")
+def inferred_raise(n: i32) -> i32:
+    if n < 0:
+        raise ErrorC(7)
+    return n + 1
+
+
+@func(exceptions="infer")
+def inferred_forward(n: i32) -> i32:
+    return inferred_raise(n) + 10
+
+
+@func(exceptions="infer")
+def inferred_catch(n: i32) -> i32:
+    try:
+        return inferred_raise(n)
+    except ErrorC as e:
+        return e.code + 100
+
+
+@func(exceptions="infer")
+def inferred_two(n: i32) -> i32:
+    return raise_a(n) + raise_b(n)
+
+
+@func(exceptions="infer")
+def nested_catch(n: i32) -> i32:
+    try:
+        try:
+            return raise_a(n)
+        except ErrorB:
+            return -1
+    except ErrorA as e:
+        return e.code + 100
+
+
+@struct()
+class ErrorBig(Exception):
+    a: i64
+    b: i64
+    c: i64
+
+
+@func()
+def make_big(n: i32) -> ErrorBig:
+    return ErrorBig(n, n + 1, n + 2)
+
+
+@func(exceptions="infer")
+def raise_big(n: i32) -> i32:
+    # a call returning an aggregate is raised through a result pointer: the
+    # delivery into the (still inferred) space is deferred to its commit
+    if n < 0:
+        raise make_big(n)
+    return n + 1
+
+
+@func(exceptions="infer")
+def catch_big(n: i32) -> i32:
+    try:
+        raise_big(n)
+    except ErrorBig as e:
+        return e.a + e.b + e.c
+    return 0
+
+
+def call_with_error(handle: Any, arg: int) -> tuple[int, int, int]:
+    """Compile ``handle`` (a Python-side call is rejected after compiling it)
+    and invoke its native form directly, with the hidden error-code and payload
+    pointers filled in by this helper.  Returns ``(result, error code, payload
+    read as i32)``; the payload is only meaningful when the code is not zero."""
+    entry = handle.get_entry()
+    if len(entry.specs) == 0:
+        with TestCase().assertRaises(SpyError):
+            handle(arg)
+    assert len(entry.specs) == 1, entry.specs
+    instance = next(iter(entry.specs.values()))
+    native = instance.wrapper_fn or instance.native_fn
+    assert native is not None
+    code = ctypes.c_uint8(255)
+    payload = ctypes.c_int32(-1)
+    result = native.call(
+        ctypes.c_int32(arg),
+        ctypes.c_void_p(ctypes.addressof(code)),
+        ctypes.c_void_p(ctypes.addressof(payload)),
+    )
+    return int(result), int(code.value), int(payload.value)
+
+
+class SpyErrorUnionTest(TestCase):
+    """``raise`` delivers an exception into the function's error location - an
+    error code and a payload - and ends the path; a call of a function that
+    may raise carries the error to its caller, remapping the tag to the
+    caller's own exception set."""
+
+    def test_a_raising_function_lowers_to_a_code_and_a_payload(self) -> None:
+        self._compile(raise_a, 1)
+        args, ret = mir_signature(raise_a)
+        i32_mir = mir.IntType(32, True)
+        # ``fn(i32, *u1, *payload) -> i32``: one exception needs one bit for
+        # its two tags (no error and the exception)
+        self.assertEqual(ret, i32_mir)
+        self.assertEqual(args[0], i32_mir)
+        self.assertEqual(args[1], mir.PointerType(mir.IntType(1, False), False))
+        self.assertIsInstance(args[2], mir.PointerType)
+
+    def test_a_function_that_raises_nothing_has_no_error_part(self) -> None:
+        # the empty ``ErrorUnion[]`` is the unit type: an exception-free
+        # function's lowered signature has neither an error code nor a payload
+        self.assertEqual(catch_without_declaring(5), 6)
+        args, ret = mir_signature(catch_without_declaring)
+        i32_mir = mir.IntType(32, True)
+        self.assertEqual(args, (i32_mir,))
+        self.assertEqual(ret, i32_mir)
+
+    def test_raising_an_undeclared_exception_is_rejected(self) -> None:
+        # the function declares no exception, so the error is rejected when it
+        # is tagged (``HirRunner._tag_of``), with a hint about the declaration
+        with self.assertRaises(CompileError) as ctx:
+            raise_undeclared(5)
+        self.assertIn('cannot raise', str(ctx.exception))
+
+    def test_a_caller_widens_the_error_code(self) -> None:
+        self._compile(forward_raise, 1)
+        args, _ = mir_signature(forward_raise)
+        # two exceptions need two bits (three tags)
+        self.assertEqual(args[1], mir.PointerType(mir.IntType(2, False), False))
+
+    def test_the_declared_exceptions_are_recorded(self) -> None:
+        entry = raise_a.get_entry()  # pyright: ignore
+        signature = entry.hir.signature
+        assert signature.exceptions is not None
+        self.assertEqual(list(signature.exceptions.values), [struct_type(ErrorA)])
+
+    def test_calling_a_raising_function_from_python_is_rejected(self) -> None:
+        with self.assertRaises(SpyError) as ctx:
+            raise_a(1)
+        self.assertIn('not supported', str(ctx.exception))
+
+    def _compile(self, handle: Any, arg: int) -> None:
+        # a call from Python compiles the function before the boundary rejects
+        # it: the Python-side handling of errors is not implemented yet
+        with self.assertRaises(SpyError):
+            handle(arg)
+
+
+class SpyTryExceptTest(TestCase):
+    """``try``/``except`` catches the error a call (or a ``raise``) delivered:
+    the clause whose type matches the error code runs, taking the payload for
+    its ``as`` name; an error no clause matches re-raises to the enclosing
+    handler, or out of the function."""
+
+    def test_catching_the_normal_result_passes_through(self) -> None:
+        result, code, _ = call_with_error(catch_bound, 5)
+        self.assertEqual((result, code), (6, 0))
+
+    def test_catching_binds_the_payload(self) -> None:
+        result, code, _ = call_with_error(catch_bound, -3)
+        self.assertEqual((result, code), (107, 0))
+
+    def test_a_plain_clause_catches_without_binding(self) -> None:
+        result, code, _ = call_with_error(catch_multi, -3)
+        self.assertEqual((result, code), (207, 0))
+
+    def test_multiple_clauses_pick_the_matching_one(self) -> None:
+        self.assertEqual(call_with_error(catch_multi, 5)[:2], (6, 0))
+        self.assertEqual(call_with_error(catch_multi, -3)[:2], (207, 0))
+
+    def test_an_unmatched_error_escapes_the_try(self) -> None:
+        _result, code, payload = call_with_error(escape_through, -3)
+        # the two exceptions need two bits, and the code is non-zero: the
+        # error escaped the ``try`` and reached the function's caller
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload, 7)
+
+    def test_a_caught_exception_need_not_be_declared(self) -> None:
+        # the function declares nothing, so Python can call it directly
+        self.assertEqual(catch_without_declaring(5), 6)
+        self.assertEqual(catch_without_declaring(-3), 507)
+
+
+class SpyInferTest(TestCase):
+    """An inferred exception set (``exceptions="infer"``): the space's set,
+    its code width and its payload union follow from what the body actually
+    raises or lets through, fixed when the function's analysis ends."""
+
+    def test_an_inferred_set_lowers_to_a_code_and_a_payload(self) -> None:
+        result, code, _ = call_with_error(inferred_raise, 5)
+        self.assertEqual((result, code), (6, 0))
+        result, code, payload = call_with_error(inferred_raise, -3)
+        self.assertEqual((result, code, payload), (0, 1, 7))
+        entry = inferred_raise.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        assert instance.ret_sig is not None and instance.ret_sig.exceptions is not None
+        self.assertEqual(list(instance.ret_sig.exceptions.values), [struct_type(ErrorC)])
+        args = instance.mir.args
+        self.assertEqual(args[1], mir.PointerType(mir.IntType(1, False), False))
+
+    def test_an_inferred_error_propagates(self) -> None:
+        self.assertEqual(call_with_error(inferred_forward, 5)[:2], (16, 0))
+        self.assertEqual(call_with_error(inferred_forward, -3)[1:], (1, 7))
+
+    def test_a_fully_caught_inferred_function_is_callable(self) -> None:
+        self.assertEqual(inferred_catch(5), 6)
+        self.assertEqual(inferred_catch(-3), 107)
+
+    def test_an_inferred_set_collects_every_callee(self) -> None:
+        self.assertEqual(call_with_error(inferred_two, 5)[:2], (13, 0))
+        self.assertEqual(call_with_error(inferred_two, -3)[1:], (1, 7))
+        entry = inferred_two.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        assert instance.ret_sig is not None and instance.ret_sig.exceptions is not None
+        # first-delivery order, and two exceptions need two bits
+        self.assertEqual(
+            list(instance.ret_sig.exceptions.values),
+            [struct_type(ErrorA), struct_type(ErrorB)],
+        )
+        self.assertEqual(instance.mir.args[1], mir.PointerType(mir.IntType(2, False), False))
+
+    def test_nested_tries_hand_over_inward(self) -> None:
+        # the inner ``try`` catches nothing, so its error is re-raised into the
+        # outer one, which catches it
+        self.assertEqual(nested_catch(5), 6)
+        self.assertEqual(nested_catch(-3), 107)
+
+    def test_raising_a_call_returning_an_aggregate(self) -> None:
+        # ``raise make_big(n)`` hands a result pointer to the callee, deferred
+        # until the inferred space's payload type is known
+        self.assertEqual(catch_big(-3), -6)
+        self.assertEqual(catch_big(5), 0)
+
+
 all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
@@ -2796,4 +3250,8 @@ all_tests = [
     SpyOptionTest,
     SpyOptionNestingTest,
     SpyMultiReturnTest,
+    SpyErrorUnionPrimitiveTest,
+    SpyErrorUnionTest,
+    SpyTryExceptTest,
+    SpyInferTest,
 ]

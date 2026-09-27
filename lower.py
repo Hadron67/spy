@@ -97,6 +97,10 @@ class _ModuleTypes:
                     )
                     self._structs[type] = ret
                 return ret
+            case mir.UnionType():
+                # an untagged union is laid out as its storage (the largest
+                # variant): a variant is read and written through a bitcast
+                return self.to_llvm(type.payload)
             case _:
                 raise CompileError(f'type {type!r} cannot be lowered to LLVM')
 
@@ -127,6 +131,8 @@ def to_ctype(type: mir.MayBeVoidType) -> Any:
             return ctypes.c_void_p
         case mir.StructType():
             return struct_ctype(type)
+        case mir.UnionType():
+            return to_ctype(type.payload)
         case mir.ArrayType():
             # an array crosses the boundary as its elements in a row
             ctype = to_ctype(type.elem)
@@ -222,11 +228,29 @@ class _Lowerer:
             for inst in block.insts:
                 if isinstance(inst, mir.Alloca):
                     self._lower_inst(llvm_fn.entry, inst, arg_values, block_map)
+        # a pointer ``BitCast`` of a stable pointer (an alloca or a parameter)
+        # is resolved into the entry block first, so that it is available to
+        # every block that takes the address of a union variant through it (it
+        # emits no instruction of its own, see ``_lower_inst``)
+        hoisted = True
+        while hoisted:
+            hoisted = False
+            for block in blocks:
+                for inst in block.insts:
+                    if not isinstance(inst, mir.BitCast) or id(inst) in self._lowered:
+                        continue
+                    operand = inst.value
+                    if isinstance(operand, mir.Param) or (
+                        isinstance(operand, mir.Inst) and id(operand) in self._lowered
+                    ):
+                        self._lower_inst(llvm_fn.entry, inst, arg_values, block_map)
+                        hoisted = True
         for block in blocks:
             target = block_map[id(block)]
             for inst in block.insts:
-                if isinstance(inst, mir.Alloca):
-                    # already lowered into the entry block
+                if id(inst) in self._lowered:
+                    # an ``Alloca`` or a resolved ``BitCast``: already lowered
+                    # into the entry block
                     continue
                 self._lower_inst(target, inst, arg_values, block_map)
         return llvm_fn
@@ -294,7 +318,7 @@ class _Lowerer:
                     self._value(inst.ptr, arg_values), self._value(inst.value, arg_values)
                 )
             case mir.Load():
-                result = block.load(self._value(inst.ptr, arg_values))
+                result = block.load(self._value(inst.ptr, arg_values), self._to_llvm(inst.get_type()))
             case mir.Gep():
                 ptr = self._value(inst.ptr, arg_values)
                 index = inst.index
@@ -342,6 +366,15 @@ class _Lowerer:
                         result = block.emit(sllvm.FloatToUInt(value, to))  # type: ignore[arg-type]
                     case _:
                         raise CompileError(f"unsupported conversion '{inst.kind}'")
+            case mir.BitCast():
+                value = self._value(inst.value, arg_values)
+                if isinstance(inst.value.get_type(), mir.PointerType) and isinstance(inst.type, mir.PointerType):
+                    # the LLVM IR pointers are untyped (``ptr``): reinterpreting
+                    # one pointer type as another is a no-op, the address is
+                    # used as it is
+                    result = value
+                else:
+                    result = block.bitcast(value, self._to_llvm(inst.type))
             case mir.Cmp():
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)
@@ -362,6 +395,12 @@ class _Lowerer:
                     self._value(inst.cond, arg_values),
                     block_map[id(inst.if_true)],
                     block_map[id(inst.if_false)],
+                )
+            case mir.Switch():
+                block.switch(
+                    self._value(inst.value, arg_values),
+                    block_map[id(inst.default)],
+                    *tuple((case, block_map[id(block0)]) for case, block0 in inst.cases),
                 )
             case mir.Ret():
                 block.ret(

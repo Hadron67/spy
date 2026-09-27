@@ -850,8 +850,8 @@ class BasicBlock(LocalValue):
     def rem(self, lhs: Value, rhs: Value, signed: bool) -> Value:
         return self.emit(Binary(SRem() if signed else URem(), lhs, rhs))
 
-    def load(self, ptr: Value) -> Value:
-        return self.emit(Load(ptr))
+    def load(self, ptr: Value, type: Type) -> Value:
+        return self.emit(Load(ptr, type))
 
     def store(self, ptr: Value, value: Value | int):
         if isinstance(value, Value):
@@ -901,6 +901,9 @@ class BasicBlock(LocalValue):
     def ptrtoint(self, value: Value, type: IntType):
         return self.emit(PtrToInt(value, type))
 
+    def bitcast(self, value: Value, type: Type):
+        return self.emit(BitCast(value, type))
+
     def icmp(self, op: IcmpOp, signed: bool, lhs: Value, rhs: Value):
         return self.emit(Icmp(op, signed, lhs, rhs))
 
@@ -926,6 +929,9 @@ class BasicBlock(LocalValue):
 
     def jmp(self, target: BasicBlock):
         self.emit(BrDirect(target))
+
+    def switch(self, value: Value, default: BasicBlock, *cases: tuple[int, BasicBlock]) -> None:
+        self.emit(Switch(value, default, tuple(cases)))
 
     def call(self, fn: Value, *args: Value):
         return self.emit(Call(fn, args))
@@ -1277,11 +1283,9 @@ class Load(Inst):
     ptr: Value
     type: Type
 
-    def __init__(self, ptr: Value):
+    def __init__(self, ptr: Value, type: Type):
         self.ptr = ptr
-        type = ptr.get_type()
-        assert isinstance(type, PointerType), f"pointer type expected, got {type}"
-        self.type = type.child
+        self.type = type
 
     @override
     def get_type(self) -> Type:
@@ -1382,6 +1386,14 @@ class UIntExt(ConversionInst[IntType]):
     def head_name(self) -> str:
         return 'zext'
 
+class BitCast(ConversionInst[Type]):
+    """Reinterpret a value of one type as a value of another type of the same
+    size (a pointer bitcast in practice)."""
+
+    @override
+    def head_name(self) -> str:
+        return 'bitcast'
+
 @gen_get_children
 class GetElementPtr(Inst):
     ptr: Value
@@ -1479,10 +1491,9 @@ class Store(Inst):
     def __init__(self, ptr: Value, value: Value):
         self.ptr = ptr
         self.value = value
-        ptr_type = ptr.get_type()
-        value_type = value.get_type()
-        assert isinstance(ptr_type, PointerType), "pointer type expected"
-        assert ptr_type.child.is_compatible(value_type), f"incompatible types {ptr_type} and {value_type}"
+        # the pointer's child type is not checked: the LLVM IR pointers are
+        # untyped (``ptr``), so a store through a reinterpreted address is
+        # indistinguishable from any other pointer at this level
 
     @override
     def get_type(self) -> Type:
@@ -1598,6 +1609,41 @@ class BrDirect(Branch):
     @override
     def get_type(self) -> Type:
         return VoidType()
+
+class Switch(Branch):
+    """A multi-way branch on an integer value (the error code of a call):
+    control goes to the block of the case whose constant matches ``value``, or
+    to ``default`` when no case matches."""
+
+    value: Value
+    default: BasicBlock
+    cases: tuple[tuple[int, BasicBlock], ...]
+
+    def __init__(self, value: Value, default: BasicBlock, cases: tuple[tuple[int, BasicBlock], ...]) -> None:
+        value_type = value.get_type()
+        assert isinstance(value_type, IntType), f"int type expected, got {value_type}"
+        self.value = value
+        self.default = default
+        self.cases = cases
+
+    @override
+    def get_children(self) -> list[Value]:
+        return [self.value, self.default, *(block for _, block in self.cases)]
+
+    @override
+    def get_type(self) -> Type:
+        return VoidType()
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        type_str = self.value.get_type().stringify(name_context)
+        value = self.value.stringify(name_context, local_counter)
+        default = self.default.stringify(name_context, local_counter)
+        cases = ' '.join(
+            f'{type_str} {case}, {block.stringify(name_context, local_counter)}'
+            for case, block in self.cases
+        )
+        return f'switch {value}, {default} [ {cases} ]'
 
 @gen_get_children
 class Ret(Branch):

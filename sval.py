@@ -201,6 +201,177 @@ class TupleType(Type):
 
 
 @dataclass(frozen=True)
+class UnionType(Type):
+    """The payload of an error union: an untagged union that holds exactly one
+    of ``types`` (the exception structs), the largest one occupying the
+    storage.  It has no tag of its own - the error code next to it *is* the
+    tag - so a variant value is written and read through a reinterpretation of
+    the payload's address (see ``mir.UnionType``)."""
+
+    types: tuple[Type, ...]
+
+    @override
+    def get_type(self) -> Type:
+        level = 0
+        for type in self.types:
+            child = type.get_type()
+            assert isinstance(child, TypeType)
+            level = max(level, child.level)
+        return TypeType(level)
+
+    @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        return self.types
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        """A union is a subtype of a union of the same variants and of
+        nothing else (the variants are compared for equality, like the
+        elements of an array)."""
+        return isinstance(other, UnionType) and self == other
+
+    @override
+    def get_unit_value(self) -> AnyValue | None:
+        """A union holds no storage when it has no variant, or when every
+        variant is zero-sized: it then equals the unit value."""
+        for type in self.types:
+            if type.get_unit_value() is None:
+                return None
+        return Void()
+
+    def storage_variant(self) -> Type | None:
+        """The variant whose storage the union uses: the largest one (and,
+        among equally large ones, the most aligned), or None when every
+        variant is zero-sized."""
+        best: Type | None = None
+        best_key: tuple[int, int] | None = None
+        for type in self.types:
+            if type.get_unit_value() is not None:
+                continue
+            key = (estimated_size_of(type), estimated_alignment_of(type))
+            if best_key is None or key > best_key:
+                best = type
+                best_key = key
+        return best
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        payload = self.storage_variant()
+        if payload is None:
+            return mir.VOID
+        mir_payload = payload.to_mir_type()
+        if mir_payload is None:
+            return None
+        if isinstance(mir_payload, mir.VoidType):
+            return mir.VOID
+        return _union_mir(self, mir_payload)
+
+    def __str__(self) -> str:
+        return f"union[{", ".join(str(t) for t in self.types)}]"
+
+
+_UNION_MIRS: dict[UnionType, mir.UnionType] = {}
+
+def _union_mir(type: UnionType, payload: mir.Type) -> mir.UnionType:
+    """The MIR mirror of one payload union (interned per union, so that every
+    reference to the same union names one MIR type)."""
+    ret = _UNION_MIRS.get(type)
+    if ret is None:
+        ret = mir.UnionType('union', payload)
+        _UNION_MIRS[type] = ret
+    return ret
+
+
+@dataclass(frozen=True)
+class ErrorUnionType(Type):
+    """The error union ``ErrorUnion[T1, T2, ...]`` of a function: the set of
+    exceptions it may raise, with the implicit "no error" tag ``0``.  It is a
+    compile-time-only type: it never has a value of its own at runtime, because
+    when a function returns one it is *spread out* into the error code and the
+    payload union (see :func:`make_ret_spec`).
+
+    An empty error union (``ErrorUnion[]``) is the unit type: a function that
+    raises nothing."""
+
+    types: tuple[Type, ...]
+
+    @property
+    def tag_bits(self) -> int:
+        """The width in bits of the error code: the smallest that can hold
+        the tags ``0..len(types)`` (``0`` for an empty error union)."""
+        n = len(self.types)
+        return 0 if n == 0 else n.bit_length()
+
+    @property
+    def code_type(self) -> IntType:
+        """The type of the error code: an unsigned integer of :attr:`tag_bits`
+        bits (``u0`` for an empty error union)."""
+        return IntType(self.tag_bits, False)
+
+    @property
+    def union(self) -> UnionType:
+        """The payload union: the storage of the exception value the error
+        code tags."""
+        return UnionType(self.types)
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        return self.types
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        """An error union is a subtype of an error union whose set contains
+        every exception of this one - so the empty error union is a subtype of
+        every error union."""
+        return isinstance(other, ErrorUnionType) and all(t in other.types for t in self.types)
+
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        """The peer of two error unions: the union of their exception sets, in
+        first-delivery order (this one's exceptions first)."""
+        if not isinstance(other, ErrorUnionType):
+            return None
+        types = list(self.types)
+        for type in other.types:
+            if type not in types:
+                types.append(type)
+        return ErrorUnionType(tuple(types))
+
+    @override
+    def get_unit_value(self) -> AnyValue | None:
+        # an empty error union is the unit type, whose unique value is
+        # ``Success``; a non-empty one always has a code, which is not
+        # zero-sized
+        return Success() if len(self.types) == 0 else None
+
+    @override
+    def to_mir_type(self) -> mir.MayBeVoidType | None:
+        # compile-time only: the type is spread out into the code and the
+        # payload union when it is lowered (see ``make_ret_spec``)
+        return None
+
+    def __str__(self) -> str:
+        return f"ErrorUnion[{", ".join(str(t) for t in self.types)}]"
+
+
+class Success(Value):
+    """The unique *value* of the empty error union :class:`ErrorUnionType`:
+    the outcome of a path that raises no error.  Delivering it into an error
+    location writes the "no error" tag (``0``)."""
+
+    @override
+    def get_type(self) -> Type:
+        return ErrorUnionType(())
+
+    def __str__(self) -> str:
+        return 'success'
+
+
+@dataclass(frozen=True)
 class StrDictType(Type):
     values: frozendict[str, Type]
 
@@ -1238,6 +1409,9 @@ def estimated_size_of(type: Type) -> int:
                 offset += estimated_size_of(field.type)
             align = estimated_alignment_of(type)
             return (offset + align - 1) // align * align
+        case UnionType():
+            # a union holds its largest variant's storage (no tag of its own)
+            return max((estimated_size_of(t) for t in type.types), default=0)
         case _:
             raise SpyError(f"type {type} has no layout")
 
@@ -1280,6 +1454,12 @@ def estimated_alignment_of(type: Type) -> int:
                 ),
                 default=1,
             )
+        case UnionType():
+            # a union's alignment is the maximum of its variants'
+            return max(
+                (estimated_alignment_of(t) for t in type.types),
+                default=1,
+            )
         case _:
             raise SpyError(f"type {type} has no layout")
 
@@ -1309,7 +1489,7 @@ def returns_via_result_ptr(type: Type) -> bool:
     value.  A signature may override the default
     (``fn.ReturnSignature.ret_spec``)."""
     match type:
-        case StructType() | ArrayType() | OptionType():
+        case StructType() | ArrayType() | OptionType() | UnionType():
             if _mentions_type_var(type):
                 # the layout is not known until the call substitutes the
                 # type parameter: assumed small now, re-decided on substitution
@@ -1333,19 +1513,22 @@ class RetValue:
 @dataclass(frozen=True, slots=True)
 class RetTuple:
     """A group of results: the ``tuple[...]`` a function returns (or one
-    written as an element of that annotation).  The whole return type is one
-    :class:`RetSpec` - a :class:`RetValue` for a single value, a
-    :class:`RetTuple` when it is a ``tuple[...]`` - so a single result is just
-    the trivial case and the nesting mirrors the annotation.
+    written as an element of that annotation), or the ``ErrorUnion[...]`` error
+    group a function's logical return type carries.  The whole return type is
+    one :class:`RetSpec` - a :class:`RetValue` for a single value, a
+    :class:`RetTuple` when it is a ``tuple[...]`` or an ``ErrorUnion[...]`` - so
+    a single result is just the trivial case and the nesting mirrors the
+    annotation.
 
     The group is a *compile-time* regrouping of the values of its elements: a
     tuple has no runtime representation of its own, so the lowered signature
     delivers its leaves (see :func:`make_ret_spec`) and the caller regroups
-    them (see ``interp``)."""
+    them (see ``interp``).  An error group holds exactly two leaves - the error
+    code and the payload union."""
 
-    # the ``tuple[...]`` the group was written as (its ``types`` are the
-    # element types, one per entry of ``values``)
-    type: TupleType
+    # the ``TupleType`` (or ``ErrorUnionType``) the group was written as (its
+    # ``types`` are the element types, one per entry of ``values``)
+    type: Type
     values: tuple[RetSpec, ...]
 
 
@@ -1364,12 +1547,33 @@ def iter_ret_leaves(spec: RetSpec) -> Iterator[RetValue]:
                 work.extend(reversed(values))
 
 
+def ret_returned_type(spec: RetSpec) -> Type | None:
+    """The spy type of the value the lowered function returns directly (the
+    by-value result), or ``None`` when it returns void - every value then goes
+    through a result pointer, or is zero-sized."""
+    for leaf in iter_ret_leaves(spec):
+        if not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
+            return leaf.type
+    return None
+
+
+def ret_by_value_index(spec: RetSpec) -> int | None:
+    """The position of the one leaf returned by value (its value has storage
+    and fits in registers) among all the leaves, in depth-first declaration
+    order, or ``None`` when the lowered function returns void."""
+    for index, leaf in enumerate(iter_ret_leaves(spec)):
+        if not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
+            return index
+    return None
+
+
 def make_ret_spec(type: Type) -> RetSpec:
     """The return convention of a function whose return annotation is the spy
     type ``type`` (a ``tuple[...]`` for several values, nested at whatever
     depth it is written): the annotation as one :class:`RetSpec` tree.  A
     ``tuple[...]`` - at the top level or nested - becomes a :class:`RetTuple`
-    of its elements, and every other type a :class:`RetValue` leaf.
+    of its elements, an ``ErrorUnion[...]`` a :class:`RetTuple` of its error
+    code and its payload union, and every other type a :class:`RetValue` leaf.
 
     At most one leaf is returned *by value* - the first one that fits in
     registers (``returns_via_result_ptr`` says so) - and every other leaf is
@@ -1377,6 +1581,10 @@ def make_ret_spec(type: Type) -> RetSpec:
     qualifies the function returns void.  A zero-sized leaf has no value to
     return: it is delivered as its unit value and never takes the by-value
     slot."""
+    if isinstance(type, ErrorUnionType) and len(type.types) == 0:
+        raise CompileError(
+            'an empty error union is the unit type and has no return spec'
+        )
     # the leaf types, in declaration order (depth first)
     leaves: list[Type] = []
     work: list[Type] = [type]
@@ -1389,6 +1597,11 @@ def make_ret_spec(type: Type) -> RetSpec:
                         'a varying number of return values has no fixed shape'
                     )
                 work.extend(reversed(item.types))
+            case ErrorUnionType():
+                # the error union spreads into the error code and the payload
+                # union (in that order)
+                work.append(item.union)
+                work.append(item.code_type)
             case _:
                 leaves.append(item)
     chosen: int | None = None
@@ -1409,7 +1622,7 @@ def make_ret_spec(type: Type) -> RetSpec:
     # whole type is itself a group when it is a ``tuple[...]``)
     index = 0
     groups: list[list[RetSpec]] = [[]]
-    group_types: list[TupleType] = []
+    group_types: list[Type] = []
     if isinstance(type, TupleType):
         build_work: list[Type | None] = list(reversed(type.types))
     else:
@@ -1425,6 +1638,12 @@ def make_ret_spec(type: Type) -> RetSpec:
             case TupleType():
                 build_work.append(None)
                 build_work.extend(reversed(item.types))
+                groups.append([])
+                group_types.append(item)
+            case ErrorUnionType():
+                build_work.append(None)
+                build_work.append(item.union)
+                build_work.append(item.code_type)
                 groups.append([])
                 group_types.append(item)
             case _:
@@ -1448,7 +1667,7 @@ def pass_by_ref(type: Type) -> bool:
     passes a parameter by reference when its formal declares it as one
     (``fn.SignatureFormalArg.by_ref``), whatever its type."""
     match type:
-        case StructType() | ArrayType() | OptionType():
+        case StructType() | ArrayType() | OptionType() | UnionType():
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False
@@ -1835,6 +2054,10 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
                 tuple(replace_type_vars_type(t, reps) for t in value.types),
                 value.has_ellipsis,
             )
+        case UnionType():
+            return UnionType(tuple(replace_type_vars_type(t, reps) for t in value.types))
+        case ErrorUnionType():
+            return ErrorUnionType(tuple(replace_type_vars_type(t, reps) for t in value.types))
         case StructType():
             # a struct type carries its type arguments: substituting into it
             # rebuilds the specialization (and keeps the identity of the one

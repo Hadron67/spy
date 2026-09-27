@@ -56,7 +56,7 @@ import ast
 import inspect
 import textwrap
 from collections.abc import Callable
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 from . import hir, syntax
 from .errors import CompileError
@@ -65,6 +65,7 @@ from .sval import (
     AnyValue,
     Null,
     StructDecl,
+    StructType,
     Type,
     Value,
     VoidType,
@@ -74,7 +75,7 @@ from .sval import (
 from .sval import (
     TypeVar as SpyTypeVar,
 )
-from .util import IndexedMap, frozendict
+from .util import ArraySet, IndexedMap, frozendict
 
 _BIN_OPS: dict[type[ast.AST], hir.BinaryOp] = {
     ast.Add: '+',
@@ -180,6 +181,17 @@ class _Builder:
                 else:
                     self.add(hir.StoreVoidRetloc())
                 self.add(hir.Ret())
+            case ast.Raise():
+                # the exception is delivered into the function's error
+                # location (its payload written and its error code set by the
+                # result-location conversion), then the path ends - the
+                # ``hir.Raise`` itself carries nothing
+                if node.exc is None:
+                    raise CompileError(
+                        f'a bare raise is not supported yet in spy function {fn_name}'
+                    )
+                self._gen_result_loc(node.exc, hir.ErrorLoc())
+                self.add(hir.Raise())
             case ast.Pass():
                 pass
             case ast.Expr():
@@ -204,6 +216,8 @@ class _Builder:
                     self.add(hir.Else())
                     self._gen_branch(node.orelse)
                 self.add(hir.End())
+            case ast.Try():
+                self._gen_try(node)
             case _:
                 raise CompileError(
                     f"unsupported statement {type(node).__name__} in spy function {fn_name}"
@@ -220,6 +234,58 @@ class _Builder:
         for stmt in stmts:
             sub._gen_stmt(stmt)
         self.insts.extend(sub.insts)
+
+    def _gen_try(self, node: ast.Try) -> None:
+        """Translate one ``try``/``except`` statement: the try body, then one
+        ``hir.Except`` marker (and clause body) per handler, closed by an
+        ``hir.End``.  The ``as`` slot of every clause is reserved *before* the
+        ``Try`` so that the clause body can read it; the interpreter writes the
+        caught exception into it (see ``hir.Try``).  ``else``/``finally`` are
+        not supported yet."""
+        fn_name = self._fn_ir.name
+        if len(node.orelse) > 0:
+            raise CompileError(f'try-else is not supported in spy function {fn_name}')
+        if len(node.finalbody) > 0:
+            raise CompileError(f'try-finally is not supported in spy function {fn_name}')
+        if len(node.handlers) == 0:
+            raise CompileError(f'a try must have an except clause in spy function {fn_name}')
+        binds: list[hir.Value | None] = []
+        for handler in node.handlers:
+            if handler.name is not None:
+                binds.append(self.add(hir.Alloca()))
+            else:
+                binds.append(None)
+        self.add(hir.Try(tuple(binds)))
+        for stmt in node.body:
+            self._gen_stmt(stmt)
+        for index, handler in enumerate(node.handlers):
+            self.add(hir.Except(self._gen_except_type(handler.type), index))
+            sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
+            bind = binds[index]
+            if handler.name is not None:
+                assert bind is not None
+                sub._scope.bindings[handler.name] = bind
+            for stmt in handler.body:
+                sub._gen_stmt(stmt)
+            self.insts.extend(sub.insts)
+        self.add(hir.End())
+
+    def _gen_except_type(self, node: ast.expr | None) -> hir.Value | None:
+        """The HIR operand naming the exception struct an ``except`` clause
+        catches, or None for a bare ``except:``.  A global name of a struct (or
+        an attribute of one) is supported; a tuple of types, a subscripted
+        struct template, ... are not yet."""
+        if node is None:
+            return None
+        match node:
+            case ast.Name():
+                return self._gen_name(node.id)
+            case ast.Attribute():
+                return self._gen_expr(node)[0].value
+            case _:
+                raise CompileError(
+                    f'unsupported except type {ast.unparse(node)!r}: expected a spy struct'
+                )
 
     # -- variables ------------------------------------------------------------
 
@@ -684,6 +750,7 @@ def parse_function(
     self_type: Type | None = None,
     self_by_value: bool = False,
     context_type_vars: dict[TypeVar, Value] | None = None,
+    exceptions: set[Any] | Literal["infer"] | None = None,
 ) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
@@ -696,6 +763,11 @@ def parse_function(
     parameters of the struct the method belongs to, which Python only makes
     visible inside the method's annotation scope.  They are keyed by the
     Python type parameter object the annotations evaluate to.
+
+    ``exceptions`` is the ``@func(exceptions=...)`` declaration: ``None`` (the
+    default) declares that the function raises nothing, ``"infer"`` that the
+    exceptions are inferred from the body, and a set of spy struct classes the
+    exceptions it may raise (in error-code order).
     """
     try:
         source = inspect.getsource(fn)
@@ -798,6 +870,26 @@ def parse_function(
             return Null()
         return convert(value, 'a default value')
 
+    def exception_set() -> ArraySet[Type] | None:
+        """The declared exception set of the function: ``None`` when it is to
+        be inferred, an empty set when the function raises nothing, and the
+        spy struct types of the declared exceptions otherwise (in
+        declaration order, which is the error-code order)."""
+        if exceptions is None:
+            return ArraySet()
+        if exceptions == 'infer':
+            return None
+        ret: ArraySet[Type] = ArraySet()
+        for exception in exceptions:
+            value = as_value(exception, type_vars)
+            if not isinstance(value, StructType):
+                raise CompileError(
+                    f'cannot use {exception!r} as an exception of function '
+                    f'{node.name}: an exception must be a spy struct'
+                )
+            ret.add(value)
+        return ret
+
     # the signature: the formal parameters, by declaration position
     all_args = list(node.args.args)
     offset = len(all_args) - len(defaults)
@@ -826,7 +918,7 @@ def parse_function(
     # signature are always None; the signature model and ``bind_arg_pos``
     # already support them for the calls the parser will allow later.
     signature = Signature(
-        tuple(generic_args), positional, None, None, annotation_of(ret_annotation),
+        tuple(generic_args), positional, None, None, annotation_of(ret_annotation), exception_set(),
     )
 
     ir = FunctionIR(node.name, signature, ())
