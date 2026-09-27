@@ -293,7 +293,7 @@ class _Builder:
         # slot (the same way any other unary expression is) and read back into a
         # register, so that the ``if`` sees a boolean value whether the
         # condition is compile-time or not
-        negated = self.add(hir.Alloca(True))
+        negated = self.add(hir.Alloca(hir.InlineMode.NON_AGGREGATE))
         self.add(hir.Unary('not', ArgEntry(cond, False), negated))
         self.add(hir.CommitSlot(negated))
         self.add(hir.If(self.add(hir.Load(negated))))
@@ -491,7 +491,9 @@ class _Builder:
             )
         is_comptime, type_node = self._split_comptime(node.annotation)
         declared = None if type_node is None else self._as_value(self._gen_expr(type_node)[0])
-        slot = self.add(hir.Alloca(is_comptime, declared))
+        slot = self.add(hir.Alloca(
+            hir.InlineMode.FULL if is_comptime else hir.InlineMode.NONE, declared
+        ))
         self._scope.bindings[target.id] = slot
         if node.value is not None:
             self._gen_result_loc(node.value, slot)
@@ -611,7 +613,7 @@ class _Builder:
     def _as_ref(self, node: ArgEntry[hir.Value]):
         if node.is_ref:
             return node.value
-        loc = self.add(hir.Alloca(True))
+        loc = self.add(hir.Alloca(hir.InlineMode.NON_AGGREGATE))
         self.add(hir.Store(loc, node.value))
         self.add(hir.CommitSlot(loc))
         return loc
@@ -739,7 +741,7 @@ class _Builder:
             case _:
                 if not allow_retloc:
                     raise CompileError(f"unexpected expression {node}")
-                loc = self.add(hir.Alloca(True))
+                loc = self.add(hir.Alloca(hir.InlineMode.NON_AGGREGATE))
                 self._gen_result_loc(node, loc, False)
                 self.add(hir.CommitSlot(loc))
                 return ArgEntry(loc, True), False

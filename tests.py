@@ -1090,12 +1090,12 @@ def construct_nothing(x: i32) -> i32:
     return x if spy_typeof(n) == Nothing else x + 1
 
 
-# a construction that provides no field at all still takes its type from the
-# construction: every field of ``Blank`` is zero-sized, so all of them may be
-# left to their default
+# a construction takes its type from the construction itself: ``Blank``'s only
+# field is zero-sized, and its value is given all the same (a field may only be
+# left out when it has a default, which is not implemented yet)
 @func()
 def construct_blank(x: i32) -> i32:
-    b = Blank()  # pyright: ignore[reportCallIssue]
+    b = Blank(None)
     return x if spy_typeof(b) == Blank else x + 1
 
 
@@ -1969,6 +1969,206 @@ def choose_non_bool_condition(a: i32, b: i32) -> i32:
     # spy has no truthiness: the condition has to be a bool
     return a if a else b
 
+
+# ---------------------------------------------------------------------------
+# compile-time structs: a struct built in an inline slot - an expression
+# temporary or a ``Comptime`` variable - is an aggregate whose fields are their
+# own compile-time places, so a field is read and written at compile time: a
+# field assignment is folded in Python, a field read may condition a
+# compile-time ``while syntax.unroll``, and a whole aggregate is copied field by
+# field (see ``interp.ComptimeAggregatePtr``)
+# ---------------------------------------------------------------------------
+
+
+@struct()
+class Toggle:
+    on: bool
+    n: i32
+
+
+@func()
+def comptime_struct_field_read(x: i32) -> i32:
+    s: Comptime = Small(1, 2)
+    s.b = s.a
+    return s.b + x
+
+
+@func()
+def comptime_struct_with_a_runtime_field(x: i32) -> i32:
+    # a field that holds a runtime value is a runtime place of its own: the
+    # other field is still compile-time
+    s: Comptime = Small(x, 2)
+    return s.a + s.b
+
+
+@func()
+def comptime_struct_declared_type() -> i32:
+    # a declared compile-time type builds the aggregate in place
+    s: Comptime[Small] = Small(4, 5)
+    return s.b
+
+
+@func()
+def comptime_struct_reassigned() -> i32:
+    # a second construction writes the fields of the aggregate already there
+    s: Comptime[Small] = Small(4, 5)
+    s = Small(6, 7)
+    return s.b
+
+
+@func()
+def comptime_struct_copied() -> i32:
+    # an assignment copies the value: writing the copy leaves the source alone
+    a: Comptime = Toggle(True, 1)
+    b: Comptime = a
+    b.on = False
+    return 1 if a.on else 0
+
+
+@func()
+def comptime_struct_zst_field() -> i32:
+    h: Comptime = Holder(None, 7)
+    return h.n
+
+
+@func()
+def comptime_struct_nested() -> i32:
+    # a field of struct type is an aggregate of its own, built in place
+    h: Comptime = StructHolder(Pair[i32](1, 2), 3)
+    a: i32 = h.p.a
+    b: i32 = h.p.b
+    c: i32 = h.extra
+    return a * 100 + b * 10 + c
+
+
+@func()
+def comptime_struct_ref_aliases() -> i32:
+    # the compile-time variable holds the aggregate itself, so the pointer is
+    # the aggregate: writing through it writes the aggregate
+    s: Comptime = Small(1, 2)
+    p: Comptime = ref(s)
+    p[...].b = 5
+    return s.b
+
+
+@func()
+def comptime_struct_ref_in_memory() -> i32:
+    # ... a plain local has no compile-time storage for the pointer: the
+    # aggregate is materialized and the local points at that copy (an aggregate
+    # has no address of its own)
+    s: Comptime = Small(1, 2)
+    p = ref(s)
+    p[...].b = 5
+    return s.b
+
+
+@func()
+def comptime_struct_method() -> i32:
+    # a native method takes the aggregate's address: the value is materialized
+    return Pair[i32](1, 2).total()
+
+
+@func()
+def comptime_struct_argument() -> i32:
+    return sum_small(Small(1, 2))
+
+
+@func()
+def comptime_struct_choose(c: spy_bool) -> i32:
+    # both branches build into one storage: the second reuses the field places
+    # the first recorded (see ``finish_struct``)
+    s: Comptime = Small(1, 1) if c else Small(2, 2)
+    return s.b
+
+
+@func()
+def comptime_struct_unroll() -> i32:
+    # the field is a compile-time value, so it may condition a compile-time
+    # loop: the body runs once, then the condition turns false
+    s: Comptime = Toggle(True, 0)
+    total: i32 = 0
+    while syntax.unroll(s.on):
+        s.on = False
+        total = total + 1
+    return total
+
+
+@func()
+def runtime_struct_unroll() -> i32:
+    # ... a runtime struct's field is a runtime value, so it cannot: the unroll
+    # cap reports it instead of unrolling forever (see ``inline_bad_cond``)
+    s = Toggle(True, 0)
+    while syntax.unroll(s.on):
+        s.on = False
+    return s.n
+
+
+@func()
+def comptime_struct_nested_copy() -> i32:
+    # a whole-aggregate copy of a struct with a struct field: the field place is
+    # an aggregate of its own (see ``init_inline_aggregate``)
+    h: Comptime = StructHolder(Pair[i32](1, 2), 3)
+    b: Comptime = h
+    return b.p.a * 100 + b.p.b * 10 + b.extra
+
+
+@func()
+def comptime_struct_field_comparison() -> spy_bool:
+    # a field read is a compile-time constant, so an operator on it is folded
+    # in Python
+    s: Comptime = Small(1, 2)
+    return s.a == 1
+
+
+@func()
+def comptime_struct_zst_in_a_comptime_local() -> spy_bool:
+    # a zero-sized aggregate is an aggregate too: it is held by its places, not
+    # by a compile-time box
+    b: Comptime = Blank(None)
+    return spy_typeof(b) == Blank
+
+
+# ---------------------------------------------------------------------------
+# compile-time arrays: an array built in an inline slot - an expression
+# temporary or a ``Comptime`` variable - is an aggregate (like a struct) whose
+# elements are their own compile-time places (see ``interp.ComptimeAggregatePtr``)
+# ---------------------------------------------------------------------------
+
+
+@func()
+def comptime_array_element() -> i32:
+    a: Comptime = array(1, 2)
+    return a[1]
+
+
+@func()
+def comptime_array_copy() -> i32:
+    a: Comptime = array(1, 2)
+    b: Comptime = a
+    return b[1]
+
+
+@func()
+def comptime_array_of_structures() -> i32:
+    a: Comptime = array(Small(1, 2), Small(3, 4))
+    b: Comptime = a
+    return b[1].a * 10 + b[0].b
+
+
+@func()
+def comptime_nested_array() -> i32:
+    a: Comptime = array(array(1, 2), array(3, 4))
+    return a[1][0]
+
+
+@func()
+def comptime_array_with_a_runtime_element(x: i32) -> i32:
+    # a runtime element is a runtime place of its own: the other element is
+    # still compile-time
+    a: Comptime = array(x, 2)
+    return a[0] + a[1]
+
+
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
@@ -2412,6 +2612,93 @@ class SpyStructTest(TestCase):
         # a struct of one struct field whose mirror is itself a struct type:
         # the field is still at the address of the value itself
         self.assertEqual(nested_struct_field(5), 5)
+
+
+class SpyComptimeStructTest(TestCase):
+    """Compile-time structs: a struct built in an inline slot - an expression
+    temporary or a ``Comptime`` variable - is an aggregate whose fields are
+    their own compile-time places, so a field read or write is folded in
+    Python (a field value may condition a compile-time ``while
+    syntax.unroll``)."""
+
+    def test_field_read(self) -> None:
+        self.assertEqual(comptime_struct_field_read(0), 1)
+
+    def test_runtime_field(self) -> None:
+        self.assertEqual(comptime_struct_with_a_runtime_field(5), 7)
+
+    def test_declared_comptime_type(self) -> None:
+        self.assertEqual(comptime_struct_declared_type(), 5)
+
+    def test_reassigned(self) -> None:
+        self.assertEqual(comptime_struct_reassigned(), 7)
+
+    def test_copy_is_a_value(self) -> None:
+        self.assertEqual(comptime_struct_copied(), 1)
+
+    def test_zero_sized_field(self) -> None:
+        self.assertEqual(comptime_struct_zst_field(), 7)
+
+    def test_nested_aggregate(self) -> None:
+        self.assertEqual(comptime_struct_nested(), 123)
+
+    def test_native_method(self) -> None:
+        self.assertEqual(comptime_struct_method(), 3)
+
+    def test_a_pointer_to_an_aggregate_aliases_it(self) -> None:
+        self.assertEqual(comptime_struct_ref_aliases(), 5)
+
+    def test_a_pointer_in_memory_points_at_a_copy(self) -> None:
+        self.assertEqual(comptime_struct_ref_in_memory(), 2)
+
+    def test_native_argument(self) -> None:
+        self.assertEqual(comptime_struct_argument(), 3)
+
+    def test_field_conditions_a_compile_time_loop(self) -> None:
+        self.assertEqual(comptime_struct_unroll(), 1)
+
+    def test_a_runtime_branch_writes_the_aggregate(self) -> None:
+        # both branches of a runtime ``if`` are typed, so the construction
+        # writes the same places twice and the last write wins - exactly like a
+        # scalar compile-time local (``x: Comptime = 1 if c else 2`` is always
+        # 2): a compile-time location holds one value, and no store knows the
+        # runtime condition
+        self.assertEqual(comptime_struct_choose(True), 2)
+        self.assertEqual(comptime_struct_choose(False), 2)
+
+    def test_nested_aggregate_copy(self) -> None:
+        self.assertEqual(comptime_struct_nested_copy(), 123)
+
+    def test_field_comparison(self) -> None:
+        self.assertTrue(comptime_struct_field_comparison())
+
+    def test_zero_sized_aggregate_in_a_comptime_local(self) -> None:
+        self.assertTrue(comptime_struct_zst_in_a_comptime_local())
+
+
+class SpyComptimeArrayTest(TestCase):
+    """Compile-time arrays: an array built in an inline slot - an expression
+    temporary or a ``Comptime`` variable - is an aggregate whose elements are
+    their own compile-time places, like a struct's fields."""
+
+    def test_element_read(self) -> None:
+        self.assertEqual(comptime_array_element(), 2)
+
+    def test_copy_is_a_value(self) -> None:
+        self.assertEqual(comptime_array_copy(), 2)
+
+    def test_array_of_structures(self) -> None:
+        self.assertEqual(comptime_array_of_structures(), 32)
+
+    def test_nested_array(self) -> None:
+        self.assertEqual(comptime_nested_array(), 3)
+
+    def test_runtime_element(self) -> None:
+        self.assertEqual(comptime_array_with_a_runtime_element(5), 7)
+
+    def test_a_runtime_struct_cannot_unroll(self) -> None:
+        with self.assertRaises(CompileError):
+            runtime_struct_unroll()
 
 
 class SpyGenericStructTest(TestCase):
@@ -4210,6 +4497,8 @@ all_tests = [
     SpyInlineLoopTest,
     SpyAnnotationTest,
     SpyStructTest,
+    SpyComptimeStructTest,
+    SpyComptimeArrayTest,
     SpyStructMirrorTest,
     SpyGenericStructTest,
     SpyPointerTest,

@@ -2112,6 +2112,10 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     builds the MIR constant from it later."""
     if isinstance(value, AsValue):
         value = value.value
+    if isinstance(value, (Int, Float)):
+        # an already-typed constant (the value a compile-time location holds):
+        # the target type governs, like the constant of any other location
+        value = value.value
     match type:
         case BoolType():
             if not isinstance(value, bool):

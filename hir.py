@@ -13,8 +13,9 @@ result into the slot of its ``ret`` operand (:class:`CallInplace`) and
 produces no register of its own.  A caller that needs the value
 allocates a slot and loads it back.  The slot only becomes real memory
 when it is committed (``CommitSlot``): a slot all of whose stores are
-compile-time - an inline temporary, ``Alloca(True)`` - stays a
-compile-time value, a zero-sized slot only records its unit value, and
+compile-time - an inline temporary, an ``Alloca`` whose
+:class:`InlineMode` allows it - stays a compile-time value, a
+zero-sized slot only records its unit value, and
 anything else is materialized as memory.  The store/load round trip a
 runtime call result leaves behind is folded back into registers
 afterwards by ``opt`` (see ``interp``).  The return of a function is
@@ -77,6 +78,7 @@ leaves the loop (jumping to the code after its ``End``) and a
 """
 
 from dataclasses import dataclass
+from enum import IntEnum, auto
 from typing import Any
 
 from .binop import BinaryOp, CompareOp, UnaryOp
@@ -86,6 +88,22 @@ from .fn import ArgEntry, RawArgList, frozendict
 
 class Value:
     pass
+
+
+class InlineMode(IntEnum):
+    """How much of a slot's value may be kept inline (see :class:`Alloca`).
+
+    ``NONE`` is a plain runtime location: the slot holds a value with a
+    runtime representation.  ``NON_AGGREGATE`` may keep any value inline
+    except an *aggregate* (a struct or an array), which has no inline storage
+    of its own here (see ``ComptimeAggregatePtr``).  ``FULL`` may keep
+    anything inline - it is what a ``Comptime`` variable declares.  A
+    zero-sized value has no runtime representation at all, so its slot only
+    records its unit value whatever the mode is."""
+
+    NONE = auto()
+    NON_AGGREGATE = auto()
+    FULL = auto()
 
 
 @dataclass(frozen=True)
@@ -147,17 +165,18 @@ class Alloca(Inst):
     until it is used: the stores that target it (a plain ``Store``, or a
     ``CallInplace`` result under RLS) type it, and the ``CommitSlot``
     that follows then materializes it - a slot whose stores may all be
-    inlined becomes a compile-time box instead of memory (see
-    ``interp``).
+    kept inline stays a compile-time value instead of memory (see
+    :class:`InlineMode` and ``interp``).
 
     An annotated local variable (``x: T``/``x: Comptime[T]``) declares its
     type here instead: ``type`` is the compile-time type value of the
     annotation (``None`` for the bare ``Comptime``, whose type is left to
     the stores), and the interpreter materializes the slot right away -
-    memory for a runtime type, a compile-time box for a ``Comptime`` or a
-    zero-sized one.  ``allow_inline`` marks a ``Comptime`` variable: its
-    value may be kept inline even when its type is not zero-sized."""
-    allow_inline: bool = False
+    memory for a runtime type, a compile-time value for a ``Comptime`` or a
+    zero-sized one.  ``inline`` is how much of the value may be kept inline:
+    the default is a plain slot, ``NON_AGGREGATE`` an expression temporary
+    and ``FULL`` a ``Comptime`` variable."""
+    inline: InlineMode = InlineMode.NONE
     type: Value | None = None
 
 @dataclass(eq=False)
@@ -230,12 +249,12 @@ class FinishStruct(Inst):
     fields were generated into.  ``indices`` are the addresses the
     positional arguments were written into, in the order they were given,
     and ``names`` the ones the keyword arguments were written into, by
-    field name; every field that no argument wrote is filled with its
-    default (the unit value of a zero-sized field), and a field with a
-    runtime representation that no argument provides is an error.  The
-    parser only has to know the syntax, not the field layout: the
-    interpreter resolves the struct type (inferring the generic arguments
-    a template was not given) from ``struct`` and the field addresses."""
+    field name; every field has to be written - a field may only be left
+    out when it has a default, which is not implemented yet - so a missing
+    field is an error, a zero-sized one included.  The parser only has to
+    know the syntax, not the field layout: the interpreter resolves the
+    struct type (inferring the generic arguments a template was not given)
+    from ``struct`` and the field addresses."""
 
     struct: Value
     dest: Value
