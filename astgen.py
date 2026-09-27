@@ -167,6 +167,10 @@ class _Builder:
         # unevaluated - be resolved (see ``_gen_ann_assign``)
         self._type_vars = type_vars
         self._generic_names: dict[str, Value] = {tp.__name__: v for tp, v in type_vars.items()}
+        # the ``syntax.unroll()`` marker seen since the last statement: the loop
+        # that immediately follows consumes it, any other statement rejects it
+        # (see ``_gen_stmt``)
+        self._inline: bool = False
         self.insts: list[hir.Inst] = []
 
     def add(self, inst: hir.Inst) -> hir.Inst:
@@ -175,8 +179,54 @@ class _Builder:
 
     # -- statements -----------------------------------------------------------
 
+    def _consume_inline(self) -> bool:
+        """Whether a ``syntax.unroll()`` marker seen since the last statement
+        marks this loop as a compile-time one; the flag is cleared either way."""
+        inline = self._inline
+        self._inline = False
+        return inline
+
+    def _check_no_inline(self) -> None:
+        """Reject a pending ``syntax.unroll()`` marker that no loop follows."""
+        if self._inline:
+            raise CompileError('syntax.unroll() must be followed by a loop')
+
+    def _is_unroll_marker(self, node: ast.stmt) -> bool:
+        """Whether ``node`` is the statement ``syntax.unroll()`` (recognized by
+        the global the callee names, like the other ``syntax`` markers)."""
+        return (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and self._try_resolve_object(node.value.func) is syntax.unroll
+        )
+
+    def _gen_body(self, stmts: list[ast.stmt]) -> None:
+        """Generate a whole statement list, rejecting a marker that no loop
+        follows at its end."""
+        for stmt in stmts:
+            self._gen_stmt(stmt)
+        self._check_no_inline()
+
     def _gen_stmt(self, node: ast.stmt) -> None:
         fn_name = self._fn_ir.name
+        match node:
+            case ast.While():
+                self._gen_while(node, self._consume_inline())
+                return
+            case ast.For():
+                self._gen_for(node, self._consume_inline())
+                return
+        # every non-loop statement rejects a pending marker: the
+        # ``syntax.unroll()`` before it is not followed by a loop
+        self._check_no_inline()
+        if self._is_unroll_marker(node):
+            assert isinstance(node, ast.Expr)
+            value = node.value
+            assert isinstance(value, ast.Call)
+            if len(value.args) != 0 or len(value.keywords) != 0:
+                raise CompileError('syntax.unroll takes no arguments')
+            self._inline = True
+            return
         match node:
             case ast.Return():
                 # the return expression is generated into the function's
@@ -224,10 +274,6 @@ class _Builder:
                     self.add(hir.Else())
                     self._gen_branch(node.orelse)
                 self.add(hir.End())
-            case ast.While():
-                self._gen_while(node)
-            case ast.For():
-                self._gen_for(node)
             case ast.Break():
                 self.add(hir.Break())
             case ast.Continue():
@@ -247,11 +293,10 @@ class _Builder:
         visible after the block (an assignment to a name it sees writes
         that variable, see ``_gen_assign``)."""
         sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
-        for stmt in stmts:
-            sub._gen_stmt(stmt)
+        sub._gen_body(stmts)
         self.insts.extend(sub.insts)
 
-    def _gen_while(self, node: ast.While) -> None:
+    def _gen_while(self, node: ast.While, is_inline: bool) -> None:
         """Translate one ``while``/``else`` statement into a dead ``loop``:
 
         .. code-block:: text
@@ -276,19 +321,12 @@ class _Builder:
         the condition.  Both the body and the else clause are lexical
         blocks of their own (children of the enclosing block).
 
-        A condition wrapped in ``syntax.unroll(...)`` marks a
-        *compile-time* loop: the ``Loop`` is opened with ``is_inline`` and the
+        The ``syntax.unroll()`` marker immediately before the ``while`` makes it
+        a *compile-time* loop: ``is_inline`` marks the ``Loop`` and the
         interpreter unrolls the body once per compile-time iteration instead of
         emitting a back edge (see ``interp``)."""
-        is_inline = False
-        test = node.test
-        if isinstance(test, ast.Call) and self._try_resolve_object(test.func) is syntax.unroll:
-            if len(test.args) != 1 or len(test.keywords) != 0:
-                raise CompileError('syntax.unroll takes exactly one argument')
-            is_inline = True
-            test = test.args[0]
         self.add(hir.Loop(is_inline=is_inline))
-        cond = self.add(hir.AsBool(self._gen_expr(test)[0]))
+        cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
         # ``%2 = not %1``: the negated condition is materialized in an inline
         # slot (the same way any other unary expression is) and read back into a
         # register, so that the ``if`` sees a boolean value whether the
@@ -298,8 +336,7 @@ class _Builder:
         self.add(hir.CommitSlot(negated))
         self.add(hir.If(self.add(hir.Load(negated))))
         else_clause = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
-        for stmt in node.orelse:
-            else_clause._gen_stmt(stmt)
+        else_clause._gen_body(node.orelse)
         self.insts.extend(else_clause.insts)
         self.add(hir.Break())
         self.add(hir.Else())
@@ -307,7 +344,7 @@ class _Builder:
         self.add(hir.End())
         self.add(hir.End())
 
-    def _gen_for(self, node: ast.For) -> None:
+    def _gen_for(self, node: ast.For, is_inline: bool) -> None:
         """Translate one ``for exprs in iter: body`` (with an optional
         ``else``) into an explicit iterator loop:
 
@@ -334,19 +371,13 @@ class _Builder:
         ``StopIteration``, which the ``try`` catches - when the ``else`` clause
         runs before the ``break``.  A ``break`` in the body leaves the loop
         directly (skipping the else clause), like Python, and a ``continue``
-        starts the next iteration.  ``iter`` wrapped in ``syntax.unroll(...)``
-        opens the loop as a compile-time one (see ``interp``)."""
-        iter_node = node.iter
-        is_inline = False
-        if isinstance(iter_node, ast.Call) and self._try_resolve_object(iter_node.func) is syntax.unroll:
-            if len(iter_node.args) != 1 or len(iter_node.keywords) != 0:
-                raise CompileError('syntax.unroll takes exactly one argument')
-            is_inline = True
-            iter_node = iter_node.args[0]
+        starts the next iteration.  The ``syntax.unroll()`` marker immediately
+        before the ``for`` opens the loop as a compile-time one (see
+        ``interp``)."""
         # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
         # iteration would restart the iteration)
         it = self.add(hir.Alloca())
-        base = self._as_ref(self._gen_expr(iter_node)[0])
+        base = self._as_ref(self._gen_expr(node.iter)[0])
         self.add(hir.CallMethodInplace(base, '__iter__', RawArgList((), frozendict()), it))
         self.add(hir.CommitSlot(it))
         # the loop body, in a block of its own: the loop variable(s) are
@@ -359,11 +390,9 @@ class _Builder:
         sub.add(hir.CallMethodInplace(it, '__next__', RawArgList((), frozendict()), place))
         for slot in new_slots:
             sub.add(hir.CommitSlot(slot))
-        for stmt in node.body:
-            sub._gen_stmt(stmt)
+        sub._gen_body(node.body)
         sub.add(hir.Except(sub._gen_name('StopIteration'), 0))
-        for stmt in node.orelse:
-            sub._gen_stmt(stmt)
+        sub._gen_body(node.orelse)
         sub.add(hir.Break())
         sub.add(hir.End())
         sub.add(hir.End())
@@ -390,8 +419,7 @@ class _Builder:
             else:
                 binds.append(None)
         self.add(hir.Try(tuple(binds)))
-        for stmt in node.body:
-            self._gen_stmt(stmt)
+        self._gen_body(node.body)
         for index, handler in enumerate(node.handlers):
             self.add(hir.Except(self._gen_except_type(handler.type), index))
             sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
@@ -399,8 +427,7 @@ class _Builder:
             if handler.name is not None:
                 assert bind is not None
                 sub._scope.bindings[handler.name] = bind
-            for stmt in handler.body:
-                sub._gen_stmt(stmt)
+            sub._gen_body(handler.body)
             self.insts.extend(sub.insts)
         self.add(hir.End())
 
@@ -753,12 +780,10 @@ class _Builder:
             return ArgEntry(self._as_ref(self._gen_expr(args[0])[0]), False), False
 
         if callee is syntax.unroll:
-            # it only means something as the condition of a ``while`` or the
-            # iterable of a ``for`` (see ``_gen_while``/``_gen_for``), which is
-            # where it is recognized
+            # it is a *statement* marker placed before a loop (see
+            # ``_gen_stmt``), not a value
             raise CompileError(
-                'syntax.unroll can only be used as the condition of a while loop '
-                'or the iterable of a for loop'
+                'syntax.unroll() is a statement marker and must be followed by a loop'
             )
 
         raise CompileError(f'unsupported syntax call {callee}')
@@ -1099,8 +1124,7 @@ def parse_function(
     # solved it to; the function's own parameters are added last, so they
     # shadow a struct's parameter of the same name, like Python scoping
     builder = _Builder(fn, ir, scope, type_vars)
-    for stmt in node.body:
-        builder._gen_stmt(stmt)
+    builder._gen_body(node.body)
     builder.add(hir.StoreVoidRetloc())
     ir.body = tuple(builder.insts)
     return ir

@@ -653,10 +653,10 @@ def write_through_self_ref(x: i32) -> i32:
 
 
 # ---------------------------------------------------------------------------
-# compile-time loops: ``while syntax.inline_loop(cond)`` unrolls the body once
-# per compile-time iteration (the condition is a compile-time value that the
-# body advances); ``break`` leaves the whole unrolled sequence and
-# ``continue`` jumps to the next unrolled body.
+# compile-time loops: a loop preceded by the statement ``syntax.unroll()``
+# unrolls its body once per compile-time iteration (the condition is a
+# compile-time value that the body advances); ``break`` leaves the whole
+# unrolled sequence and ``continue`` jumps to the next unrolled body.
 # ---------------------------------------------------------------------------
 
 
@@ -664,7 +664,8 @@ def write_through_self_ref(x: i32) -> i32:
 def inline_sum() -> i32:
     i: Comptime = 0
     total: i32 = 0
-    while syntax.unroll(i < 4):
+    syntax.unroll()
+    while i < 4:
         total = total + i
         i = i + 1
     return total
@@ -674,7 +675,8 @@ def inline_sum() -> i32:
 def inline_false() -> i32:
     # a compile-time false condition unrolls no body and runs the else clause
     total: i32 = 0
-    while syntax.unroll(False):
+    syntax.unroll()
+    while False:
         total = total + 1
     else:  # noqa: PLW0120 - the else clause is the point of the fixture
         total = total + 2
@@ -686,7 +688,8 @@ def inline_break(n: i32) -> i32:
     # a runtime-conditional break leaves all the remaining unrolled bodies
     i: Comptime = 0
     total: i32 = 0
-    while syntax.unroll(i < 10):
+    syntax.unroll()
+    while i < 10:
         i = i + 1
         if i == n:
             break
@@ -699,7 +702,8 @@ def inline_continue(n: i32) -> i32:
     # a runtime-conditional continue jumps to the next unrolled body
     i: Comptime = 0
     total: i32 = 0
-    while syntax.unroll(i < 6):
+    syntax.unroll()
+    while i < 6:
         i = i + 1
         if i == n:
             continue
@@ -711,7 +715,8 @@ def inline_continue(n: i32) -> i32:
 def inline_else() -> i32:
     i: Comptime = 0
     total: i32 = 0
-    while syntax.unroll(i < 3):
+    syntax.unroll()
+    while i < 3:
         total = total + i
         i = i + 1
     else:  # noqa: PLW0120 - the else clause is the point of the fixture
@@ -723,9 +728,11 @@ def inline_else() -> i32:
 def inline_nested() -> i32:
     i: Comptime = 0
     total: i32 = 0
-    while syntax.unroll(i < 3):
+    syntax.unroll()
+    while i < 3:
         j: Comptime = 0
-        while syntax.unroll(j < 2):
+        syntax.unroll()
+        while j < 2:
             total = total + 1
             j = j + 1
         i = i + 1
@@ -737,7 +744,8 @@ def inline_continue_always() -> i32:
     # an unconditional continue: the body has no falling end, so the next body
     # is unrolled from the block the continue jumped to
     i: Comptime = 0
-    while syntax.unroll(i < 4):
+    syntax.unroll()
+    while i < 4:
         i = i + 1
         continue
     return i
@@ -750,7 +758,8 @@ def runtime_loop_with_inline(n: i32) -> i32:
     total: i32 = 0
     while k < n:
         i: Comptime = 0
-        while syntax.unroll(i < 3):
+        syntax.unroll()
+        while i < 3:
             total = total + 1
             i = i + 1
         k = k + 1
@@ -764,7 +773,8 @@ def inline_continue_or_return(n: i32) -> i32:
     # through
     i: Comptime = 0
     total: i32 = 0
-    while syntax.unroll(i < 5):
+    syntax.unroll()
+    while i < 5:
         i = i + 1
         if i == n:
             return total
@@ -777,15 +787,17 @@ def inline_continue_or_return(n: i32) -> i32:
 @func()
 def inline_bad_cond(n: i32) -> i32:
     # a runtime condition cannot be unrolled: the cap is what reports it
-    while syntax.unroll(n > 0):
+    syntax.unroll()
+    while n > 0:
         n = n - 1
     return n
 
 
 @func()
 def inline_loop_misuse(n: i32) -> i32:
-    # the marker only means something as a ``while`` condition
-    return syntax.unroll(n)
+    # the marker must be followed by a loop
+    syntax.unroll()
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -1975,8 +1987,8 @@ def choose_non_bool_condition(a: i32, b: i32) -> i32:
 # temporary or a ``Comptime`` variable - is an aggregate whose fields are their
 # own compile-time places, so a field is read and written at compile time: a
 # field assignment is folded in Python, a field read may condition a
-# compile-time ``while syntax.unroll``, and a whole aggregate is copied field by
-# field (see ``interp.ComptimeAggregatePtr``)
+# compile-time loop marked with ``syntax.unroll()``, and a whole aggregate is
+# copied field by field (see ``interp.ComptimeAggregatePtr``)
 # ---------------------------------------------------------------------------
 
 
@@ -2087,7 +2099,8 @@ def comptime_struct_unroll() -> i32:
     # loop: the body runs once, then the condition turns false
     s: Comptime = Toggle(True, 0)
     total: i32 = 0
-    while syntax.unroll(s.on):
+    syntax.unroll()
+    while s.on:
         s.on = False
         total = total + 1
     return total
@@ -2098,7 +2111,9 @@ def runtime_struct_unroll() -> i32:
     # ... a runtime struct's field is a runtime value, so it cannot: the unroll
     # cap reports it instead of unrolling forever (see ``inline_bad_cond``)
     s = Toggle(True, 0)
-    while syntax.unroll(s.on):
+
+    syntax.unroll()
+    while s.on:
         s.on = False
     return s.n
 
@@ -2406,8 +2421,8 @@ class SpyWhileTest(TestCase):
 
 
 class SpyInlineLoopTest(TestCase):
-    """Compile-time loops: ``while syntax.inline_loop(cond)`` unrolls its body
-    once per compile-time iteration, ``break`` leaves the whole unrolled
+    """Compile-time loops: a loop preceded by ``syntax.unroll()`` unrolls its
+    body once per compile-time iteration, ``break`` leaves the whole unrolled
     sequence and ``continue`` jumps to the next unrolled body."""
 
     def test_unrolled(self) -> None:
@@ -2618,8 +2633,8 @@ class SpyComptimeStructTest(TestCase):
     """Compile-time structs: a struct built in an inline slot - an expression
     temporary or a ``Comptime`` variable - is an aggregate whose fields are
     their own compile-time places, so a field read or write is folded in
-    Python (a field value may condition a compile-time ``while
-    syntax.unroll``)."""
+    Python (a field value may condition a compile-time loop marked with
+    ``syntax.unroll()``)."""
 
     def test_field_read(self) -> None:
         self.assertEqual(comptime_struct_field_read(0), 1)

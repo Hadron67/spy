@@ -1023,7 +1023,7 @@ class HirRunner:
 
         self._fn_req_resumer: Callable[[Self, mir.Value, ReturnSignature]] | None = None
         # the number of compile-time loop bodies unrolled so far, and the limit
-        # that keeps a non-terminating ``while syntax.inline_loop(...)`` (one
+        # that keeps a non-terminating loop marked with ``syntax.unroll()`` (one
         # whose condition never becomes false) from unrolling forever (see
         # ``_unroll_inline_loop``)
         self._loop_unrolls: int = 0

@@ -45,5 +45,5 @@ def array[T, Len: int](*elems: T, length: Len = 0) -> Array[T, Len]:
 def comptime[T](val: T) -> Comptime[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
-def unroll[T](val: T) -> T:
+def unroll():
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")

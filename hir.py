@@ -431,8 +431,8 @@ class Loop(Inst):
     :class:`Break` (or a ``return``/``raise``).  The ``Loop`` instruction
     carries nothing; it only delimits the flat instruction stream.
 
-    ``is_inline`` marks a *compile-time* loop (a ``while`` whose condition
-    the source wraps in ``syntax.inline_loop``): the interpreter does not
+    ``is_inline`` marks a *compile-time* loop (a loop preceded by the source
+    statement ``syntax.unroll()``): the interpreter does not
     emit a back edge but unrolls the body once per compile-time iteration,
     so a :class:`Break` leaves the whole unrolled sequence and a
     :class:`Continue` jumps to the next unrolled body (see ``interp``)."""
