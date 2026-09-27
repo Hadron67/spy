@@ -392,6 +392,24 @@ class IfBlockData(BlockFrameData):
     exit_block: mir.BasicBlock | None = None
 
 @dataclass
+class LoopBlockData(BlockFrameData):
+    """The state of one open ``loop`` of the HIR.
+
+    ``header_block`` is the loop's head - the block the condition is
+    computed in, the target of the back edge the body's falling end and
+    every ``continue`` emit.  ``exit_block`` is the block the code after
+    the loop continues in, created on the first ``break`` that reaches it:
+    the loop can be left exactly when some ``break`` (a source one, or the
+    implicit one the ``while`` lowering puts after its else clause) jumped
+    there, so a loop without one (``while True:``) never gets an exit and
+    the code after it is dead (see ``_cut``).  ``p_end`` is the position of
+    the matching ``End`` marker (found by ``_scan_block``)."""
+
+    p_end: int
+    header_block: mir.BasicBlock
+    exit_block: mir.BasicBlock | None = None
+
+@dataclass
 class TryExceptBlockData(BlockFrameData):
     """The state of one open ``try`` of the HIR.
 
@@ -1441,14 +1459,20 @@ class HirRunner:
                 return self.binary_assign(inst.op, self.operand(inst.lhs), self.operand_arg(inst.rhs))
             case hir.If():
                 self._exec_if(inst)
+            case hir.Loop():
+                self._exec_loop()
             case hir.Try():
                 self._exec_try()
             case hir.Except():
                 self._exec_except(inst)
+            case hir.Break():
+                return self._exec_break()
+            case hir.Continue():
+                return self._exec_continue()
             case hir.Else():
                 self._exec_else()
             case hir.End():
-                self._exec_end()
+                return self._exec_end()
             case hir.Load():
                 regs[inst] = self.load(self.operand(inst.ptr))
             case hir.Alloca():
@@ -1531,6 +1555,61 @@ class HirRunner:
             frame.pc = p_else + 1
             return
         self._exec_runtime_if(cond, entry)
+
+    def _exec_loop(self) -> None:
+        """Open a ``loop`` block (``hir.Loop``): its body follows in the frame's
+        flat instruction list, closed by the matching ``hir.End``.  The current
+        block jumps to the new header, which the body's falling end and every
+        ``continue`` jump back to (a back edge) - the loop is left only by a
+        ``break`` (or a ``return``/``raise``), whose jump to the on-demand exit
+        block is what tells a later ``_cut`` whether the code after the loop is
+        reachable (see ``LoopBlockData``)."""
+        frame = self._frames[-1]
+        entry = frame.pc - 1
+        p_else, p_end = self._scan_block(entry)
+        assert p_else is None, 'a loop body has no else marker'
+        header = mir.BasicBlock()
+        if not self._cur_block.is_finished:
+            self._cur_block.emit(mir.Jmp(header))
+        self._cur_block = header
+        frame.block_stack.append(
+            BlockFrame(entry, LoopBlockData(p_end=p_end, header_block=header))
+        )
+
+    def _find_loop(self) -> LoopBlockData:
+        """The state of the innermost open ``loop`` of the executing frame - the
+        target of a ``break``/``continue``.  An inlined body never crosses a
+        loop (Python forbids ``break``/``continue`` in a nested function), so the
+        open loops of the executing frame are all of them."""
+        for bf in reversed(self._frames[-1].block_stack):
+            data = bf.data
+            if isinstance(data, LoopBlockData):
+                return data
+        raise CompileError('break/continue outside of a loop')
+
+    def _exec_break(self) -> PollResult:
+        """``hir.Break``: end the current path at the innermost loop's exit block,
+        created on demand - the first ``break`` is what makes the code after the
+        loop reachable - and unwind the frame's open blocks like any other ended
+        path (see ``_cut``).  The loop's exit is exactly where a ``_cut`` that
+        reaches the loop continues the walk."""
+        data = self._find_loop()
+        exit_block = data.exit_block
+        if exit_block is None:
+            exit_block = data.exit_block = mir.BasicBlock()
+        if not self._cur_block.is_finished:
+            self._cur_block.emit(mir.Jmp(exit_block))
+        return self._cut()
+
+    def _exec_continue(self) -> PollResult:
+        """``hir.Continue``: end the current path back at the innermost loop's
+        header, so the rest of the body and the ``while``'s else clause are
+        skipped and the loop's condition is evaluated again; then unwind like any
+        other ended path (see ``_cut``)."""
+        data = self._find_loop()
+        if not self._cur_block.is_finished:
+            self._cur_block.emit(mir.Jmp(data.header_block))
+        return self._cut()
 
     def _exec_else(self) -> None:
         """The walk fell off the end of the then branch and reached the
@@ -1753,8 +1832,8 @@ class HirRunner:
         else:
             self._emit_function_return()
 
-    def _exec_end(self) -> None:
-        """The walk fell off the end of a branch and reached the ``End``
+    def _exec_end(self) -> PollResult:
+        """The walk fell off the end of a region and reached the ``End``
         marker of the innermost open block.  A runtime ``if`` whose
         currently-typed region fell off its end - the then-region of an
         ``if`` without an else, or the else-region - is complete: the
@@ -1763,9 +1842,20 @@ class HirRunner:
         target of the branch).  Both branches falling through (a join) is
         fine: a variable a branch *assigns* lives in an enclosing block's
         slot - memory, since an assignment in a branch has to be visible
-        after it - so the state crossing the join needs no phi."""
+        after it - so the state crossing the join needs no phi.
+
+        A ``loop`` body falling off its end jumps back to the loop header
+        (the next iteration) and the code after the loop is typed next (see
+        ``_cut``, which decides whether it is reachable)."""
         frame = self._frames[-1]
         data = frame.block_stack[-1].data
+        if isinstance(data, LoopBlockData):
+            # the loop body fell off its end: jump back to the header.  Whether
+            # the code after the loop is live is decided by ``_cut`` from the
+            # loop's exit block (created only by a ``break``)
+            if not self._cur_block.is_finished:
+                self._cur_block.emit(mir.Jmp(data.header_block))
+            return self._cut()
         if isinstance(data, TryExceptBlockData):
             # the last except clause fell off its end: the try is complete
             assert data.join is not None
@@ -1773,18 +1863,19 @@ class HirRunner:
                 self._cur_block.emit(mir.Jmp(data.join))
             self._cur_block = data.join
             frame.block_stack.pop()
-            return
+            return PollResult.AGAIN
         assert isinstance(data, IfBlockData)
         if data.chosen is not None:
             # a compile-time ``if``: the chosen branch fell off its end
             frame.block_stack.pop()
-            return
+            return PollResult.AGAIN
         exit_block = data.exit_block
         assert exit_block is not None
         if not self._cur_block.is_finished:
             self._cur_block.emit(mir.Jmp(exit_block))
         self._cur_block = exit_block
         frame.block_stack.pop()
+        return PollResult.AGAIN
 
     # -- runtime ``if`` regions --------------------------------------------
 
@@ -1822,7 +1913,11 @@ class HirRunner:
         with its sibling region, or - when its else-region ended - is
         complete: a single falling branch resumes the code after the
         ``if``, and when both branches returned the cut keeps unwinding.
-        With no open block left, the run of the frame's body ended."""
+        A ``loop`` whose body the path ended in is complete too: the walk
+        continues in the loop's exit block - the code after the loop - when
+        some ``break`` reaches it, and keeps unwinding (the code after the
+        loop is dead) when none does.  With no open block left, the run of
+        the frame's body ended."""
         while True:
             frame = self._frames[-1]
             if not frame.block_stack:
@@ -1860,6 +1955,21 @@ class HirRunner:
                     frame.pc = data.p_end + 1
                     return PollResult.AGAIN
                 continue
+            if isinstance(data, LoopBlockData):
+                # the current path ended inside the loop body (a ``break``, a
+                # ``continue``, a ``return`` or a ``raise``) and every enclosing
+                # block of the body has been closed: the body is complete.  A
+                # ``break`` jumps to the loop's exit block, so the code after
+                # the loop is typed there; a loop no ``break`` can leave
+                # (``while True:``) never has one, and the code after it is dead -
+                # the cut keeps unwinding.
+                frame.block_stack.pop()
+                exit_block = data.exit_block
+                if exit_block is None:
+                    continue
+                self._cur_block = exit_block
+                frame.pc = data.p_end + 1
+                return PollResult.AGAIN
             assert isinstance(data, IfBlockData)
             if data.chosen is not None:
                 # the path ran through the chosen branch of a compile-time

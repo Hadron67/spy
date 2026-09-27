@@ -216,6 +216,12 @@ class _Builder:
                     self.add(hir.Else())
                     self._gen_branch(node.orelse)
                 self.add(hir.End())
+            case ast.While():
+                self._gen_while(node)
+            case ast.Break():
+                self.add(hir.Break())
+            case ast.Continue():
+                self.add(hir.Continue())
             case ast.Try():
                 self._gen_try(node)
             case _:
@@ -234,6 +240,50 @@ class _Builder:
         for stmt in stmts:
             sub._gen_stmt(stmt)
         self.insts.extend(sub.insts)
+
+    def _gen_while(self, node: ast.While) -> None:
+        """Translate one ``while``/``else`` statement into a dead ``loop``:
+
+        .. code-block:: text
+
+            loop
+                %1 = <cond>
+                %2 = not %1
+                if %2
+                    <else_clause>
+                    break
+                else
+                    <body>
+                end
+            end
+
+        The condition is evaluated at the head of every iteration; when it
+        turns false the ``else`` clause runs and the implicit ``break``
+        leaves the loop, while otherwise the body runs and its falling end
+        loops back.  Only a natural exit (the condition turning false)
+        reaches the else clause - a ``break`` in the body skips it, like
+        Python - and a ``continue`` jumps back to the head, re-evaluating
+        the condition.  Both the body and the else clause are lexical
+        blocks of their own (children of the enclosing block)."""
+        self.add(hir.Loop())
+        cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
+        # ``%2 = not %1``: the negated condition is materialized in an inline
+        # slot (the same way any other unary expression is) and read back into a
+        # register, so that the ``if`` sees a boolean value whether the
+        # condition is compile-time or not
+        negated = self.add(hir.Alloca(True))
+        self.add(hir.Unary('not', ArgEntry(cond, False), negated))
+        self.add(hir.CommitSlot(negated))
+        self.add(hir.If(self.add(hir.Load(negated))))
+        else_clause = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
+        for stmt in node.orelse:
+            else_clause._gen_stmt(stmt)
+        self.insts.extend(else_clause.insts)
+        self.add(hir.Break())
+        self.add(hir.Else())
+        self._gen_branch(node.body)
+        self.add(hir.End())
+        self.add(hir.End())
 
     def _gen_try(self, node: ast.Try) -> None:
         """Translate one ``try``/``except`` statement: the try body, then one

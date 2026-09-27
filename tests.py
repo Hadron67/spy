@@ -313,6 +313,242 @@ def id_f32(a: f32) -> f32:
 
 
 # ---------------------------------------------------------------------------
+# loops: ``while`` compiles into a dead ``loop`` block whose head re-evaluates
+# the condition at every iteration; ``break`` leaves the loop, ``continue``
+# jumps back to the head and the ``else`` clause runs only on a natural exit.
+# A loop-carried variable is an ordinary block-local slot (memory), so no phi
+# is needed across the back edge.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def sum_to(n: i32) -> i32:
+    i: i32 = 0
+    total: i32 = 0
+    while i < n:
+        total = total + i
+        i = i + 1
+    return total
+
+
+@func()
+def count_up(n: i32) -> i32:
+    i: i32 = 0
+    while i < n:
+        i = i + 1
+    return i
+
+
+@func()
+def sum_calls(n: i32) -> i32:
+    # a spy call inside the loop body
+    i: i32 = 0
+    total: i32 = 0
+    while i < n:
+        total = total + inc(i)
+        i = i + 1
+    return total
+
+
+@func()
+def find_divisor(n: i32) -> i32:
+    # leaves the loop at the first divisor; when there is none the condition
+    # fails and the loop exits normally (with ``i == n``)
+    i: i32 = 2
+    while i < n:
+        if n % i == 0:
+            break
+        i = i + 1
+    return i
+
+
+@func()
+def sum_odd(n: i32) -> i32:
+    i: i32 = 0
+    total: i32 = 0
+    while i < n:
+        i = i + 1
+        if i % 2 == 0:
+            continue
+        total = total + i
+    return total
+
+
+@func()
+def skip_and_stop(n: i32) -> i32:
+    # both ``continue`` and ``break`` in the body, each under a runtime ``if``
+    i: i32 = 0
+    total: i32 = 0
+    while i < n:
+        i = i + 1
+        if i == 2:
+            continue
+        if i == 5:
+            break
+        total = total + i
+    return total
+
+
+@func()
+def while_else_natural(n: i32) -> i32:
+    # the else clause runs when the condition turns false
+    i: i32 = 0
+    result: i32 = 0
+    while i < n:
+        i = i + 1
+    else:  # noqa: PLW0120 - the else clause is the point of the fixture
+        result = 100
+    return result + i
+
+
+@func()
+def while_else_break(n: i32) -> i32:
+    # ... and is skipped by a ``break``
+    i: i32 = 0
+    result: i32 = 0
+    while i < n:
+        i = i + 1
+        if i == 2:
+            break
+    else:
+        result = 100
+    return result + i
+
+
+@func()
+def while_else_continue(n: i32) -> i32:
+    # a ``continue`` does not skip the else clause for good: it runs when the
+    # condition finally turns false
+    i: i32 = 0
+    result: i32 = 0
+    while i < n:
+        i = i + 1
+        if i % 2 == 0:
+            continue
+    else:  # noqa: PLW0120 - the else clause is the point of the fixture
+        result = 100
+    return result + i
+
+
+@func()
+def nested_loop_sum(n: i32, m: i32) -> i32:
+    i: i32 = 0
+    total: i32 = 0
+    while i < n:
+        j: i32 = 0
+        while j < m:
+            total = total + i * j
+            j = j + 1
+        i = i + 1
+    return total
+
+
+@func()
+def loop_return(n: i32) -> i32:
+    # ``while True`` whose only exit is a ``return``: the code after the loop is
+    # dead and the loop never needs an exit block
+    steps: i32 = 0
+    while True:
+        if n == 0:
+            return steps
+        n = n - 1
+        steps = steps + 1
+
+
+@func()
+def loop_void(n: i32) -> None:
+    i: i32 = 0
+    while i < n:
+        i = i + 1
+
+
+@func()
+def assign_outside_from_loop(n: i32) -> i32:
+    # a variable declared outside the loop is written in the body: it lives in
+    # memory, so the write survives the back edge
+    acc: i32 = 0
+    i: i32 = 0
+    while i < n:
+        acc += i
+        i = i + 1
+    return acc
+
+
+@func()
+def comptime_false_loop(n: i32) -> i32:
+    # a compile-time false condition never runs the body and runs the else
+    # clause once (only the chosen branch of the head ``if`` is emitted)
+    total: i32 = 0
+    while False:
+        total = total + n
+    else:  # noqa: PLW0120 - the else clause is the point of the fixture
+        total = total + 1
+    return total
+
+
+@func()
+def break_in_try(n: i32) -> i32:
+    # the try body may raise (``raise_a`` may), so the handler is live; a
+    # ``break`` in the body still leaves the loop directly, without going
+    # through the clause
+    i: i32 = 0
+    while i < 100:
+        i = i + 1
+        try:
+            raise_a(1)
+            if i == n:
+                break
+        except ErrorA:
+            return -1
+    return i
+
+
+@func()
+def continue_in_try(n: i32) -> i32:
+    i: i32 = 0
+    total: i32 = 0
+    while i < 10:
+        i = i + 1
+        try:
+            raise_a(1)
+            if i == n:
+                continue
+            total = total + i
+        except ErrorA:
+            return -1
+    return total
+
+
+@func()
+def bounded_loop(n: i32) -> i32:
+    # ``while True`` whose only exit is an explicit ``break``: the exit block
+    # comes from that break alone (the implicit one of the lowering is
+    # compile-time dead), and the code after the loop is reachable through it
+    i: i32 = 0
+    while True:
+        if i >= n:
+            break
+        i = i + 1
+    return i + 100
+
+
+def sum_inline(n: i32) -> i32:
+    # an undecorated plain function: its body - loop included - is inlined at
+    # the call site, in a frame of its own
+    i: i32 = 0
+    total: i32 = 0
+    while i < n:
+        total = total + i
+        i = i + 1
+    return total
+
+
+@func()
+def call_sum_inline(n: i32) -> i32:
+    return sum_inline(n)
+
+
+# ---------------------------------------------------------------------------
 # struct values: a struct is declared by decorating a class with ``@struct()``
 # - its annotated class attributes are the fields, in declaration order, and
 # the functions of its body are its methods - and is laid out by the mirror
@@ -1660,6 +1896,73 @@ class SpyFunctionCallTest(TestCase):
 @func()
 def div(a: i32, b: i32) -> i32:
     return a / b # pyright: ignore[reportReturnType]
+
+
+class SpyWhileTest(TestCase):
+    """``while`` loops: the condition is re-evaluated at the head of every
+    iteration, ``break`` leaves the loop, ``continue`` starts the next
+    iteration and the ``else`` clause runs only on a natural exit."""
+
+    def test_counting_loop(self) -> None:
+        self.assertEqual(sum_to(0), 0)
+        self.assertEqual(sum_to(1), 0)
+        self.assertEqual(sum_to(5), 10)
+        self.assertEqual(count_up(4), 4)
+
+    def test_call_inside_the_body(self) -> None:
+        self.assertEqual(sum_calls(4), 10)
+        self.assertEqual(sum_calls(0), 0)
+
+    def test_break(self) -> None:
+        self.assertEqual(find_divisor(15), 3)
+        self.assertEqual(find_divisor(9), 3)
+        # a prime has no divisor below it: the loop exits normally with i == n
+        self.assertEqual(find_divisor(7), 7)
+        self.assertEqual(skip_and_stop(10), 8)
+        self.assertEqual(skip_and_stop(1), 1)
+
+    def test_continue(self) -> None:
+        self.assertEqual(sum_odd(5), 9)
+        self.assertEqual(sum_odd(0), 0)
+
+    def test_while_else(self) -> None:
+        # the else clause runs on a natural exit ...
+        self.assertEqual(while_else_natural(3), 103)
+        # ... and is skipped by a ``break``
+        self.assertEqual(while_else_break(5), 2)
+        self.assertEqual(while_else_break(1), 101)
+        # ... while a ``continue`` only delays it
+        self.assertEqual(while_else_continue(4), 104)
+
+    def test_nested_loops(self) -> None:
+        self.assertEqual(nested_loop_sum(3, 4), 18)
+        self.assertEqual(nested_loop_sum(0, 4), 0)
+
+    def test_comptime_condition(self) -> None:
+        self.assertEqual(comptime_false_loop(5), 1)
+
+    def test_loop_whose_only_exit_is_return(self) -> None:
+        self.assertEqual(loop_return(4), 4)
+        self.assertEqual(loop_return(0), 0)
+
+    def test_loop_in_a_void_function(self) -> None:
+        self.assertIsNone(loop_void(3))
+
+    def test_assignment_across_iterations(self) -> None:
+        self.assertEqual(assign_outside_from_loop(5), 10)
+
+    def test_break_and_continue_in_try(self) -> None:
+        # a ``break``/``continue`` in a try body leaves the loop directly; the
+        # clause is only reachable when the body raises first
+        self.assertEqual(break_in_try(3), 3)
+        self.assertEqual(continue_in_try(3), 52)
+
+    def test_break_out_of_while_true(self) -> None:
+        self.assertEqual(bounded_loop(3), 103)
+        self.assertEqual(bounded_loop(0), 100)
+
+    def test_loop_in_an_inlined_body(self) -> None:
+        self.assertEqual(call_sum_inline(4), 6)
 
 
 class SpyAnnotationTest(TestCase):

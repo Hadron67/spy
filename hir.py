@@ -67,8 +67,13 @@ exists), and the :class:`End` marker that closes the block, like WASM's
 ``if ... else ... end``.  The interpreter walks the flat list: a
 compile-time ``if`` skips the branch it does not choose (its
 instructions are never run, so the branch is dead), a runtime ``if``
-types both branches (both survive at runtime).  Future block
-instructions (loops, ...) will use the same marker representation.
+types both branches (both survive at runtime).  A loop is a
+:class:`Loop` instruction followed by its body and the ``End`` that
+closes it, like WASM's ``loop ... end``: the interpreter types the body
+once and jumping back to it is the next iteration; a :class:`Break`
+leaves the loop (jumping to the code after its ``End``) and a
+:class:`Continue` starts the next iteration (jumping back to the
+``Loop`` itself).
 """
 
 from dataclasses import dataclass
@@ -398,6 +403,34 @@ class Else(Inst):
 
 
 @dataclass(eq=False)
+class Loop(Inst):
+    """The start of a ``loop`` block (WASM-style, like :class:`If`): the
+    instructions of the body follow it in the same list, closed by the
+    matching :class:`End`.  The block is a *dead loop*: falling off its
+    end jumps back to the ``Loop`` itself (the next iteration, whose head
+    re-evaluates whatever the body computes), and it is left only by a
+    :class:`Break` (or a ``return``/``raise``).  The ``Loop`` instruction
+    carries nothing; it only delimits the flat instruction stream."""
+
+
+@dataclass(eq=False)
+class Break(Inst):
+    """Leave the innermost open :class:`Loop` unconditionally: the path
+    ends at the code after the loop's matching :class:`End`.  Like a
+    ``ret`` the instruction carries nothing - the interpreter ends the
+    current path with a jump to the loop's exit block (see ``interp``)."""
+
+
+@dataclass(eq=False)
+class Continue(Inst):
+    """Start the next iteration of the innermost open :class:`Loop`
+    unconditionally: the path ends back at the loop's head, so the rest
+    of the body (and the ``else`` clause of the ``while``) is skipped and
+    the loop's condition is evaluated again.  Like :class:`Break` the
+    instruction carries nothing."""
+
+
+@dataclass(eq=False)
 class Try(Inst):
     """Open a ``try`` block: the instructions of the try body follow, then one
     :class:`Except` marker per ``except`` clause (each followed by its clause
@@ -423,12 +456,12 @@ class Except(Inst):
 
 @dataclass(eq=False)
 class End(Inst):
-    """The marker that closes a block opened by an :class:`If` (or a
-    future block instruction): everything between the ``If`` (or its
-    :class:`Else`) and this marker is one branch body, and the code
-    after this marker is the continuation of the enclosing block.  A
-    marker produces no register; it only delimits the flat instruction
-    stream."""
+    """The marker that closes a block opened by an :class:`If`, a
+    :class:`Loop` or a :class:`Try`: everything between the ``If`` (or its
+    :class:`Else`) and this marker is one branch body, everything between
+    the ``Loop`` and this marker is the loop body, and the code after
+    this marker is the continuation of the enclosing block.  A marker
+    produces no register; it only delimits the flat instruction stream."""
 
 @dataclass(eq=False)
 class CommitSlot(Inst):
@@ -438,14 +471,16 @@ class CommitSlot(Inst):
 def scan_block(insts: tuple[Inst, ...], entry: int) -> tuple[int | None, int]:
     """The positions of the ``Else`` (or None when the block has no
     else branch) and ``End`` markers that close the block opened at
-    ``entry`` (an ``hir.If``) of the executing frame's flat
-    instruction list, found by a balanced scan forward from the
-    entry (nested blocks close their own markers first)."""
+    ``entry`` (an ``hir.If`` or an ``hir.Loop``) of the executing frame's
+    flat instruction list, found by a balanced scan forward from the
+    entry (nested blocks close their own markers first).  A ``Loop``
+    block has no ``Else`` marker of its own, so its ``Else`` is always
+    None."""
     depth = 0
     p_else: int | None = None
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, (If, Try)):
+        if isinstance(inst, (If, Loop, Try)):
             depth += 1
         elif isinstance(inst, End):
             if depth == 0:
@@ -465,7 +500,7 @@ def scan_try(insts: tuple[Inst, ...], entry: int) -> tuple[list[int], int]:
     excepts: list[int] = []
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, (If, Try)):
+        if isinstance(inst, (If, Loop, Try)):
             depth += 1
         elif isinstance(inst, End):
             if depth == 0:
