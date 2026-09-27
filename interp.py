@@ -1117,18 +1117,30 @@ class HirRunner:
         assert isinstance(space, PendingSlot)
         return space
 
-    def _innermost_error_space(self) -> PendingSlot:
-        """The error space the errors at the current position are delivered
-        into: the innermost open try's space (a try space is active only while
-        its body is being walked, see ``_commit_try``), or else the function
-        proper's own.  This is what ``hir.ErrorLoc`` resolves to; the frames are
-        searched innermost-last so that an inlined body's errors reach the try
-        blocks enclosing its caller."""
+    def _active_try(self) -> TryExceptBlockData | None:
+        """The innermost *open* try block the walk currently sits in, or None
+        when no try body is being typed.  A try is open only while its body is
+        walked: from the moment its space is committed (``_commit_try``, which
+        runs before the clauses and after the body) the error at the current
+        position belongs to the enclosing try instead.  The frames are
+        searched innermost-last so that an error of an inlined body belongs to
+        the try blocks enclosing its caller - the single place both the error
+        location (``_innermost_error_space``) and the handler
+        (``_innermost_handler``) are read from, so that the two always agree."""
         for frame in reversed(self._frames):
             for bf in reversed(frame.block_stack):
                 data = bf.data
                 if isinstance(data, TryExceptBlockData) and not data.committed:
-                    return data.space
+                    return data
+        return None
+
+    def _innermost_error_space(self) -> PendingSlot:
+        """The error space the errors at the current position are delivered
+        into: the innermost open try's space, or else the function proper's
+        own.  This is what ``hir.ErrorLoc`` resolves to."""
+        data = self._active_try()
+        if data is not None:
+            return data.space
         return self._error_space()
 
     def _defer_return(self) -> None:
@@ -1670,24 +1682,31 @@ class HirRunner:
         raise CompileError(f'{obj!r} is not an exception struct')
 
     def _enclosing_handler(self, data: TryExceptBlockData) -> TryExceptBlockData | None:
-        """The try block enclosing ``data`` (the one its re-raise reaches), or
-        None at the function's boundary."""
+        """The try block whose clauses catch an error escaping ``data`` (the one
+        its re-raise reaches), or None at the function's boundary: the innermost
+        still-open try outside ``data``.  The frames are searched outwards like
+        ``_active_try`` - an inlined body's try re-raises into the try blocks
+        enclosing its caller - and a try whose body has been walked is skipped
+        for the same reason ``_active_try`` skips it: the error is delivered into
+        the enclosing space, not into a space that is already committed."""
         found = False
-        for bf in reversed(self._frames[-1].block_stack):
-            if bf.data is data:
-                found = True
-                continue
-            if found and isinstance(bf.data, TryExceptBlockData):
-                return bf.data
+        for frame in reversed(self._frames):
+            for bf in reversed(frame.block_stack):
+                block_data = bf.data
+                if block_data is data:
+                    found = True
+                    continue
+                if found and isinstance(block_data, TryExceptBlockData) and not block_data.committed:
+                    return block_data
         return None
 
     def _innermost_handler(self) -> TryExceptBlockData | None:
-        """The try block whose handler catches the errors raised at the current
-        position (the innermost open one), or None at the function's boundary."""
-        for bf in reversed(self._frames[-1].block_stack):
-            if isinstance(bf.data, TryExceptBlockData):
-                return bf.data
-        return None
+        """The try block whose clauses catch the errors raised at the current
+        position (the innermost open one), or None at the function's boundary.
+        This is the try owning ``_innermost_error_space``: the two are read from
+        the same place because an error is caught by the try whose space it was
+        delivered into."""
+        return self._active_try()
 
     def _dispatch_entry(self, handler: TryExceptBlockData | None) -> mir.BasicBlock | None:
         """The block an error propagates to when it is caught by ``handler``:

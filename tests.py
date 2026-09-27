@@ -2998,6 +2998,115 @@ def raise_undeclared(n: i32) -> i32:
     return n + 1
 
 
+# inlined plain Python functions: their bodies are emitted into their call
+# sites, so an error they raise or let through belongs to the error space - and
+# to the try blocks - enclosing the *caller*, exactly like an error raised at
+# the call site itself (see ``HirRunner._active_try``)
+
+
+def inline_raise(n: i32) -> i32:
+    if n < 0:
+        raise ErrorA(7)
+    return n + 1
+
+
+def inline_catch(n: i32) -> i32:
+    # the inline body has a try of its own: a raise crosses two frames before
+    # reaching the try (the body of the raise is inlined into this one)
+    try:
+        return inline_raise(n)
+    except ErrorA as e:
+        return e.code + 100
+
+
+def inline_reraise(n: i32) -> i32:
+    # the clause matches nothing the callee raises, so the error is re-raised
+    # out of the body's own try - into the caller's, not out of the function
+    try:
+        return inline_raise(n)
+    except ErrorB:
+        return 1
+
+
+def inline_forward(n: i32) -> i32:
+    # a native call inside an inlined body: the error it carries is delivered
+    # into the caller's space too
+    return raise_a(n) + 10
+
+
+def inline_raise_two(n: i32) -> i32:
+    # an inlined body that may raise either of two exceptions
+    if n > 10:
+        raise ErrorA(7)
+    if n > 0:
+        raise ErrorB(9)
+    return n + 1
+
+
+@func()
+def catch_inline_raise(n: i32) -> i32:
+    try:
+        return inline_raise(n)
+    except ErrorA as e:
+        return e.code + 100
+
+
+@func()
+def catch_inline_own_try(n: i32) -> i32:
+    return inline_catch(n) + 1000
+
+
+@func()
+def catch_inline_reraise(n: i32) -> i32:
+    try:
+        return inline_reraise(n)
+    except ErrorA as e:
+        return e.code + 100
+
+
+@func()
+def catch_inline_call(n: i32) -> i32:
+    try:
+        return inline_forward(n) + 10
+    except ErrorA as e:
+        return e.code + 900
+
+
+@func()
+def catch_inline_in_branch(n: i32) -> i32:
+    # the raise sits in a branch of the try body, so the other branch of the
+    # inline body still falls into the code after the call
+    try:
+        if n < 0:
+            inline_raise(n)
+            return 1
+        return 2
+    except ErrorA as e:
+        return e.code + 100
+
+
+@func(exceptions={ErrorA, ErrorB})
+def raise_in_clause(n: i32) -> i32:
+    # a raise inside a clause body belongs to the try *enclosing* the clause,
+    # never to the clause's own try again
+    try:
+        raise_b(n)
+    except ErrorB:
+        try:
+            raise_a(n)
+        except ErrorB:
+            return 1
+        return 2
+    return 3
+
+
+@func()
+def raise_in_inline_undeclared(n: i32) -> i32:
+    # the function proper declares nothing and the raise has no try to be
+    # caught by: it is rejected when the error is tagged
+    return inline_raise(n) + 10
+
+
 @struct()
 class ErrorC(Exception):
     code: i32
@@ -3035,6 +3144,16 @@ def nested_catch(n: i32) -> i32:
             return raise_a(n)
         except ErrorB:
             return -1
+    except ErrorA as e:
+        return e.code + 100
+
+
+@func(exceptions="infer")
+def inferred_inline_catch(n: i32) -> i32:
+    # the clause catches only ``ErrorA``, so only the ``ErrorB`` the inlined body
+    # lets through is inferred into this function's own set
+    try:
+        return inline_raise_two(n)
     except ErrorA as e:
         return e.code + 100
 
@@ -3182,6 +3301,76 @@ class SpyTryExceptTest(TestCase):
         # the function declares nothing, so Python can call it directly
         self.assertEqual(catch_without_declaring(5), 6)
         self.assertEqual(catch_without_declaring(-3), 507)
+
+
+class SpyInlineErrorTest(TestCase):
+    """Errors of an inlined body.  An inlined plain Python function is part of
+    its caller, so its errors are delivered into - and caught by - the error
+    space and the try blocks enclosing the *caller*: the error location and the
+    handler are read from one innermost-*open*-try lookup across the inlined
+    frames (see ``HirRunner._active_try``), which keeps the two in step."""
+
+    def test_the_callers_try_catches_the_raise(self) -> None:
+        self.assertEqual(catch_inline_raise(5), 6)
+        self.assertEqual(catch_inline_raise(-3), 107)
+
+    def test_the_bodys_own_try_catches_the_raise(self) -> None:
+        # the raise is inlined *into* the body whose try catches it, so the two
+        # sit in different frames
+        self.assertEqual(catch_inline_own_try(5), 1006)
+        self.assertEqual(catch_inline_own_try(-3), 1107)
+
+    def test_an_unmatched_error_of_the_body_re_raises_to_the_caller(self) -> None:
+        self.assertEqual(catch_inline_reraise(5), 6)
+        self.assertEqual(catch_inline_reraise(-3), 107)
+
+    def test_a_native_call_in_the_body_reaches_the_callers_try(self) -> None:
+        # the error of the native call is carried into the caller's space, and
+        # the caller's try is the handler the error propagates to
+        self.assertEqual(catch_inline_call(5), 26)
+        self.assertEqual(catch_inline_call(-3), 907)
+
+    def test_a_raise_in_a_branch_of_the_body(self) -> None:
+        # the raising branch leaves the try through the handler, while the other
+        # branch of the body still falls into the code after the call
+        self.assertEqual(catch_inline_in_branch(5), 2)
+        self.assertEqual(catch_inline_in_branch(-3), 107)
+
+    def test_a_raise_in_a_clause_body_is_not_caught_by_it_again(self) -> None:
+        # the clause's own try is no longer open while its body is typed, so the
+        # inner try's unmatched error belongs to the function's space
+        self.assertEqual(call_with_error(raise_in_clause, 5), (3, 0, -1))
+        _result, code, payload = call_with_error(raise_in_clause, -3)
+        entry = raise_in_clause.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        assert instance.ret_sig is not None and instance.ret_sig.exceptions is not None
+        # it is the ``ErrorA`` the inner try raised, tagged in the declared
+        # set's own order
+        types = list(instance.ret_sig.exceptions.values)
+        self.assertEqual((code, payload), (types.index(struct_type(ErrorA)) + 1, 7))
+
+    def test_an_inferred_set_takes_only_the_error_the_try_lets_through(self) -> None:
+        # an inferred function whose try catches one of the two exceptions its
+        # inlined callee may raise: the caught one never leaves the try, the
+        # other escapes it and is inferred into the function's own set
+        self.assertEqual(call_with_error(inferred_inline_catch, 0)[:2], (1, 0))
+        self.assertEqual(call_with_error(inferred_inline_catch, 20)[:2], (107, 0))
+        _result, code, payload = call_with_error(inferred_inline_catch, 5)
+        entry = inferred_inline_catch.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        assert instance.ret_sig is not None and instance.ret_sig.exceptions is not None
+        # only ``ErrorB`` is inferred, and being the only exception of the space
+        # it has tag 1 (one bit for its two tags)
+        self.assertEqual(list(instance.ret_sig.exceptions.values), [struct_type(ErrorB)])
+        self.assertEqual((code, payload), (1, 9))
+        self.assertEqual(instance.mir.args[1], mir.PointerType(mir.IntType(1, False), False))
+
+    def test_an_inlined_raise_needs_a_declaration_or_a_try(self) -> None:
+        # without either, the error has nowhere to go: it is rejected when it is
+        # tagged, naming the declaration that would allow it
+        with self.assertRaises(CompileError) as ctx:
+            raise_in_inline_undeclared(-3)
+        self.assertIn('cannot raise', str(ctx.exception))
 
 
 class SpyInferTest(TestCase):
