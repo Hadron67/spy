@@ -483,6 +483,14 @@ def _substitute_exceptions(exceptions: ArraySet[Type], substitute: Callable[[Typ
 class FunctionIR:
     name: str
     signature: Signature
+    # for each positional parameter, whether the HIR binds its argument directly
+    # as an address.  It only matters where the parameter is not already passed
+    # by reference (``Signature.is_ref``): then True binds ``hir.Arg(i)`` to the
+    # argument - the address of the value - instead of materializing the value
+    # into a fresh slot.  A method's ``self`` (``self_by_value=False``) is such a
+    # parameter: its signature type is ``Ptr[Self]`` and the HIR reads the
+    # receiver out of the pointer (see ``interp``)
+    arg_is_ref: tuple[bool, ...]
     body: tuple[hir.Inst, ...]
 
 class NativeFn:

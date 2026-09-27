@@ -1668,6 +1668,10 @@ def pass_by_ref(type: Type) -> bool:
     (``fn.SignatureFormalArg.by_ref``), whatever its type."""
     match type:
         case StructType() | ArrayType() | OptionType() | UnionType():
+            if _mentions_type_var(type):
+                # the layout is not known until the call substitutes the type
+                # parameter: assumed small now, re-decided on substitution
+                return False
             return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
         case _:
             return False

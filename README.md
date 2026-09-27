@@ -91,8 +91,9 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
   - 支持分支嵌套、连续 `if`、`elif`（即嵌套 `if`）。
 - 运行时 `if` 也允许出现在**内联函数体内**（普通函数与未装饰的结构体方法）。内联体直接续写调用点所在的块，并为调用方的延续预留一个**出口块**：内联 `return` 把值写入调用方结果位置（内存）后以 `jmp` 跳到出口块，落穿的内联体也汇入出口块，因此在调用点形成内存汇合（同样无需 phi）；若各路径返回类型不一致、或部分路径落穿/裸 `return`，会像函数本身一样报错。
 - **`while`/`while`-`else` 循环**：`while cond: body` 降级为一个死循环块（`hir.Loop`…`hir.End`）：每轮在块头重新求值 `cond`，为真则执行 `body`，块体末尾跳回块头；为假则先执行 `else` 子句（若有）再**跳出**循环。`break` 直接跳到循环之后（因此 `while`-`else` 的 `else` 只在条件自然为假时执行，被 `break` 跳过，与 Python 一致），`continue` 跳回块头（重新求值条件，并跳过本轮剩余 body）。循环在 MIR 里就是带回边的普通块，循环携带的变量是普通 alloca（内存），因此无需 phi。编译期为假的 `while False:` 不会生成 body（只保留选中的分支）。可在循环体内嵌套 `if`/`try`：`break`/`continue` 位于循环内的 `try` 体里时直接跳出/回到块头，except 子句只在该 try 体先抛异常时才走。
-- 尚无 `for` 循环；运行时 `and`/`or` 仍只支持编译期操作数。
-- **编译期循环**：`while syntax.inline_loop(cond): body` 中的条件被标记为编译期循环，`interp` 不为它发出回边，而是把循环体按 `cond` 的编译期取值**展开**成多个 body 块（条件必须是编译期值，且循环体要让编译期状态推进，否则展开次数超过 `HirRunner.max_loop_unroll`（默认 1024）时报错）。`break` 跳过全部展开的块（到循环之后），`continue` 跳到下一个 body（重新求值条件），`while`-`else` 的 `else` 在条件转假时执行一次。`syntax.inline_loop` 只能用作 `while` 的条件。
+- **`for` 循环**：`for exprs in iter: body`（可带 `else`）在 astgen 里降级为一个显式迭代器循环：循环前先取一次迭代器（`%it = iter.__iter__()` 并 commit），循环体放在一个 `try` 里：`exprs = %it.__next__()`，commit，再执行 `body`；`except StopIteration`（`std.StopIteration`）里先跑 `else` 再 `break`。`__next__` 抛 `StopIteration` 即循环结束（`else` 只在这种情况下执行，`break` 跳过它，与 Python 一致），`continue` 开始下一轮。`__iter__`/`__next__` 由迭代器的静态类型解析（`range` 这个内建名在 astgen 里映射到 `std.range`，`StopIteration` 映射到 `std.StopIteration`）。循环变量绑在循环体的子作用域里，循环之后不可见。`iter` 包在 `syntax.unroll(...)` 里时，外层 `Loop` 标记为编译期循环（同下面的 `while`，需要编译期 try/except，暂未实现）。
+- 运行时 `and`/`or` 仍只支持编译期操作数。
+- **编译期循环**：`while syntax.unroll(cond): body` 的条件被标记为编译期循环，`interp` 不为它发出回边，而是把循环体按 `cond` 的编译期取值**展开**成多个 body 块（条件必须是编译期值，且循环体要让编译期状态推进，否则展开次数超过 `HirRunner.max_loop_unroll`（默认 1024）时报错）。`break` 跳过全部展开的块（到循环之后），`continue` 跳到下一个 body（重新求值条件），`while`-`else` 的 `else` 在条件转假时执行一次。`syntax.unroll` 只能用作 `while` 的条件或 `for` 的可迭代对象。
 
 ### 函数与调用
 
@@ -133,7 +134,7 @@ assert use_point(2) == 12
 
 - **字段**按声明顺序排列，支持嵌套结构体（`p.inner.a`）；字段可读、可赋值、可 `+=`（`x.h = e`、`x.h += e`，可任意嵌套）。局部结构体变量是一个 alloca，`y = x` 拷贝结构体（改 `y` 不影响 `x`）。
 - **传参按值**：结构体实参是调用方结构体的一份拷贝，函数内对参数字段的修改不外溢（大于 16 字节的聚合在原生 ABI 上以指针传递，但语义仍是拷贝）。
-- **方法**：在类里定义并用 `@spy.func()` 装饰的是编译成原生调用的 spy 方法（未写返回注解时按函数体推断，什么都不返回就是 void 方法）；未装饰的方法在调用处被**内联**。方法的 `self` 默认按引用传递（因此可以就地写回），`@spy.func(sfv=True)` 让 `self` 按值传递。
+- **方法**：在类里定义并用 `@spy.func()` 装饰的是编译成原生调用的 spy 方法（未写返回注解时按函数体推断，什么都不返回就是 void 方法）；未装饰的方法在调用处被**内联**。方法的 `self` 默认是一个指向自身的指针（`self: Ptr[Self]`）：HIR 直接把 `self` 绑到调用方传进来的那个指针上（`FunctionIR.arg_is_ref`），因此读 `self` 会隐含解引用得到接收者本身、`ref(self)` 是 `Ptr[Self]`，可以就地写回；`@spy.func(sfv=True)` 让 `self` 按值传递（得到一份拷贝）。
 - **构造**：`Point(a, b)` 是一个 result-location 构造调用——`p = Point(...)` 或 `return Point(...)` 直接向目标位置的 slot 写字段，嵌套构造（`Bar(Foo(...), ...)`）把内层结构体直接建在外层字段里，不产生拷贝。位置实参按字段声明顺序写入，关键字实参按名指定；字段必须都得到值，只有零大小类型（ZST）的字段可以省略。类里**不能**定义 `__init__`（自定义构造函数尚未支持）。
 - **返回结构体**：函数可以返回结构体（含方法）。返回方式由返回类型决定（`sval.returns_via_result_ptr`）：默认**小结构体（≤16 字节）按值返回**——spy 之间直接走 LLVM 聚合返回；**大结构体经 result 指针返回**——MIR 阶段就给函数追加一个 result 指针形参并返回 void，callee 直接写进调用方的结果位置。`return expr` 语句本身也走 RLS：表达式（含调用）直接写进函数的结果位置。
 - **布局**：非 `extern_c` 结构体由编译器布局——字段按对齐重排（对齐小的在前），ZST 字段不占位置；只含一个非 ZST 字段的结构体，其 MIR 镜像是该字段本身（无包装结构体）；没有非 ZST 字段的镜像为 void。`@spy.struct(extern_c=True)` 保持声明顺序、并保留包装结构体，以便匹配 C ABI。
@@ -275,7 +276,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 
 ## 尚未实现 / 已知限制
 
-- `for` 循环、运行时 `and`/`or`（目前只支持编译期操作数）。
+- 运行时 `and`/`or`（目前只支持编译期操作数）。
 - 赋值仅支持 `=`（含元组解包）与 `+=`（无链式赋值 `a = b = e`、其它增强赋值）。
 - `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、对**指针**的下标 `p[i]`（指针只有解引用 `p[...]` 可用；数组的 `a[i]` 已实现）。
 - 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字符串的运算。

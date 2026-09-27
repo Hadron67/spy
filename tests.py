@@ -19,7 +19,7 @@ function no earlier test has compiled.
 import ctypes
 import io
 from contextlib import redirect_stdout
-from typing import Any, Literal, Protocol, Self
+from typing import Any, Literal
 from unittest import TestCase
 
 from spy.dsl import func, struct
@@ -45,21 +45,13 @@ from . import as_ as spy_as
 from . import bool as spy_bool
 from . import typeof as spy_typeof
 from .lower import LLVMBackend
+from .std import Numeric
 from .syntax import Array, Comptime, Option, Ptr, array, ref
 from .util import StrBiMap
 
 # ---------------------------------------------------------------------------
 # functions under test
 # ---------------------------------------------------------------------------
-
-class Numeric(Protocol):
-    def __add__(self, other: Self, /) -> Self: ...
-    def __sub__(self, other: Self, /) -> Self: ...
-    def __mod__(self, other: Self, /) -> Self: ...
-    def __lt__(self, other: Self, /) -> spy_bool: ...
-    def __gt__(self, other: Self, /) -> spy_bool: ...
-    def __le__(self, other: Self, /) -> spy_bool: ...
-    def __ge__(self, other: Self, /) -> spy_bool: ...
 
 
 @func()
@@ -546,6 +538,118 @@ def sum_inline(n: i32) -> i32:
 @func()
 def call_sum_inline(n: i32) -> i32:
     return sum_inline(n)
+
+
+# ---------------------------------------------------------------------------
+# for loops: ``for x in iter`` desugars into an explicit iterator loop (see
+# ``astgen._gen_for``); ``range`` (the builtin name) names the ``std.range``
+# struct and the loop ends when ``__next__`` raises ``std.StopIteration``.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def for_sum(n: i32) -> i32:
+    total: i32 = 0
+    for i in range(n, 0, 1):
+        total = total + i
+    return total
+
+
+@func()
+def for_else(n: i32) -> i32:
+    # the else clause runs when the sequence is exhausted
+    total: i32 = 0
+    for i in range(n, 0, 1):
+        total = total + i
+    else:  # noqa: PLW0120 - the else clause is the point of the fixture
+        total = total + 100
+    return total
+
+
+@func()
+def for_break(n: i32) -> i32:
+    # ... and is skipped by a ``break``
+    total: i32 = 0
+    for i in range(n, 0, 1):
+        if i == 3:
+            break
+        total = total + i
+    else:
+        total = total + 100
+    return total
+
+
+@func()
+def for_continue(n: i32) -> i32:
+    total: i32 = 0
+    for i in range(n, 0, 1):
+        if i == 2:
+            continue
+        total = total + i
+    return total
+
+
+@func()
+def for_step(n: i32) -> i32:
+    # start and step are given explicitly
+    total: i32 = 0
+    for i in range(n, 1, 2):
+        total = total + i
+    return total
+
+
+@func()
+def for_nested(n: i32) -> i32:
+    total: i32 = 0
+    for i in range(n, 0, 1):
+        for j in range(i, 0, 1):
+            total = total + j
+    return total
+
+
+@func()
+def for_call(n: i32) -> i32:
+    # a spy call in the body of a for loop
+    total: i32 = 0
+    for i in range(n, 0, 1):
+        total = total + inc(i)
+    return total
+
+
+@func()
+def for_leaks(n: i32) -> i32:
+    # the loop variable is only visible inside the loop
+    for i in range(n, 0, 1):
+        pass
+    return i  # pyright: ignore
+
+
+@func()
+def for_iter_is_a_copy(n: i32) -> i32:
+    # ``__iter__`` returns the range by value (a copy), so writing through the
+    # returned iterator does not touch the original range
+    r = range(n, 0, 1)
+    it = r.__iter__()
+    it.start = 42  # pyright: ignore[reportAttributeAccessIssue]
+    return r.start  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@struct()
+class Addressable:
+    x: i32
+
+    def addr(self) -> Ptr[Addressable]:
+        # ``self`` is bound directly to the incoming pointer, so ``ref(self)``
+        # is a ``Ptr[Self]``
+        return ref(self)
+
+
+@func()
+def write_through_self_ref(x: i32) -> i32:
+    p = Addressable(x)
+    q = p.addr()
+    q[...].x = 99
+    return p.x
 
 
 # ---------------------------------------------------------------------------
@@ -2155,6 +2259,55 @@ class SpyInlineLoopTest(TestCase):
     def test_marker_outside_a_while_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
             inline_loop_misuse(3)
+
+
+class SpyForTest(TestCase):
+    """``for`` loops: the iterable is iterated with ``__iter__``/``__next__``
+    (``range`` names ``std.range``), a ``break`` leaves the loop, a
+    ``continue`` starts the next iteration and the ``else`` clause runs only
+    when the sequence is exhausted."""
+
+    def test_sum(self) -> None:
+        self.assertEqual(for_sum(0), 0)
+        self.assertEqual(for_sum(5), 10)
+
+    def test_else_runs_when_exhausted(self) -> None:
+        self.assertEqual(for_else(3), 3 + 100)
+
+    def test_break_skips_the_else(self) -> None:
+        self.assertEqual(for_break(6), 1 + 2)
+        # a break never taken runs the whole loop and the else
+        self.assertEqual(for_break(2), 1 + 100)
+
+    def test_continue(self) -> None:
+        self.assertEqual(for_continue(5), 0 + 1 + 3 + 4)
+
+    def test_start_and_step(self) -> None:
+        self.assertEqual(for_step(7), 1 + 3 + 5)
+
+    def test_nested(self) -> None:
+        # the inner loop runs ``range(i, 0, 1)`` = ``0 .. i - 1``
+        self.assertEqual(for_nested(4), 0 + 0 + (0 + 1) + (0 + 1 + 2))
+
+    def test_call_in_the_body(self) -> None:
+        self.assertEqual(for_call(4), (0 + 1) + (1 + 1) + (2 + 1) + (3 + 1))
+
+    def test_loop_variable_is_not_visible_after_the_loop(self) -> None:
+        with self.assertRaises(CompileError):
+            for_leaks(3)
+
+    def test_iter_returns_a_copy(self) -> None:
+        # ``__iter__`` returns the range by value, so the loop iterates a copy
+        self.assertEqual(for_iter_is_a_copy(3), 0)
+
+
+class SpyMethodSelfTest(TestCase):
+    """A method's ``self`` is bound directly to the incoming pointer (its
+    ``FunctionIR.arg_is_ref``), so reading ``self`` implicitly loads the
+    receiver and ``ref(self)`` is a ``Ptr[Self]``."""
+
+    def test_ref_of_self_is_a_pointer_to_the_receiver(self) -> None:
+        self.assertEqual(write_through_self_ref(1), 99)
 
 
 class SpyAnnotationTest(TestCase):
@@ -4052,6 +4205,8 @@ all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
     SpyWhileTest,
+    SpyForTest,
+    SpyMethodSelfTest,
     SpyInlineLoopTest,
     SpyAnnotationTest,
     SpyStructTest,

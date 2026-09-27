@@ -53,6 +53,7 @@ it, see ``_resolve_closure``).
 """
 
 import ast
+import builtins
 import inspect
 import textwrap
 from collections.abc import Callable
@@ -64,12 +65,14 @@ from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
     Null,
+    PointerType,
     StructDecl,
     StructType,
     Type,
     Value,
     VoidType,
     as_value,
+    pass_by_ref,
     unwrap_comptime,
 )
 from .sval import (
@@ -223,6 +226,8 @@ class _Builder:
                 self.add(hir.End())
             case ast.While():
                 self._gen_while(node)
+            case ast.For():
+                self._gen_for(node)
             case ast.Break():
                 self.add(hir.Break())
             case ast.Continue():
@@ -271,7 +276,7 @@ class _Builder:
         the condition.  Both the body and the else clause are lexical
         blocks of their own (children of the enclosing block).
 
-        A condition wrapped in ``syntax.inline_loop(...)`` marks a
+        A condition wrapped in ``syntax.unroll(...)`` marks a
         *compile-time* loop: the ``Loop`` is opened with ``is_inline`` and the
         interpreter unrolls the body once per compile-time iteration instead of
         emitting a back edge (see ``interp``)."""
@@ -279,7 +284,7 @@ class _Builder:
         test = node.test
         if isinstance(test, ast.Call) and self._try_resolve_object(test.func) is syntax.unroll:
             if len(test.args) != 1 or len(test.keywords) != 0:
-                raise CompileError('syntax.inline_loop takes exactly one argument')
+                raise CompileError('syntax.unroll takes exactly one argument')
             is_inline = True
             test = test.args[0]
         self.add(hir.Loop(is_inline=is_inline))
@@ -301,6 +306,68 @@ class _Builder:
         self._gen_branch(node.body)
         self.add(hir.End())
         self.add(hir.End())
+
+    def _gen_for(self, node: ast.For) -> None:
+        """Translate one ``for exprs in iter: body`` (with an optional
+        ``else``) into an explicit iterator loop:
+
+        .. code-block:: text
+
+            %it = alloca
+            %it = iter.__iter__()
+            commit %it
+            loop
+                try
+                    <exprs> = %it.__next__()
+                    commit <exprs>
+                    <body>
+                except StopIteration
+                    <else>
+                    break
+                end
+            end
+
+        The iterator is taken once, before the loop; every iteration asks it for
+        the next element (with result-location semantics straight into the
+        place ``exprs`` denotes, so a destructuring target unpacks it in place)
+        and runs the body.  The loop ends when ``__next__`` raises
+        ``StopIteration``, which the ``try`` catches - when the ``else`` clause
+        runs before the ``break``.  A ``break`` in the body leaves the loop
+        directly (skipping the else clause), like Python, and a ``continue``
+        starts the next iteration.  ``iter`` wrapped in ``syntax.unroll(...)``
+        opens the loop as a compile-time one (see ``interp``)."""
+        iter_node = node.iter
+        is_inline = False
+        if isinstance(iter_node, ast.Call) and self._try_resolve_object(iter_node.func) is syntax.unroll:
+            if len(iter_node.args) != 1 or len(iter_node.keywords) != 0:
+                raise CompileError('syntax.unroll takes exactly one argument')
+            is_inline = True
+            iter_node = iter_node.args[0]
+        # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
+        # iteration would restart the iteration)
+        it = self.add(hir.Alloca())
+        base = self._as_ref(self._gen_expr(iter_node)[0])
+        self.add(hir.CallMethodInplace(base, '__iter__', RawArgList((), frozendict()), it))
+        self.add(hir.CommitSlot(it))
+        # the loop body, in a block of its own: the loop variable(s) are
+        # declared there and are not visible after the loop
+        sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
+        sub.add(hir.Loop(is_inline=is_inline))
+        sub.add(hir.Try((None,)))
+        new_slots: list[hir.Value] = []
+        place = sub._gen_lhs(node.target, new_slots)
+        sub.add(hir.CallMethodInplace(it, '__next__', RawArgList((), frozendict()), place))
+        for slot in new_slots:
+            sub.add(hir.CommitSlot(slot))
+        for stmt in node.body:
+            sub._gen_stmt(stmt)
+        sub.add(hir.Except(sub._gen_name('StopIteration'), 0))
+        for stmt in node.orelse:
+            sub._gen_stmt(stmt)
+        sub.add(hir.Break())
+        sub.add(hir.End())
+        sub.add(hir.End())
+        self.insts.extend(sub.insts)
 
     def _gen_try(self, node: ast.Try) -> None:
         """Translate one ``try``/``except`` statement: the try body, then one
@@ -356,6 +423,29 @@ class _Builder:
 
     # -- variables ------------------------------------------------------------
 
+    def _gen_lhs(self, target: ast.expr, new_slots: list[hir.Value]) -> hir.Value:
+        """The place - or, for a destructuring target, the ``hir.Tuple`` of
+        places - a target denotes, declaring every name it binds nowhere (their
+        fresh slots are appended to ``new_slots``).  It is the first half of an
+        assignment, shared by ``_gen_assign`` and the ``for`` desugaring (see
+        ``_gen_for``): the caller generates the value into the returned place
+        with result-location semantics and then commits ``new_slots``."""
+        if isinstance(target, ast.Tuple):
+            # a destructuring target is a tuple of addresses, one per element:
+            # the right-hand side is generated straight into them (result-
+            # location semantics), so no intermediate tuple value is built
+            return self._gen_target_tuple(target, new_slots)
+        if isinstance(target, ast.Name) and self._scope.lookup(target.id) is None:
+            # the name is bound nowhere: declare it here, in the current block
+            slot = self.add(hir.Alloca())
+            self._scope.bindings[target.id] = slot
+            new_slots.append(slot)
+            return slot
+        lhs = self._gen_expr(target, False)[0]
+        if not lhs.is_ref:
+            raise CompileError(f"the target of an assignment must be a variable, got {target}")
+        return lhs.value
+
     def _gen_assign(self, target: ast.expr, value: ast.expr) -> None:
         """One ``target = expr`` statement.  An assignment to a name that
         is already bound - in this block, or in an enclosing one, a
@@ -370,28 +460,11 @@ class _Builder:
         straight into the target slot (result-location semantics): a
         constructor ``x = Bar(...)`` fills the fields of the slot in
         place, and a scalar call result is only recorded in it."""
-        if isinstance(target, ast.Tuple):
-            # a destructuring target is a tuple of addresses, one per element:
-            # the right-hand side is generated straight into them (result-
-            # location semantics), so no intermediate tuple value is built
-            new_slots: list[hir.Value] = []
-            ptrs = self._gen_target_tuple(target, new_slots)
-            self._gen_result_loc(value, ptrs)
-            for slot in new_slots:
-                self.add(hir.CommitSlot(slot))
-            return
-        emit_commit = False
-        if isinstance(target, ast.Name) and self._scope.lookup(target.id) is None:
-            # the name is bound nowhere: declare it here, in the current block
-            slot = self.add(hir.Alloca())
-            self._scope.bindings[target.id] = slot
-            emit_commit = True
-        lhs = self._gen_expr(target, False)[0]
-        if not lhs.is_ref:
-            raise CompileError(f"target of augmented assignment must be a variable, got {target}")
-        self._gen_result_loc(value, lhs.value)
-        if emit_commit:
-            self.add(hir.CommitSlot(lhs.value))
+        new_slots: list[hir.Value] = []
+        place = self._gen_lhs(target, new_slots)
+        self._gen_result_loc(value, place)
+        for slot in new_slots:
+            self.add(hir.CommitSlot(slot))
 
     def _gen_ann_assign(self, node: ast.AnnAssign) -> None:
         """One annotated declaration ``name: T`` or ``name: T = expr``.  The
@@ -514,7 +587,12 @@ class _Builder:
         """The raw Python object the global name ``name`` resolves to:
         the value of its closure cell, or of its module global.  The
         object is embedded by ``_gen_name`` as a ``hir.Const`` (value
-        context) or a ``hir.ConstRef`` (reference context)."""
+        context) or a ``hir.ConstRef`` (reference context).
+
+        A builtin the compiler gives a spy meaning resolves to the ``std``
+        struct it stands for: ``range`` is the iterable struct and
+        ``StopIteration`` the exception its ``__next__`` raises - the
+        desugarings the compiler writes refer to them by these names."""
         closure = self._resolve_closure(name)
         if closure is not None:
             return closure
@@ -522,6 +600,10 @@ class _Builder:
         globals = fn.__globals__
         if name in globals:
             return globals[name]
+        builtin = getattr(builtins, name, None)
+        if builtin is range or builtin is StopIteration:
+            from . import std
+            return std.range if builtin is range else std.StopIteration
         raise CompileError(
             f"name '{name}' is not defined in the scope of function {self._fn_ir.name}"
         )
@@ -669,10 +751,12 @@ class _Builder:
             return ArgEntry(self._as_ref(self._gen_expr(args[0])[0]), False), False
 
         if callee is syntax.unroll:
-            # it only means something as the condition of a ``while`` (see
-            # ``_gen_while``), which is where it is recognized
+            # it only means something as the condition of a ``while`` or the
+            # iterable of a ``for`` (see ``_gen_while``/``_gen_for``), which is
+            # where it is recognized
             raise CompileError(
-                'syntax.inline_loop can only be used as the condition of a while loop'
+                'syntax.unroll can only be used as the condition of a while loop '
+                'or the iterable of a for loop'
             )
 
         raise CompileError(f'unsupported syntax call {callee}')
@@ -968,6 +1052,7 @@ def parse_function(
     all_args = list(node.args.args)
     offset = len(all_args) - len(defaults)
     positional = IndexedMap[str, SignatureFormalArg]()
+    arg_is_ref: list[bool] = []
     for i, arg in enumerate(all_args):
         has_default = i >= offset
         default_value = default_of(defaults[i - offset]) if has_default else None
@@ -978,14 +1063,19 @@ def parse_function(
         arg_type = annotation_of(annotated)
         by_ref = False
         if i == 0 and self_type is not None:
-            # the ``self`` of a method: the object is passed by reference
-            # (its address), which is what makes a method able to write
-            # through ``self``; ``self_by_value`` passes its value instead
-            arg_type = self_type
-            by_ref = not self_by_value
+            # the ``self`` of a method: its declared type is a pointer to the
+            # struct itself (``self_by_value`` passes the object's value
+            # instead); the HIR reads the receiver through it (see
+            # ``FunctionIR.arg_is_ref`` and ``interp``)
+            arg_type = self_type if self_by_value else PointerType(self_type)
+        elif arg_type is not None:
+            by_ref = pass_by_ref(arg_type)
         positional.add(
             arg.arg, SignatureFormalArg(arg_type, is_comptime, by_ref, default_value)
         )
+        # a method's ``self`` is bound directly to its argument (the receiver's
+        # address); every other parameter is passed as the signature says
+        arg_is_ref.append(i == 0 and self_type is not None and not self_by_value)
 
     # ``*args``/``**kwargs`` are rejected above (a spy function definition
     # may not declare them yet), so the ``varargs``/``kwargs`` slots of the
@@ -995,7 +1085,7 @@ def parse_function(
         tuple(generic_args), positional, None, None, annotation_of(ret_annotation), exception_set(),
     )
 
-    ir = FunctionIR(node.name, signature, ())
+    ir = FunctionIR(node.name, signature, tuple(arg_is_ref), ())
 
     # At HIR level, parameters are passed by ref (pointer)
     scope = _Scope(None)

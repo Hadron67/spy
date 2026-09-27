@@ -964,6 +964,7 @@ class HirRunner:
     def run_function(
         self,
         body: tuple[hir.Inst, ...],
+        arg_is_ref: tuple[bool, ...],
         sig: CallSignature,
         ret_sig: PartialReturnSignature | None,
         generic_var_values: dict[sval.TypeVar, InterpVal],
@@ -983,7 +984,7 @@ class HirRunner:
         )
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
-        args = self._init_args_from_signature(sig, mir_args)
+        args = self._init_args_from_signature(sig, mir_args, arg_is_ref)
         for arg in mir_args:
             assert arg is not None
         frame.arg_values = args
@@ -1014,7 +1015,7 @@ class HirRunner:
             value_loc = self.alloca(False)
         return value_loc, space
 
-    def _init_one_arg(self, node: SpecializedFormalArg, mir_args: list[mir.Type]) -> InterpVal:
+    def _init_one_arg(self, node: SpecializedFormalArg, mir_args: list[mir.Type], arg_is_ref: bool) -> InterpVal:
         match node:
             case SpecializedComptimeArg():
                 return ComptimeVal(sval.ConstRef(node.value))
@@ -1022,18 +1023,27 @@ class HirRunner:
                 mir_type = node.type.to_mir_type()
                 if mir_type is None or isinstance(mir_type, mir.VoidType):
                     raise _no_runtime_type(node.type)
-                type = mir_type
                 index = len(mir_args)
                 if node.is_ref:
-                    type = mir.PointerType(type, True)
-                    mir_args.append(type)
-                    return RuntimeVal(mir.Param(index, type), sval.PointerType(node.type, True))
+                    # the signature passes the address of the value as a const
+                    # pointer
+                    arg_mir = mir.PointerType(mir_type, True)
+                    arg_sval = sval.PointerType(node.type, True)
                 else:
-                    mir_args.append(type)
-                    ret = self.alloca()
-                    self._commit_pending_slot(ret, node.type)
-                    self.store(ret, RuntimeVal(mir.Param(index, type), node.type))
-                    return ret
+                    arg_mir = mir_type
+                    arg_sval = node.type
+                mir_args.append(arg_mir)
+                if node.is_ref or arg_is_ref:
+                    # the HIR binds the parameter directly to its argument - the
+                    # address of the value - and a read of the name loads it.  A
+                    # method's ``self`` is such a parameter (its type is already
+                    # a pointer, so no extra indirection is added) without being
+                    # a by-reference one in the signature
+                    return RuntimeVal(mir.Param(index, arg_mir), arg_sval)
+                slot = self.alloca()
+                self._commit_pending_slot(slot, node.type)
+                self.store(slot, RuntimeVal(mir.Param(index, arg_mir), node.type))
+                return slot
             case _:
                 raise CompileError(f'unsupported specialized argument {node!r}')
 
@@ -1041,16 +1051,17 @@ class HirRunner:
         self,
         signature: CallSignature,
         mir_args: list[mir.Type],
+        arg_is_ref: tuple[bool, ...],
     ) -> tuple[InterpVal, ...]:
         arg_values: list[InterpVal] = []
 
-        for arg in signature.positional:
-            arg_values.append(self._init_one_arg(arg[1], mir_args))
+        for (_, arg), is_ref in zip(signature.positional, arg_is_ref):
+            arg_values.append(self._init_one_arg(arg, mir_args, is_ref))
 
         if signature.varargs:
-            arg_values.append(ComptimeTuple(tuple(ArgEntry(self._init_one_arg(a, mir_args), True) for a in signature.varargs)))
+            arg_values.append(ComptimeTuple(tuple(ArgEntry(self._init_one_arg(a, mir_args, False), True) for a in signature.varargs)))
         if signature.kwargs:
-            arg_values.append(ComptimeDict({k: ArgEntry(self._init_one_arg(v, mir_args), True) for k, v in signature.kwargs.items()}))
+            arg_values.append(ComptimeDict({k: ArgEntry(self._init_one_arg(v, mir_args, False), True) for k, v in signature.kwargs.items()}))
 
         return tuple(arg_values)
 
@@ -3399,7 +3410,7 @@ class HirRunner:
         if fn.force_inline:
             # an undecorated plain Python function: its body is inlined into
             # the current stream (it has no native specialization of its own)
-            return self._start_inline(fn.hir.body, binded_args, ret, generic_var_values)
+            return self._start_inline(fn.hir.body, fn.hir.arg_is_ref, binded_args, ret, generic_var_values)
         arg_types = binded_args.map(_arg_type_of)
         spec_sig = sig.specialize(arg_types)
 
@@ -3641,6 +3652,7 @@ class HirRunner:
     def _start_inline(
         self,
         body: tuple[hir.Inst, ...],
+        arg_is_ref: tuple[bool, ...],
         args: ArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
         generic_var_values: frozendict[sval.TypeVar, sval.Value] | None = None,
@@ -3670,8 +3682,12 @@ class HirRunner:
         if len(args.varargs) > 0 or len(args.kwargs) > 0:
             raise CompileError('*args/**kwargs cannot be inlined yet')
         arg_values: list[InterpVal] = []
-        for arg in args.positional:
-            if arg.is_ref:
+        for (arg, is_ref) in zip(args.positional, arg_is_ref):
+            # ``arg_is_ref`` is the *callee's* HIR binding: a method's ``self`` is
+            # bound directly to its argument (the address) even though the
+            # caller passed it as a value; every other parameter is forwarded as
+            # the caller passed it (by reference, or materialized by value)
+            if arg_is_ref or arg.is_ref:
                 arg_values.append(arg.value)
             else:
                 slot = self.alloca(True)
@@ -3822,7 +3838,10 @@ class Analyser:
             (tv, ComptimeVal(v))
             for tv, v in zip(fn_entry.hir.signature.generic_args, call_sig.generic_args)
         )
-        runner.run_function(fn_entry.hir.body, call_sig, ret_sig, frame_generic_values)
+        runner.run_function(
+            fn_entry.hir.body, fn_entry.hir.arg_is_ref,
+            call_sig, ret_sig, frame_generic_values,
+        )
         self._analyse_stack.append(runner)
         return None
 
