@@ -3228,6 +3228,22 @@ def inferred_inline_catch(n: i32) -> i32:
         return e.code + 100
 
 
+@func(exceptions="infer")
+def inferred_no_return(n: i32) -> i32:
+    # an inferred exception set leaves the declared return type in place, even
+    # though the inlined body never returns and no value is ever stored
+    return inline_no_return(n) + 10
+
+
+@func(exceptions="infer")
+def inferred_wider_return(n: i32) -> i64:
+    # ... and it is the *declared* type that fixes the value result, not the
+    # type of the values the body stores (``n + 1`` here is an ``i32``)
+    if n < 0:
+        raise ErrorA(7)
+    return n + 1
+
+
 @struct()
 class ErrorBig(Exception):
     a: i64
@@ -3432,7 +3448,7 @@ class SpyInlineErrorTest(TestCase):
         _result, code, payload = call_with_error(raise_in_clause, -3)
         entry = raise_in_clause.get_entry()  # pyright: ignore
         instance = next(iter(entry.specs.values()))
-        assert instance.ret_sig is not None and instance.ret_sig.exceptions is not None
+        assert instance.ret_sig is not None
         # it is the ``ErrorA`` the inner try raised, tagged in the declared
         # set's own order
         types = list(instance.ret_sig.exceptions.values)
@@ -3447,7 +3463,7 @@ class SpyInlineErrorTest(TestCase):
         _result, code, payload = call_with_error(inferred_inline_catch, 5)
         entry = inferred_inline_catch.get_entry()  # pyright: ignore
         instance = next(iter(entry.specs.values()))
-        assert instance.ret_sig is not None and instance.ret_sig.exceptions is not None
+        assert instance.ret_sig is not None
         # only ``ErrorB`` is inferred, and being the only exception of the space
         # it has tag 1 (one bit for its two tags)
         self.assertEqual(list(instance.ret_sig.exceptions.values), [struct_type(ErrorB)])
@@ -3474,7 +3490,7 @@ class SpyInferTest(TestCase):
         self.assertEqual((result, code, payload), (0, 1, 7))
         entry = inferred_raise.get_entry()  # pyright: ignore
         instance = next(iter(entry.specs.values()))
-        assert instance.ret_sig is not None and instance.ret_sig.exceptions is not None
+        assert instance.ret_sig is not None
         self.assertEqual(list(instance.ret_sig.exceptions.values), [struct_type(ErrorC)])
         args = instance.mir.args
         self.assertEqual(args[1], mir.PointerType(mir.IntType(1, False), False))
@@ -3492,13 +3508,37 @@ class SpyInferTest(TestCase):
         self.assertEqual(call_with_error(inferred_two, -3)[1:], (1, 7))
         entry = inferred_two.get_entry()  # pyright: ignore
         instance = next(iter(entry.specs.values()))
-        assert instance.ret_sig is not None and instance.ret_sig.exceptions is not None
+        assert instance.ret_sig is not None
         # first-delivery order, and two exceptions need two bits
         self.assertEqual(
             list(instance.ret_sig.exceptions.values),
             [struct_type(ErrorA), struct_type(ErrorB)],
         )
         self.assertEqual(instance.mir.args[1], mir.PointerType(mir.IntType(2, False), False))
+
+    def test_an_inferred_set_keeps_the_declared_return_type(self) -> None:
+        # the exceptions are inferred, the value type is the declared ``i64`` -
+        # not the ``i32`` the body stores - so the value is the by-value result
+        # and the error code goes through a pointer
+        self.assertEqual(call_with_error(inferred_wider_return, 3)[:2], (4, 0))
+        self.assertEqual(call_with_error(inferred_wider_return, -3)[1:], (1, 7))
+        entry = inferred_wider_return.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        assert instance.ret_sig is not None
+        self.assertEqual(list(instance.ret_sig.exceptions.values), [struct_type(ErrorA)])
+        self.assertEqual(instance.mir.ret_type, mir.IntType(64, True))
+        self.assertEqual(instance.mir.args[1], mir.PointerType(mir.IntType(1, False), False))
+
+    def test_a_body_that_never_returns_keeps_the_declared_return_type(self) -> None:
+        # nothing is stored into the result location at all, so the result type
+        # has to come from the declaration
+        _result, code, payload = call_with_error(inferred_no_return, 3)
+        self.assertEqual((code, payload), (1, 7))
+        entry = inferred_no_return.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        assert instance.ret_sig is not None
+        self.assertEqual(instance.mir.ret_type, mir.IntType(32, True))
+        self.assertEqual(instance.mir.args[1], mir.PointerType(mir.IntType(1, False), False))
 
     def test_nested_tries_hand_over_inward(self) -> None:
         # the inner ``try`` catches nothing, so its error is re-raised into the

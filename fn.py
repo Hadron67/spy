@@ -112,26 +112,53 @@ class SpecializedComptimeArg(SpecializedFormalArg):
         return str(self.value)
 
 @dataclass(frozen=True, slots=True)
-class ReturnSignature:
-    """The logical return convention of one specialization, *before* the error
-    part is added: the return spec of the declared return type
-    (``ret_type_spec``) and the exceptions the function may raise
-    (``exceptions``, in error-code order; empty for a function that raises
-    nothing, ``None`` while they still have to be inferred).
-
-    The *effective* spec - the one the lowered function and its callers work
-    with, in which the error union is spread into its error code and its
-    payload (see ``sval.make_ret_spec``) - is :meth:`ret_spec`."""
+class PartialReturnSignature:
+    """The return convention of one specialization as far as the function's
+    definition declares it: the return spec of its return annotation
+    (``ret_type_spec``) and the exceptions it may raise (``exceptions``, in
+    error-code order).  Either part is ``None`` when it is left to be inferred
+    from the body (see ``HirRunner._finish_function``)."""
 
     ret_type_spec: RetSpec | None
     exceptions: ArraySet[Type] | None
+
+    def is_complete(self) -> bool:
+        """Whether both parts are declared - the convention can then be fixed
+        before the body is typed (see ``HirRunner.run_function``)."""
+        return self.ret_type_spec is not None and self.exceptions is not None
+
+    def complete(self) -> ReturnSignature:
+        """The complete return signature of this one, which requires both of
+        its parts to be declared (see :meth:`is_complete`)."""
+        ret_type_spec = self.ret_type_spec
+        exceptions = self.exceptions
+        assert ret_type_spec is not None and exceptions is not None, (
+            'the return signature is not complete yet'
+        )
+        return ReturnSignature(ret_type_spec, exceptions)
+
+@dataclass(frozen=True, slots=True)
+class ReturnSignature:
+    """The complete return convention of one specialization, *before* the error
+    part is added: the return spec of the declared return type
+    (``ret_type_spec``) and the exceptions the function may raise
+    (``exceptions``, in error-code order; empty for a function that raises
+    nothing).
+
+    The *effective* spec - the one the lowered function and its callers work
+    with, in which the error union is spread into its error code and its
+    payload (see ``sval.make_ret_spec``) - is :meth:`ret_spec`.  A signature
+    that still leaves a part to be inferred is a
+    :class:`PartialReturnSignature` instead."""
+
+    ret_type_spec: RetSpec
+    exceptions: ArraySet[Type]
 
     def ret_spec(self) -> RetSpec:
         """The effective return spec: the declared return spec with the error
         code and the payload union appended.  The error part is always present -
         a function that raises nothing has the empty ``ErrorUnion[]``, whose code
         and payload are zero-sized and so never reach the MIR."""
-        assert self.ret_type_spec is not None and self.exceptions is not None
         return make_ret_spec(TupleType(
             (self.ret_type_spec.type, ErrorUnionType(tuple(self.exceptions.values))), False,
         ))
@@ -361,10 +388,9 @@ class Signature:
             exceptions=None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute),
         )
 
-    def specialize(self, provided: ArgList[Type | None]) -> tuple[CallSignature, ReturnSignature | None]:
+    def specialize(self, provided: ArgList[Type | None]) -> tuple[CallSignature, PartialReturnSignature]:
         """Specialize one call of this signature: the concrete typing of
-        its arguments and (when the signature declares a return type)
-        of its result.
+        its arguments and the return convention this signature declares.
 
         The declared generic type parameters are solved from ``provided``
         (see :meth:`solve_param_types`) and substituted into every
@@ -378,9 +404,10 @@ class Signature:
         carries its unit value as a compile-time argument.
 
         Returns the specialized call signature - also the cache key of
-        the specialization - and the return signature, or ``None`` when
-        the signature declares no return type (the interpreter infers
-        it from the body)."""
+        the specialization - and the return convention as far as the
+        definition declares it: a part it leaves out is missing (``None``),
+        and the interpreter infers it from the body (see
+        ``PartialReturnSignature``)."""
         type_var_values = self.solve_param_types(provided)
         reps: dict[TypeVar, AnyValue] = dict(zip(self.generic_args, type_var_values))
 
@@ -436,12 +463,11 @@ class Signature:
             tuple(type_var_values), positional, varargs, kwargs
         )
 
-        if self.ret_type is None or self.exceptions is None:
-            # no declared return type, or an inferred exception set: the
-            # interpreter infers the missing part from the body
-            return call_sig, None
-        exceptions = _substitute_exceptions(self.exceptions, substitute)
-        return call_sig, ReturnSignature(make_ret_spec(substitute(self.ret_type)), exceptions)
+        # the parts the definition declares; the interpreter infers the ones it
+        # leaves out from the body
+        ret_type_spec = None if self.ret_type is None else make_ret_spec(substitute(self.ret_type))
+        exceptions = None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute)
+        return call_sig, PartialReturnSignature(ret_type_spec, exceptions)
 
 
 def _substitute_exceptions(exceptions: ArraySet[Type], substitute: Callable[[Type], Type]) -> ArraySet[Type]:

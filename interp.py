@@ -93,6 +93,7 @@ from .fn import (
     FunctionInstance,
     FunctionValue,
     NativeFn,
+    PartialReturnSignature,
     RawArgList,
     ReturnSignature,
     Signature,
@@ -918,10 +919,12 @@ class HirRunner:
         # ``mir.Ret`` is filled in by ``_finish_function`` once the result
         # location has been materialized
         self._deferred_returns: list[mir.Insertion] = []
-        self.return_sig: ReturnSignature | None = None
-        # the effective return spec (the declared one with the error part
-        # added), derived from ``return_sig`` once it is known
-        self.ret_spec: RetSpec | None = None
+        # the return convention the signature declares, with the parts the body
+        # still has to infer missing (see ``PartialReturnSignature``)
+        self.partial_ret_sig: PartialReturnSignature | None = None
+        # the complete return convention, fixed by ``_materialize_ret_sig`` once
+        # its parts are known
+        self.ret_sig: ReturnSignature | None = None
 
         self._fn_req_resumer: Callable[[Self, mir.Value, ReturnSignature]] | None = None
 
@@ -931,14 +934,14 @@ class HirRunner:
         self,
         body: tuple[hir.Inst, ...],
         sig: CallSignature,
-        ret_sig: ReturnSignature | None,
+        ret_sig: PartialReturnSignature | None,
         generic_var_values: dict[sval.TypeVar, InterpVal],
     ):
         # reset the per-specialization state; the result location of the
         # function proper is reserved first so its slot sits at a known
         # position in the body
-        self.return_sig = ret_sig
-        self.ret_spec = None
+        self.partial_ret_sig = ret_sig
+        self.ret_sig = None
         self.resume_info = None
         self._deferred_returns = []
         value_loc, space = self._reserve_result_loc(ret_sig)
@@ -953,30 +956,29 @@ class HirRunner:
         for arg in mir_args:
             assert arg is not None
         frame.arg_values = args
-        if ret_sig is not None and ret_sig.ret_type_spec is not None and ret_sig.exceptions is not None:
+        if ret_sig is not None and ret_sig.is_complete():
             # the whole return convention is declared: fix it before the body
-            self._materialize_ret_sig(ret_sig)
+            self._materialize_ret_sig(ret_sig.complete())
 
-    def _reserve_result_loc(self, ret_sig: ReturnSignature | None) -> tuple[InterpVal, PendingSlot]:
+    def _reserve_result_loc(self, ret_sig: PartialReturnSignature | None) -> tuple[InterpVal, PendingSlot]:
         """``(value_loc, error_space)``: the place the declared results are
         delivered into and the function's error space (the two parts of the
         function proper's result location at ``InlineFrame.ret_loc``).  The
         error space is an error-union slot either way - declared or still to be
         inferred - and is committed once the return convention is known (see
         ``_materialize_ret_sig``)."""
-        declared_value = ret_sig is not None and ret_sig.ret_type_spec is not None
-        declared_exceptions = ret_sig is not None and ret_sig.exceptions is not None
-        if declared_value and declared_exceptions:
-            assert ret_sig is not None
-            loc = self._ret_spec_place(ret_sig.ret_spec())
+        declared_value = ret_sig.ret_type_spec if ret_sig is not None else None
+        if ret_sig is not None and ret_sig.is_complete():
+            # the value and the error part are both declared: the result
+            # location is the one the effective spec names
+            loc = self._ret_spec_place(ret_sig.complete().ret_spec())
             assert isinstance(loc, ComptimeTuple) and len(loc.values) == 2
             error = loc.values[1].value
             assert isinstance(error, PendingSlot)
             return loc.values[0].value, error
         space = self._new_error_space()
-        if declared_value:
-            assert ret_sig is not None and ret_sig.ret_type_spec is not None
-            value_loc = self._ret_spec_place(ret_sig.ret_type_spec)
+        if declared_value is not None:
+            value_loc = self._ret_spec_place(declared_value)
         else:
             value_loc = self.alloca(False)
         return value_loc, space
@@ -1055,16 +1057,15 @@ class HirRunner:
         (``sval.make_ret_spec``) unless the signature declares it.
         """
         spec = sig.ret_spec()
-        if self.ret_spec is not None:
-            if self.ret_spec != spec:
+        if self.ret_sig is not None:
+            if self.ret_sig != sig:
                 raise CompileError(
                     f"function returns values of conflicting types "
-                    f"{[leaf.type for leaf in iter_ret_leaves(self.ret_spec)]} and "
+                    f"{[leaf.type for leaf in iter_ret_leaves(self.ret_sig.ret_spec())]} and "
                     f"{[leaf.type for leaf in iter_ret_leaves(spec)]}"
                 )
             return
-        self.return_sig = sig
-        self.ret_spec = spec
+        self.ret_sig = sig
         self._fn_instance.mir.ret_type = mir.VOID
         self._commit_ret_places(spec, self._current_result_loc())
 
@@ -1172,8 +1173,9 @@ class HirRunner:
         (whatever inline frame the path sits in): its by-value result is
         loaded out of the function's result location, or none is returned when
         every result goes through a result pointer."""
-        spec = self.ret_spec
-        assert spec is not None
+        sig = self.ret_sig
+        assert sig is not None
+        spec = sig.ret_spec()
         places = _result_places(self._frames[0].ret_loc)
         index = ret_by_value_index(spec)
         if index is None:
@@ -1419,7 +1421,7 @@ class HirRunner:
                         self._cur_block.emit(mir.Jmp(frame.continuation()))
                     return self._cut()
                 self._set_error_code_zero()
-                if self.ret_spec is None:
+                if self.ret_sig is None:
                     # the return convention is not fixed yet (an unannotated
                     # return type, or an inferred exception set): the ``mir.Ret``
                     # is filled in by ``_finish_function`` once it is known
@@ -1745,7 +1747,7 @@ class HirRunner:
     def _propagate_error_to(self, handler_block: mir.BasicBlock | None) -> None:
         if handler_block is not None:
             self._cur_block.emit(mir.Jmp(handler_block))
-        elif self.ret_spec is None:
+        elif self.ret_sig is None:
             # the return convention is not fixed yet: a deferred return
             self._defer_return()
         else:
@@ -3270,12 +3272,9 @@ class HirRunner:
                 convert_one(arg, call_sig.kwargs[name])
 
         spec = ret_sig.ret_spec()
-        exceptions = ret_sig.exceptions
-        if exceptions is None or len(exceptions) == 0:
+        if len(ret_sig.exceptions) == 0:
             # the callee has no error part in its MIR: deliver its value alone
-            value_spec = ret_sig.ret_type_spec
-            assert value_spec is not None
-            self._deliver_result(callee, mir_args, ret, value_spec)
+            self._deliver_result(callee, mir_args, ret, ret_sig.ret_type_spec)
             return
         # the callee may raise: it delivers its normal result into ``ret`` and
         # its error code and payload into fresh places, checked below
@@ -3290,7 +3289,7 @@ class HirRunner:
             ComptimeTuple((ArgEntry(ret, True), ArgEntry(error_tuple, True))),
             spec,
         )
-        self._check_call_error(exceptions, code_place, payload_place)
+        self._check_call_error(ret_sig.exceptions, code_place, payload_place)
 
     def _check_call_error(
         self,
@@ -3523,25 +3522,24 @@ class HirRunner:
         and/or the exception set the signature left to be inferred, from the
         stores the body performed - and fill in the ``mir.Ret`` of every
         deferred return site."""
-        sig = self.return_sig
-        if sig is None or sig.ret_type_spec is None or sig.exceptions is None:
-            value_spec = sig.ret_type_spec if sig is not None else None
-            if value_spec is None:
-                location = self._result_loc()
-                assert isinstance(location, PendingSlot)
-                if len(location.stores) == 0:
-                    value_spec = sval.make_ret_spec(sval.VoidType())
-                else:
-                    value_spec = sval.make_ret_spec(location.committed_type())
-            if sig is not None and sig.exceptions is not None:
-                exceptions = sig.exceptions
+        partial = self.partial_ret_sig
+        value_spec = partial.ret_type_spec if partial is not None else None
+        if value_spec is None:
+            location = self._result_loc()
+            assert isinstance(location, PendingSlot)
+            if len(location.stores) == 0:
+                value_spec = sval.make_ret_spec(sval.VoidType())
             else:
-                exceptions = ArraySet()
-                for type in _error_union_type(self._error_space()).types:
-                    exceptions.add(type)
-            self._materialize_ret_sig(ReturnSignature(value_spec, exceptions))
-        spec = self.ret_spec
-        assert spec is not None
+                value_spec = sval.make_ret_spec(location.committed_type())
+        exceptions = partial.exceptions if partial is not None else None
+        if exceptions is None:
+            exceptions = ArraySet()
+            for type in _error_union_type(self._error_space()).types:
+                exceptions.add(type)
+        self._materialize_ret_sig(ReturnSignature(value_spec, exceptions))
+        sig = self.ret_sig
+        assert sig is not None
+        spec = sig.ret_spec()
         places = _result_places(self._current_result_loc())
         index = ret_by_value_index(spec)
         for block in self._deferred_returns:
@@ -3580,7 +3578,7 @@ class Analyser:
         self,
         fn_entry: FunctionValue,
         call_sig: CallSignature,
-        ret_sig: ReturnSignature | None,
+        ret_sig: PartialReturnSignature | None,
         generic_var_values: frozendict[sval.TypeVar, sval.Value] | None = None,
     ) -> tuple[mir.Value, ReturnSignature] | None:
         """Make sure the specialization ``call_sig`` of ``fn_entry`` is
@@ -3617,11 +3615,14 @@ class Analyser:
                 assert instance.ret_sig is not None
                 return instance.mir, instance.ret_sig
             # still being compiled: a recursive reference to the very
-            # function being typed; its return type must be known already
-            actual = instance.ret_sig or ret_sig
+            # function being typed; its return convention must be known already
+            actual = instance.ret_sig
+            if actual is None and ret_sig is not None and ret_sig.is_complete():
+                actual = ret_sig.complete()
             if actual is None:
                 raise CompileError(
-                    f"recursive function {fn_entry.hir.name} requires a return type annotation"
+                    f"recursive function {fn_entry.hir.name} requires a declared "
+                    f"return type and exception set"
                 )
             return instance.mir, actual
         mir_fn = mir.Function(name, [], [], mir.VOID)
@@ -3645,19 +3646,19 @@ class Analyser:
             top = self._analyse_stack[-1]
             if top._run_machine() == PollResult.DONE:
                 top.finish()
-                assert top.return_sig is not None
+                assert top.ret_sig is not None
                 self._analyse_stack.pop()
                 instance = top._fn_instance
-                instance.ret_sig = top.return_sig
+                instance.ret_sig = top.ret_sig
                 instance.mir.is_complete = True
                 if self._analyse_stack:
                     last_top = self._analyse_stack[-1]
-                    last_top.resume(instance.mir, top.return_sig)
+                    last_top.resume(instance.mir, top.ret_sig)
                 else:
-                    return instance.mir, top.return_sig
+                    return instance.mir, top.ret_sig
         return None
 
-    def analyse_function(self, fn_entry: FunctionValue, call_sig: CallSignature, ret_sig: ReturnSignature | None):
+    def analyse_function(self, fn_entry: FunctionValue, call_sig: CallSignature, ret_sig: PartialReturnSignature | None):
         """Type (and thereby compile) the specialization ``call_sig`` of
         ``fn_entry`` if it is not compiled yet."""
         if self._request_function(fn_entry, call_sig, ret_sig) is None:

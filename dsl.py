@@ -56,8 +56,8 @@ from .fn import (
     CallSignature,
     FunctionValue,
     NativeFn,
+    PartialReturnSignature,
     RawArgList,
-    ReturnSignature,
     SpecializedComptimeArg,
     SymbolTable,
 )
@@ -222,7 +222,7 @@ class _RegisteredFn(AsSpyValue):
         assert native_fn is not None
         ret_sig = instance.ret_sig
         assert ret_sig is not None
-        if ret_sig.exceptions is not None and len(ret_sig.exceptions) > 0:
+        if len(ret_sig.exceptions) > 0:
             raise SpyError(
                 'calling a function that may raise from Python is not supported yet'
             )
@@ -402,7 +402,7 @@ class _Context(GlobalResolver):
                 return None
 
     def _resolve_call(
-        self, fn: FunctionValue, call_sig: CallSignature, ret_sig: ReturnSignature | None
+        self, fn: FunctionValue, call_sig: CallSignature, ret_sig: PartialReturnSignature
     ):
         analyser = Analyser(self)
         analyser.analyse_function(fn, call_sig, ret_sig)
