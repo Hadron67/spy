@@ -2103,14 +2103,27 @@ def is_numeric_type(type: Type):
 
 def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     """Turn a Python value into the typed spy value of the spy type
-    ``type`` (an ``Int``/``Float``/``Void``/``Type``/``bool``); the
-    interpreter builds the MIR constant from it later."""
+    ``type`` (an ``Int``/``Float``/``Void``/``Type``/``bool``, or the value
+    itself for the untyped type of an integer literal); the interpreter
+    builds the MIR constant from it later."""
     if isinstance(value, AsValue):
         value = value.value
     match type:
         case BoolType():
             if not isinstance(value, bool):
                 raise CompileError(f"cannot use {value!r} as a bool constant")
+            return value
+        case AnyIntType():
+            # the type of an untyped integer literal: its values are the plain
+            # Python ints the source wrote, so the literal itself is what a
+            # location that may hold a compile-time value (a ``Comptime``
+            # variable, an expression temporary) keeps.  The type has no runtime
+            # representation, so a *runtime* location of it is rejected instead
+            # (see ``_no_runtime_type``).
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise CompileError(
+                    f"cannot use {value!r} as an untyped integer constant"
+                )
             return value
         case IntType():
             if isinstance(value, bool) or not isinstance(value, int):

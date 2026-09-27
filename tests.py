@@ -88,6 +88,17 @@ def mul(a: i32, b: i32) -> i32:
 
 
 @func()
+def negative_literals(n: i32) -> i32:
+    # a negative literal is a ``-`` over an untyped literal, not a bare constant
+    # like ``3``: it is evaluated into an expression temporary, which is a
+    # compile-time box of the literal's own (untyped) type (see
+    # ``sval.coerce_const``)
+    if n < -10:
+        return -1
+    return n * -2 + 3
+
+
+@func()
 def mod(a: i32, b: i32) -> i32:
     return a % b
 
@@ -1500,6 +1511,15 @@ class SpyFunctionCallTest(TestCase):
         self.assertEqual(sub(7, 12), -5)
         self.assertEqual(mul(6, 7), 42)
         self.assertEqual(mod(17, 5), 2)
+
+    def test_negative_literals(self) -> None:
+        # a negative literal is a ``-`` applied to an untyped literal, not a
+        # bare constant like ``3``: it is evaluated into an expression
+        # temporary, which is a compile-time box holding the literal's own
+        # (untyped) type - a value position, a comparison and an operand alike
+        self.assertEqual(negative_literals(0), 3)
+        self.assertEqual(negative_literals(5), -7)
+        self.assertEqual(negative_literals(-20), -1)
 
     def test_generic_int(self) -> None:
         # a plain Python int marshals to the default signed 64-bit type

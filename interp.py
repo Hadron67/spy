@@ -1345,7 +1345,17 @@ class HirRunner:
 
     def _pop_frame(self) -> None:
         """Leave the innermost inlined body: its caller continues in the
-        frame's exit block, which every falling path of the body reaches."""
+        frame's exit block, which every falling path of the body reaches.
+
+        A body *every* path of which ends in a raise - ``def g(n): raise E(7)``
+        - never reaches that block, yet the caller's code after the call is
+        still typed into it, the walk being linear: the dead continuation then
+        commits the call's result temporary, whose slot no store ever typed,
+        and is rejected with ``cannot give a value of type empty a runtime
+        representation``.  This is a known gap (only an inlined body with a
+        falling path can be called as an expression or a statement); closing it
+        means not switching to the exit block when no path has jumped to it
+        yet, and unwinding the caller's path instead, as a dead path does."""
         frame = self._frames.pop()
         exit_block = frame.exit_block
         assert exit_block is not None, 'the function proper has no exit block'
