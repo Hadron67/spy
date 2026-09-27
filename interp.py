@@ -397,17 +397,24 @@ class LoopBlockData(BlockFrameData):
 
     ``header_block`` is the loop's head - the block the condition is
     computed in, the target of the back edge the body's falling end and
-    every ``continue`` emit.  ``exit_block`` is the block the code after
-    the loop continues in, created on the first ``break`` that reaches it:
-    the loop can be left exactly when some ``break`` (a source one, or the
-    implicit one the ``while`` lowering puts after its else clause) jumped
-    there, so a loop without one (``while True:``) never gets an exit and
-    the code after it is dead (see ``_cut``).  ``p_end`` is the position of
-    the matching ``End`` marker (found by ``_scan_block``)."""
+    every ``continue`` emit.  It is None for a compile-time (``is_inline``)
+    loop, which has no back edge: its body is unrolled and the iterations
+    fall through one into the next.  ``exit_block`` is the block the code
+    after the loop continues in, created on the first ``break`` that reaches
+    it: the loop can be left exactly when some ``break`` (a source one, or
+    the implicit one the ``while`` lowering puts after its else clause)
+    jumped there, so a loop without one (``while True:``) never gets an exit
+    and the code after it is dead (see ``_cut``).  ``inline_next`` is the
+    entry block of the next unrolled body, created on the first
+    ``continue`` of the current iteration (an inline loop only).  ``p_end``
+    is the position of the matching ``End`` marker (found by
+    ``_scan_block``)."""
 
     p_end: int
-    header_block: mir.BasicBlock
+    is_inline: bool = False
+    header_block: mir.BasicBlock | None = None
     exit_block: mir.BasicBlock | None = None
+    inline_next: mir.BasicBlock | None = None
 
 @dataclass
 class TryExceptBlockData(BlockFrameData):
@@ -945,6 +952,12 @@ class HirRunner:
         self.ret_sig: ReturnSignature | None = None
 
         self._fn_req_resumer: Callable[[Self, mir.Value, ReturnSignature]] | None = None
+        # the number of compile-time loop bodies unrolled so far, and the limit
+        # that keeps a non-terminating ``while syntax.inline_loop(...)`` (one
+        # whose condition never becomes false) from unrolling forever (see
+        # ``_unroll_inline_loop``)
+        self._loop_unrolls: int = 0
+        self.max_loop_unroll: int = 1024
 
     # -- entry point ---------------------------------------------------------
 
@@ -1563,11 +1576,22 @@ class HirRunner:
         ``continue`` jump back to (a back edge) - the loop is left only by a
         ``break`` (or a ``return``/``raise``), whose jump to the on-demand exit
         block is what tells a later ``_cut`` whether the code after the loop is
-        reachable (see ``LoopBlockData``)."""
+        reachable (see ``LoopBlockData``).
+
+        A compile-time loop (``is_inline``) has no back edge and no header: the
+        body is unrolled in place, one iteration after another (see
+        ``_unroll_inline_loop``), so opening it only pushes the loop's state."""
         frame = self._frames[-1]
         entry = frame.pc - 1
+        inst = frame.insts[entry]
+        assert isinstance(inst, hir.Loop)
         p_else, p_end = self._scan_block(entry)
         assert p_else is None, 'a loop body has no else marker'
+        if inst.is_inline:
+            frame.block_stack.append(
+                BlockFrame(entry, LoopBlockData(p_end=p_end, is_inline=True))
+            )
+            return
         header = mir.BasicBlock()
         if not self._cur_block.is_finished:
             self._cur_block.emit(mir.Jmp(header))
@@ -1587,12 +1611,39 @@ class HirRunner:
                 return data
         raise CompileError('break/continue outside of a loop')
 
+    def _unroll_inline_loop(self, frame: InlineFrame, bf: BlockFrame, data: LoopBlockData) -> None:
+        """Start the next iteration of a compile-time loop: the current
+        iteration is complete (its body fell off its end, or every path of it
+        ended elsewhere), so route that falling end into the next body's entry -
+        the block a ``continue`` of the iteration jumped to, when there was one -
+        and rewind the walk to the head of the body to evaluate the condition
+        again.  Unrolling is counted against ``max_loop_unroll``: a condition
+        that never turns false (a non-compile-time one, or a loop that makes no
+        compile-time progress) is reported instead of unrolling forever."""
+        nxt = data.inline_next
+        data.inline_next = None
+        if nxt is not None:
+            if not self._cur_block.is_finished:
+                self._cur_block.emit(mir.Jmp(nxt))
+            self._cur_block = nxt
+        self._loop_unrolls += 1
+        if self._loop_unrolls > self.max_loop_unroll:
+            raise CompileError(
+                f'a compile-time loop unrolled more than {self.max_loop_unroll} '
+                'times: its condition must be a compile-time value and the loop '
+                'must make compile-time progress'
+            )
+        # rewind to the head of the body (the condition evaluation), keeping the
+        # loop open so its remaining iterations keep unrolling
+        frame.pc = bf.entry + 1
+
     def _exec_break(self) -> PollResult:
         """``hir.Break``: end the current path at the innermost loop's exit block,
         created on demand - the first ``break`` is what makes the code after the
         loop reachable - and unwind the frame's open blocks like any other ended
         path (see ``_cut``).  The loop's exit is exactly where a ``_cut`` that
-        reaches the loop continues the walk."""
+        reaches the loop continues the walk.  A compile-time loop's ``break``
+        works the same way: it leaves the whole unrolled sequence."""
         data = self._find_loop()
         exit_block = data.exit_block
         if exit_block is None:
@@ -1603,12 +1654,21 @@ class HirRunner:
 
     def _exec_continue(self) -> PollResult:
         """``hir.Continue``: end the current path back at the innermost loop's
-        header, so the rest of the body and the ``while``'s else clause are
-        skipped and the loop's condition is evaluated again; then unwind like any
-        other ended path (see ``_cut``)."""
+        head, so the rest of the body and the ``while``'s else clause are skipped
+        and the loop's condition is evaluated again; then unwind like any other
+        ended path (see ``_cut``).  A runtime loop jumps to its header (the back
+        edge); a compile-time loop jumps to the entry of its next unrolled body,
+        created on demand and reached by this iteration's falling end too."""
         data = self._find_loop()
+        if data.is_inline:
+            nxt = data.inline_next
+            if nxt is None:
+                nxt = data.inline_next = mir.BasicBlock()
+        else:
+            assert data.header_block is not None
+            nxt = data.header_block
         if not self._cur_block.is_finished:
-            self._cur_block.emit(mir.Jmp(data.header_block))
+            self._cur_block.emit(mir.Jmp(nxt))
         return self._cut()
 
     def _exec_else(self) -> None:
@@ -1846,13 +1906,22 @@ class HirRunner:
 
         A ``loop`` body falling off its end jumps back to the loop header
         (the next iteration) and the code after the loop is typed next (see
-        ``_cut``, which decides whether it is reachable)."""
+        ``_cut``, which decides whether it is reachable); a compile-time
+        loop's body falling off its end unrolls the next iteration in place
+        (see ``_unroll_inline_loop``)."""
         frame = self._frames[-1]
         data = frame.block_stack[-1].data
         if isinstance(data, LoopBlockData):
+            if data.is_inline:
+                # the body fell off its end: unroll the next iteration, routing
+                # this falling end into the block a ``continue`` jumped to (when
+                # there was one)
+                self._unroll_inline_loop(frame, frame.block_stack[-1], data)
+                return PollResult.AGAIN
             # the loop body fell off its end: jump back to the header.  Whether
             # the code after the loop is live is decided by ``_cut`` from the
             # loop's exit block (created only by a ``break``)
+            assert data.header_block is not None
             if not self._cur_block.is_finished:
                 self._cur_block.emit(mir.Jmp(data.header_block))
             return self._cut()
@@ -1916,8 +1985,9 @@ class HirRunner:
         A ``loop`` whose body the path ended in is complete too: the walk
         continues in the loop's exit block - the code after the loop - when
         some ``break`` reaches it, and keeps unwinding (the code after the
-        loop is dead) when none does.  With no open block left, the run of
-        the frame's body ended."""
+        loop is dead) when none does; a compile-time loop a ``continue`` of
+        the body leads out of unrolls its next iteration instead.  With no
+        open block left, the run of the frame's body ended."""
         while True:
             frame = self._frames[-1]
             if not frame.block_stack:
@@ -1959,10 +2029,15 @@ class HirRunner:
                 # the current path ended inside the loop body (a ``break``, a
                 # ``continue``, a ``return`` or a ``raise``) and every enclosing
                 # block of the body has been closed: the body is complete.  A
-                # ``break`` jumps to the loop's exit block, so the code after
-                # the loop is typed there; a loop no ``break`` can leave
+                # compile-time loop whose body a ``continue`` leads out of still
+                # has its next iteration to unroll (whatever ended this one) - a
+                # ``break`` jumps to the loop's exit block, so the code after the
+                # loop is typed there; a loop no ``break`` can leave
                 # (``while True:``) never has one, and the code after it is dead -
                 # the cut keeps unwinding.
+                if data.is_inline and data.inline_next is not None:
+                    self._unroll_inline_loop(frame, bf, data)
+                    return PollResult.AGAIN
                 frame.block_stack.pop()
                 exit_block = data.exit_block
                 if exit_block is None:

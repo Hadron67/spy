@@ -92,6 +92,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 - 运行时 `if` 也允许出现在**内联函数体内**（普通函数与未装饰的结构体方法）。内联体直接续写调用点所在的块，并为调用方的延续预留一个**出口块**：内联 `return` 把值写入调用方结果位置（内存）后以 `jmp` 跳到出口块，落穿的内联体也汇入出口块，因此在调用点形成内存汇合（同样无需 phi）；若各路径返回类型不一致、或部分路径落穿/裸 `return`，会像函数本身一样报错。
 - **`while`/`while`-`else` 循环**：`while cond: body` 降级为一个死循环块（`hir.Loop`…`hir.End`）：每轮在块头重新求值 `cond`，为真则执行 `body`，块体末尾跳回块头；为假则先执行 `else` 子句（若有）再**跳出**循环。`break` 直接跳到循环之后（因此 `while`-`else` 的 `else` 只在条件自然为假时执行，被 `break` 跳过，与 Python 一致），`continue` 跳回块头（重新求值条件，并跳过本轮剩余 body）。循环在 MIR 里就是带回边的普通块，循环携带的变量是普通 alloca（内存），因此无需 phi。编译期为假的 `while False:` 不会生成 body（只保留选中的分支）。可在循环体内嵌套 `if`/`try`：`break`/`continue` 位于循环内的 `try` 体里时直接跳出/回到块头，except 子句只在该 try 体先抛异常时才走。
 - 尚无 `for` 循环；运行时 `and`/`or` 仍只支持编译期操作数。
+- **编译期循环**：`while syntax.inline_loop(cond): body` 中的条件被标记为编译期循环，`interp` 不为它发出回边，而是把循环体按 `cond` 的编译期取值**展开**成多个 body 块（条件必须是编译期值，且循环体要让编译期状态推进，否则展开次数超过 `HirRunner.max_loop_unroll`（默认 1024）时报错）。`break` 跳过全部展开的块（到循环之后），`continue` 跳到下一个 body（重新求值条件），`while`-`else` 的 `else` 在条件转假时执行一次。`syntax.inline_loop` 只能用作 `while` 的条件。
 
 ### 函数与调用
 

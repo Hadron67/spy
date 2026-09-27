@@ -549,6 +549,142 @@ def call_sum_inline(n: i32) -> i32:
 
 
 # ---------------------------------------------------------------------------
+# compile-time loops: ``while syntax.inline_loop(cond)`` unrolls the body once
+# per compile-time iteration (the condition is a compile-time value that the
+# body advances); ``break`` leaves the whole unrolled sequence and
+# ``continue`` jumps to the next unrolled body.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def inline_sum() -> i32:
+    i: Comptime = 0
+    total: i32 = 0
+    while syntax.unroll(i < 4):
+        total = total + i
+        i = i + 1
+    return total
+
+
+@func()
+def inline_false() -> i32:
+    # a compile-time false condition unrolls no body and runs the else clause
+    total: i32 = 0
+    while syntax.unroll(False):
+        total = total + 1
+    else:  # noqa: PLW0120 - the else clause is the point of the fixture
+        total = total + 2
+    return total
+
+
+@func()
+def inline_break(n: i32) -> i32:
+    # a runtime-conditional break leaves all the remaining unrolled bodies
+    i: Comptime = 0
+    total: i32 = 0
+    while syntax.unroll(i < 10):
+        i = i + 1
+        if i == n:
+            break
+        total = total + i
+    return total
+
+
+@func()
+def inline_continue(n: i32) -> i32:
+    # a runtime-conditional continue jumps to the next unrolled body
+    i: Comptime = 0
+    total: i32 = 0
+    while syntax.unroll(i < 6):
+        i = i + 1
+        if i == n:
+            continue
+        total = total + i
+    return total
+
+
+@func()
+def inline_else() -> i32:
+    i: Comptime = 0
+    total: i32 = 0
+    while syntax.unroll(i < 3):
+        total = total + i
+        i = i + 1
+    else:  # noqa: PLW0120 - the else clause is the point of the fixture
+        total = total + 100
+    return total + i
+
+
+@func()
+def inline_nested() -> i32:
+    i: Comptime = 0
+    total: i32 = 0
+    while syntax.unroll(i < 3):
+        j: Comptime = 0
+        while syntax.unroll(j < 2):
+            total = total + 1
+            j = j + 1
+        i = i + 1
+    return total
+
+
+@func()
+def inline_continue_always() -> i32:
+    # an unconditional continue: the body has no falling end, so the next body
+    # is unrolled from the block the continue jumped to
+    i: Comptime = 0
+    while syntax.unroll(i < 4):
+        i = i + 1
+        continue
+    return i
+
+
+@func()
+def runtime_loop_with_inline(n: i32) -> i32:
+    # an inline loop inside a runtime loop
+    k: i32 = 0
+    total: i32 = 0
+    while k < n:
+        i: Comptime = 0
+        while syntax.unroll(i < 3):
+            total = total + 1
+            i = i + 1
+        k = k + 1
+    return total
+
+
+@func()
+def inline_continue_or_return(n: i32) -> i32:
+    # a ``continue`` whose sibling region of the enclosing if returns: the next
+    # body is unrolled from the continue's jump even though nothing falls
+    # through
+    i: Comptime = 0
+    total: i32 = 0
+    while syntax.unroll(i < 5):
+        i = i + 1
+        if i == n:
+            return total
+        if i == 3:
+            continue
+        total = total + i
+    return total + 100
+
+
+@func()
+def inline_bad_cond(n: i32) -> i32:
+    # a runtime condition cannot be unrolled: the cap is what reports it
+    while syntax.unroll(n > 0):
+        n = n - 1
+    return n
+
+
+@func()
+def inline_loop_misuse(n: i32) -> i32:
+    # the marker only means something as a ``while`` condition
+    return syntax.unroll(n)
+
+
+# ---------------------------------------------------------------------------
 # struct values: a struct is declared by decorating a class with ``@struct()``
 # - its annotated class attributes are the fields, in declaration order, and
 # the functions of its body are its methods - and is laid out by the mirror
@@ -1963,6 +2099,62 @@ class SpyWhileTest(TestCase):
 
     def test_loop_in_an_inlined_body(self) -> None:
         self.assertEqual(call_sum_inline(4), 6)
+
+
+class SpyInlineLoopTest(TestCase):
+    """Compile-time loops: ``while syntax.inline_loop(cond)`` unrolls its body
+    once per compile-time iteration, ``break`` leaves the whole unrolled
+    sequence and ``continue`` jumps to the next unrolled body."""
+
+    def test_unrolled(self) -> None:
+        # the body is emitted once per iteration, not looped over at runtime
+        self.assertEqual(inline_sum(), 6)
+
+    def test_comptime_false(self) -> None:
+        # no body is unrolled; the else clause runs once
+        self.assertEqual(inline_false(), 2)
+
+    def test_break_skips_the_remaining_bodies(self) -> None:
+        # i == n under a runtime condition: the break leaves every remaining
+        # unrolled body, so only 1 + ... + (n - 1) is added
+        self.assertEqual(inline_break(3), 3)
+        # a break never taken unwinds the whole loop: 1 + ... + 10
+        self.assertEqual(inline_break(0), 55)
+
+    def test_continue_jumps_to_the_next_body(self) -> None:
+        # 1 + ... + 6, minus the skipped n
+        self.assertEqual(inline_continue(3), 18)
+        self.assertEqual(inline_continue(0), 21)
+
+    def test_while_else(self) -> None:
+        self.assertEqual(inline_else(), 106)
+
+    def test_nested_unrolled_loops(self) -> None:
+        self.assertEqual(inline_nested(), 6)
+
+    def test_unconditional_continue(self) -> None:
+        # the unroll runs through the continue's jump, with no falling end
+        self.assertEqual(inline_continue_always(), 4)
+
+    def test_continue_with_a_return_sibling(self) -> None:
+        # the continue's if has a returning sibling, so the whole iteration ends
+        # without falling through: the unroll still runs from the continue
+        self.assertEqual(inline_continue_or_return(2), 1)
+        self.assertEqual(inline_continue_or_return(0), 112)
+
+    def test_inline_loop_inside_a_runtime_loop(self) -> None:
+        self.assertEqual(runtime_loop_with_inline(2), 6)
+        self.assertEqual(runtime_loop_with_inline(0), 0)
+
+    def test_runtime_condition_is_reported(self) -> None:
+        # the condition is not a compile-time value, so the loop cannot be
+        # unrolled: the unroll cap reports it instead of looping forever
+        with self.assertRaises(CompileError):
+            inline_bad_cond(3)
+
+    def test_marker_outside_a_while_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            inline_loop_misuse(3)
 
 
 class SpyAnnotationTest(TestCase):
@@ -3859,6 +4051,8 @@ class SpyInferTest(TestCase):
 all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
+    SpyWhileTest,
+    SpyInlineLoopTest,
     SpyAnnotationTest,
     SpyStructTest,
     SpyStructMirrorTest,

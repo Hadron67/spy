@@ -100,6 +100,11 @@ _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
     ast.GtE: '>=',
 }
 
+# the ``syntax.*`` markers that are *calls* in the source and are recognized by
+# identity (unlike ``syntax.array`` and ``syntax.Comptime``, which are resolved
+# through ``_gen_call``/``_split_comptime``)
+_SYNTAX_CALLS = (syntax.ref, syntax.unroll)
+
 
 def _is_struct_class(obj: Any) -> bool:
     """Whether the raw global object ``obj`` is a ``@struct()`` class handle
@@ -264,9 +269,21 @@ class _Builder:
         reaches the else clause - a ``break`` in the body skips it, like
         Python - and a ``continue`` jumps back to the head, re-evaluating
         the condition.  Both the body and the else clause are lexical
-        blocks of their own (children of the enclosing block)."""
-        self.add(hir.Loop())
-        cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
+        blocks of their own (children of the enclosing block).
+
+        A condition wrapped in ``syntax.inline_loop(...)`` marks a
+        *compile-time* loop: the ``Loop`` is opened with ``is_inline`` and the
+        interpreter unrolls the body once per compile-time iteration instead of
+        emitting a back edge (see ``interp``)."""
+        is_inline = False
+        test = node.test
+        if isinstance(test, ast.Call) and self._try_resolve_object(test.func) is syntax.unroll:
+            if len(test.args) != 1 or len(test.keywords) != 0:
+                raise CompileError('syntax.inline_loop takes exactly one argument')
+            is_inline = True
+            test = test.args[0]
+        self.add(hir.Loop(is_inline=is_inline))
+        cond = self.add(hir.AsBool(self._gen_expr(test)[0]))
         # ``%2 = not %1``: the negated condition is materialized in an inline
         # slot (the same way any other unary expression is) and read back into a
         # register, so that the ``if`` sees a boolean value whether the
@@ -541,7 +558,7 @@ class _Builder:
         fn = self._try_resolve_object(callee)
         if fn is None:
             return False
-        return fn is syntax.ref
+        return fn in _SYNTAX_CALLS
 
     def _gen_expr(self, node: ast.expr, allow_retloc: bool = True) -> tuple[ArgEntry[hir.Value], bool]:
         """A reference to the value of ``node``: addressable names give
@@ -650,6 +667,13 @@ class _Builder:
             if len(args) != 1:
                 raise CompileError('ref takes exactly one argument')
             return ArgEntry(self._as_ref(self._gen_expr(args[0])[0]), False), False
+
+        if callee is syntax.unroll:
+            # it only means something as the condition of a ``while`` (see
+            # ``_gen_while``), which is where it is recognized
+            raise CompileError(
+                'syntax.inline_loop can only be used as the condition of a while loop'
+            )
 
         raise CompileError(f'unsupported syntax call {callee}')
     # -- struct values ---------------------------------------------------------

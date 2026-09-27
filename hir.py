@@ -410,7 +410,15 @@ class Loop(Inst):
     end jumps back to the ``Loop`` itself (the next iteration, whose head
     re-evaluates whatever the body computes), and it is left only by a
     :class:`Break` (or a ``return``/``raise``).  The ``Loop`` instruction
-    carries nothing; it only delimits the flat instruction stream."""
+    carries nothing; it only delimits the flat instruction stream.
+
+    ``is_inline`` marks a *compile-time* loop (a ``while`` whose condition
+    the source wraps in ``syntax.inline_loop``): the interpreter does not
+    emit a back edge but unrolls the body once per compile-time iteration,
+    so a :class:`Break` leaves the whole unrolled sequence and a
+    :class:`Continue` jumps to the next unrolled body (see ``interp``)."""
+
+    is_inline: bool = False
 
 
 @dataclass(eq=False)
