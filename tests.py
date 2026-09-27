@@ -3054,6 +3054,25 @@ def inline_forward(n: i32) -> i32:
     return raise_a(n) + 10
 
 
+def inline_no_return(n: i32) -> i32:
+    # an inlined body whose every path raises: it never falls through to its
+    # caller, so the caller's code after the call is dead (see
+    # ``HirRunner._pop_frame``)
+    raise ErrorA(7)
+
+
+def inline_raise_either(n: i32) -> i32:
+    # both paths of the body raise, so it does not fall through either
+    if n < 0:
+        raise ErrorA(7)
+    raise ErrorB(9)
+
+
+def inline_forward_no_return(n: i32) -> i32:
+    # an inlined body whose only path raises through another inlined body
+    return inline_no_return(n) + 3
+
+
 def inline_raise_two(n: i32) -> i32:
     # an inlined body that may raise either of two exceptions
     if n > 10:
@@ -3118,6 +3137,37 @@ def raise_in_clause(n: i32) -> i32:
             return 1
         return 2
     return 3
+
+
+@func(exceptions={ErrorA})
+def forward_no_return(n: i32) -> i32:
+    # the ``+ 10`` after the call is dead: the inlined body never returns
+    return inline_no_return(n) + 10
+
+
+@func(exceptions={ErrorA})
+def nested_forward_no_return(n: i32) -> i32:
+    return inline_forward_no_return(n) + 10
+
+
+@func()
+def catch_no_return(n: i32) -> i32:
+    try:
+        inline_no_return(n)
+        return 1
+    except ErrorA as e:
+        return e.code + 100
+
+
+@func()
+def catch_raise_either(n: i32) -> i32:
+    try:
+        inline_raise_either(n)
+        return 1
+    except ErrorA as e:
+        return e.code + 100
+    except ErrorB as e:
+        return e.n + 200
 
 
 @func()
@@ -3339,6 +3389,25 @@ class SpyInlineErrorTest(TestCase):
         # sit in different frames
         self.assertEqual(catch_inline_own_try(5), 1006)
         self.assertEqual(catch_inline_own_try(-3), 1107)
+
+    def test_a_body_with_no_falling_path_hands_its_error_to_the_caller(self) -> None:
+        # the inlined body never reaches the caller's continuation, so the code
+        # after the call - ``return 1`` here - is dead and must not be typed
+        self.assertEqual(catch_no_return(3), 107)
+
+    def test_a_body_whose_paths_all_raise_hands_its_error_to_the_caller(self) -> None:
+        self.assertEqual(catch_raise_either(-3), 107)
+        self.assertEqual(catch_raise_either(3), 209)
+
+    def test_an_error_of_a_body_with_no_falling_path_escapes_the_function(self) -> None:
+        # the error leaves the inlined body, and the function with it: the ``+
+        # 10`` after the call is dead all the same
+        _result, code, payload = call_with_error(forward_no_return, 3)
+        self.assertEqual((code, payload), (1, 7))
+
+    def test_the_same_through_two_levels_of_inlining(self) -> None:
+        _result, code, payload = call_with_error(nested_forward_no_return, 3)
+        self.assertEqual((code, payload), (1, 7))
 
     def test_an_unmatched_error_of_the_body_re_raises_to_the_caller(self) -> None:
         self.assertEqual(catch_inline_reraise(5), 6)

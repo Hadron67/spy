@@ -53,7 +53,10 @@ Calls are dispatched at compile time:
 
 An inlined body is emitted into the block the call sits in; the caller's
 continuation is a fresh *exit block* that every return of the body jumps
-to (a falling end joins it too).  It may contain runtime ``if`` branches
+to (a falling end joins it too).  That block is created the first time a
+path of the body reaches it: a body whose every path ends elsewhere (a
+``raise`` that leaves it) never gets one, and the caller's code after the
+call is then dead.  An inlined body may contain runtime ``if`` branches
 like the function proper.  Every return of the body stores its value into
 the call's result location on its own runtime path, whatever the path is,
 so the result location's memory is the join of the paths (its alloca is
@@ -431,10 +434,20 @@ class InlineFrame:
         self.pc: int = 0
         self.block_stack: list[BlockFrame] = []
         self.regs: dict[hir.Inst, InterpVal] = {}
-        # the block the caller continues in once the inlined body ends
-        # (set when the frame is pushed, see ``_start_inline``); None for
-        # the function proper, which has no caller to return to
+        # the block the caller of the inlined body continues in: created by
+        # ``continuation`` the first time a path of the body reaches it, so that
+        # a body whose every path ends elsewhere (a ``raise`` leaving it) has
+        # none - which is what makes the caller's code after the call dead (see
+        # ``_pop_frame``); None for the function proper, which has no caller
         self.exit_block: mir.BasicBlock | None = None
+
+    def continuation(self) -> mir.BasicBlock:
+        """The block the caller continues in once the inlined body ends,
+        created on the first path that reaches it: every ``return`` of the body
+        jumps to it and its falling end joins it too (see ``_pop_frame``)."""
+        if self.exit_block is None:
+            self.exit_block = mir.BasicBlock()
+        return self.exit_block
 
 # ---------------------------------------------------------------------------
 # stateless helpers of the interpreter: pure functions over their arguments
@@ -1343,25 +1356,25 @@ class HirRunner:
             if ret != PollResult.AGAIN:
                 return ret
 
-    def _pop_frame(self) -> None:
-        """Leave the innermost inlined body: its caller continues in the
-        frame's exit block, which every falling path of the body reaches.
-
-        A body *every* path of which ends in a raise - ``def g(n): raise E(7)``
-        - never reaches that block, yet the caller's code after the call is
-        still typed into it, the walk being linear: the dead continuation then
-        commits the call's result temporary, whose slot no store ever typed,
-        and is rejected with ``cannot give a value of type empty a runtime
-        representation``.  This is a known gap (only an inlined body with a
-        falling path can be called as an expression or a statement); closing it
-        means not switching to the exit block when no path has jumped to it
-        yet, and unwinding the caller's path instead, as a dead path does."""
+    def _pop_frame(self) -> bool:
+        """Leave the innermost inlined body.  Its caller's continuation is the
+        frame's exit block, which exists exactly when some path of the body
+        reached it (see ``continuation``): the path now sitting at the frame's
+        end is a falling one (the block is not closed yet) when it jumps there,
+        and otherwise the body ended every path of itself elsewhere - a
+        ``raise`` delivering the error out of the body - so the caller's code
+        after the call is dead and must not be typed.  Returns whether the
+        caller's continuation is live; ``_cut`` keeps unwinding the caller's own
+        blocks when it is not, as it does for a dead path."""
         frame = self._frames.pop()
-        exit_block = frame.exit_block
-        assert exit_block is not None, 'the function proper has no exit block'
         if not self._cur_block.is_finished:
-            self._cur_block.emit(mir.Jmp(exit_block))
+            # the path fell off the end of the body: it joins the caller
+            self._cur_block.emit(mir.Jmp(frame.continuation()))
+        exit_block = frame.exit_block
+        if exit_block is None:
+            return False
         self._cur_block = exit_block
+        return True
 
     def _step(self) -> PollResult:
         """Execute one step of the machine: the instruction at the pc of
@@ -1370,7 +1383,8 @@ class HirRunner:
         frame = self._frames[-1]
         if frame.pc >= len(frame.insts):
             # the body fell off its end: every block is closed (see the
-            # block transitions) - the run of the frame ended
+            # block transitions) - the run of the frame ended, and its
+            # falling path joins the caller (see ``_pop_frame``)
             assert not frame.block_stack
             if len(self._frames) == 1:
                 return PollResult.DONE
@@ -1401,10 +1415,8 @@ class HirRunner:
                     # an inlined ``return`` delivers its value (already
                     # stored into the result location) and leaves the
                     # inlined body; the caller continues in the exit block
-                    exit_block = frame.exit_block
-                    assert exit_block is not None
                     if not self._cur_block.is_finished:
-                        self._cur_block.emit(mir.Jmp(exit_block))
+                        self._cur_block.emit(mir.Jmp(frame.continuation()))
                     return self._cut()
                 self._set_error_code_zero()
                 if self.ret_spec is None:
@@ -1816,8 +1828,12 @@ class HirRunner:
                 # after it
                 if len(self._frames) == 1:
                     return PollResult.DONE
-                self._pop_frame()
-                return PollResult.AGAIN
+                if self._pop_frame():
+                    return PollResult.AGAIN
+                # no path of the body reached the caller's continuation, so
+                # the caller's path ended with the body's: keep unwinding its
+                # own blocks (see ``_pop_frame``)
+                continue
             bf = frame.block_stack[-1]
             data = bf.data
             if isinstance(data, TryExceptBlockData):
@@ -3449,10 +3465,11 @@ class HirRunner:
         bound arguments into addressable values (the callee's ``hir.Arg``
         leaves denote its parameter slots) and push its frame.  The body is
         emitted into the block the call happened in (an inlined body is
-        entered unconditionally), and a fresh *exit block* is reserved for
-        the caller's continuation: every ``return`` of the body jumps to
-        it, and the falling end of the body joins it too (see
-        ``_pop_frame``).  An argument that is already a reference is
+        entered unconditionally), and the caller's continuation - the frame's
+        *exit block*, which every ``return`` of the body jumps to and its
+        falling end joins - is created on the first path of the body that
+        reaches it (see ``InlineFrame.continuation`` and ``_pop_frame``).  An
+        argument that is already a reference is
         forwarded as the address it is.  The body now runs under the
         machine; its return statements write into ``ret`` directly (it is
         the body's result location), so no result is handed back here.
@@ -3485,7 +3502,6 @@ class HirRunner:
             ComptimeTuple((ArgEntry(ret, True), ArgEntry(self._innermost_error_space(), True))),
             body,
         )
-        frame.exit_block = mir.BasicBlock()
         self._frames.append(frame)
         return PollResult.AGAIN
 
