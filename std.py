@@ -1,7 +1,9 @@
-from typing import Protocol, Self, cast
+from typing import Literal, Protocol, Self, cast
+
+from spy import u64
 
 from .dsl import struct
-from .syntax import comptime
+from .syntax import MultiPtr, comptime
 
 
 class Numeric(Protocol):
@@ -38,3 +40,8 @@ class range[T: Numeric]:
         result = self.start
         self.start += self.step
         return result
+
+@struct()
+class Slice[T, C: bool = Literal[False]]:
+    ptr: MultiPtr[T, C]
+    length: u64

@@ -63,7 +63,7 @@ from .fn import (
 )
 from .interp import Analyser
 from .lower import LLVMBackend, to_ctype
-from .sval import AsSpyValue, GlobalResolver, StructDecl
+from .sval import GlobalResolver, StructDecl
 from .util import frozendict
 
 # the ``spy.*`` builtins, by the name the interpreter knows them by
@@ -185,7 +185,7 @@ def _call_multi_value(
 
 _INT_LITERAL_BITS = 64
 
-class _RegisteredFn(AsSpyValue):
+class _RegisteredFn:
     def __init__(self, fn, cls, meta: FnMetadata, context: _Context) -> None:
         self.fn = fn
         self.cls = cls
@@ -197,6 +197,17 @@ class _RegisteredFn(AsSpyValue):
         # class: the Python type parameter object an annotation evaluates to
         # -> its spy value (see ``astgen.parse_function``)
         self.context_type_vars: dict[TypeVar, sval.Value] = {}
+
+    def with_context(self, context: _Context) -> _RegisteredFn:
+        # the handle of the same Python function in ``context``: its compiled
+        # artifacts (and its native symbols) belong to that context, so a
+        # handle resolved from another context must be re-bound there (see
+        # ``_Context.resolve_global``).  The enclosing context's type
+        # parameters carry over, so that a method still resolves the struct's
+        # annotations in the scope it was written in.
+        clone = _RegisteredFn(self.fn, self.cls, self.meta, context)
+        clone.context_type_vars = dict(self.context_type_vars)
+        return clone
 
     def __call__(self, *args, **kwds):
         entry = self.get_entry()
@@ -246,12 +257,11 @@ class _RegisteredFn(AsSpyValue):
         if self.entry is None:
             hir = astgen.parse_function(
                 self.fn, self.cls, self.meta.sfv, self.context_type_vars,
-                self.meta.exceptions,
+                self.meta.exceptions, self.context,
             )
             self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
         return self.entry
 
-    @override
     def as_spy_value(self) -> sval.AnyValue:
         return self.get_entry()
 
@@ -329,7 +339,12 @@ class _RegisteredClass(StructDecl):
             for name, value in self.cls.__dict__.items():
                 if isinstance(value, _RegisteredFn):
                     # a registered method: ``self`` is the struct it belongs
-                    # to (the method is parsed with that type, see astgen)
+                    # to (the method is parsed with that type, see astgen).  A
+                    # handle registered in another context is re-bound here,
+                    # so that the method is parsed and compiled with this
+                    # context's struct type and type parameters
+                    if value.context is not self.context:
+                        value = value.with_context(self.context)
                     value.cls = template
                     value.context_type_vars = self.class_type_vars
                     head.methods[name] = value
@@ -357,9 +372,8 @@ class _RegisteredClass(StructDecl):
 
         A future *class-name method access* (``Foo[i32].m(x)``) resolves the
         same specialization through this path (see ``interp``)."""
-        head = self.get_entry()
         args = key if isinstance(key, tuple) else (key,)
-        return sval.StructTypeApplication(head, args)
+        return sval.StructTypeApplication(self, args)
 
     @override
     def as_spy_value(self) -> sval.AnyValue:
@@ -388,13 +402,38 @@ class _Context(GlobalResolver):
         self._inline_cache: dict[Any, FunctionValue] = {}
         self._symbol_table = SymbolTable()
 
+    def _local_fn(self, handle: _RegisteredFn) -> _RegisteredFn:
+        # this context's handle of the Python function ``handle`` names: a
+        # context registers one handle per Python function, so a handle that
+        # belongs to another context is re-bound here and cached, so that the
+        # function is compiled (and its native symbols named) in this context
+        existing = self._fn_anotation_cache.get(handle.fn)
+        if existing is None:
+            existing = handle.with_context(self)
+            self._fn_anotation_cache[handle.fn] = existing
+        return existing
+
+    def _local_class(self, handle: _RegisteredClass) -> _RegisteredClass:
+        # likewise for a struct class: the struct type this context declares
+        # for it, with this context's own method handles (see
+        # ``_RegisteredClass.get_entry``)
+        existing = self._cls_annotation_cache.get(handle.cls)
+        if existing is None:
+            existing = _RegisteredClass(handle.cls, self, handle.meta)
+            self._cls_annotation_cache[handle.cls] = existing
+        return existing
+
     @override
     def resolve_global(self, value: Any) -> AnyValue | None:
         match value:
             case _RegisteredFn():
-                return value.get_entry()
+                # a handle of another context is re-bound here, so that a spy
+                # body only ever reaches this context's functions and structs
+                handle = value if value.context is self else self._local_fn(value)
+                return handle.get_entry()
             case _RegisteredClass():
-                return value.as_spy_value()
+                handle = value if value.context is self else self._local_class(value)
+                return handle.as_spy_value()
             case pytypes.FunctionType():
                 builtin = _BUILTINS.get(value)
                 if builtin is not None:
@@ -403,7 +442,7 @@ class _Context(GlobalResolver):
                 # it is called (it contributes no native specialization)
                 entry = self._inline_cache.get(value)
                 if entry is None:
-                    hir = astgen.parse_function(value)
+                    hir = astgen.parse_function(value, resolver=self)
                     entry = FunctionValue(value.__qualname__, hir, force_inline=True)
                     self._inline_cache[value] = entry
                 return entry

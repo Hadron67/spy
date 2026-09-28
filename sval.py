@@ -1788,18 +1788,18 @@ def type_of(value: AnyValue, int_literal_bits: int | None = None) -> Type:
         case str():
             return PointerType(IntType(8, False), True)
 
-class AsSpyValue:
+class StructDecl:
+    """A Python-level object that declares a spy struct: the handle a
+    ``@struct()`` class binds to (``dsl._RegisteredClass``).  Its spy value
+    is the struct it declares (``as_spy_value``).  The parser tells a
+    construction from an ordinary call by the *type* of the callee object
+    (see ``astgen``), because asking a function handle for its spy value
+    parses the function body - which may reenter the parser (a recursive
+    function)."""
+
     @abstractmethod
     def as_spy_value(self) -> AnyValue:
         ...
-
-class StructDecl(AsSpyValue):
-    """A Python-level object that declares a spy struct: the handle a
-    ``@struct()`` class binds to (``dsl._RegisteredClass``).  Its spy value
-    is the struct it declares.  The parser tells a construction from an
-    ordinary call by the *type* of the callee object (see ``astgen``),
-    because asking a function handle for its spy value parses the function
-    body - which may reenter the parser (a recursive function)."""
 
 @dataclass(frozen=True, slots=True)
 class StructTypeApplication:
@@ -1810,12 +1810,13 @@ class StructTypeApplication:
     function or class - the arguments name the type parameters of that
     scope, which ``__getitem__`` does not see.  :func:`as_value` turns the
     application into the struct specialization once it is given that scope
-    (its ``type_vars``).
+    (its ``type_vars``) and the host to resolve the template in (so that a
+    struct declared by another context resolves to that context's copy).
 
     Not a :class:`Value`: it is a transient Python-level object that never
     denotes a value of the spy domain."""
 
-    struct: StructTypeHead
+    struct: StructDecl
     generic_vars: tuple[Any, ...]
 
 def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, resolver: GlobalResolver | None = None) -> AnyValue:
@@ -1823,9 +1824,11 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
     scalars and ``sval.Value`` objects pass through, and ``None`` is the
     ``Null`` value (the absent value of an option, the unit value of the
     zero-sized ``NullType``).  Class objects of the scalar types map to their
-    default spy types, and any object that knows its own spy value
-    (``as_spy_value``, the protocol of a struct class, see
-    ``dsl._RegisteredClass``) is asked for it."""
+    default spy types, and any other object that the host knows - a struct
+    class or a registered function handle - is resolved through ``resolver``
+    (see :class:`GlobalResolver`), so that the object is resolved *in the
+    resolving context* and every context gets its own handle (see
+    ``dsl._Context.resolve_global``)."""
     if isinstance(value, (Value, int, float, str, bool)):
         return value
     if value is None:
@@ -1848,8 +1851,14 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
             raise TypeError(f'cannot convert {value} to a value')
         return type_vars[value]
     if isinstance(value, StructTypeApplication):
-        # ``Foo[T]``: resolve its arguments in the scope it was written in,
-        # then specialize the template for them
+        # ``Foo[T]``: resolve the template in the host (a struct declared by
+        # another context resolves to this context's copy), then its arguments
+        # in the scope it was written in, then specialize it
+        head = resolver.resolve_global(value.struct) if resolver is not None else None
+        if head is None:
+            head = value.struct.as_spy_value()
+        if not isinstance(head, StructTypeHead):
+            raise TypeError(f'cannot use {value.struct} as a generic struct template')
         resolved: list[Value] = []
         for arg in value.generic_vars:
             arg_value = as_value(arg, type_vars, resolver)
@@ -1858,9 +1867,7 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
                     f'cannot use {arg!r} as a generic argument of {value.struct}'
                 )
             resolved.append(arg_value)
-        return value.struct.specialize(tuple(resolved))
-    if isinstance(value, AsSpyValue):
-        return value.as_spy_value()
+        return head.specialize(tuple(resolved))
     if typing.get_origin(value) is tuple:
         # ``tuple[T1, T2, ...]``: the return annotation of a function that
         # returns several values.  ``tuple[T, ...]`` is the variable-length
@@ -1936,6 +1943,13 @@ def as_value(value: Any, type_vars: dict[typing.TypeVar, Value] | None = None, r
             raise TypeError(f'{rest[0]!r} is not a type')
         return OptionType(child)
 
+    # anything else is asked of the host: an object it knows (a struct class
+    # or a registered function handle) resolves in *this* context, so that
+    # every context sees its own handle (see ``dsl._Context.resolve_global``)
+    if resolver is not None:
+        host_value = resolver.resolve_global(value)
+        if host_value is not None:
+            return host_value
     raise TypeError(f'cannot convert {value} to a value')
 
 def unwrap_comptime(annotation: Any) -> tuple[bool, Any]:
