@@ -69,9 +69,14 @@ class _ModuleTypes:
     def __init__(self) -> None:
         self._structs: dict[mir.StructType, sllvm.StructType] = {}
 
-    def to_llvm(self, type: mir.MayBeVoidType) -> sllvm.Type:
+    def to_llvm(self, type: mir.ReturnType) -> sllvm.Type:
         match type:
             case mir.VoidType():
+                return sllvm.VoidType()
+            case mir.NoReturn():
+                # a function that never returns returns nothing: only its
+                # ``noreturn`` attribute tells LLVM about it (see
+                # ``_lower_function_no_cache``)
                 return sllvm.VoidType()
             case mir.BoolType():
                 return sllvm.IntType(1)
@@ -115,11 +120,11 @@ def _ctypes_of_int(bits: int, signed: bool) -> Any:
     return ctypes.c_int64 if signed else ctypes.c_uint64
 
 
-def to_ctype(type: mir.MayBeVoidType) -> Any:
+def to_ctype(type: mir.ReturnType) -> Any:
     """The ctypes type of a MIR type crossing the native boundary
-    (``None`` for a void result)."""
+    (``None`` for a void result, and for one that never returns)."""
     match type:
-        case mir.VoidType():
+        case mir.VoidType() | mir.NoReturn():
             return None
         case mir.BoolType():
             return ctypes.c_bool
@@ -199,7 +204,7 @@ class _Lowerer:
         self._globals = globals
         self.lowered_globals: dict[mir.GlobalValue, sllvm.GlobalValue] = {}
 
-    def _to_llvm(self, type: mir.MayBeVoidType) -> sllvm.Type:
+    def _to_llvm(self, type: mir.ReturnType) -> sllvm.Type:
         return self._types.to_llvm(type)
 
     def _lower_function_no_cache(self, fn: mir.Function) -> sllvm.Function:
@@ -212,7 +217,10 @@ class _Lowerer:
         first be stored inside a runtime branch, and its address must then
         be defined on every path that stores to it or reads it later."""
         assert fn not in self.lowered_globals
-        llvm_fn = sllvm.Function(self._globals.get_key(fn))
+        llvm_fn = sllvm.Function(
+            self._globals.get_key(fn),
+            noreturn=isinstance(fn.ret_type, mir.NoReturn),
+        )
         # register the definition before lowering the body: a call to this
         # function inside its own body (recursion) must resolve to it
         self.lowered_globals[fn] = llvm_fn
@@ -420,6 +428,10 @@ class _Lowerer:
                 result = block.call(
                     callee, *(self._value(a, arg_values) for a in inst.args)
                 )
+                if inst.is_noreturn():
+                    # a call of a function that never returns ends its block;
+                    # LLVM wants the end of a block spelled out
+                    block.unreachable()
             case mir.Jmp():
                 block.jmp(block_map[id(inst.target)])
             case mir.Br():

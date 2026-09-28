@@ -11,12 +11,11 @@ from .errors import CompileError, TypeMismatchError
 from .sval import (
     AnyFunction,
     AnyValue,
-    ErrorUnionType,
     FormalArg,
     FunctionType,
+    ResultType,
     RetSpec,
     RetValue,
-    TupleType,
     Type,
     TypeVar,
     TypeVarSolver,
@@ -24,6 +23,7 @@ from .sval import (
     make_ret_spec,
     pass_by_ref,
     replace_type_vars_type,
+    ret_spec_value_is_empty,
     type_of,
 )
 from .util import ArraySet, IndexedMap, StrBiMap, frozendict, sanitize_name
@@ -155,13 +155,31 @@ class ReturnSignature:
     exceptions: ArraySet[Type]
 
     def ret_spec(self) -> RetSpec:
-        """The effective return spec: the declared return spec with the error
-        code and the payload union appended.  The error part is always present -
-        a function that raises nothing has the empty ``ErrorUnion[]``, whose code
-        and payload are zero-sized and so never reach the MIR."""
-        return make_ret_spec(TupleType(
-            (self.ret_type_spec.type, ErrorUnionType(tuple(self.exceptions.values))), False,
-        ))
+        """The effective return spec: the declared return spec with the value's
+        result type - its error code and its payload union - spread into the
+        leaves.  The error part is always present - a function that raises
+        nothing has the empty ``ResultType``, whose code and payload are
+        zero-sized and so never reach the MIR."""
+        return make_ret_spec(self.result_type())
+
+    def result_type(self) -> ResultType:
+        """The result type of this function: the value it returns normally and
+        the exceptions it may raise, which is what decides how its error codes
+        are encoded (see :class:`sval.ResultType`)."""
+        return ResultType(self.ret_type_spec.type, tuple(self.exceptions.values))
+
+    def value_is_empty(self) -> bool:
+        """Whether the function has no value to return at all: its only value
+        is of the empty type (a body that never delivers a result), so no
+        ``return`` path can exist and its error codes carry no "no error"
+        one."""
+        return ret_spec_value_is_empty(self.ret_type_spec)
+
+    def is_noreturn(self) -> bool:
+        """Whether the function can never return: it has no value to return and
+        raises nothing either, so its lowered form is a ``mir.NoReturn``
+        function."""
+        return self.value_is_empty() and len(self.exceptions) == 0
 
     def is_single_value(self) -> bool:
         """Whether the function returns exactly one value - the trivial case
@@ -591,11 +609,11 @@ class SymbolTable:
     def _add(self, name: str, fn: NativeFn):
         self._symbols.add(name, fn)
 
-def _must_pass_by_ref(type: mir.MayBeVoidType) -> bool:
+def _must_pass_by_ref(type: mir.ReturnType) -> bool:
     """Whether a value of ``type`` crosses the native boundary as a
-    pointer: ctypes cannot carry an aggregate (a struct or an array) by
-    value, so those are passed by pointer there."""
-    return isinstance(type, (mir.StructType, mir.ArrayType))
+    pointer: ctypes cannot carry an aggregate (a struct, an array or a
+    union) by value, so those are passed by pointer there."""
+    return isinstance(type, (mir.StructType, mir.ArrayType, mir.UnionType))
 
 def _needs_thunk(fn: mir.Function) -> bool:
     """Whether this function's value form cannot be called through
@@ -622,8 +640,8 @@ def _make_thunk(fn: mir.Function) -> mir.Function:
         arg_names.append(None)
 
     out_arg: mir.Param | None = None
-    ret_type: mir.MayBeVoidType = fn.ret_type
-    if not isinstance(ret_type, mir.VoidType) and _must_pass_by_ref(ret_type):
+    ret_type: mir.ReturnType = fn.ret_type
+    if not isinstance(ret_type, (mir.VoidType, mir.NoReturn)) and _must_pass_by_ref(ret_type):
         out_arg = mir.Param(len(arg_types), mir.PointerType(ret_type))
         arg_types.append(out_arg.type)
         arg_names.append('$result')
@@ -643,7 +661,12 @@ def _make_thunk(fn: mir.Function) -> mir.Function:
         else:
             call_args.append(mir.Param(i, arg_type))
 
-    if out_arg is not None:
+    if isinstance(fn.ret_type, mir.NoReturn):
+        # the callee never returns, so neither does the thunk: its entry ends
+        # with the call (and a Python-side call of the function never returns
+        # either)
+        thunk.entry.emit(mir.Call(fn, tuple(call_args), mir.NORETURN))
+    elif out_arg is not None:
         assert not isinstance(fn.ret_type, mir.VoidType)
         value = mir.Call(fn, tuple(call_args), fn.ret_type)
         thunk.entry.emit(value)

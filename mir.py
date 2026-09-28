@@ -30,6 +30,22 @@ VOID = VoidType()
 
 type MayBeVoidType = Type | VoidType
 
+
+class NoReturn:
+    """The return type of a function that never returns: its lowered form
+    returns void and is marked ``noreturn``, and a call of it does not come back
+    (the block it sits in ends with it)."""
+
+    def __repr__(self) -> str:
+        return 'noreturn'
+
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
+NORETURN = NoReturn()
+
+type ReturnType = MayBeVoidType | NoReturn
+
 @dataclass(frozen=True)
 class BoolType(Type):
     """Booleans; they are ``i1`` at the LLVM level."""
@@ -154,7 +170,7 @@ class FunctionType(Type):
     pointer)."""
 
     args: tuple[Type, ...]
-    return_type: MayBeVoidType
+    return_type: ReturnType
 
     def get_children(self) -> tuple[Any, ...]:
         return (*self.args, self.return_type)
@@ -561,18 +577,25 @@ class Phi(Inst):
 class Call(Inst):
     """A call of a function value returning a value of type ``type``
     (``mir.VOID`` for a call of a void function, which produces no
-    result).  The callee is either a :class:`Function` (compiled in the
-    same LLVM module) or a :class:`GlobalValue` of an earlier module
+    result, and ``mir.NoReturn`` for a call of a function that never
+    returns, which ends the block it sits in - see :func:`ends_block`).
+    The callee is either a :class:`Function` (compiled in the same LLVM
+    module) or a :class:`GlobalValue` of an earlier module
     (:class:`ExternAnonSymbol`, or an :class:`ExternSymbol` resolved from
     the process)."""
 
     callee: Value
     args: tuple[Value, ...]
-    type: MayBeVoidType
+    type: ReturnType
+
+    def is_noreturn(self) -> bool:
+        """Whether this call never comes back: what it calls is a function
+        that never returns."""
+        return isinstance(self.type, NoReturn)
 
     @override
     def get_type(self) -> MayBeVoidType:
-        return self.type
+        return VOID if isinstance(self.type, NoReturn) else self.type
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.callee, *self.args)
@@ -607,11 +630,12 @@ class BasicBlock:
 
     def emit(self, inst: Inst) -> Inst:
         """Append one instruction to this block.  A terminator ends the
-        block, so nothing may follow it - the assertion catches an
+        block, and so does a call of a function that never returns (see
+        ``ends_block``), so nothing may follow it - the assertion catches an
         instruction that would end up on a dead path."""
         assert not self.is_finished, 'cannot emit into a finished basic block'
         self.insts.append(inst)
-        if isinstance(inst, Terminator):
+        if ends_block(inst):
             self.is_finished = True
         return inst
 
@@ -644,6 +668,7 @@ class BasicBlock:
         return ret
 
 
+@dataclass(eq=False)
 class Terminator(Inst):
     """The transfer instruction that ends a basic block: a :class:`Jmp`, a
     :class:`Br` or a :class:`Ret`.  It produces no value, and its targets
@@ -654,6 +679,15 @@ class Terminator(Inst):
     def get_targets(self) -> tuple[BasicBlock, ...]:
         """The blocks this terminator transfers control to."""
         ...
+
+
+def ends_block(inst: Inst) -> bool:
+    """Whether ``inst`` ends its basic block: a terminator, or a call of a
+    function that never returns (a :class:`NoReturn` call), after which no
+    instruction can run."""
+    return isinstance(inst, Terminator) or (
+        isinstance(inst, Call) and inst.is_noreturn()
+    )
 
 
 @dataclass(eq=False)
@@ -828,9 +862,10 @@ def normalize(fn: Function) -> None:
                     changed = True
 
     for block in blocks:
-        if len(block.insts) == 0 or not isinstance(block.insts[-1], Terminator):
+        if len(block.insts) == 0 or not ends_block(block.insts[-1]):
             raise CompileError(
-                'every basic block must end with a jump, a branch or a return'
+                'every basic block must end with a jump, a branch, a return or a'
+                ' call of a function that never returns'
             )
         block.is_finished = True
 
@@ -849,7 +884,7 @@ class Function(GlobalValue):
     name_base: str
     args: list[Type]
     arg_names: list[str | None]
-    ret_type: MayBeVoidType
+    ret_type: ReturnType
     entry: BasicBlock = field(default_factory=BasicBlock)
     is_complete: bool = False
     impose_linkname: bool = False
@@ -876,7 +911,7 @@ class Function(GlobalValue):
         branches to, so the result holds only the values and types the
         module must also declare."""
         ret: list[Type] = list(self.args)
-        if not isinstance(self.ret_type, VoidType):
+        if isinstance(self.ret_type, Type):
             ret.append(self.ret_type)
         for block in self.entry.collect_blocks():
             for inst in block.insts:

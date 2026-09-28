@@ -28,7 +28,10 @@ Values in the register table are either
   gets memory: it only records its unit value, or
 * :class:`ComptimeBox` - the compile-time memory a committed
   compile-time slot materializes into (a pointer to a compile-time
-  value).
+  value), or
+* :class:`ComptimeResult` - the result location of a function: the places
+  its normal value, its error code and its payload union are delivered into
+  (the interpreter's form of a :class:`sval.ResultType`).
 
 Instructions whose operands are all compile-time values are evaluated
 eagerly in Python (the comptime semantics of the DSL); instructions
@@ -296,6 +299,19 @@ class PendingSlot(InterpVal):
             return False
         return not (self.inline_mode == InlineMode.NON_AGGREGATE and _is_aggregate(type))
 
+@dataclass(frozen=True, slots=True)
+class ComptimeResult(InterpVal):
+    """The value form of a :class:`sval.ResultType`: the result location of a
+    function - the place its normal result is delivered into, the place of its
+    error code and the place of its payload union, in that order.  The places
+    are :class:`PendingSlot`s while the location is not committed yet (the code
+    and payload widths follow from the exception set at the commit, see
+    ``_commit_error_space``), and the materialized places afterwards (a
+    ``ComptimeBox`` for a zero-sized one)."""
+
+    value: InterpVal
+    code: InterpVal
+    payload: InterpVal
 
 @dataclass(frozen=True, slots=True)
 class ComptimeTuple(InterpVal):
@@ -316,18 +332,17 @@ class ComptimeAggregatePtr(InterpVal):
     ptrs: tuple[InterpVal, ...]
 
 @dataclass
-class ComptimeErrorUnion(InterpVal):
-    """The interpreter's handle to one error location: the place of the error
-    code and the place of the payload union.  ``types`` is the exception set, in
-    first-delivery order (the i-th exception has tag ``i + 1``), and it grows as
-    an inferred location receives deliveries.  ``code``/``payload`` are the
-    location's two places: :class:`PendingSlot`s while the location is not
-    committed yet (their exact widths follow from ``types`` at the commit, see
-    ``_commit_error_space``), and the materialized places afterwards."""
+class _PendingErrorCodeWrite:
+    """One write of the error code of ``exception`` into the function's own
+    error location (an error escaping the function, or one raised through a
+    result location): the code of an exception depends on the function's
+    *result type* - a value-less function has no "no error" code, so its tags
+    start at 0 - which may still be inferred while the body runs.  The write is
+    therefore deferred to the insertion emitted at its position and filled in
+    by ``HirRunner._finish_function``, once the result type is known."""
 
-    code: InterpVal
-    payload: InterpVal
-    types: ArraySet[sval.Type] = field(default_factory=ArraySet)
+    exception: sval.Type
+    insertion: mir.Insertion
 
 def _is_comptime_val(val: InterpVal) -> bool:
     """Whether the value is *deeply* compile-time: it is known in full while
@@ -379,8 +394,20 @@ def _is_aggregate(type: sval.Type) -> bool:
     """Whether ``type`` is an *aggregate*: a struct or an array.  An aggregate
     has no storage of its own here - an inline slot holds it as a
     :class:`ComptimeAggregatePtr`, whose fields or elements are their own
-    places - so a :class:`ComptimeBox` never holds one (see ``InlineMode``)."""
+    places - so a :class:`ComptimeBox` never holds one (see ``InlineMode``).
+
+    A union is not one: its storage is a single variant, not a field per
+    place."""
     return isinstance(type, (sval.StructType, sval.ArrayType))
+
+def _is_union_unit(val: InterpVal) -> bool:
+    """Whether ``val`` is a union value that carries no storage
+    (:class:`sval.UnionValue`): it says only which union it belongs to, so a
+    storage destination has no variant to write."""
+    obj = _to_comptime(val)
+    if isinstance(obj, sval.AsValue):
+        obj = obj.value
+    return isinstance(obj, sval.UnionValue)
 
 def _aggregate_place_types(type: sval.Type) -> tuple[sval.Type, ...]:
     """The type of every place of the aggregate ``type``, in place order: the
@@ -495,14 +522,17 @@ class BlockFrame:
     data: BlockFrameData
 
 class InlineFrame:
-    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeTuple, insts: tuple[hir.Inst, ...]) -> None:
+    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResult, insts: tuple[hir.Inst, ...], value_is_empty: bool = False) -> None:
         self.generic_var_values = generic_var_values
         self.arg_values = arg_values
-        # the frame's result location: the pair of the place its result is
-        # delivered into and its error destination (the function proper's own
-        # error space; an inlined plain body raises into the enclosing space
-        # instead, so its error part is only a placeholder)
-        self.ret_loc: ComptimeTuple = ret_loc
+        # the frame's result location: the place its result is delivered into and
+        # the function proper's error places (an inlined plain body raises into
+        # the enclosing function's error location, so it shares them)
+        self.ret_loc: ComptimeResult = ret_loc
+        # whether the body of this frame has no value to return (the *declared*
+        # one of an inlined plain-Python body; the function proper's own type is
+        # asked for when it runs, see ``HirRunner._current_value_is_empty``)
+        self.value_is_empty = value_is_empty
         self.insts = insts
         self.pc: int = 0
         self.block_stack: list[BlockFrame] = []
@@ -725,11 +755,12 @@ def _result_places(location: InterpVal) -> tuple[InterpVal, ...]:
         place = _shallow_normalize(work.pop())
         if isinstance(place, ComptimeTuple):
             work.extend(reversed([entry.value for entry in place.values]))
-        elif isinstance(place, ComptimeErrorUnion):
-            # the error union spreads into its error code and payload, in that
-            # order (see ``sval.make_ret_spec``)
+        elif isinstance(place, ComptimeResult):
+            # the result spreads into its value, its error code and its payload,
+            # in that order (see ``sval.make_ret_spec``)
             work.append(place.payload)
             work.append(place.code)
+            work.append(place.value)
         else:
             places.append(place)
     return tuple(places)
@@ -890,6 +921,14 @@ def _convert_inst(
     instruction is needed (the types are equal, or both are pointers)."""
     if from_type == to_type:
         return None
+    if isinstance(from_type, sval.UnionType) and isinstance(to_type, sval.UnionType):
+        # a union value cannot be converted: its storage has to be
+        # reinterpreted through a pointer instead (see ``_convert_result_ptr``),
+        # so only a store of the very same union is expressible
+        raise CompileError(
+            f'cannot convert a {from_type} value to {to_type}: the storage of a '
+            f'union is written through a pointer to it'
+        )
     mir_to_type = to_type.to_mir_type()
     assert mir_to_type is not None and not isinstance(mir_to_type, mir.VoidType)
     if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.IntType):
@@ -981,6 +1020,15 @@ class HirRunner:
         # ``mir.Ret`` is filled in by ``_finish_function`` once the result
         # location has been materialized
         self._deferred_returns: list[mir.Insertion] = []
+        # the exception set of the function proper's own error location, in
+        # first-delivery order (its error codes follow from this order, see
+        # ``sval.ResultType``); it grows with every delivery while the set is
+        # inferred
+        self._error_types: ArraySet[sval.Type] = ArraySet()
+        # the writes of those error codes, deferred until the result type (which
+        # decides the tags the function uses) is known (see
+        # ``_PendingErrorCodeWrite``)
+        self._pending_error_code_writes: list[_PendingErrorCodeWrite] = []
         # the return convention the signature declares, with the parts the body
         # still has to infer missing (see ``PartialReturnSignature``)
         self.partial_ret_sig: PartialReturnSignature | None = None
@@ -988,7 +1036,7 @@ class HirRunner:
         # its parts are known
         self.ret_sig: ReturnSignature | None = None
 
-        self._fn_req_resumer: Callable[[Self, mir.Value, ReturnSignature]] | None = None
+        self._fn_req_resumer: Callable[[Self, mir.Value, ReturnSignature], PollResult] | None = None
         # the number of compile-time loop bodies unrolled so far, and the limit
         # that keeps a non-terminating loop marked with ``syntax.unroll()`` (one
         # whose condition never becomes false) from unrolling forever (see
@@ -1013,11 +1061,15 @@ class HirRunner:
         self.ret_sig = None
         self.resume_info = None
         self._deferred_returns = []
-        value_loc, space = self._reserve_result_loc(ret_sig)
+        self._pending_error_code_writes = []
+        self._error_types = ArraySet()
+        if ret_sig is not None and ret_sig.exceptions is not None:
+            # a declared exception set is the function's own from the start: its
+            # order fixes the error codes, whatever the value type turns out to be
+            for exception in ret_sig.exceptions.values:
+                self._error_types.add(exception)
         frame = InlineFrame(
-            generic_var_values, (),
-            ComptimeTuple((ArgEntry(value_loc, True), ArgEntry(space, True))),
-            body,
+            generic_var_values, (), self._reserve_result_loc(ret_sig), body,
         )
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
@@ -1029,28 +1081,27 @@ class HirRunner:
             # the whole return convention is declared: fix it before the body
             self._materialize_ret_sig(ret_sig.complete())
 
-    def _reserve_result_loc(self, ret_sig: PartialReturnSignature | None) -> tuple[InterpVal, ComptimeErrorUnion]:
-        """``(value_loc, error)``: the place the declared results are delivered
-        into and the function's error location (the two parts of the function
-        proper's result location at ``InlineFrame.ret_loc``).  The error location
-        is a :class:`ComptimeErrorUnion` whose code and payload places are fresh
-        slots - committed right away when the signature declares the error part,
-        and once the set is known otherwise (see ``_materialize_ret_sig``)."""
+    def _reserve_result_loc(self, ret_sig: PartialReturnSignature | None) -> ComptimeResult:
+        """The result location of the function proper (see ``ComptimeResult``):
+        the place its declared result is delivered into and its error places.
+        The places are the ones the effective spec names when the signature
+        declares the whole return convention, and fresh slots otherwise - an
+        inferred error place has no width until its set is known (see
+        ``_materialize_ret_sig``)."""
         declared_value = ret_sig.ret_type_spec if ret_sig is not None else None
         if ret_sig is not None and ret_sig.is_complete():
             # the value and the error part are both declared: the result
             # location is the one the effective spec names
             loc = self._ret_spec_place(ret_sig.complete().ret_spec())
-            assert isinstance(loc, ComptimeTuple) and len(loc.values) == 2
-            error = loc.values[1].value
-            assert isinstance(error, ComptimeErrorUnion)
-            return loc.values[0].value, error
-        space = self._new_error_space()
+            assert isinstance(loc, ComptimeResult)
+            return loc
         if declared_value is not None:
             value_loc = self._ret_spec_place(declared_value)
         else:
             value_loc = self.alloca(InlineMode.NONE)
-        return value_loc, space
+        return ComptimeResult(
+            value_loc, self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE),
+        )
 
     def _init_one_arg(self, node: SpecializedFormalArg, mir_args: list[mir.Type], arg_is_ref: bool) -> InterpVal:
         match node:
@@ -1104,15 +1155,22 @@ class HirRunner:
 
     def _ret_spec_place(self, node: RetSpec) -> InterpVal:
         """The result place one declared result is delivered into: a fresh slot
-        for a value, a tuple of the places of its elements for a group, and a
-        fresh error location for an error group (its exception set and storage
-        are fixed when it is committed, see ``_commit_error_space``)."""
+        for a value, a tuple of the places of its elements for a group, and the
+        function's result location for a result-type group (its exception set and
+        storage are fixed when it is committed, see ``_commit_error_space``)."""
         match node:
             case RetValue():
                 return self.alloca(InlineMode.NONE)
             case RetTuple(type=type, values=values):
-                if isinstance(type, sval.ErrorUnionType):
-                    return self._new_error_space()
+                if isinstance(type, sval.ResultType):
+                    # the function's own result location: its value, its error
+                    # code and its payload union (the set and the storage are
+                    # fixed when the group is committed, see ``_commit_error_space``)
+                    return ComptimeResult(
+                        self._ret_spec_place(values[0]),
+                        self.alloca(InlineMode.NONE),
+                        self.alloca(InlineMode.NONE),
+                    )
                 entries: list[ArgEntry[InterpVal]] = []
                 for child in values:
                     place = self._ret_spec_place(child)
@@ -1147,26 +1205,46 @@ class HirRunner:
         self.ret_sig = sig
         self._fn_instance.mir.ret_type = mir.VOID
         self._commit_ret_places(spec, self._current_result_loc())
+        if sig.is_noreturn():
+            # the function has no value to return and raises nothing: no path
+            # of it can ever come back, which its lowered form says outright
+            self._fn_instance.mir.ret_type = mir.NORETURN
 
     def _commit_ret_places(self, node: RetSpec, place: InterpVal) -> None:
         """Commit the result place(s) mirroring the spec node ``node``: a leaf
         place is committed (through a hidden result pointer when the leaf says
-        so), and an error-union group - whose place is one error slot - is
-        committed as a whole, its code and payload places being the group's two
-        leaves."""
+        so), and a result-type group - whose place is the result location - is
+        committed as a whole, its places being the value, the error code and the
+        payload union of the result."""
         match node:
             case RetValue():
                 self._commit_pending_slot(place, node.type, ptr=self._ret_leaf_ptr(node))
             case RetTuple(type=type, values=values):
-                if isinstance(type, sval.ErrorUnionType):
-                    assert isinstance(place, ComptimeErrorUnion)
-                    code_ptr = self._ret_leaf_ptr(values[0])
-                    payload_ptr = self._ret_leaf_ptr(values[1])
+                if isinstance(type, sval.ResultType):
+                    assert isinstance(place, ComptimeResult)
+                    value, code, payload = values
+                    self._commit_result_place(value, place.value)
+                    code_ptr = self._ret_leaf_ptr(code)
+                    payload_ptr = self._ret_leaf_ptr(payload)
                     self._commit_error_space(place, type, code_ptr, payload_ptr)
                     return
                 assert isinstance(place, ComptimeTuple)
                 for child, entry in zip(values, place.values):
                     self._commit_ret_places(child, entry.value)
+
+    def _commit_result_place(self, node: RetSpec, place: InterpVal) -> None:
+        """Commit the place(s) of the value part of a result (the first element
+        of a result-type group): a leaf is committed - through the hidden result
+        pointer it is delivered through when it says so - and a nested group of
+        values by pairing it with the place tree the caller reserved for it."""
+        match node:
+            case RetValue():
+                self._commit_pending_slot(place, node.type, ptr=self._ret_leaf_ptr(node))
+            case RetTuple(type=type, values=values):
+                assert not isinstance(type, sval.ResultType)
+                assert isinstance(place, ComptimeTuple)
+                for child, entry in zip(values, place.values):
+                    self._commit_result_place(child, entry.value)
 
     def _ret_leaf_ptr(self, leaf: RetSpec) -> mir.Value | None:
         """The hidden result pointer a leaf is delivered through (appending the
@@ -1194,21 +1272,37 @@ class HirRunner:
 
     # -- return statements ------------------------------------------------
 
-    def _current_result_loc(self) -> ComptimeTuple:
+    def _current_result_loc(self) -> ComptimeResult:
         assert len(self._frames) > 0, 'no function result location'
-        return self._frames[-1].ret_loc
+        ret = self._frames[-1].ret_loc
+        assert isinstance(ret, ComptimeResult)
+        return ret
 
     def _result_loc(self) -> InterpVal:
         """The place the current frame's result is delivered into: the value
-        part of the frame's result location (its error part is separate)."""
-        return self._current_result_loc().values[0].value
+        part of the frame's result location (its error places are separate)."""
+        return self._current_result_loc().value
 
-    def _error_space(self) -> ComptimeErrorUnion:
-        """The function proper's own error location (the error part of its
-        result location; an empty set for a function that raises nothing)."""
-        space = self._frames[0].ret_loc.values[1].value
-        assert isinstance(space, ComptimeErrorUnion)
-        return space
+    def _function_result(self) -> ComptimeResult:
+        """The function proper's own result location (the frame at the bottom of
+        the stack: an inlined body's result location shares its error places)."""
+        ret = self._frames[0].ret_loc
+        assert isinstance(ret, ComptimeResult)
+        return ret
+
+    def _current_value_is_empty(self) -> bool:
+        """Whether the body being executed has no value to return, so that no
+        path of it may deliver a result (see ``hir.Ret`` and
+        ``store_void_retloc``): the function proper's settled value type (the
+        empty type for a ``-> Never`` annotation, or a type parameter that solved
+        to it), or the declared one of an inlined plain-Python body - an inlined
+        body has no convention of its own, so only a declaration can say it."""
+        if not self._in_function_proper():
+            return self._frames[-1].value_is_empty
+        if self.ret_sig is not None:
+            return self.ret_sig.value_is_empty()
+        partial = self.partial_ret_sig
+        return partial is not None and sval.ret_spec_value_is_empty(partial.ret_type_spec)
 
     def _function_error_inferred(self) -> bool:
         """Whether the function proper's exception set is still to be inferred
@@ -1264,13 +1358,13 @@ class HirRunner:
 
     def _set_error_code_zero(self) -> None:
         """Record a successful outcome: the function proper's error code is
-        cleared (a ``return`` path is defined to carry no error).  The store is
+        cleared (a ``return`` path is defined to carry no error, and a path that
+        returns a value cannot be one of a value-less function).  The store is
         made with at least one bit so that it takes part in the code slot's type
         even when no exception has been delivered yet - an inferred set may
         still grow later, and the successful path must clear the code either
         way."""
-        eu = self._error_space()
-        self.store(eu.code, ComptimeVal(sval.Int(0, sval.IntType(0, False))))
+        self.store(self._function_result().code, ComptimeVal(sval.Int(0, sval.IntType(0, False))))
 
     def _end_error_path(self) -> None:
         """End a path at the function boundary (an error escaping the function):
@@ -1304,47 +1398,49 @@ class HirRunner:
 
     # -- error locations ---------------------------------------------------
 
-    def _new_error_space(self) -> ComptimeErrorUnion:
-        """A fresh, uncommitted error location: its code and payload places are
-        slots whose widths follow from its exception set when it is committed
-        (see ``_commit_error_space``), and whose set grows with every
-        delivery."""
-        return ComptimeErrorUnion(self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE))
-
-    def _commit_error_space(self, eu: ComptimeErrorUnion, type: sval.ErrorUnionType, code_ptr: mir.Value | None = None, payload_ptr: mir.Value | None = None) -> None:
+    def _commit_error_space(self, result: ComptimeResult, type: sval.ResultType, code_ptr: mir.Value | None = None, payload_ptr: mir.Value | None = None) -> None:
         """Commit an error location: its code and payload slots are materialized
         (through a hidden result pointer when given, freshly allocated
-        otherwise), their widths following from the exception set, and the
-        deliveries recorded on them run against them."""
+        otherwise), their widths following from the result type, and the
+        deliveries recorded on them run against them.  The exception set becomes
+        the function's own (the error codes follow from its order).
+
+        A payload place is always storage (an alloca of its own when the payload
+        is not delivered through a result pointer, see ``_ret_leaf_ptr``): the
+        variant of an exception is built through its address either way, and a
+        by-value payload return loads it back out of it.  A zero-sized payload
+        union holds no storage and only records its unit value."""
         for exception in type.types:
-            eu.types.add(exception)
-        self._commit_pending_slot(eu.code, type.code_type, ptr=code_ptr)
-        self._commit_pending_slot(eu.payload, type.union, ptr=payload_ptr)
+            self._error_types.add(exception)
+        self._commit_pending_slot(result.code, type.code_type, ptr=code_ptr)
+        self._commit_pending_slot(result.payload, type.union, ptr=payload_ptr)
 
-    def _tag_of(self, eu: ComptimeErrorUnion, exception: sval.Type) -> int:
-        """The error code of ``exception`` in the error location ``eu`` (0 is
-        no error, so the i-th exception has tag ``i + 1``)."""
-        types = eu.types.values
-        if exception not in types:
-            raise CompileError(
-                f'{exception} is not an exception of this error space: the '
-                f'function cannot raise it (declare it with '
-                f'@func(exceptions={{...}}) or @func(exceptions="infer"))'
-            )
-        return types.index(exception) + 1
-
-    def _add_function_exception(self, exception: sval.Type) -> int:
-        """Record that the function proper may raise ``exception`` and return
-        its error code: an exception the (declared) set does not allow is
-        rejected; an inferred set grows to hold it."""
+    def _add_function_exception(self, exception: sval.Type) -> None:
+        """Record that the function proper may raise ``exception``: an exception
+        the (declared) set does not allow is rejected, and an inferred set grows
+        to hold it.  Its error code is written later (see
+        ``_defer_error_code_write``), because the tags depend on the function's
+        result type - which may still be inferred here."""
         if not isinstance(exception, sval.StructType):
             raise CompileError(f'cannot raise {exception}: an exception must be a struct')
-        eu = self._error_space()
-        if exception not in eu.types.values:
+        if exception not in self._error_types.values:
             if not self._function_error_inferred():
-                self._tag_of(eu, exception)
-            eu.types.add(exception)
-        return self._tag_of(eu, exception)
+                raise CompileError(
+                    f'{exception} is not an exception of this function: it '
+                    f'cannot raise it (declare it with @func(exceptions={{...}}) '
+                    f'or @func(exceptions="infer"))'
+                )
+            self._error_types.add(exception)
+
+    def _defer_error_code_write(self, exception: sval.StructType) -> None:
+        """Record the write of ``exception``'s error code into the function's own
+        error location at the current position: the insertion is filled in by
+        ``_finish_function``, once the result type names the tag."""
+        insertion = mir.Insertion([], None)
+        self._emit(insertion)
+        self._pending_error_code_writes.append(
+            _PendingErrorCodeWrite(exception, insertion)
+        )
 
     def _union_variant_ptr(self, place: InterpVal, struct_type: sval.StructType) -> InterpVal:
         """The address a value of the union variant ``struct_type`` is written
@@ -1361,22 +1457,24 @@ class HirRunner:
         bitcast = self._emit(mir.BitCast(self._to_runtime(place), mir.PointerType(mir_struct)))
         return RuntimeVal(bitcast, sval.PointerType(struct_type, is_const=False))
 
-    def _error_payload_ptr(self, error: ComptimeErrorUnion, struct_type: sval.StructType) -> InterpVal:
+    def _error_payload_ptr(self, error: ComptimeResult, struct_type: sval.StructType) -> InterpVal:
         """The address the variant ``struct_type`` is written to inside the
         error location ``error``."""
         return self._union_variant_ptr(error.payload, struct_type)
 
-    def _raise_error(self, space: ComptimeErrorUnion, exception: sval.StructType, value: InterpVal) -> None:
-        """Deliver one exception value into the error location ``space`` (a
-        ``raise``): tag it and write it into the payload."""
-        self.store(space.code, ComptimeVal(self._tag_of(space, exception)))
-        self.store(self._error_payload_ptr(space, exception), value)
+    def _raise_error(self, result: ComptimeResult, exception: sval.StructType, value: InterpVal) -> None:
+        """Deliver one exception value into the error location ``result`` (a
+        ``raise`` through a result location): tag it and write it into the
+        payload."""
+        self._add_function_exception(exception)
+        self._defer_error_code_write(exception)
+        self.store(self._error_payload_ptr(result, exception), value)
 
-    def _payload_variant_ptr(self, eu: ComptimeErrorUnion, exception: sval.StructType) -> InterpVal:
+    def _payload_variant_ptr(self, exception: sval.StructType) -> InterpVal:
         """The address the variant ``exception`` lives at in the function's
         error location - a fresh placeholder while its payload has no address
         yet (see ``_defer_ptr_convertion``)."""
-        payload = eu.payload
+        payload = self._function_result().payload
         if isinstance(payload, PendingSlot) and payload.committed is None:
             return self._defer_ptr_convertion(payload, exception)
         return self._convert_result_ptr(payload, exception)
@@ -1390,10 +1488,9 @@ class HirRunner:
         for exception in callee_exceptions:
             if self._find_catching_clause(exception) is not None:
                 return False
-        eu = self._error_space()
         if self._function_error_inferred():
             return True
-        return all(exception in eu.types.values for exception in callee_exceptions)
+        return all(exception in self._error_types.values for exception in callee_exceptions)
 
     def _route_to_clause(self, data: TryExceptBlockData, index: int, incoming: InterpVal, exception: sval.StructType) -> None:
         """Route one caught error to clause ``index``: create the clause's entry
@@ -1433,29 +1530,29 @@ class HirRunner:
 
     def _deliver_uncaught_call(self, exception: sval.StructType, payload_place: InterpVal, use_ret_payload: bool) -> None:
         """Deliver a call's error no clause catches into the function's error
-        location and end the path: the callee's tag remapped, the payload
-        already in place when the callee wrote straight into the location (no
-        copy) or copied from the call's payload slot otherwise."""
-        tag = self._add_function_exception(exception)
-        eu = self._error_space()
-        self.store(eu.code, ComptimeVal(sval.Int(tag, sval.IntType(tag.bit_length(), False))))
+        location and end the path: the callee's tag remapped (written once the
+        tags are known, see ``_defer_error_code_write``), the payload already in
+        place when the callee wrote straight into the location (no copy) or
+        copied from the call's payload slot otherwise."""
+        self._add_function_exception(exception)
+        self._defer_error_code_write(exception)
         if not use_ret_payload and not exception.is_zst():
             value = self.load(self._union_variant_ptr(payload_place, exception))
-            self.store(self._payload_variant_ptr(eu, exception), value)
+            self.store(self._payload_variant_ptr(exception), value)
         self._end_error_path()
 
     def _deliver_uncaught_raise(self, slot: InterpVal, exception: sval.StructType) -> None:
         """Deliver a ``raise`` no clause catches into the function's error
         location and end the path: the exception's own slot is bound to the
         location's payload variant, so the already built value is written there
-        directly (no copy), and the code tagged."""
-        tag = self._add_function_exception(exception)
-        eu = self._error_space()
-        self.store(eu.code, ComptimeVal(sval.Int(tag, sval.IntType(tag.bit_length(), False))))
+        directly (no copy), and the code tagged (once the tags are known, see
+        ``_defer_error_code_write``)."""
+        self._add_function_exception(exception)
+        self._defer_error_code_write(exception)
         if exception.is_zst():
             self._commit_pending_slot(slot, exception)
         else:
-            dest = self._payload_variant_ptr(eu, exception)
+            dest = self._payload_variant_ptr(exception)
             assert isinstance(dest, RuntimeVal)
             self._commit_pending_slot(slot, exception, ptr=dest.value)
         self._end_error_path()
@@ -1541,6 +1638,15 @@ class HirRunner:
         regs = frame.regs
         match inst:
             case hir.Ret():
+                if self._current_value_is_empty():
+                    # the body has no value to return, so nothing ever wrote its
+                    # result location: a ``return`` (whose store into that
+                    # location is a no-op) is rejected here - the function proper
+                    # and an inlined body alike
+                    raise CompileError(
+                        'a function that returns Never cannot return: it has no '
+                        'value to return'
+                    )
                 if not self._in_function_proper():
                     # an inlined ``return`` delivers its value (already
                     # stored into the result location) and leaves the
@@ -2023,9 +2129,13 @@ class HirRunner:
         while True:
             frame = self._frames[-1]
             if not frame.block_stack:
-                # the body run ended in a return: skip the dead code
-                # after it
+                # the body run ended in a return: skip the dead code after it
                 if len(self._frames) == 1:
+                    # the walk of the function proper is over: park the pc at the
+                    # end of its body, so that a run resumed after the cut (the
+                    # analyser resumes a runner whose callee never returns) ends
+                    # at once rather than walking on into the dead code
+                    frame.pc = len(frame.insts)
                     return PollResult.DONE
                 if self._pop_frame():
                     return PollResult.AGAIN
@@ -2236,9 +2346,9 @@ class HirRunner:
             return
 
         ptr = _shallow_normalize(ptr)
-        if isinstance(ptr, ComptimeErrorUnion):
-            # a delivery into a committed error space: the value is either the
-            # "no error" tag (``Success``) or an exception value, tagged and
+        if isinstance(ptr, ComptimeResult):
+            # a delivery into the function's result location: the value is either
+            # the "no error" tag (``Success``) or an exception value, tagged and
             # written into the payload
             obj = value.obj if isinstance(value, ComptimeVal) else None
             if isinstance(obj, sval.Success):
@@ -2269,6 +2379,10 @@ class HirRunner:
             raise CompileError(f"cannot store to a {ptr_type} value")
         elem = ptr_type.elem
         if elem.is_zst():
+            return
+        if isinstance(elem, sval.UnionType) and _is_union_unit(value):
+            # a union value carries no storage - it says nothing but which union
+            # it belongs to - so a storage destination has nothing to write
             return
         if isinstance(elem, sval.OptionType):
             # an option (and the ``T``/``Null`` a store delivers) is written
@@ -2320,7 +2434,15 @@ class HirRunner:
     def store_void_retloc(self) -> None:
         """Deliver the void unit value into the result location (see
         ``hir.StoreVoidRetloc``): the value a body that falls off its end
-        returns."""
+        returns.  A function with no value to return cannot fall off its end
+        either - that would be a returning path all the same - so a body of the
+        empty type is rejected here (its store into the result location would
+        otherwise be a silent no-op)."""
+        if self._current_value_is_empty():
+            raise CompileError(
+                'a function that returns Never cannot fall off its end: it has no '
+                'value to return'
+            )
         location = self._result_loc()
         if isinstance(location, ComptimeTuple):
             raise CompileError('a function that returns several values must return them')
@@ -2461,7 +2583,7 @@ class HirRunner:
         Auto-dereferences a base that points at a pointer, unlike
         ``field_index_addr``."""
         ptr = _shallow_normalize(ptr)
-        if is_aggregate_init and isinstance(ptr, ComptimeErrorUnion):
+        if is_aggregate_init and isinstance(ptr, ComptimeResult):
             # a field of the exception being raised: its address is decided by
             # the ``FinishStruct`` that closes the construction, in the error
             # location's payload (see ``finish_struct``)
@@ -2522,7 +2644,7 @@ class HirRunner:
         instruction into an insertion block instead of the current position.
         A zero-sized field/element occupies no storage and has no address."""
         ptr = _shallow_normalize(ptr)
-        if is_aggregate_init and isinstance(ptr, ComptimeErrorUnion):
+        if is_aggregate_init and isinstance(ptr, ComptimeResult):
             # a keyword field of the exception being raised (see
             # ``field_index_addr``)
             return self.alloca(InlineMode.NONE)
@@ -3109,10 +3231,9 @@ class HirRunner:
                 ptr.value = ComptimeTuple(action.places)
             case _PendingPtrConvertion():
                 input_ptr = _shallow_normalize(action.input)
-                if isinstance(input_ptr, ComptimeErrorUnion):
-                    # a call returning an aggregate is raised: the error code is
-                    # tagged and the payload pointer handed over (the space's
-                    # type - and tag - are known now)
+                if isinstance(input_ptr, ComptimeResult):
+                    # a call returning an aggregate is raised: the payload pointer
+                    # is handed over (and the error code tagged) at the commit
                     action.output.value = self._to_runtime(self._convert_result_ptr(action.input, action.type))
                 else:
                     if not (isinstance(input_ptr, RuntimeVal) and isinstance(input_ptr.type, sval.PointerType)):
@@ -3176,10 +3297,11 @@ class HirRunner:
         a delivery of an exception ``E`` are the other case: the error is
         tagged and written into the payload (``_error_payload_ptr``)."""
         ptr = _shallow_normalize(ptr)
-        if isinstance(ptr, ComptimeErrorUnion):
+        if isinstance(ptr, ComptimeResult):
             if not isinstance(to_type, sval.StructType):
                 raise CompileError(f'cannot raise {to_type}: an exception must be a struct')
-            self.store(ptr.code, ComptimeVal(self._tag_of(ptr, to_type)))
+            self._add_function_exception(to_type)
+            self._defer_error_code_write(to_type)
             return self._error_payload_ptr(ptr, to_type)
         ptr_type = _type_of(ptr)
         if not isinstance(ptr_type, sval.PointerType):
@@ -3645,31 +3767,37 @@ class HirRunner:
         _check_comptime_args(sig, binded_args)
         if fn.force_inline:
             # an undecorated plain Python function: its body is inlined into
-            # the current stream (it has no native specialization of its own)
-            return self._start_inline(fn.hir.body, fn.hir.arg_is_ref, binded_args, ret, generic_var_values)
+            # the current stream (it has no native specialization of its own).
+            # Its declared return type still says when it can never return a
+            # value, which its body must respect (see ``_current_value_is_empty``)
+            return self._start_inline(
+                fn.hir.body, fn.hir.arg_is_ref, binded_args, ret,
+                generic_var_values, value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
+            )
         arg_types = binded_args.map(_arg_type_of)
         spec_sig = sig.specialize(arg_types)
 
-        def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature):
-            self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
+        def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
+            return self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
 
         self._fn_req_resumer = _resumer
         res = self._analyser._request_function(fn, spec_sig[0], spec_sig[1], generic_var_values)
         if res is not None:
             fn_mir, ret_sig = res
-            self.resume(fn_mir, ret_sig)
-            return PollResult.AGAIN
+            return self.resume(fn_mir, ret_sig)
         return PollResult.SUSPEND
 
-    def resume(self, fn_mir: mir.Value, ret_sig: ReturnSignature):
+    def resume(self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
         resumer = self._fn_req_resumer
         assert resumer is not None
         self._fn_req_resumer = None
-        resumer(self, fn_mir, ret_sig)
+        return resumer(self, fn_mir, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature) -> None:
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature) -> PollResult:
         """Emit the native call of an already-resolved callee and hand its
-        result to the call's result location."""
+        result to the call's result location.  A callee that cannot return
+        normally (no value and no error, or no value at all) ends the current
+        path, which is unwound like any other ended one (see ``_cut``)."""
         mir_args: list[mir.Value] = []
 
         def convert_one(arg: ArgEntry[InterpVal], sig_arg: SpecializedFormalArg) -> None:
@@ -3704,10 +3832,18 @@ class HirRunner:
                 convert_one(arg, call_sig.kwargs[name])
 
         spec = ret_sig.ret_spec()
+        callee_result = ret_sig.result_type()
+        value_is_empty = ret_sig.value_is_empty()
         if len(ret_sig.exceptions) == 0:
             # the callee has no error part in its MIR: deliver its value alone
-            self._deliver_result(callee, mir_args, ret, ret_sig.ret_type_spec)
-            return
+            # (and when that value is the empty type, nothing comes back at all)
+            self._deliver_result(
+                callee, mir_args, ret, ret_sig.ret_type_spec,
+                noreturn=ret_sig.is_noreturn(),
+            )
+            if value_is_empty:
+                return self._cut()
+            return PollResult.AGAIN
         # the callee may raise: it delivers its normal result into ``ret`` and
         # its error code and payload through fresh places, dispatched below
         callee_exceptions = tuple(ret_sig.exceptions.values)
@@ -3716,62 +3852,84 @@ class HirRunner:
         if use_ret_payload:
             # no ``try`` catches the callee's errors: it writes them straight
             # into the function's own error payload (no copy on the way out)
-            payload_place: InterpVal = self._error_space().payload
+            payload_place: InterpVal = self._function_result().payload
         else:
             payload_place = self.alloca(InlineMode.NONE)
-        error_tuple: InterpVal = ComptimeTuple((
-            ArgEntry(code_place, True),
-            ArgEntry(payload_place, True),
-        ))
-        self._deliver_result(
-            callee, mir_args,
-            ComptimeTuple((ArgEntry(ret, True), ArgEntry(error_tuple, True))),
-            spec,
+        error_tuple: InterpVal = ComptimeResult(ret, code_place, payload_place)
+        self._deliver_result(callee, mir_args, error_tuple, spec)
+        self._check_call_error(
+            callee_exceptions, callee_result, code_place, payload_place,
+            use_ret_payload, value_is_empty,
         )
-        self._check_call_error(callee_exceptions, code_place, payload_place, use_ret_payload)
+        if value_is_empty:
+            # a callee with no value to return can never come back normally: the
+            # code is one of its exceptions, and every path out of the switch
+            # ended (in a clause, or in the function's own error location)
+            return self._cut()
+        return PollResult.AGAIN
 
     def _check_call_error(
         self,
         callee_exceptions: tuple[sval.Type, ...],
+        callee_result: sval.ResultType,
         code_place: InterpVal,
         payload_place: InterpVal,
         use_ret_payload: bool,
+        value_is_empty: bool,
     ) -> None:
-        """Dispatch the error a call delivered when its code is non-zero (see
-        ``_make_runtime_call``): a ``switch`` on the callee's code sends every
-        exception to the clause that catches it - jumped to with the payload
-        pointer handed over through the clause's ``Phi`` - or, when nothing
-        catches it, into the function's own error location (see
-        ``_deliver_uncaught_call``).  A zero code continues in a fresh block."""
+        """Dispatch the error a call delivered (see ``_make_runtime_call``): a
+        ``switch`` on the callee's code sends every exception to the clause that
+        catches it - jumped to with the payload pointer handed over through the
+        clause's ``Phi`` - or, when nothing catches it, into the function's own
+        error location (see ``_deliver_uncaught_call``).  The code ``0`` of a
+        callee that returns a value is the successful outcome and continues in a
+        fresh block; a value-less callee has no such code, so there is no
+        continuation at all - and one with a single exception has no code at all
+        (``u0``), so its only error is dispatched statically."""
         self._commit_pending_slot(code_place)
         if not use_ret_payload:
             self._commit_pending_slot(payload_place)
-        code = self.load(code_place)
-        assert isinstance(code, RuntimeVal)
-        mir_code_type = code.type.to_mir_type()
-        assert isinstance(mir_code_type, mir.IntType)
-        cond = self._emit(mir.Cmp('!=', False, 'int', code.value, mir.Int(0, mir_code_type)))
-        err_block = mir.BasicBlock()
-        cont_block = mir.BasicBlock()
-        self._cur_block.emit(mir.Br(cond, err_block, cont_block))
-        self._cur_block = err_block
-        case_blocks = [mir.BasicBlock() for _ in callee_exceptions]
-        self._cur_block.emit(mir.Switch(
-            code.value, case_blocks[0],
-            tuple((index + 1, case_blocks[index]) for index in range(len(case_blocks))),
-        ))
-        for index, exception in enumerate(callee_exceptions):
-            assert isinstance(exception, sval.StructType)
-            self._cur_block = case_blocks[index]
-            target = self._find_catching_clause(exception)
-            if target is not None:
-                data, clause = target
-                assert not use_ret_payload
-                incoming = self._union_variant_ptr(payload_place, exception)
-                self._route_to_clause(data, clause, incoming, exception)
-            else:
-                self._deliver_uncaught_call(exception, payload_place, use_ret_payload)
-        self._cur_block = cont_block
+        code_type = callee_result.code_type
+        mir_code_type = code_type.to_mir_type()
+        zero_sized = mir_code_type is None or isinstance(mir_code_type, mir.VoidType)
+        cont_block = mir.BasicBlock() if not value_is_empty else None
+        if zero_sized:
+            # the callee uses no code at all: its single exception is the only
+            # outcome of the call (a value-less callee always delivers an error)
+            assert len(callee_exceptions) == 1
+            self._dispatch_call_error(callee_exceptions[0], payload_place, use_ret_payload)
+        else:
+            assert isinstance(mir_code_type, mir.IntType)
+            code = self.load(code_place)
+            assert isinstance(code, RuntimeVal)
+            case_blocks = [mir.BasicBlock() for _ in callee_exceptions]
+            cases = [
+                (callee_result.code_of(exception), case_blocks[index])
+                for index, exception in enumerate(callee_exceptions)
+            ]
+            if cont_block is not None:
+                cases.append((0, cont_block))
+            default = case_blocks[0] if cont_block is None else cont_block
+            self._cur_block.emit(mir.Switch(code.value, default, tuple(cases)))
+            for index, exception in enumerate(callee_exceptions):
+                self._cur_block = case_blocks[index]
+                self._dispatch_call_error(exception, payload_place, use_ret_payload)
+        if cont_block is not None:
+            self._cur_block = cont_block
+
+    def _dispatch_call_error(self, exception: sval.Type, payload_place: InterpVal, use_ret_payload: bool) -> None:
+        """Route one exception a call may deliver: to the clause that catches
+        it, or - when nothing catches it - into the function's own error
+        location (which ends the path)."""
+        assert isinstance(exception, sval.StructType)
+        target = self._find_catching_clause(exception)
+        if target is not None:
+            data, clause = target
+            assert not use_ret_payload
+            incoming = self._union_variant_ptr(payload_place, exception)
+            self._route_to_clause(data, clause, incoming, exception)
+        else:
+            self._deliver_uncaught_call(exception, payload_place, use_ret_payload)
 
     def _deliver_result(
         self,
@@ -3779,6 +3937,7 @@ class HirRunner:
         mir_args: list[mir.Value],
         ret: InterpVal,
         spec: RetSpec,
+        noreturn: bool = False,
     ) -> None:
         """Emit the native call of a callee returning the value(s) of ``spec``
         and hand every result to its place.
@@ -3793,13 +3952,14 @@ class HirRunner:
         ``_no_runtime_type``).
 
         A zero-sized result occupies no place of its own: its unit value is
-        written into its place."""
+        written into its place.  A ``noreturn`` call (``mir.NoReturn``) ends the
+        block it is emitted into."""
         places: list[InterpVal] = []
         packed: list[tuple[InterpVal, ComptimeTuple]] = []
         self._pair_places(spec, ArgEntry(ret, True), places, packed)
 
         result_args: list[mir.Value] = []
-        ret_type: mir.MayBeVoidType = mir.VOID
+        ret_type: mir.ReturnType = mir.VOID
         by_value: tuple[InterpVal, sval.Type] | None = None
         for leaf, place in zip(iter_ret_leaves(spec), places):
             if leaf.via_result_ptr:
@@ -3831,9 +3991,22 @@ class HirRunner:
             ret_type = mir_type
             by_value = (place, leaf.type)
 
+        if noreturn:
+            # the callee never comes back: the call ends the block it is in
+            ret_type = mir.NORETURN
         call_inst = self._emit(mir.Call(callee, (*mir_args, *result_args), ret_type))
         if by_value is not None:
             place, type = by_value
+            if isinstance(type, sval.UnionType):
+                # a union value cannot be converted, and the destination (the
+                # function's own payload, a union of its whole exception set) may
+                # be a superset: the storage is reinterpreted as the union that
+                # arrives (its variants live at offset 0, and a pointer
+                # reinterpretation is free)
+                if isinstance(place, PendingSlot) and place.committed is None:
+                    place = self._defer_ptr_convertion(place, type)
+                else:
+                    place = self._convert_result_ptr(place, type)
             self.store(place, RuntimeVal(call_inst, type))
 
         if len(packed) == 0:
@@ -3868,7 +4041,16 @@ class HirRunner:
                         'the target of a multi-value result must be addressable'
                     )
                 places.append(target)
-            case RetTuple(values=values):
+            case RetTuple(type=type, values=values):
+                if isinstance(type, sval.ResultType):
+                    # the result group: its value, its error code and its payload
+                    # union, in the order of the result location
+                    assert isinstance(target, ComptimeResult)
+                    for child, sub in zip(
+                        values, (target.value, target.code, target.payload),
+                    ):
+                        self._pair_places(child, ArgEntry(sub, True), places, packed)
+                    return
                 if isinstance(target, ComptimeTuple):
                     if len(target.values) != len(values):
                         raise CompileError(
@@ -3905,6 +4087,7 @@ class HirRunner:
         args: ArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
         generic_var_values: frozendict[sval.TypeVar, sval.Value] | None = None,
+        value_is_empty: bool = False,
     ) -> PollResult:
         """Start the inlined body of a plain Python callee: convert its
         bound arguments into addressable values (the callee's ``hir.Arg``
@@ -3946,10 +4129,14 @@ class HirRunner:
         frame_values: dict[sval.TypeVar, InterpVal] = {}
         if generic_var_values is not None:
             frame_values = {tv: ComptimeVal(v) for tv, v in generic_var_values.items()}
+        # the body delivers its result into the call's place and shares the
+        # function proper's error places: an error of the body leaves the
+        # function the same way
+        error = self._function_result()
         frame = InlineFrame(
             frame_values, tuple(arg_values),
-            ComptimeTuple((ArgEntry(ret, True), ArgEntry(self._error_space(), True))),
-            body,
+            ComptimeResult(ret, error.code, error.payload),
+            body, value_is_empty=value_is_empty,
         )
         self._frames.append(frame)
         return PollResult.AGAIN
@@ -3970,25 +4157,28 @@ class HirRunner:
     def _finish_function(self) -> None:
         """Fix the return convention of the function proper - the return type
         and/or the exception set the signature left to be inferred, from the
-        stores the body performed - and fill in the ``mir.Ret`` of every
-        deferred return site."""
+        stores the body performed - fill in the ``mir.Ret`` of every deferred
+        return site, and write the deferred error codes, which the result type
+        now names."""
         partial = self.partial_ret_sig
         value_spec = partial.ret_type_spec if partial is not None else None
         if value_spec is None:
             location = self._result_loc()
             assert isinstance(location, PendingSlot)
-            if len(location.stores) == 0:
-                value_spec = sval.make_ret_spec(sval.VoidType())
-            else:
-                value_spec = sval.make_ret_spec(location.committed_type())
+            # a result location nothing was ever stored into holds no value: its
+            # type is the *empty* type, so the function cannot return a value at
+            # all (see ``sval.EmptyType``)
+            value_spec = sval.make_ret_spec(location.committed_type())
         exceptions = partial.exceptions if partial is not None else None
         if exceptions is None:
             exceptions = ArraySet()
-            for exception in self._error_space().types.values:
+            for exception in self._error_types.values:
                 exceptions.add(exception)
         self._materialize_ret_sig(ReturnSignature(value_spec, exceptions))
         sig = self.ret_sig
         assert sig is not None
+        result_type = sig.result_type()
+        self._write_deferred_error_codes(result_type)
         spec = sig.ret_spec()
         places = _result_places(self._current_result_loc())
         index = ret_by_value_index(spec)
@@ -4006,6 +4196,30 @@ class HirRunner:
                     block.insts.append(mir.Ret(self._to_runtime(slot.value)))
                 else:
                     raise CompileError('cannot deliver the return value')
+
+    def _write_deferred_error_codes(self, result_type: sval.ResultType) -> None:
+        """Fill in the deferred writes of the function's error codes (see
+        ``_PendingErrorCodeWrite``): the tag of an exception is its position in
+        the exception set, offset by the result type's base (a value-less
+        function has no "no error" code).  A zero-sized code holds no storage -
+        and the code of a value-less function's single exception is always 0 -
+        so there is nothing to write then."""
+        if len(self._pending_error_code_writes) == 0:
+            return
+        code_type = result_type.code_type
+        mir_code_type = code_type.to_mir_type()
+        if mir_code_type is None or isinstance(mir_code_type, mir.VoidType):
+            # a zero-sized code holds no storage: the only code a value-less
+            # function ever writes is 0, which is what ``u0`` is anyway
+            return
+        assert isinstance(mir_code_type, mir.IntType)
+        code = _shallow_normalize(self._function_result().code)
+        assert isinstance(code, RuntimeVal), 'an error code with storage is memory'
+        for write in self._pending_error_code_writes:
+            tag = result_type.code_of(write.exception)
+            write.insertion.insts.append(
+                mir.Store(code.value, mir.Int(tag, mir_code_type))
+            )
 
 class Analyser:
     def __init__(self, resolver: GlobalResolver) -> None:

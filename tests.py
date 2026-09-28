@@ -19,7 +19,7 @@ function no earlier test has compiled.
 import ctypes
 import io
 from contextlib import redirect_stdout
-from typing import Any, Literal
+from typing import Any, Literal, Never
 from unittest import TestCase
 
 from spy.dsl import func, struct
@@ -3790,13 +3790,13 @@ def _union_lowering_fn() -> mir.Function:
 
 
 class SpyErrorUnionPrimitiveTest(TestCase):
-    """The type-system and lowering primitives of error handling: the error
-    union spreads into an error code and a payload union (see
+    """The type-system and lowering primitives of error handling: the result
+    type spreads into a value, an error code and a payload union (see
     ``sval.make_ret_spec``), and the payload union is an untagged union read and
     written through a ``BitCast``."""
 
     def test_empty_error_union_is_the_unit_type(self) -> None:
-        empty = sval.ErrorUnionType(())
+        empty = sval.ResultType(sval.VoidType(), ())
         self.assertEqual(empty.tag_bits, 0)
         self.assertEqual(empty.code_type, sval.IntType(0, False))
         self.assertIsNotNone(empty.get_unit_value())
@@ -3805,10 +3805,20 @@ class SpyErrorUnionPrimitiveTest(TestCase):
     def test_error_code_width_is_the_smallest(self) -> None:
         small = struct_type(Small)
         large = struct_type(Large)
-        self.assertEqual(sval.ErrorUnionType((small,)).tag_bits, 1)
-        self.assertEqual(sval.ErrorUnionType((small, large)).tag_bits, 2)
-        self.assertEqual(sval.ErrorUnionType((small, large, small)).tag_bits, 2)
-        self.assertEqual(sval.ErrorUnionType((small, large, small, large)).tag_bits, 3)
+        void = sval.VoidType()
+        self.assertEqual(sval.ResultType(void, (small,)).tag_bits, 1)
+        self.assertEqual(sval.ResultType(void, (small, large)).tag_bits, 2)
+        self.assertEqual(sval.ResultType(void, (small, large, small)).tag_bits, 2)
+        self.assertEqual(sval.ResultType(void, (small, large, small, large)).tag_bits, 3)
+        # a function that returns no value has no "no error" code: its i-th
+        # exception is tagged ``i``, so a single one needs no code at all
+        empty = sval.EmptyType()
+        self.assertEqual(sval.ResultType(empty, ()).tag_bits, 0)
+        self.assertEqual(sval.ResultType(empty, (small,)).tag_bits, 0)
+        self.assertEqual(sval.ResultType(empty, (small, large)).tag_bits, 1)
+        self.assertEqual(sval.ResultType(empty, (small, large, small)).tag_bits, 2)
+        self.assertEqual(sval.ResultType(empty, (small,)).code_of(small), 0)
+        self.assertEqual(sval.ResultType(void, (small,)).code_of(small), 1)
 
     def test_payload_union_uses_the_largest_variant_and_is_interned(self) -> None:
         small = struct_type(Small)
@@ -3818,19 +3828,18 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         self.assertIs(one.storage_variant(), large)
         self.assertIs(one.to_mir_type(), two.to_mir_type())
         self.assertIs(sval.UnionType(()).to_mir_type(), mir.VOID)
+        self.assertEqual(sval.UnionType(()).get_unit_value(), sval.UnionValue(sval.UnionType(())))
 
     def test_make_ret_spec_spreads_the_error_union(self) -> None:
         small = struct_type(Small)
         i32_type = sval.IntType(32, True)
-        type = sval.TupleType((i32_type, sval.ErrorUnionType((small,))), False)
+        type = sval.ResultType(i32_type, (small,))
         spec = sval.make_ret_spec(type)
         assert isinstance(spec, sval.RetTuple)
-        result, error = spec.values
+        self.assertIs(spec.type, type)
+        result, code, payload = spec.values
         assert isinstance(result, sval.RetValue)
         self.assertIs(result.type, i32_type)
-        assert isinstance(error, sval.RetTuple)
-        self.assertIsInstance(error.type, sval.ErrorUnionType)
-        code, payload = error.values
         assert isinstance(code, sval.RetValue)
         assert isinstance(payload, sval.RetValue)
         self.assertEqual(code.type, sval.IntType(1, False))
@@ -3841,29 +3850,46 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         self.assertTrue(payload.via_result_ptr)
         self.assertEqual(len(list(sval.iter_ret_leaves(spec))), 3)
 
+    def test_a_value_less_function_returns_its_small_payload_by_value(self) -> None:
+        small = struct_type(Small)
+        # no value to return, one exception: the code is ``u0`` (zero-sized) and
+        # the payload union takes the by-value slot
+        type = sval.ResultType(sval.EmptyType(), (small,))
+        spec = sval.make_ret_spec(type)
+        assert isinstance(spec, sval.RetTuple)
+        _value, code, payload = spec.values
+        assert isinstance(code, sval.RetValue)
+        assert isinstance(payload, sval.RetValue)
+        self.assertEqual(code.type, sval.IntType(0, False))
+        self.assertFalse(code.via_result_ptr)
+        self.assertFalse(payload.via_result_ptr)
+        self.assertIs(sval.ret_returned_type(spec), payload.type)
+
     def test_error_union_subtyping_is_set_inclusion(self) -> None:
         small = struct_type(Small)
         large = struct_type(Large)
-        empty = sval.ErrorUnionType(())
-        one = sval.ErrorUnionType((small,))
-        both = sval.ErrorUnionType((small, large))
+        void = sval.VoidType()
+        empty = sval.ResultType(void, ())
+        one = sval.ResultType(void, (small,))
+        both = sval.ResultType(void, (small, large))
         self.assertTrue(empty.is_subtype_of(one))
         self.assertTrue(one.is_subtype_of(both))
         self.assertFalse(both.is_subtype_of(one))
-        self.assertFalse(one.is_subtype_of(sval.ErrorUnionType((large,))))
+        self.assertFalse(one.is_subtype_of(sval.ResultType(void, (large,))))
 
     def test_error_union_peer_is_the_union_in_delivery_order(self) -> None:
         small = struct_type(Small)
         large = struct_type(Large)
-        peer = sval.ErrorUnionType((small,)).resolve_peer_type(sval.ErrorUnionType((large, small)))
-        self.assertEqual(peer, sval.ErrorUnionType((small, large)))
+        void = sval.VoidType()
+        peer = sval.ResultType(void, (small,)).resolve_peer_type(sval.ResultType(void, (large, small)))
+        self.assertEqual(peer, sval.ResultType(void, (small, large)))
         self.assertEqual(
-            sval.ErrorUnionType(()).resolve_peer_type(sval.ErrorUnionType((small,))),
-            sval.ErrorUnionType((small,)),
+            sval.ResultType(void, ()).resolve_peer_type(sval.ResultType(void, (small,))),
+            sval.ResultType(void, (small,)),
         )
 
     def test_success_is_the_value_of_the_empty_error_union(self) -> None:
-        empty = sval.ErrorUnionType(())
+        empty = sval.ResultType(sval.VoidType(), ())
         success = empty.get_unit_value()
         assert success is not None
         self.assertIsInstance(success, sval.Success)
@@ -3886,8 +3912,8 @@ class SpyErrorUnionPrimitiveTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# raising and propagating exceptions: a function that may raise returns an
-# error code and a payload next to its result (see ``sval.ErrorUnionType``),
+# raising and propagating exceptions: a function that may raise carries an
+# error code and a payload next to its result (see ``sval.ResultType``),
 # and a call carries the error to its caller (remapping the tag)
 # ---------------------------------------------------------------------------
 
@@ -3962,7 +3988,7 @@ def catch_without_declaring(n: i32) -> i32:
 @func()
 def raise_undeclared(n: i32) -> i32:
     # the function declares no exception, so raising one is rejected when the
-    # error is tagged (see ``HirRunner._tag_of``)
+    # error is recorded (see ``HirRunner._add_function_exception``)
     if n < 0:
         raise ErrorA(7)
     return n + 1
@@ -4274,8 +4300,8 @@ class SpyErrorUnionTest(TestCase):
         self.assertIsInstance(args[2], mir.PointerType)
 
     def test_a_function_that_raises_nothing_has_no_error_part(self) -> None:
-        # the empty ``ErrorUnion[]`` is the unit type: an exception-free
-        # function's lowered signature has neither an error code nor a payload
+        # the empty exception set is the unit type: an exception-free function's
+        # lowered signature has neither an error code nor a payload
         self.assertEqual(catch_without_declaring(5), 6)
         args, ret = mir_signature(catch_without_declaring)
         i32_mir = mir.IntType(32, True)
@@ -4284,7 +4310,7 @@ class SpyErrorUnionTest(TestCase):
 
     def test_raising_an_undeclared_exception_is_rejected(self) -> None:
         # the function declares no exception, so the error is rejected when it
-        # is tagged (``HirRunner._tag_of``), with a hint about the declaration
+        # is tagged (``HirRunner._add_function_exception``), with a hint about the declaration
         with self.assertRaises(CompileError) as ctx:
             raise_undeclared(5)
         self.assertIn('cannot raise', str(ctx.exception))
@@ -4517,6 +4543,252 @@ class SpyInferTest(TestCase):
         self.assertEqual(catch_big(5), 0)
 
 
+@func()
+def loop_forever(n: i32):
+    # a body that never delivers a result and never raises: the function can
+    # never return at all (a ``mir.NoReturn`` function)
+    while True:
+        n = n + 1
+
+
+@func()
+def call_loop_forever(n: i32) -> i32:
+    # the ``return -1`` after the call is dead: the call never comes back, and
+    # the declared return type keeps the caller's own result an ``i32``
+    if n < 0:
+        loop_forever(n)
+        return -1
+    return n + 1
+
+
+@func(exceptions={ErrorA})
+def always_raises(n: i32):
+    # no value to return and one exception: the error code is zero-sized
+    # (``u0``) and the payload union takes the by-value result
+    raise ErrorA(n)
+
+
+@func()
+def catch_always_raises(n: i32) -> i32:
+    try:
+        always_raises(n)
+        return 1
+    except ErrorA as e:
+        return e.code + 100
+
+
+@func()
+def never_declared(n: i32) -> Never:
+    # ``-> Never`` declares that no value is ever returned: the body may not
+    # return, and one that also raises nothing cannot return at all
+    while True:
+        n = n + 1
+
+
+@func()
+def call_never_declared(n: i32) -> i32:
+    if n < 0:
+        never_declared(n)
+        return -1
+    return n + 1
+
+
+@func()
+def forward_never(n: i32) -> Never:
+    # a noreturn call ends the path: the implicit fallthrough of the body is
+    # never reached (and so is not rejected)
+    never_declared(n)
+
+
+@func()
+def call_forward_never(n: i32) -> i32:
+    if n < 0:
+        forward_never(n)
+        return -1
+    return n + 1
+
+
+@func(exceptions={ErrorA})
+def raises_never(n: i32) -> Never:
+    # the declared empty value behaves like the inferred one of ``always_raises``
+    raise ErrorA(n)
+
+
+@func()
+def catch_raises_never(n: i32) -> i32:
+    try:
+        raises_never(n)
+        return 1
+    except ErrorA as e:
+        return e.code + 200
+
+
+@func()
+def returns_from_never(n: i32) -> Never:
+    # the return is rejected: the function has no value to return (and the
+    # store of its value into the empty result location is a no-op)
+    return n  # pyright: ignore
+
+
+@func()
+def falls_through_never(n: i32) -> Never:  # pyright: ignore
+    # falling off the end of the body is a returning path too
+    n = n + 1
+
+
+def inline_never(n: i32) -> Never:
+    # an inlined body that always raises: its declaration holds, and the caller's
+    # code after the call is dead (the body reaches no continuation)
+    raise ErrorA(n)
+
+
+@func(exceptions="infer")
+def catch_inline_never(n: i32) -> i32:
+    try:
+        inline_never(n)
+        return 1
+    except ErrorA as e:
+        return e.code + 300
+
+
+def inline_returns_from_never(n: i32) -> Never:
+    # an inlined body has no convention of its own, so its declaration is what
+    # rejects the return
+    return n  # pyright: ignore
+
+
+@func()
+def call_inline_returns_from_never(n: i32) -> i32:
+    return inline_returns_from_never(n) + 1
+
+
+def inline_falls_through_never(n: i32) -> Never:  # pyright: ignore
+    n = n + 1
+
+
+@func()
+def call_inline_falls_through_never(n: i32) -> i32:
+    inline_falls_through_never(n)
+    return 1
+
+
+@func(exceptions="infer")
+def forward_always_raises(n: i32) -> i32:
+    # the callee's payload union is a subset of this function's own (which also
+    # holds ``ErrorB``): the by-value payload is written into the function's own
+    # payload through a pointer reinterpretation (a union cannot be converted),
+    # and the error is then only tagged (no copy)
+    if n > 100:
+        raise ErrorB(n)
+    return always_raises(n) + 1
+
+
+@func(exceptions="infer")
+def catch_forward_always_raises(n: i32) -> i32:
+    try:
+        return forward_always_raises(n)
+    except ErrorA as e:
+        return e.code + 100
+
+
+class SpyNoReturnTest(TestCase):
+    """A function that cannot return: a body that never delivers a result and
+    raises nothing lowers to a ``mir.NoReturn`` function - its LLVM form is
+    marked ``noreturn`` and a call of it ends the block it sits in, so the code
+    after the call is dead - while a value-less function that raises carries
+    error codes that start at 0 (one exception needs no code at all)."""
+
+    def test_a_value_less_function_without_errors_is_noreturn(self) -> None:
+        self.assertEqual(call_loop_forever(5), 6)
+        args, ret = mir_signature(loop_forever)
+        self.assertIs(ret, mir.NORETURN)
+        self.assertEqual(args, (mir.IntType(32, True),))
+        # the dead ``return -1`` was never typed, so the caller's result is
+        # still the declared ``i32``
+        _args, caller_ret = mir_signature(call_loop_forever)
+        self.assertEqual(caller_ret, mir.IntType(32, True))
+
+    def test_the_noreturn_function_is_marked_in_the_ir(self) -> None:
+        self.assertEqual(call_loop_forever(5), 6)
+        entry = loop_forever.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        native = instance.wrapper_fn or instance.native_fn
+        assert native is not None
+        text = '\n'.join(native.print_all())
+        self.assertIn('define void', text)
+        self.assertIn('noreturn', text)
+        # a call of it ends its block, and LLVM wants every block to end with an
+        # explicit terminator
+        self.assertIn('unreachable', text)
+
+    def test_a_declared_never_function_is_noreturn(self) -> None:
+        # ``-> Never`` declares the empty return type, which with an empty
+        # exception set is a function that can never return
+        self.assertEqual(call_never_declared(5), 6)
+        args, ret = mir_signature(never_declared)
+        self.assertIs(ret, mir.NORETURN)
+        self.assertEqual(args, (mir.IntType(32, True),))
+
+    def test_a_declared_never_function_matches_the_inferred_one(self) -> None:
+        # the declared empty value lowers to the same result type as the one
+        # ``always_raises`` infers from its body: no code, the payload by value
+        self.assertEqual(catch_raises_never(7), 207)
+        self.assertEqual(mir_signature(raises_never), mir_signature(always_raises))
+
+    def test_a_never_function_forwarding_a_noreturn_call(self) -> None:
+        # the call ends the path, so the body's fallthrough never runs
+        self.assertEqual(call_forward_never(5), 6)
+        _args, ret = mir_signature(forward_never)
+        self.assertIs(ret, mir.NORETURN)
+
+    def test_returning_from_a_never_function_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            returns_from_never(5)
+        self.assertIn('cannot return', str(ctx.exception))
+
+    def test_falling_through_a_never_function_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            falls_through_never(5)
+        self.assertIn('fall off its end', str(ctx.exception))
+
+    def test_an_inlined_never_body_may_not_return(self) -> None:
+        self.assertEqual(catch_inline_never(7), 307)
+        with self.assertRaises(CompileError) as ctx:
+            call_inline_returns_from_never(5)
+        self.assertIn('cannot return', str(ctx.exception))
+
+    def test_an_inlined_never_body_may_not_fall_through(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            call_inline_falls_through_never(5)
+        self.assertIn('fall off its end', str(ctx.exception))
+
+    def test_a_value_less_function_with_one_exception_has_no_code(self) -> None:
+        self.assertEqual(catch_always_raises(7), 107)
+        args, ret = mir_signature(always_raises)
+        # no error code at all: the i-th exception of a value-less function is
+        # tagged ``i``, so a single one needs no code, and the payload union is
+        # the by-value result
+        self.assertEqual(args, (mir.IntType(32, True),))
+        self.assertIsInstance(ret, mir.UnionType)
+
+    def test_a_by_value_payload_fills_a_wider_union(self) -> None:
+        # the caller's own payload union is wider than the callee's, so the
+        # returned union is written through a reinterpreted pointer and the error
+        # is carried on as a tag alone
+        self.assertEqual(call_with_error(catch_forward_always_raises, 7)[:2], (107, 0))
+        _result, code, payload = call_with_error(forward_always_raises, 7)
+        self.assertEqual((code, payload), (2, 7))
+        _result, code, payload = call_with_error(forward_always_raises, 105)
+        self.assertEqual((code, payload), (1, 105))
+        entry = forward_always_raises.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        assert instance.ret_sig is not None
+        self.assertEqual(
+            list(instance.ret_sig.exceptions.values),
+            [struct_type(ErrorB), struct_type(ErrorA)],
+        )
+
+
 all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
@@ -4542,4 +4814,5 @@ all_tests = [
     SpyErrorUnionTest,
     SpyTryExceptTest,
     SpyInferTest,
+    SpyNoReturnTest,
 ]

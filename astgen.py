@@ -1015,7 +1015,9 @@ def parse_function(
     # ``None``, and an explicit ``-> None`` becomes the spy ``VoidType``
     # (so that the two can be told apart - the first one lets the return
     # type be inferred from the body, the second declares a void
-    # function).  An annotation that subscripts a struct template evaluates
+    # function); an explicit ``-> Never`` becomes the spy ``EmptyType``
+    # (a function that never returns a value, see ``sval.EmptyType``).  An
+    # annotation that subscripts a struct template evaluates
     # to a ``sval.StructTypeApplication``; ``convert`` resolves it against
     # the type parameters (see ``sval.as_value``).
     try:

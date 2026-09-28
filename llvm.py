@@ -651,12 +651,16 @@ class FunctionArgs(IFunction):
         return ret
 
 class Function(GlobalValue, IFunction):
-    def __init__(self, name: str | None = None, internal: bool = False, entry: BasicBlock | None = None) -> None:
+    def __init__(self, name: str | None = None, internal: bool = False, entry: BasicBlock | None = None, noreturn: bool = False) -> None:
         self.name = name
         self._entry = entry if entry is not None else BasicBlock()
         self._args: list[ArgValue] = []
         self._type: FnType | None = None
         self._internal = internal
+        # whether the function never returns: it is emitted with the ``noreturn``
+        # attribute, and the blocks of its body hold no terminator after a call
+        # of it
+        self._noreturn = noreturn
 
     @property
     def entry(self):
@@ -667,7 +671,8 @@ class Function(GlobalValue, IFunction):
         assert self._type is not None
         ret: list[str] = []
         local_counter: ObjectCounter[LocalValue] = ObjectCounter()
-        ret.append(f'define {'internal ' if self._internal else ''}{self._type.return_type.stringify(name_context)} @{name_context.get_global_name(self)}({', '.join(i.stringify(name_context, local_counter) for i in self._args)}) {{')
+        attributes = ' noreturn' if self._noreturn else ''
+        ret.append(f'define {'internal ' if self._internal else ''}{self._type.return_type.stringify(name_context)} @{name_context.get_global_name(self)}({', '.join(i.stringify(name_context, local_counter) for i in self._args)}){attributes} {{')
 
         blocks = self._entry.collect_blocks()
 
@@ -867,6 +872,9 @@ class BasicBlock(LocalValue):
 
     def ret(self, value: Value | None = None):
         self.emit(Ret(value if value is not None else VoidValue()))
+
+    def unreachable(self):
+        self.emit(Unreachable())
 
     def extract_value(self, value: Value, *indices: int):
         return self.emit(ExtractValue(value, indices))
@@ -1659,6 +1667,23 @@ class Ret(Branch):
     @override
     def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
         return f'ret {self.value.stringify(name_context, local_counter)}'
+
+class Unreachable(Branch):
+    """The end of a path that can never be taken: the block of a call of a
+    function that never returns (LLVM requires every block to end with an
+    explicit terminator)."""
+
+    @override
+    def get_children(self) -> list[Value]:
+        return []
+
+    @override
+    def get_type(self) -> Type:
+        return VoidType()
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        return 'unreachable'
 
 @gen_get_children
 class Phi(Inst):
