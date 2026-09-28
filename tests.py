@@ -4140,6 +4140,15 @@ def inferred_raise(n: i32) -> i32:
 
 
 @func(exceptions="infer")
+def inferred_return_first(n: i32) -> i32:
+    # the successful return is typed before the raise that widens the set, so
+    # the return path clears the error code before the set is even known
+    if n >= 0:
+        return n + 1
+    raise ErrorC(7)
+
+
+@func(exceptions="infer")
 def inferred_forward(n: i32) -> i32:
     return inferred_raise(n) + 10
 
@@ -4448,6 +4457,11 @@ class SpyInferTest(TestCase):
     def test_an_inferred_error_propagates(self) -> None:
         self.assertEqual(call_with_error(inferred_forward, 5)[:2], (16, 0))
         self.assertEqual(call_with_error(inferred_forward, -3)[1:], (1, 7))
+
+    def test_a_return_before_the_raise_still_clears_the_code(self) -> None:
+        # the successful path is typed before the raise widens the set
+        self.assertEqual(call_with_error(inferred_return_first, 5)[:2], (6, 0))
+        self.assertEqual(call_with_error(inferred_return_first, -3)[1:], (1, 7))
 
     def test_a_fully_caught_inferred_function_is_callable(self) -> None:
         self.assertEqual(inferred_catch(5), 6)

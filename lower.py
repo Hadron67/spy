@@ -193,6 +193,9 @@ class _Lowerer:
     ) -> None:
         self._types = types
         self._lowered: dict[object, sllvm.Value] = {}
+        # the instructions already lowered (a terminator has no lowered value,
+        # so ``_lowered`` alone cannot tell whether one was lowered)
+        self._lowered_ids: set[int] = set()
         self._globals = globals
         self.lowered_globals: dict[mir.GlobalValue, sllvm.GlobalValue] = {}
 
@@ -237,23 +240,43 @@ class _Lowerer:
             hoisted = False
             for block in blocks:
                 for inst in block.insts:
-                    if not isinstance(inst, mir.BitCast) or id(inst) in self._lowered:
+                    if not isinstance(inst, mir.BitCast) or id(inst) in self._lowered_ids:
                         continue
                     operand = inst.value
                     if isinstance(operand, mir.Param) or (
-                        isinstance(operand, mir.Inst) and id(operand) in self._lowered
+                        isinstance(operand, mir.Inst) and id(operand) in self._lowered_ids
                     ):
                         self._lower_inst(llvm_fn.entry, inst, arg_values, block_map)
                         hoisted = True
+        # lower every remaining instruction, iterating the blocks until no
+        # progress: an instruction is lowered once every value it uses is (a
+        # ``Phi``'s incomings are defined in its predecessors, so a phi is
+        # lowered once they are), and an instruction is never lowered before an
+        # earlier one of its block - so the definitions stay in order and a phi,
+        # its block's first instruction, is inserted at the front
+        progress = True
+        while progress:
+            progress = False
+            for block in blocks:
+                for inst in block.insts:
+                    if id(inst) in self._lowered_ids:
+                        continue
+                    if not self._operands_lowered(inst):
+                        break
+                    self._lower_inst(block_map[id(block)], inst, arg_values, block_map)
+                    progress = True
         for block in blocks:
-            target = block_map[id(block)]
             for inst in block.insts:
-                if id(inst) in self._lowered:
-                    # an ``Alloca`` or a resolved ``BitCast``: already lowered
-                    # into the entry block
-                    continue
-                self._lower_inst(target, inst, arg_values, block_map)
+                if id(inst) not in self._lowered_ids:
+                    raise CompileError(f'internal error: cannot lower the MIR instruction {inst!r} in {block!r}')
         return llvm_fn
+
+    def _operands_lowered(self, inst: mir.Inst) -> bool:
+        """Whether every instruction ``inst`` uses has been lowered already."""
+        for child in inst.get_children():
+            if isinstance(child, mir.Inst) and id(child) not in self._lowered_ids:
+                return False
+        return True
 
     def _value(self, value: mir.Value, arg_values: tuple[sllvm.Value, ...]) -> sllvm.Value:
         if isinstance(value, mir.Param):
@@ -383,6 +406,15 @@ class _Lowerer:
                     result = block.icmp(op, inst.signed, lhs, rhs)
                 else:
                     result = block.fcmp(op, lhs, rhs)
+            case mir.Phi():
+                incomings = inst.incomings
+                first_value, first_block = incomings[0]
+                phi = sllvm.Phi((self._value(first_value, arg_values), block_map[id(first_block)]))
+                for value, pred in incomings[1:]:
+                    phi.add_incoming(self._value(value, arg_values), block_map[id(pred)])
+                # an LLVM phi must lead its basic block
+                block.insts.insert(0, phi)
+                result = phi
             case mir.Call():
                 callee = self._value(inst.callee, arg_values)
                 result = block.call(
@@ -408,6 +440,7 @@ class _Lowerer:
                 )
             case _:
                 raise CompileError(f'unsupported MIR instruction {type(inst).__name__}')
+        self._lowered_ids.add(id(inst))
         if result is not None:
             self._lowered[id(inst)] = result
 

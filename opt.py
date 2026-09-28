@@ -138,6 +138,8 @@ def simplify(fn: mir.Function) -> None:
                 inst.cond = resolve(inst.cond)
             case mir.Switch():
                 inst.value = resolve(inst.value)
+            case mir.Phi():
+                inst.incomings = [(resolve(value), block) for value, block in inst.incomings]
             case _:
                 pass
 
@@ -229,5 +231,7 @@ def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
             return ((inst.cond, 'use'),)
         case mir.Switch():
             return ((inst.value, 'use'),)
+        case mir.Phi():
+            return tuple((value, 'use') for value, _ in inst.incomings)
         case _:
             return ()

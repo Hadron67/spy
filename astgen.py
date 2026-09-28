@@ -240,16 +240,16 @@ class _Builder:
                     self.add(hir.StoreVoidRetloc())
                 self.add(hir.Ret())
             case ast.Raise():
-                # the exception is delivered into the function's error
-                # location (its payload written and its error code set by the
-                # result-location conversion), then the path ends - the
-                # ``hir.Raise`` itself carries nothing
+                # the exception is built into a slot of its own (result-location
+                # semantics); ``hir.Raise`` then tags and dispatches it (see
+                # ``interp``)
                 if node.exc is None:
                     raise CompileError(
                         f'a bare raise is not supported yet in spy function {fn_name}'
                     )
-                self._gen_result_loc(node.exc, hir.ErrorLoc())
-                self.add(hir.Raise())
+                slot = self.add(hir.Alloca(hir.InlineMode.NON_AGGREGATE))
+                self._gen_result_loc(node.exc, slot)
+                self.add(hir.Raise(slot))
             case ast.Pass():
                 pass
             case ast.Expr():
@@ -376,7 +376,7 @@ class _Builder:
         ``interp``)."""
         # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
         # iteration would restart the iteration)
-        it = self.add(hir.Alloca())
+        it = self.add(hir.Alloca(hir.InlineMode.FULL if is_inline else hir.InlineMode.NON_AGGREGATE))
         base = self._as_ref(self._gen_expr(node.iter)[0])
         self.add(hir.CallMethodInplace(base, '__iter__', RawArgList((), frozendict()), it))
         self.add(hir.CommitSlot(it))
@@ -401,10 +401,10 @@ class _Builder:
     def _gen_try(self, node: ast.Try) -> None:
         """Translate one ``try``/``except`` statement: the try body, then one
         ``hir.Except`` marker (and clause body) per handler, closed by an
-        ``hir.End``.  The ``as`` slot of every clause is reserved *before* the
-        ``Try`` so that the clause body can read it; the interpreter writes the
-        caught exception into it (see ``hir.Try``).  ``else``/``finally`` are
-        not supported yet."""
+        ``hir.End``.  A clause that binds its exception (``as e``) opens with
+        an :class:`hir.ExceptBind`, whose value - the address the caught
+        exception was delivered through - the clause's ``as`` name is bound to
+        (see ``interp``).  ``else``/``finally`` are not supported yet."""
         fn_name = self._fn_ir.name
         if len(node.orelse) > 0:
             raise CompileError(f'try-else is not supported in spy function {fn_name}')
@@ -412,18 +412,22 @@ class _Builder:
             raise CompileError(f'try-finally is not supported in spy function {fn_name}')
         if len(node.handlers) == 0:
             raise CompileError(f'a try must have an except clause in spy function {fn_name}')
-        binds: list[hir.Value | None] = []
+        binds: list[hir.ExceptBind | None] = []
         for handler in node.handlers:
             if handler.name is not None:
-                binds.append(self.add(hir.Alloca()))
+                binds.append(hir.ExceptBind())
             else:
                 binds.append(None)
         self.add(hir.Try(tuple(binds)))
         self._gen_body(node.body)
         for index, handler in enumerate(node.handlers):
             self.add(hir.Except(self._gen_except_type(handler.type), index))
-            sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
             bind = binds[index]
+            if bind is not None:
+                # the bind reads the clause's payload pointer: it is the first
+                # instruction of the clause body
+                self.add(bind)
+            sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
             if handler.name is not None:
                 assert bind is not None
                 sub._scope.bindings[handler.name] = bind

@@ -141,14 +141,6 @@ class ResultLoc(Value):
     """The result location of the function whose body is being executed"""
 
 
-@dataclass(frozen=True)
-class ErrorLoc(Value):
-    """The error location of the function whose body is being executed: the
-    place a ``raise`` delivers its exception into (the error code and the
-    payload).  Like :class:`ResultLoc` it is a leaf the interpreter resolves
-    to the state of the function proper, not a register of its own."""
-
-
 class Inst(Value):
     """An instruction; the object itself acts as its result register."""
 
@@ -386,11 +378,22 @@ class Ret(Inst):
 
 @dataclass(eq=False)
 class Raise(Inst):
-    """End one path of the function with an error; a path is terminated by a
-    ``raise`` statement, whose exception was already delivered into the
-    function's error location (:class:`ErrorLoc`) by the result-location
-    evaluation that precedes it - like a ``Ret``, whose value the result
-    location already holds.  The instruction therefore carries nothing."""
+    """End one path with an error: the exception value has already been
+    written into the slot ``value`` denotes (the result-location evaluation
+    that precedes this instruction built it there), and the interpreter tags
+    the current function's error location / dispatches it to the catching
+    ``except`` clause (see ``interp``)."""
+
+    value: Value
+
+
+@dataclass(eq=False)
+class ExceptBind(Inst):
+    """The address an ``except E as e`` clause caught its exception through:
+    the value of the clause's error-payload ``Phi`` - the one place the caught
+    exception lives, written by whoever raised it.  The clause's ``as`` name is
+    bound to this value directly, so reading it loads the exception and
+    ``ref(e)`` is the pointer itself (see ``interp``)."""
 
 
 @dataclass(eq=False)

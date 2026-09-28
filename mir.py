@@ -526,6 +526,38 @@ class Cmp(Inst):
 
 
 @dataclass(eq=False)
+class Phi(Inst):
+    """A value that is one of several incoming values, chosen by the
+    predecessor block control arrived from: how one merge point - the entry of
+    an ``except`` block - takes the error payload pointer that several error
+    dispatches deliver to it.  ``incomings`` pairs every incoming value with
+    the block it flows from; its result type is the (common) type of the
+    values."""
+
+    incomings: list[tuple[Value, BasicBlock]]
+
+    def add_incoming(self, value: Value, block: BasicBlock) -> None:
+        self.incomings.append((value, block))
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.incomings[0][0].get_type()
+
+    def get_children(self) -> tuple[Any, ...]:
+        return tuple(value for value, _ in self.incomings)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        changed = False
+        incomings: list[tuple[Value, BasicBlock]] = []
+        for value, block in self.incomings:
+            mapped = f(value)
+            if mapped is not value:
+                changed = True
+            incomings.append((mapped, block))
+        return self if not changed else replace(self, incomings=incomings)
+
+
+@dataclass(eq=False)
 class Call(Inst):
     """A call of a function value returning a value of type ``type``
     (``mir.VOID`` for a call of a void function, which produces no

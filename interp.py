@@ -207,29 +207,6 @@ class _PendingPtrConvertion(_PendingActionData):
         return self.type, False
 
 @dataclass
-class _PendingError(_PendingActionData):
-    """The error-union counterpart of :class:`_PendingPtrConvertion`: one
-    delivery of an error union into a still uncommitted error space.  ``types``
-    is the exception set it delivers; ``output`` is the placeholder a call
-    returning the exception through a result pointer writes through - the
-    commit fills it in with the payload pointer and the error tag; and
-    ``source_code``/``source_payload`` are a call's (or a re-raise's) error,
-    whose runtime tag is remapped into the space, with the instructions emitted
-    into ``error_block`` and control then handed to ``handler_block`` (the entry
-    of the try handler's dispatch chain, or None to return from the function)."""
-
-    types: tuple[sval.Type, ...]
-    output: mir.Insertion | None = None
-    source_code: InterpVal | None = None
-    source_payload: InterpVal | None = None
-    error_block: mir.BasicBlock | None = None
-    handler_block: mir.BasicBlock | None = None
-
-    @override
-    def info(self) -> tuple[sval.Type, bool]:
-        return sval.ErrorUnionType(self.types), False
-
-@dataclass
 class _PendingTuple(_PendingActionData):
     # one tuple initialization recorded by a PendingSlot (see ``init_tuple``):
     # the places the tuple's elements are written into.  A tuple has no
@@ -262,10 +239,6 @@ class _PendingAggregate(_PendingActionData):
     def info(self) -> tuple[sval.Type, bool]:
         return self.type, True
 
-class CommittedTypeConverter(IntEnum):
-    NONE = auto()
-    ERROR_UNION = auto()
-
 @dataclass(slots=True)
 class PendingSlot(InterpVal):
     """The value of an executed ``hir.Alloca`` before it is *committed*.
@@ -289,21 +262,13 @@ class PendingSlot(InterpVal):
 
     insertion: mir.Insertion
     inline_mode: InlineMode
-    committed_type_converter: CommittedTypeConverter = CommittedTypeConverter.NONE
     stores: list[_PendingAction] = field(default_factory=list)
     committed: InterpVal | None = None
 
     def committed_type(self) -> sval.Type:
-        # an error-space slot contributes ``ErrorUnion`` types: a plain
-        # exception (or the ``Success`` value) an action delivers is read as a
-        # one-exception error union, so the peer of the stores is the union of
-        # the exception sets
-        error_space = self.committed_type_converter == CommittedTypeConverter.ERROR_UNION
         type: sval.Type | None = None
         for store in self.stores:
             slot_type, _ = store.data.info()
-            if error_space and not isinstance(slot_type, sval.ErrorUnionType):
-                slot_type = sval.ErrorUnionType((slot_type,))
             if type is None:
                 type = slot_type
             else:
@@ -315,9 +280,6 @@ class PendingSlot(InterpVal):
                 type = peer
         if type is None:
             type = sval.EmptyType()
-        if error_space and not isinstance(type, sval.ErrorUnionType):
-            # the slot never received a delivery: it raises nothing
-            type = sval.ErrorUnionType(())
         return type
 
     def is_inline(self, type: sval.Type) -> bool:
@@ -355,13 +317,13 @@ class ComptimeAggregatePtr(InterpVal):
 
 @dataclass
 class ComptimeErrorUnion(InterpVal):
-    """The interpreter's handle to a committed error-union location: the place
-    of the error code and the place of the payload union.  ``types`` is the
-    exception set, in first-delivery order (the i-th exception has tag
-    ``i + 1``).  A still uncommitted error location is an ordinary
-    :class:`PendingSlot` marked with the ``ERROR_UNION`` converter, which its
-    commit materializes into a :class:`ComptimeErrorUnion` (see
-    ``_commit_error_space``)."""
+    """The interpreter's handle to one error location: the place of the error
+    code and the place of the payload union.  ``types`` is the exception set, in
+    first-delivery order (the i-th exception has tag ``i + 1``), and it grows as
+    an inferred location receives deliveries.  ``code``/``payload`` are the
+    location's two places: :class:`PendingSlot`s while the location is not
+    committed yet (their exact widths follow from ``types`` at the commit, see
+    ``_commit_error_space``), and the materialized places afterwards."""
 
     code: InterpVal
     payload: InterpVal
@@ -495,26 +457,36 @@ class LoopBlockData(BlockFrameData):
 class TryExceptBlockData(BlockFrameData):
     """The state of one open ``try`` of the HIR.
 
-    ``space`` is the try's own error space - the target of every error raised
-    in its body, committed once the body has been walked (see ``_commit_try``;
-    it is active only while the body is being typed).  ``region`` is the region
-    being walked: 0 is the try body, ``i + 1`` the i-th except clause.
-    ``checks[i]`` is the block the error is dispatched from to the i-th clause's
-    body and ``reraise`` the block a non-matching error falls through to;
-    ``join`` is the block the falling regions continue in.  ``binds`` holds the
-    ``as`` slot of every clause (see ``hir.Try``)."""
+    ``region`` is the region being walked: 0 is the try body, ``i + 1`` the
+    i-th except clause.  Every error raised while the body is typed is
+    dispatched straight to the clause that catches it (see
+    ``HirRunner._find_catching_clause``); a clause's entry block is created
+    lazily, on the first dispatch that reaches it, so a clause no error reaches
+    is dead code - its HIR is never typed.  ``payload_phi[i]`` is the ``Phi``
+    clause ``i``'s error payload pointer is delivered through (the clause's
+    ``binds[i]``, an :class:`hir.ExceptBind`, reads it) and ``code_phi[i]`` the
+    ``Phi`` carrying the remapped error code of a *bare* clause.  ``join`` is the
+    block the falling regions continue in, and ``binds`` holds the ``as`` bind
+    of every clause (see ``hir.Try``)."""
 
-    space: PendingSlot
+    insts: tuple[hir.Inst, ...]
+    p_excepts: list[int]
+    p_end: int
+    binds: tuple[hir.Value | None, ...]
+    join: mir.BasicBlock
+    clause_blocks: list[mir.BasicBlock | None] = field(default_factory=list)
+    payload_phi: list[mir.Phi | None] = field(default_factory=list)
+    code_phi: list[mir.Phi | None] = field(default_factory=list)
+    # the dispatches into a *bare* clause, whose union - and so the phi types -
+    # is only fixed once the try body has been walked; one (clause, case block,
+    # variant pointer, exception type) per dispatch (see
+    # ``_begin_except_clause``)
+    bare_pending: list[tuple[int, mir.BasicBlock, InterpVal, sval.Type]] = field(default_factory=list)
     region: int = 0
-    p_excepts: list[int] = field(default_factory=list)
-    p_end: int = 0
-    checks: list[mir.BasicBlock] = field(default_factory=list)
-    reraise: mir.BasicBlock | None = None
-    join: mir.BasicBlock | None = None
-    binds: tuple[hir.Value | None, ...] = ()
-    committed: bool = False
-    # whether any region (the body or a clause) fell through to ``join``: when
-    # the last region *returns* instead, the join is still reachable then
+    # the try body has been walked: errors at the current position no longer
+    # belong to this try
+    body_done: bool = False
+    # whether any region (the body or a clause) fell through to ``join``
     fell: bool = False
 
 @dataclass
@@ -734,17 +706,12 @@ def _tuple_places_type(places: tuple[ArgEntry[InterpVal], ...]) -> sval.Type:
     return sval.TupleType(tuple(types), False)
 
 
-def _error_union_type(ev: InterpVal) -> sval.ErrorUnionType:
-    """The error-union type of an error location: a committed space's set, or
-    the type a still uncommitted error slot would commit to (its stores read as
-    error-union deliveries)."""
-    ev = _shallow_normalize(ev)
-    if isinstance(ev, ComptimeErrorUnion):
-        return sval.ErrorUnionType(tuple(ev.types))
-    assert isinstance(ev, PendingSlot) and ev.committed is None
-    type = ev.committed_type()
-    assert isinstance(type, sval.ErrorUnionType)
-    return type
+def _union_contains(superset: sval.UnionType, subset: sval.UnionType) -> bool:
+    """Whether every variant of ``subset`` is a variant of ``superset``: the
+    two unions then share their layout (every variant lives at offset 0, and the
+    superset's storage holds the subset's), so one's pointer can be used as the
+    other's (see ``HirRunner._convert_result_ptr``)."""
+    return all(exception in superset.types for exception in subset.types)
 
 
 def _result_places(location: InterpVal) -> tuple[InterpVal, ...]:
@@ -1062,13 +1029,13 @@ class HirRunner:
             # the whole return convention is declared: fix it before the body
             self._materialize_ret_sig(ret_sig.complete())
 
-    def _reserve_result_loc(self, ret_sig: PartialReturnSignature | None) -> tuple[InterpVal, PendingSlot]:
-        """``(value_loc, error_space)``: the place the declared results are
-        delivered into and the function's error space (the two parts of the
-        function proper's result location at ``InlineFrame.ret_loc``).  The
-        error space is an error-union slot either way - declared or still to be
-        inferred - and is committed once the return convention is known (see
-        ``_materialize_ret_sig``)."""
+    def _reserve_result_loc(self, ret_sig: PartialReturnSignature | None) -> tuple[InterpVal, ComptimeErrorUnion]:
+        """``(value_loc, error)``: the place the declared results are delivered
+        into and the function's error location (the two parts of the function
+        proper's result location at ``InlineFrame.ret_loc``).  The error location
+        is a :class:`ComptimeErrorUnion` whose code and payload places are fresh
+        slots - committed right away when the signature declares the error part,
+        and once the set is known otherwise (see ``_materialize_ret_sig``)."""
         declared_value = ret_sig.ret_type_spec if ret_sig is not None else None
         if ret_sig is not None and ret_sig.is_complete():
             # the value and the error part are both declared: the result
@@ -1076,7 +1043,7 @@ class HirRunner:
             loc = self._ret_spec_place(ret_sig.complete().ret_spec())
             assert isinstance(loc, ComptimeTuple) and len(loc.values) == 2
             error = loc.values[1].value
-            assert isinstance(error, PendingSlot)
+            assert isinstance(error, ComptimeErrorUnion)
             return loc.values[0].value, error
         space = self._new_error_space()
         if declared_value is not None:
@@ -1138,8 +1105,8 @@ class HirRunner:
     def _ret_spec_place(self, node: RetSpec) -> InterpVal:
         """The result place one declared result is delivered into: a fresh slot
         for a value, a tuple of the places of its elements for a group, and a
-        fresh error-union slot for an error group (its exception set is fixed
-        when the slot is committed, see ``_materialize_ret_sig``)."""
+        fresh error location for an error group (its exception set and storage
+        are fixed when it is committed, see ``_commit_error_space``)."""
         match node:
             case RetValue():
                 return self.alloca(InlineMode.NONE)
@@ -1192,7 +1159,7 @@ class HirRunner:
                 self._commit_pending_slot(place, node.type, ptr=self._ret_leaf_ptr(node))
             case RetTuple(type=type, values=values):
                 if isinstance(type, sval.ErrorUnionType):
-                    assert isinstance(place, PendingSlot) and place.committed is None
+                    assert isinstance(place, ComptimeErrorUnion)
                     code_ptr = self._ret_leaf_ptr(values[0])
                     payload_ptr = self._ret_leaf_ptr(values[1])
                     self._commit_error_space(place, type, code_ptr, payload_ptr)
@@ -1236,38 +1203,38 @@ class HirRunner:
         part of the frame's result location (its error part is separate)."""
         return self._current_result_loc().values[0].value
 
-    def _error_space(self) -> PendingSlot:
-        """The function proper's own error space (the error part of its result
-        location; ``ErrorUnion[]`` for a function that raises nothing)."""
+    def _error_space(self) -> ComptimeErrorUnion:
+        """The function proper's own error location (the error part of its
+        result location; an empty set for a function that raises nothing)."""
         space = self._frames[0].ret_loc.values[1].value
-        assert isinstance(space, PendingSlot)
+        assert isinstance(space, ComptimeErrorUnion)
         return space
 
-    def _active_try(self) -> TryExceptBlockData | None:
-        """The innermost *open* try block the walk currently sits in, or None
-        when no try body is being typed.  A try is open only while its body is
-        walked: from the moment its space is committed (``_commit_try``, which
-        runs before the clauses and after the body) the error at the current
-        position belongs to the enclosing try instead.  The frames are
-        searched innermost-last so that an error of an inlined body belongs to
-        the try blocks enclosing its caller - the single place both the error
-        location (``_innermost_error_space``) and the handler
-        (``_innermost_handler``) are read from, so that the two always agree."""
+    def _function_error_inferred(self) -> bool:
+        """Whether the function proper's exception set is still to be inferred
+        (``@func(exceptions="infer")``, or no annotation at all)."""
+        partial = self.partial_ret_sig
+        return partial is None or partial.exceptions is None
+
+    def _find_catching_clause(self, exception: sval.Type) -> tuple[TryExceptBlockData, int] | None:
+        """The clause that catches ``exception`` at the current position: the
+        first clause of the innermost open try that names it (a bare ``except``
+        matching anything), or None when no clause catches it and the error
+        escapes the function.  The frames are searched innermost-last, so that
+        an error of an inlined body belongs to the try blocks enclosing its
+        caller."""
         for frame in reversed(self._frames):
             for bf in reversed(frame.block_stack):
                 data = bf.data
-                if isinstance(data, TryExceptBlockData) and not data.committed:
-                    return data
+                if not isinstance(data, TryExceptBlockData) or data.body_done:
+                    continue
+                for index, position in enumerate(data.p_excepts):
+                    inst = data.insts[position]
+                    assert isinstance(inst, hir.Except)
+                    clause_type = self._except_struct_type(inst.type)
+                    if clause_type is None or clause_type == exception:
+                        return data, index
         return None
-
-    def _innermost_error_space(self) -> PendingSlot:
-        """The error space the errors at the current position are delivered
-        into: the innermost open try's space, or else the function proper's
-        own.  This is what ``hir.ErrorLoc`` resolves to."""
-        data = self._active_try()
-        if data is not None:
-            return data.space
-        return self._error_space()
 
     def _defer_return(self) -> None:
         """End a path whose return convention is not fixed yet: a placeholder
@@ -1296,78 +1263,88 @@ class HirRunner:
             self._cur_block.emit(mir.Ret(self._to_runtime(self.load(places[index]))))
 
     def _set_error_code_zero(self) -> None:
-        """Record a successful outcome: the ``Success`` value of the function
-        proper's error space is delivered (a ``return`` path is defined to carry
-        no error)."""
-        self.store(self._error_space(), ComptimeVal(sval.Success()))
+        """Record a successful outcome: the function proper's error code is
+        cleared (a ``return`` path is defined to carry no error).  The store is
+        made with at least one bit so that it takes part in the code slot's type
+        even when no exception has been delivered yet - an inferred set may
+        still grow later, and the successful path must clear the code either
+        way."""
+        eu = self._error_space()
+        self.store(eu.code, ComptimeVal(sval.Int(0, sval.IntType(0, False))))
 
-    def _raise(self) -> PollResult:
-        """End one path of the function proper with an error (``hir.Raise``):
-        the exception already sits in its error location, and the path ends -
-        at the innermost try handler when one is open, or by returning from the
-        function otherwise (the enclosing HIR blocks are unwound like a
-        ``return``'s, see ``_cut``)."""
-        self._propagate_error()
+    def _end_error_path(self) -> None:
+        """End a path at the function boundary (an error escaping the function):
+        a typed return, or a deferred one when the convention is not fixed yet."""
+        if self.ret_sig is None:
+            self._defer_return()
+        else:
+            self._emit_function_return()
+
+    def _raise(self, slot: InterpVal) -> PollResult:
+        """End one path with ``hir.Raise``: the exception has been built into
+        the slot ``slot``.  It is dispatched straight to the clause that catches
+        its type when there is one, or written into the function's error
+        location and returned otherwise; the enclosing HIR blocks are then
+        unwound like a ``return``'s (see ``_cut``)."""
+        exception = _place_type(slot)
+        if not isinstance(exception, sval.StructType):
+            raise CompileError(f'cannot raise {exception!r}: an exception must be a struct')
+        target = self._find_catching_clause(exception)
+        if target is not None:
+            data, index = target
+            if exception.is_zst():
+                incoming = ComptimeVal(sval.Undefined(sval.PointerType(exception, is_const=False)))
+            else:
+                self._commit_pending_slot(slot, exception)
+                incoming = _shallow_normalize(slot)
+            self._route_to_clause(data, index, incoming, exception)
+        else:
+            self._deliver_uncaught_raise(slot, exception)
         return self._cut()
 
-    # -- error spaces ------------------------------------------------------
+    # -- error locations ---------------------------------------------------
 
-    def _new_error_space(self) -> PendingSlot:
-        """A fresh error-union location: a slot marked so that its stores are
-        read as error-union deliveries (a plain exception, or ``Success``, each
-        seen as a one-exception error union).  Its commit materializes it into
-        a :class:`ComptimeErrorUnion` (see ``_commit_error_space``)."""
-        insertion = mir.Insertion([], None)
-        self._emit(insertion)
-        return PendingSlot(insertion, InlineMode.NONE, CommittedTypeConverter.ERROR_UNION)
+    def _new_error_space(self) -> ComptimeErrorUnion:
+        """A fresh, uncommitted error location: its code and payload places are
+        slots whose widths follow from its exception set when it is committed
+        (see ``_commit_error_space``), and whose set grows with every
+        delivery."""
+        return ComptimeErrorUnion(self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE))
 
-    def _new_inferred_space(self) -> PendingSlot:
-        """A fresh error space whose exception set is still to be inferred."""
-        return self._new_error_space()
+    def _commit_error_space(self, eu: ComptimeErrorUnion, type: sval.ErrorUnionType, code_ptr: mir.Value | None = None, payload_ptr: mir.Value | None = None) -> None:
+        """Commit an error location: its code and payload slots are materialized
+        (through a hidden result pointer when given, freshly allocated
+        otherwise), their widths following from the exception set, and the
+        deliveries recorded on them run against them."""
+        for exception in type.types:
+            eu.types.add(exception)
+        self._commit_pending_slot(eu.code, type.code_type, ptr=code_ptr)
+        self._commit_pending_slot(eu.payload, type.union, ptr=payload_ptr)
 
-    def _commit_error_space(self, slot: PendingSlot, eu: sval.ErrorUnionType, code_ptr: mir.Value | None = None, payload_ptr: mir.Value | None = None) -> None:
-        """Commit an error-union slot: its code and payload places are created
-        at the slot's insertion position (their widths follow from the exception
-        set), the slot is materialized into a :class:`ComptimeErrorUnion`, and
-        the deliveries recorded on it run against it."""
-        assert slot.committed is None
-        code = PendingSlot(slot.insertion, InlineMode.NONE)
-        payload = PendingSlot(slot.insertion, InlineMode.NONE)
-        types: ArraySet[sval.Type] = ArraySet()
-        for type in eu.types:
-            types.add(type)
-        space = ComptimeErrorUnion(code, payload, types)
-        slot.committed = space
-        self._commit_pending_slot(code, eu.code_type, ptr=code_ptr)
-        self._commit_pending_slot(payload, eu.union, ptr=payload_ptr)
-        self._exec_pending_actions(slot, eu)
-
-    def _defer_error_ptr(self, slot: PendingSlot, exception: sval.Type) -> InterpVal:
-        """The pointer a call returning the exception ``exception`` through a
-        result pointer writes through, while the space is not committed yet: a
-        placeholder its commit fills in with the payload pointer and the error
-        tag (see ``_PendingError``)."""
-        assert slot.committed is None and slot.committed_type_converter == CommittedTypeConverter.ERROR_UNION
-        if not isinstance(exception, sval.StructType):
-            raise CompileError(f'cannot raise {exception}: an exception must be a struct')
-        mir_struct = exception.to_mir_type()
-        assert mir_struct is not None and not isinstance(mir_struct, mir.VoidType)
-        output = mir.Insertion([], None, mir.PointerType(mir_struct))
-        self._emit(output)
-        slot.stores.append(_PendingAction(output, _PendingError((exception,), output=output)))
-        return RuntimeVal(output, sval.PointerType(exception, is_const=False))
-
-    def _tag_of(self, space: InterpVal, exception: sval.Type) -> int:
-        """The error code of the exception ``exception`` in the space ``space``
-        (0 is no error, so the i-th exception has tag ``i + 1``)."""
-        eu = _error_union_type(space)
-        if exception not in eu.types:
+    def _tag_of(self, eu: ComptimeErrorUnion, exception: sval.Type) -> int:
+        """The error code of ``exception`` in the error location ``eu`` (0 is
+        no error, so the i-th exception has tag ``i + 1``)."""
+        types = eu.types.values
+        if exception not in types:
             raise CompileError(
                 f'{exception} is not an exception of this error space: the '
                 f'function cannot raise it (declare it with '
                 f'@func(exceptions={{...}}) or @func(exceptions="infer"))'
             )
-        return eu.types.index(exception) + 1
+        return types.index(exception) + 1
+
+    def _add_function_exception(self, exception: sval.Type) -> int:
+        """Record that the function proper may raise ``exception`` and return
+        its error code: an exception the (declared) set does not allow is
+        rejected; an inferred set grows to hold it."""
+        if not isinstance(exception, sval.StructType):
+            raise CompileError(f'cannot raise {exception}: an exception must be a struct')
+        eu = self._error_space()
+        if exception not in eu.types.values:
+            if not self._function_error_inferred():
+                self._tag_of(eu, exception)
+            eu.types.add(exception)
+        return self._tag_of(eu, exception)
 
     def _union_variant_ptr(self, place: InterpVal, struct_type: sval.StructType) -> InterpVal:
         """The address a value of the union variant ``struct_type`` is written
@@ -1386,63 +1363,102 @@ class HirRunner:
 
     def _error_payload_ptr(self, error: ComptimeErrorUnion, struct_type: sval.StructType) -> InterpVal:
         """The address the variant ``struct_type`` is written to inside the
-        error space ``error``."""
+        error location ``error``."""
         return self._union_variant_ptr(error.payload, struct_type)
 
     def _raise_error(self, space: ComptimeErrorUnion, exception: sval.StructType, value: InterpVal) -> None:
-        """Deliver one exception value into the (committed) error space
-        ``space`` (a ``raise``): tag it and write it into the payload."""
+        """Deliver one exception value into the error location ``space`` (a
+        ``raise``): tag it and write it into the payload."""
         self.store(space.code, ComptimeVal(self._tag_of(space, exception)))
-        self.store(self._union_variant_ptr(space.payload, exception), value)
+        self.store(self._error_payload_ptr(space, exception), value)
 
-    def _deliver_call_error(self, space: InterpVal, source_types: tuple[sval.Type, ...], source_code: InterpVal, source_payload: InterpVal, error_block: mir.BasicBlock, handler_block: mir.BasicBlock | None) -> None:
-        """Deliver the error a call (or a re-raise) produced into the error
-        space ``space``: remap the runtime tag from the source's set into the
-        space's and copy the payload.  While the space is not committed the
-        delivery is deferred - ``error_block`` is then filled in at its commit."""
-        if isinstance(space, PendingSlot) and space.committed is None:
-            action = _PendingError(
-                tuple(source_types),
-                source_code=source_code, source_payload=source_payload,
-                error_block=error_block, handler_block=handler_block,
-            )
-            saved = self._cur_block
-            self._cur_block = error_block
-            self._record_pending_action(space, action)
-            self._cur_block = saved
+    def _payload_variant_ptr(self, eu: ComptimeErrorUnion, exception: sval.StructType) -> InterpVal:
+        """The address the variant ``exception`` lives at in the function's
+        error location - a fresh placeholder while its payload has no address
+        yet (see ``_defer_ptr_convertion``)."""
+        payload = eu.payload
+        if isinstance(payload, PendingSlot) and payload.committed is None:
+            return self._defer_ptr_convertion(payload, exception)
+        return self._convert_result_ptr(payload, exception)
+
+    def _use_ret_payload(self, callee_exceptions: tuple[sval.Type, ...]) -> bool:
+        """Whether the callee's error payload is written straight into the
+        function's own error location rather than a fresh slot: it is when no
+        enclosing ``try`` catches any of the callee's exceptions (so the error
+        is only propagated) and the function's declared set already holds them
+        (or is still to be inferred, in which case it grows to)."""
+        for exception in callee_exceptions:
+            if self._find_catching_clause(exception) is not None:
+                return False
+        eu = self._error_space()
+        if self._function_error_inferred():
+            return True
+        return all(exception in eu.types.values for exception in callee_exceptions)
+
+    def _route_to_clause(self, data: TryExceptBlockData, index: int, incoming: InterpVal, exception: sval.StructType) -> None:
+        """Route one caught error to clause ``index``: create the clause's entry
+        block - and its error-payload ``Phi`` - on the first dispatch that
+        reaches it, then have the current block jump to it with ``incoming`` (the
+        address of the caught exception) as its payload pointer.  A bare clause's
+        union - and so its phi types - is only fixed once the whole try body has
+        been walked, so its dispatch is deferred through a case block."""
+        block = data.clause_blocks[index]
+        if block is None:
+            block = mir.BasicBlock()
+            data.clause_blocks[index] = block
+        if self._clause_is_bare(data, index):
+            case_block = mir.BasicBlock()
+            self._cur_block.emit(mir.Jmp(case_block))
+            data.bare_pending.append((index, case_block, incoming, exception))
             return
-        committed = _shallow_normalize(space)
-        assert isinstance(committed, ComptimeErrorUnion)
-        self._emit_error_remap(committed, source_types, source_code, source_payload, error_block, handler_block)
+        if exception.is_zst():
+            # a zero-sized exception has no payload: the clause is entered
+            # without a payload pointer (its bind is the unit value)
+            self._cur_block.emit(mir.Jmp(block))
+            return
+        value = self._to_runtime(incoming)
+        phi = data.payload_phi[index]
+        if phi is None:
+            phi = mir.Phi([(value, self._cur_block)])
+            data.payload_phi[index] = phi
+            block.emit(phi)
+        else:
+            phi.add_incoming(value, self._cur_block)
+        self._cur_block.emit(mir.Jmp(block))
 
-    def _emit_error_remap(self, space: ComptimeErrorUnion, source_types: tuple[sval.Type, ...], source_code: InterpVal, source_payload: InterpVal, error_block: mir.BasicBlock, handler_block: mir.BasicBlock | None) -> None:
-        """Fill ``error_block`` (a call's or a re-raise's error path) with the
-        delivery into ``space``: a ``Switch`` on the source code maps the tag
-        of the exception that occurred to the space's own and copies its
-        payload, then the error propagates on."""
-        saved = self._cur_block
-        self._cur_block = error_block
-        code = self.load(source_code)
-        assert isinstance(code, RuntimeVal)
-        mir_type = code.type.to_mir_type()
-        assert isinstance(mir_type, mir.IntType)
-        case_blocks = [mir.BasicBlock() for _ in source_types]
-        default = mir.BasicBlock()
-        self._cur_block.emit(mir.Switch(
-            code.value, default,
-            tuple((i + 1, case_blocks[i]) for i in range(len(case_blocks))),
-        ))
-        for index, type in enumerate(source_types):
-            assert isinstance(type, sval.StructType)
-            self._cur_block = case_blocks[index]
-            self.store(space.code, ComptimeVal(self._tag_of(space, type)))
-            if not type.is_zst():
-                value = self.load(self._union_variant_ptr(source_payload, type))
-                self.store(self._union_variant_ptr(space.payload, type), value)
-            self._propagate_error_to(handler_block)
-        self._cur_block = default
-        self._propagate_error_to(handler_block)
-        self._cur_block = saved
+    def _clause_is_bare(self, data: TryExceptBlockData, index: int) -> bool:
+        inst = data.insts[data.p_excepts[index]]
+        assert isinstance(inst, hir.Except)
+        return self._except_struct_type(inst.type) is None
+
+    def _deliver_uncaught_call(self, exception: sval.StructType, payload_place: InterpVal, use_ret_payload: bool) -> None:
+        """Deliver a call's error no clause catches into the function's error
+        location and end the path: the callee's tag remapped, the payload
+        already in place when the callee wrote straight into the location (no
+        copy) or copied from the call's payload slot otherwise."""
+        tag = self._add_function_exception(exception)
+        eu = self._error_space()
+        self.store(eu.code, ComptimeVal(sval.Int(tag, sval.IntType(tag.bit_length(), False))))
+        if not use_ret_payload and not exception.is_zst():
+            value = self.load(self._union_variant_ptr(payload_place, exception))
+            self.store(self._payload_variant_ptr(eu, exception), value)
+        self._end_error_path()
+
+    def _deliver_uncaught_raise(self, slot: InterpVal, exception: sval.StructType) -> None:
+        """Deliver a ``raise`` no clause catches into the function's error
+        location and end the path: the exception's own slot is bound to the
+        location's payload variant, so the already built value is written there
+        directly (no copy), and the code tagged."""
+        tag = self._add_function_exception(exception)
+        eu = self._error_space()
+        self.store(eu.code, ComptimeVal(sval.Int(tag, sval.IntType(tag.bit_length(), False))))
+        if exception.is_zst():
+            self._commit_pending_slot(slot, exception)
+        else:
+            dest = self._payload_variant_ptr(eu, exception)
+            assert isinstance(dest, RuntimeVal)
+            self._commit_pending_slot(slot, exception, ptr=dest.value)
+        self._end_error_path()
 
     def _in_function_proper(self) -> bool:
         """Whether the instructions currently being executed are those
@@ -1542,11 +1558,26 @@ class HirRunner:
                 self._emit_function_return()
                 return self._cut()
             case hir.Raise():
-                # the exception was already delivered into the function's
-                # error location by the result-location evaluation that
-                # preceded this instruction; the path ends - like a ``ret``,
-                # but the function (with its inlined bodies) ends at once
-                return self._raise()
+                # the exception was built into the slot the instruction names;
+                # the path ends, dispatched to the clause that catches it or
+                # returned from the function (see ``_raise``)
+                return self._raise(self.operand(inst.value))
+            case hir.ExceptBind():
+                # the payload pointer of the clause currently being typed: the
+                # value of its error-payload ``Phi`` (see ``_begin_except_clause``)
+                frame0 = self._frames[-1]
+                data0 = frame0.block_stack[-1].data
+                assert isinstance(data0, TryExceptBlockData)
+                clause = data0.insts[data0.p_excepts[data0.region - 1]]
+                assert isinstance(clause, hir.Except)
+                exception = self._except_struct_type(clause.type)
+                assert exception is not None
+                phi = data0.payload_phi[data0.region - 1]
+                if phi is None:
+                    # a zero-sized exception has no payload: its bind is the unit
+                    regs[inst] = ComptimeVal(sval.Undefined(sval.PointerType(exception, is_const=False)))
+                else:
+                    regs[inst] = RuntimeVal(phi, sval.PointerType(exception, is_const=False))
             case hir.AsBool():
                 return self.as_bool(self.operand_arg(inst.value), inst)
             case hir.BinaryAssign():
@@ -1778,142 +1809,110 @@ class HirRunner:
         frame.pc = data.p_end + 1
 
     def _exec_try(self) -> None:
-        """Open a ``try`` block (``hir.Try``): reserve the blocks the handler
-        dispatches through (``checks[i]`` per clause, ``reraise`` for an error
-        no clause catches, ``join`` for the continuation), push the block, and
-        give it its own (still inferred) error space - the target of every
-        error raised inside the body (see ``_propagate_error``)."""
+        """Open a ``try`` block (``hir.Try``): reserve its continuation block
+        and push it.  A clause's entry block is created lazily, when the first
+        error reaches it (see ``_route_to_clause``), so a clause no error
+        reaches is dead code (see ``_next_live_clause``)."""
         frame = self._frames[-1]
         entry = frame.pc - 1
         inst = frame.insts[entry]
         assert isinstance(inst, hir.Try)
         p_excepts, p_end = hir.scan_try(frame.insts, entry)
-        checks = [mir.BasicBlock() for _ in p_excepts]
-        reraise = mir.BasicBlock()
-        join = mir.BasicBlock()
-        space = self._new_inferred_space()
         data = TryExceptBlockData(
-            p_excepts=p_excepts, p_end=p_end,
-            checks=checks, reraise=reraise, join=join, binds=inst.binds,
-            space=space,
+            insts=frame.insts,
+            p_excepts=p_excepts, p_end=p_end, binds=inst.binds,
+            join=mir.BasicBlock(),
+            clause_blocks=[None] * len(p_excepts),
+            payload_phi=[None] * len(p_excepts),
+            code_phi=[None] * len(p_excepts),
         )
         frame.block_stack.append(BlockFrame(entry, data))
 
     def _exec_except(self, inst: hir.Except) -> None:
         """The region just walked fell off its end and reached the ``Except``
-        marker of the innermost try block: it joins the continuation, and the
-        clause the marker opens is typed next."""
+        marker ``inst``: it joins the continuation, and the clause the marker
+        opens is typed next (when some error reached it)."""
         frame = self._frames[-1]
         data = frame.block_stack[-1].data
         assert isinstance(data, TryExceptBlockData)
-        assert data.join is not None
         if not self._cur_block.is_finished:
             self._cur_block.emit(mir.Jmp(data.join))
         data.fell = True
-        self._commit_try(data)
-        self._begin_except_clause(data, inst.index, inst)
-        data.region = inst.index + 1
-
-    def _commit_try(self, data: TryExceptBlockData) -> None:
-        """Fix the try block's error space once its body has been walked: the
-        space is committed with the exception set delivered into it, and the
-        error no clause catches is re-raised into the enclosing space - the
-        ``except rest as e: raise e`` the missing clauses stand for."""
-        if data.committed:
+        data.body_done = True
+        index = self._next_live_clause(data, inst.index)
+        if index is None:
+            frame.pc = data.p_end
             return
-        space = data.space
-        # the clause bodies run in the enclosing space
-        assert self._innermost_error_space() is space
-        data.committed = True
-        enclosing_block = self._dispatch_entry(self._enclosing_handler(data))
-        reraise_block = data.reraise
-        assert reraise_block is not None
-        saved = self._cur_block
-        self._cur_block = reraise_block
-        eu = _error_union_type(space)
-        if len(eu.types) == 0:
-            # the body never raises: the whole handler is dead
-            self._propagate_error_to(enclosing_block)
-            self._cur_block = saved
-            return
-        self._commit_error_space(space, eu)
-        committed = _shallow_normalize(space)
-        assert isinstance(committed, ComptimeErrorUnion)
-        clause_types = self._except_clause_types(data)
-        leftover = tuple(
-            type for type in eu.types
-            if clause_types is None or type not in clause_types
-        )
-        if len(leftover) == 0:
-            # every error the body raises is caught: nothing escapes
-            self._propagate_error_to(enclosing_block)
-        else:
-            self._deliver_call_error(
-                self._innermost_error_space(), leftover, committed.code, committed.payload,
-                reraise_block, enclosing_block,
-            )
-        self._cur_block = saved
+        clause = data.insts[data.p_excepts[index]]
+        assert isinstance(clause, hir.Except)
+        self._begin_except_clause(data, index, clause)
+        data.region = index + 1
+        frame.pc = data.p_excepts[index] + 1
 
-    def _except_clause_types(self, data: TryExceptBlockData) -> ArraySet[sval.Type] | None:
-        """The exception types the try's ``except`` clauses name, or None when
-        one of them is a bare ``except:`` (which catches everything)."""
-        ret: ArraySet[sval.Type] = ArraySet()
-        for position in data.p_excepts:
-            inst = self._frames[-1].insts[position]
-            assert isinstance(inst, hir.Except)
-            type = self._except_struct_type(inst.type)
-            if type is None:
-                return None
-            ret.add(type)
-        return ret
+    def _next_live_clause(self, data: TryExceptBlockData, start: int) -> int | None:
+        """The first clause at or after ``start`` that some error reached - its
+        entry block exists - or None when there is none: the remaining clauses
+        are dead code and are not typed."""
+        for index in range(start, len(data.p_excepts)):
+            if data.clause_blocks[index] is not None:
+                return index
+        return None
 
     def _begin_except_clause(self, data: TryExceptBlockData, index: int, inst: hir.Except) -> None:
-        """Start typing the except clause ``index``: the clause's ``checks``
-        block tests the error code against the clause's exception (a bare
-        ``except:`` matches anything) and branches to the clause body, which
-        clears the error and takes the payload for its ``as`` name."""
-        space = data.space
-        check = data.checks[index]
-        except_type = self._except_struct_type(inst.type)
-        eu = _error_union_type(space)
-        live = len(eu.types) > 0
-        committed = _shallow_normalize(space)
-        next_block = data.checks[index + 1] if index + 1 < len(data.checks) else data.reraise
-        assert next_block is not None
-        if not live:
-            # the try body never raises: the whole clause is dead
-            body = mir.BasicBlock()
-            check.emit(mir.Jmp(next_block))
-        elif except_type is None:
-            # a bare ``except:`` catches whatever error occurred
-            body = check
-        elif except_type in eu.types:
-            assert isinstance(committed, ComptimeErrorUnion)
-            self._cur_block = check
-            code = self.load(committed.code)
-            assert isinstance(code, RuntimeVal)
-            mir_type = code.type.to_mir_type()
-            assert isinstance(mir_type, mir.IntType)
-            cond = self._emit(mir.Cmp('==', False, 'int', code.value, mir.Int(self._tag_of(space, except_type), mir_type)))
-            body = mir.BasicBlock()
-            check.emit(mir.Br(cond, body, next_block))
-        else:
-            # the body raises no such exception: the clause is dead
-            body = mir.BasicBlock()
-            check.emit(mir.Jmp(next_block))
-        self._cur_block = body
-        bind = data.binds[index]
-        if bind is not None:
-            if except_type is None:
-                raise CompileError('an except clause with an ``as`` name must name a type')
-            self._commit_pending_slot(self.operand(bind), except_type)
-            if live and except_type in eu.types:
-                assert isinstance(committed, ComptimeErrorUnion)
-                self.store(self.operand(bind), self.load(self._error_payload_ptr(committed, except_type)))
-        if live:
-            # the error is handled: clear the code so a later call starts fresh
-            assert isinstance(committed, ComptimeErrorUnion)
-            self.store(committed.code, ComptimeVal(0))
+        """Start typing the except clause ``index``: its entry block - reached
+        from every dispatch the clause caught, with the payload ``Phi`` they
+        delivered - is entered, and the clause's ``as`` bind reads that phi (see
+        ``hir.ExceptBind``).  A bare clause's union (and so its phis) is fixed
+        here, once the whole body has been walked."""
+        block = data.clause_blocks[index]
+        assert block is not None
+        if self._except_struct_type(inst.type) is None:
+            self._finalize_bare_clause(data, index)
+        self._cur_block = block
+
+    def _finalize_bare_clause(self, data: TryExceptBlockData, index: int) -> None:
+        """Fix a bare clause's error union once the try body has been walked:
+        the dispatches into it, deferred while the union was still growing (see
+        ``_route_to_clause``), now get their case blocks finished with the union,
+        the error code and the payload pointer passed through the clause's phis.
+        The clause uses neither for now, so nothing reads them."""
+        records = [record for record in data.bare_pending if record[0] == index]
+        if len(records) == 0:
+            return
+        block = data.clause_blocks[index]
+        assert block is not None
+        union = sval.UnionType(tuple(exception for _, _, _, exception in records))
+        union_mir = union.to_mir_type()
+        assert isinstance(union_mir, mir.UnionType)
+        code_mir = mir.IntType(len(records).bit_length(), False)
+        payload_phi: mir.Phi | None = None
+        code_phi: mir.Phi | None = None
+        saved = self._cur_block
+        for tag, (_, case_block, incoming, exception) in enumerate(records, start=1):
+            self._cur_block = case_block
+            if exception.is_zst():
+                # a zero-sized exception has no payload: a null is passed, the
+                # clause does not read it
+                bitcast = mir.NullValue(mir.PointerType(union_mir))
+            else:
+                bitcast = self._emit(mir.BitCast(
+                    self._to_runtime(incoming), mir.PointerType(union_mir),
+                ))
+            case_block.emit(mir.Jmp(block))
+            if payload_phi is None:
+                payload_phi = mir.Phi([(bitcast, case_block)])
+                block.emit(payload_phi)
+            else:
+                payload_phi.add_incoming(bitcast, case_block)
+            code_value = mir.Int(tag, code_mir)
+            if code_phi is None:
+                code_phi = mir.Phi([(code_value, case_block)])
+                block.emit(code_phi)
+            else:
+                code_phi.add_incoming(code_value, case_block)
+        self._cur_block = saved
+        data.payload_phi[index] = payload_phi
+        data.code_phi[index] = code_phi
 
     def _except_struct_type(self, node: hir.Value | None) -> sval.StructType | None:
         """The exception struct an ``except`` clause names (None for a bare
@@ -1924,54 +1923,6 @@ class HirRunner:
         if isinstance(obj, sval.StructType):
             return obj
         raise CompileError(f'{obj!r} is not an exception struct')
-
-    def _enclosing_handler(self, data: TryExceptBlockData) -> TryExceptBlockData | None:
-        """The try block whose clauses catch an error escaping ``data`` (the one
-        its re-raise reaches), or None at the function's boundary: the innermost
-        still-open try outside ``data``.  The frames are searched outwards like
-        ``_active_try`` - an inlined body's try re-raises into the try blocks
-        enclosing its caller - and a try whose body has been walked is skipped
-        for the same reason ``_active_try`` skips it: the error is delivered into
-        the enclosing space, not into a space that is already committed."""
-        found = False
-        for frame in reversed(self._frames):
-            for bf in reversed(frame.block_stack):
-                block_data = bf.data
-                if block_data is data:
-                    found = True
-                    continue
-                if found and isinstance(block_data, TryExceptBlockData) and not block_data.committed:
-                    return block_data
-        return None
-
-    def _innermost_handler(self) -> TryExceptBlockData | None:
-        """The try block whose clauses catch the errors raised at the current
-        position (the innermost open one), or None at the function's boundary.
-        This is the try owning ``_innermost_error_space``: the two are read from
-        the same place because an error is caught by the try whose space it was
-        delivered into."""
-        return self._active_try()
-
-    def _dispatch_entry(self, handler: TryExceptBlockData | None) -> mir.BasicBlock | None:
-        """The block an error propagates to when it is caught by ``handler``:
-        the entry of the handler's clause dispatch chain, or None at the
-        function's boundary (the error is returned)."""
-        return None if handler is None else handler.checks[0]
-
-    def _propagate_error(self) -> None:
-        """End the current block by propagating the error that sits in the
-        innermost error space: jump to the innermost try handler, or return
-        from the function when there is none."""
-        self._propagate_error_to(self._dispatch_entry(self._innermost_handler()))
-
-    def _propagate_error_to(self, handler_block: mir.BasicBlock | None) -> None:
-        if handler_block is not None:
-            self._cur_block.emit(mir.Jmp(handler_block))
-        elif self.ret_sig is None:
-            # the return convention is not fixed yet: a deferred return
-            self._defer_return()
-        else:
-            self._emit_function_return()
 
     def _exec_end(self) -> PollResult:
         """The walk fell off the end of a region and reached the ``End``
@@ -2085,23 +2036,21 @@ class HirRunner:
             bf = frame.block_stack[-1]
             data = bf.data
             if isinstance(data, TryExceptBlockData):
-                if data.region < len(data.checks):
-                    # the region that ended (the try body, or a clause) returned
-                    # or raised: the next clause is typed next, from its
-                    # ``Except`` marker (the ended block needs no jump)
-                    index = data.region
+                # the region that ended (the try body, or a clause) returned or
+                # raised: a later clause some error reached is typed next;
+                # otherwise the try is complete, and the code after it is still
+                # reachable when some earlier region fell through to the join
+                data.body_done = True
+                index = self._next_live_clause(data, data.region)
+                if index is not None:
                     inst = frame.insts[data.p_excepts[index]]
                     assert isinstance(inst, hir.Except)
-                    self._commit_try(data)
                     self._begin_except_clause(data, index, inst)
                     data.region = index + 1
                     frame.pc = data.p_excepts[index] + 1
                     return PollResult.AGAIN
-                # every region ended: the try is complete; the code after it is
-                # still reachable when some earlier region fell through to it
                 frame.block_stack.pop()
                 if data.fell:
-                    assert data.join is not None
                     self._cur_block = data.join
                     frame.pc = data.p_end + 1
                     return PollResult.AGAIN
@@ -2219,8 +2168,6 @@ class HirRunner:
                 # ``hir.ResultLoc`` names the declared results: the value part
                 # of the frame's result location (its error part is separate)
                 return self._result_loc()
-            case hir.ErrorLoc():
-                return self._innermost_error_space()
             case hir.Inst():
                 reg = regs.get(value)
                 assert reg is not None, 'register not evaluated'
@@ -3092,11 +3039,6 @@ class HirRunner:
         if type is None:
             type = val.committed_type()
 
-        if isinstance(type, sval.ErrorUnionType):
-            # an error-union location: materialize it into a ComptimeErrorUnion
-            self._commit_error_space(val, type)
-            return
-
         if ptr is not None:
             self._bind_slot(val, ptr, type)
             return
@@ -3193,28 +3135,8 @@ class HirRunner:
                         self.field_index_addr(ptr, _index_value(index)),
                         self.load(place),
                     )
-            case _PendingError():
-                assert isinstance(ptr, ComptimeErrorUnion)
-                self._emit_error_delivery(action, ptr)
             case _:
                 raise CompileError(f'unsupported pending action {action}')
-
-    def _emit_error_delivery(self, action: _PendingError, space: ComptimeErrorUnion) -> None:
-        """Deliver one recorded delivery into an error space, now that the
-        space is committed (see ``_PendingError``): an exception written
-        through a result pointer is tagged and handed the payload pointer, and
-        a call's (or a re-raise's) error its remapped tag and payload."""
-        if action.output is not None:
-            exception = action.types[0]
-            assert isinstance(exception, sval.StructType)
-            action.output.value = self._to_runtime(self._convert_result_ptr(space, exception))
-            return
-        assert action.error_block is not None
-        assert action.source_code is not None and action.source_payload is not None
-        self._emit_error_remap(
-            space, action.types, action.source_code, action.source_payload,
-            action.error_block, action.handler_block,
-        )
 
     def _defer_ptr_convertion(self, slot: PendingSlot, type: sval.Type) -> InterpVal:
         """The address a delivery into ``slot`` writes through, when the slot
@@ -3265,6 +3187,22 @@ class HirRunner:
         from_type = ptr_type.elem
         if from_type == to_type:
             return ptr
+        if isinstance(from_type, sval.UnionType) and isinstance(to_type, sval.StructType):
+            # an exception written through the address of an error payload: the
+            # union's storage reinterpreted as the variant
+            if to_type not in from_type.types:
+                raise CompileError(f'{to_type} is not a variant of {from_type}')
+            return self._union_variant_ptr(ptr, to_type)
+        if isinstance(from_type, sval.UnionType) and isinstance(to_type, sval.UnionType):
+            # one union's storage reinterpreted as another's: a subset union's
+            # pointer is a pointer to the superset union as well (every variant
+            # lives at offset 0, and the superset's storage holds it)
+            if not (_union_contains(from_type, to_type) or _union_contains(to_type, from_type)):
+                raise CompileError(f'cannot convert a {from_type} pointer to {to_type}')
+            to_mir = to_type.to_mir_type()
+            assert to_mir is not None and not isinstance(to_mir, mir.VoidType)
+            bitcast = self._emit(mir.BitCast(self._to_runtime(ptr), mir.PointerType(to_mir)))
+            return RuntimeVal(bitcast, sval.PointerType(to_type, is_const=False))
         if isinstance(from_type, sval.OptionType):
             # the delivery goes into the payload of the option - and, when the
             # option's child is an option itself, through each of its layers
@@ -3771,9 +3709,16 @@ class HirRunner:
             self._deliver_result(callee, mir_args, ret, ret_sig.ret_type_spec)
             return
         # the callee may raise: it delivers its normal result into ``ret`` and
-        # its error code and payload into fresh places, checked below
+        # its error code and payload through fresh places, dispatched below
+        callee_exceptions = tuple(ret_sig.exceptions.values)
+        use_ret_payload = self._use_ret_payload(callee_exceptions)
         code_place = self.alloca(InlineMode.NONE)
-        payload_place = self.alloca(InlineMode.NONE)
+        if use_ret_payload:
+            # no ``try`` catches the callee's errors: it writes them straight
+            # into the function's own error payload (no copy on the way out)
+            payload_place: InterpVal = self._error_space().payload
+        else:
+            payload_place = self.alloca(InlineMode.NONE)
         error_tuple: InterpVal = ComptimeTuple((
             ArgEntry(code_place, True),
             ArgEntry(payload_place, True),
@@ -3783,27 +3728,24 @@ class HirRunner:
             ComptimeTuple((ArgEntry(ret, True), ArgEntry(error_tuple, True))),
             spec,
         )
-        self._check_call_error(ret_sig.exceptions, code_place, payload_place)
+        self._check_call_error(callee_exceptions, code_place, payload_place, use_ret_payload)
 
     def _check_call_error(
         self,
-        callee_exceptions: ArraySet[sval.Type],
+        callee_exceptions: tuple[sval.Type, ...],
         code_place: InterpVal,
         payload_place: InterpVal,
+        use_ret_payload: bool,
     ) -> None:
-        """Check the error code a call delivered and deliver the error into the
-        innermost error space when it is non-zero (see ``_make_runtime_call``):
-        the callee's tag is remapped to the space's own and the payload is
-        copied, after which the error propagates on.  A zero code continues in
-        a fresh block.
-
-        The callee's and the space's exception sets have to agree: an exception
-        the space does not allow is an error (for a declared set), and every
-        callee exception is remapped to its tag of the same type."""
+        """Dispatch the error a call delivered when its code is non-zero (see
+        ``_make_runtime_call``): a ``switch`` on the callee's code sends every
+        exception to the clause that catches it - jumped to with the payload
+        pointer handed over through the clause's ``Phi`` - or, when nothing
+        catches it, into the function's own error location (see
+        ``_deliver_uncaught_call``).  A zero code continues in a fresh block."""
         self._commit_pending_slot(code_place)
-        self._commit_pending_slot(payload_place)
-        space = self._innermost_error_space()
-        handler_block = self._dispatch_entry(self._innermost_handler())
+        if not use_ret_payload:
+            self._commit_pending_slot(payload_place)
         code = self.load(code_place)
         assert isinstance(code, RuntimeVal)
         mir_code_type = code.type.to_mir_type()
@@ -3812,9 +3754,23 @@ class HirRunner:
         err_block = mir.BasicBlock()
         cont_block = mir.BasicBlock()
         self._cur_block.emit(mir.Br(cond, err_block, cont_block))
-        self._deliver_call_error(
-            space, tuple(callee_exceptions.values), code_place, payload_place, err_block, handler_block,
-        )
+        self._cur_block = err_block
+        case_blocks = [mir.BasicBlock() for _ in callee_exceptions]
+        self._cur_block.emit(mir.Switch(
+            code.value, case_blocks[0],
+            tuple((index + 1, case_blocks[index]) for index in range(len(case_blocks))),
+        ))
+        for index, exception in enumerate(callee_exceptions):
+            assert isinstance(exception, sval.StructType)
+            self._cur_block = case_blocks[index]
+            target = self._find_catching_clause(exception)
+            if target is not None:
+                data, clause = target
+                assert not use_ret_payload
+                incoming = self._union_variant_ptr(payload_place, exception)
+                self._route_to_clause(data, clause, incoming, exception)
+            else:
+                self._deliver_uncaught_call(exception, payload_place, use_ret_payload)
         self._cur_block = cont_block
 
     def _deliver_result(
@@ -3849,18 +3805,13 @@ class HirRunner:
             if leaf.via_result_ptr:
                 target = place
                 if isinstance(target, PendingSlot) and target.committed is None:
-                    if target.committed_type_converter == CommittedTypeConverter.ERROR_UNION:
-                        # a call delivered into a still uncommitted error
-                        # location: the aggregate exception is written through
-                        # the payload pointer, deferred to the space's commit
-                        target = self._defer_error_ptr(target, leaf.type)
-                    else:
-                        # the slot has no address yet: the call writes through a
-                        # placeholder its commit fills in
-                        target = self._defer_ptr_convertion(target, leaf.type)
+                    # the slot has no address yet: the call writes through a
+                    # placeholder its commit fills in
+                    target = self._defer_ptr_convertion(target, leaf.type)
                 else:
-                    # a committed error location: the result-location conversion
-                    # tags the error and hands back the payload pointer
+                    # a committed location: the result-location conversion (a
+                    # union variant, an option's payload, ...) hands back the
+                    # pointer to write through
                     target = self._convert_result_ptr(target, leaf.type)
                 result_args.append(self._to_runtime(_shallow_normalize(target)))
                 continue
@@ -3997,7 +3948,7 @@ class HirRunner:
             frame_values = {tv: ComptimeVal(v) for tv, v in generic_var_values.items()}
         frame = InlineFrame(
             frame_values, tuple(arg_values),
-            ComptimeTuple((ArgEntry(ret, True), ArgEntry(self._innermost_error_space(), True))),
+            ComptimeTuple((ArgEntry(ret, True), ArgEntry(self._error_space(), True))),
             body,
         )
         self._frames.append(frame)
@@ -4033,8 +3984,8 @@ class HirRunner:
         exceptions = partial.exceptions if partial is not None else None
         if exceptions is None:
             exceptions = ArraySet()
-            for type in _error_union_type(self._error_space()).types:
-                exceptions.add(type)
+            for exception in self._error_space().types.values:
+                exceptions.add(exception)
         self._materialize_ret_sig(ReturnSignature(value_spec, exceptions))
         sig = self.ret_sig
         assert sig is not None
