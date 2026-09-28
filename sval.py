@@ -68,6 +68,59 @@ class AsValue(Value):
     def __repr__(self) -> str:
         return f'AsValue({self.value!r}, {self.type!r})'
 
+class SpecialTypeKind(IntEnum):
+    """How a spy type maps onto runtime code (see ``Type.classify``).
+
+    ``NONE`` - an ordinary type, with a MIR mirror of its own; ``COMPTIME`` -
+    a type only compile-time values may have (it has no mirror); ``ZST`` -
+    a zero-sized (unit) type, which has no storage and no mirror of its own;
+    ``DST`` - a dynamically-sized type (a function type), whose mirror only a
+    pointer to it may use: a value of one cannot be allocated, loaded or
+    returned."""
+
+    NONE = auto()
+    COMPTIME = auto()
+    ZST = auto()
+    DST = auto()
+
+
+class MirLowerCache:
+    """The MIR mirrors a lowering host creates for the spy types that must be
+    *interned*: a ``mir.StructType``/``mir.UnionType`` is an identity object
+    and a module declares one LLVM struct/union per MIR type, so two equal spy
+    ``Option[T]``/unions have to lower to one MIR type.  One cache belongs to
+    one host context (``dsl._Context``), so the contexts of one process do not
+    share the types they intern."""
+
+    def __init__(self) -> None:
+        self._union_mirs: dict[UnionType, mir.UnionType] = {}
+        self._option_struct_mirs: dict[Type, mir.StructType] = {}
+
+    def union_mir(self, type: UnionType, payload: mir.Type) -> mir.UnionType:
+        """The (interned) MIR mirror of the payload union ``type``."""
+        ret = self._union_mirs.get(type)
+        if ret is None:
+            ret = mir.UnionType('union', payload)
+            self._union_mirs[type] = ret
+        return ret
+
+    def option_struct_mir(self, child: Type, child_mir: mir.Type) -> mir.StructType:
+        """The (interned) MIR mirror of the ``Option[T]`` whose ``T``
+        (``child``) has no pointer to be tagged on: a struct of a ``bool`` tag
+        and the value."""
+        ret = self._option_struct_mirs.get(child)
+        if ret is None:
+            ret = mir.StructType(
+                'option',
+                (
+                    mir.FormalArg('tag', mir.BoolType()),
+                    mir.FormalArg('value', child_mir),
+                ),
+            )
+            self._option_struct_mirs[child] = ret
+        return ret
+
+
 class Type(Value):
     def get_unit_value(self) -> AnyValue | None:
         """The canonical *unit value* of a zero-sized type (ZST): ``None``
@@ -75,10 +128,19 @@ class Type(Value):
         zero-sized), otherwise the one compile-time value every value of
         the type equals - ``Void()`` for the void type, ``Int(0, T)`` for
         a zero-bit integer, an ``AggregateValue`` for a struct whose
-        fields are all ZSTs.  A ZST has no runtime representation: its
-        ``mir`` mirror is the void type (``to_mir_type`` returns
-        ``mir.VOID``)."""
+        fields are all ZSTs.  A ZST has no runtime representation at all:
+        it has no mirror of its own (``to_mir_type`` returns ``None``)."""
         return None
+
+    def classify(self) -> SpecialTypeKind:
+        """How a value of this type maps onto runtime code (see
+        :class:`SpecialTypeKind`).  The classification is computed from the
+        type alone - it never asks for the MIR mirror - so it is what a
+        caller uses to decide whether a mirror can be asked for at all.
+
+        The default is :attr:`SpecialTypeKind.NONE`; the types that have no
+        mirror, no storage or no size override it."""
+        return SpecialTypeKind.NONE
 
     def is_subtype_of(self, other: Type) -> bool:
         return isinstance(other, self.__class__)
@@ -92,20 +154,22 @@ class Type(Value):
         return other if self.is_subtype_of(other) else None
 
     @abstractmethod
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         """The MIR mirror of this spy type: the static type the runtime
-        register of a value of this type has.  A zero-sized type has no
-        runtime representation and mirrors to the MIR's void type
-        (:data:`mir.VOID` - a function whose return type is a ZST returns
-        void); a spy struct type mirrors to the one MIR type every value
-        of the struct shares (created lazily and cached on the
-        descriptor, see :meth:`StructType._calculate_mir`).  Types that
-        cannot cross into runtime code at all (``TypeType``,
-        ``AnyFunction``, ...) have no mirror and return ``None``."""
+        register of a value of this type has, or ``None`` when there is no
+        such type - a zero-sized type (which holds no storage), a
+        compile-time-only type, and a struct template all have no mirror.
+        A spy struct type mirrors to the one MIR type every value of the
+        struct shares (created lazily and cached on the descriptor, see
+        :meth:`StructType._calculate_mir`); a function that returns a
+        zero-sized type returns no value at all.
+
+        ``cache`` interns the mirrors that have to be one object per
+        lowering host (see :class:`MirLowerCache`); most types ignore it."""
         ...
 
     def is_zst(self) -> bool:
-        return isinstance(self.to_mir_type(), mir.VoidType)
+        return self.classify() == SpecialTypeKind.ZST
 
     def is_copyable(self) -> bool:
         return True
@@ -136,7 +200,11 @@ class TypeType(Type):
         return self.level <= type.level
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
     def __str__(self) -> str:
@@ -160,7 +228,11 @@ class TypeVar(Type):
         return TYPE_TYPE
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
     def __str__(self) -> str:
@@ -193,7 +265,11 @@ class TupleType(Type):
         return self.types
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
     def __str__(self) -> str:
@@ -256,31 +332,28 @@ class UnionType(Type):
         return best
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        if any(type.classify() == SpecialTypeKind.COMPTIME for type in self.types):
+            return SpecialTypeKind.COMPTIME
+        if any(type.classify() == SpecialTypeKind.DST for type in self.types):
+            return SpecialTypeKind.DST
+        if all(type.classify() == SpecialTypeKind.ZST for type in self.types):
+            return SpecialTypeKind.ZST
+        return SpecialTypeKind.NONE
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         payload = self.storage_variant()
         if payload is None:
-            return mir.VOID
-        mir_payload = payload.to_mir_type()
+            # every variant is zero-sized: the union holds no storage
+            return None
+        mir_payload = payload.to_mir_type(cache)
         if mir_payload is None:
             return None
-        if isinstance(mir_payload, mir.VoidType):
-            return mir.VOID
-        return _union_mir(self, mir_payload)
+        return cache.union_mir(self, mir_payload)
 
     def __str__(self) -> str:
         return f"union[{", ".join(str(t) for t in self.types)}]"
-
-
-_UNION_MIRS: dict[UnionType, mir.UnionType] = {}
-
-def _union_mir(type: UnionType, payload: mir.Type) -> mir.UnionType:
-    """The MIR mirror of one payload union (interned per union, so that every
-    reference to the same union names one MIR type)."""
-    ret = _UNION_MIRS.get(type)
-    if ret is None:
-        ret = mir.UnionType('union', payload)
-        _UNION_MIRS[type] = ret
-    return ret
 
 
 @dataclass(frozen=True)
@@ -398,7 +471,11 @@ class ResultType(Type):
         return Success() if len(self.types) == 0 else None
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         # compile-time only: the type is spread out into the value, the code and
         # the payload union when it is lowered (see ``make_ret_spec``)
         return None
@@ -426,7 +503,11 @@ class StrDictType(Type):
     values: frozendict[str, Type]
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
     def __str__(self) -> str:
@@ -443,7 +524,7 @@ class BoolType(Type):
         return TYPE_TYPE
 
     @override
-    def to_mir_type(self) -> mir.BoolType:
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return mir.BoolType()
 
     def __str__(self) -> str:
@@ -459,9 +540,9 @@ class EmptyType(Type):
     ``0..len(types) - 1`` alone - it carries no "no error" code (see
     :class:`ResultType`).
 
-    For the machinery of the compiler it behaves like a zero-sized type: its
-    MIR mirror is the MIR void type and the value a slot of it holds is the
-    "no value" marker ``Void()``."""
+    For the machinery of the compiler it behaves like a zero-sized type: it
+    has no mirror of its own and the value a slot of it holds is the "no
+    value" marker ``Void()``."""
 
     def get_type(self) -> Type:
         return TYPE_TYPE
@@ -477,8 +558,12 @@ class EmptyType(Type):
         return other
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
-        return mir.VOID
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.ZST
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
 
     def __str__(self) -> str:
         return 'empty'
@@ -488,9 +573,9 @@ class VoidType(Type):
     """The unit type: a zero-sized type (ZST) whose unique value is
     :class:`Void` (``sval.Void()``).  It is the declared return type of a
     function that returns no value (``-> None``, or one inferred for a body
-    without value returns), and it has no runtime representation: its
-    ``mir`` mirror is the MIR void type (``to_mir_type`` returns
-    ``mir.VOID``) and no load/store is ever emitted for it."""
+    without value returns), and it has no runtime representation: it has no
+    mirror of its own (``to_mir_type`` returns ``None``) and no load/store is
+    ever emitted for it."""
 
     @override
     def get_type(self) -> Type:
@@ -501,8 +586,12 @@ class VoidType(Type):
         return Void()
 
     @override
-    def to_mir_type(self) -> mir.VoidType:
-        return mir.VOID
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.ZST
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
 
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
@@ -561,8 +650,12 @@ class NullType(Type):
                 return OptionType(other)
 
     @override
-    def to_mir_type(self) -> mir.VoidType:
-        return mir.VOID
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.ZST
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
 
     def __str__(self) -> str:
         return 'null'
@@ -622,20 +715,31 @@ class OptionType(Type):
         return None if child is None else OptionType(child)
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        match self.child.classify():
+            case SpecialTypeKind.COMPTIME:
+                return SpecialTypeKind.COMPTIME
+            case SpecialTypeKind.DST:
+                return SpecialTypeKind.DST
+            case _:
+                # an option is never zero-sized: it keeps whether a value is there
+                return SpecialTypeKind.NONE
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         child = self.child
-        child_mir = child.to_mir_type()
-        if child_mir is None:
-            return None
-        if isinstance(child_mir, mir.VoidType):
+        if child.is_zst():
             # a zero-sized child carries no value: only whether there is one
             return mir.BoolType()
+        child_mir = child.to_mir_type(cache)
+        if child_mir is None:
+            return None
         if find_first_pointer_type_pos(child) is not None:
             # the child holds a pointer, which is null exactly when the option
             # is: the child itself is the representation
             return child_mir
         # no pointer to use as the tag: a struct of the tag and the value
-        return _option_struct_mir(child, child_mir)
+        return cache.option_struct_mir(child, child_mir)
 
     @override
     def is_copyable(self) -> bool:
@@ -643,26 +747,6 @@ class OptionType(Type):
 
     def __str__(self) -> str:
         return f'Option[{self.child}]'
-
-_OPTION_STRUCT_MIRS: dict[Type, mir.StructType] = {}
-
-def _option_struct_mir(child: Type, child_mir: mir.Type) -> mir.StructType:
-    """The MIR mirror of an ``Option[T]`` whose ``T`` has no pointer to be
-    tagged on: a struct of a ``bool`` tag and the value.  The mirror is
-    interned per child type - a MIR struct type is an identity object, so two
-    ``Option[T]`` of the same ``T`` must share one (the module declares one
-    LLVM struct per MIR struct type)."""
-    ret = _OPTION_STRUCT_MIRS.get(child)
-    if ret is None:
-        ret = mir.StructType(
-            'option',
-            (
-                mir.FormalArg('tag', mir.BoolType()),
-                mir.FormalArg('value', child_mir),
-            ),
-        )
-        _OPTION_STRUCT_MIRS[child] = ret
-    return ret
 
 def _resolve_option_peer(type: Type, option: OptionType) -> Type | None:
     """The peer type of ``type`` and the option ``option``: the peer type of
@@ -736,7 +820,11 @@ class AnyIntType(Type):
         return TYPE_TYPE
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
     def __str__(self) -> str:
@@ -767,8 +855,12 @@ class IntType(Type):
         return None
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
-        return mir.VOID if self.bits == 0 else mir.IntType(self.bits, self.signed)
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.ZST if self.bits == 0 else SpecialTypeKind.NONE
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None if self.bits == 0 else mir.IntType(self.bits, self.signed)
 
     @override
     def is_subtype_of(self, other: Type) -> bool:
@@ -833,7 +925,7 @@ class FloatType(Type):
         return TYPE_TYPE
 
     @override
-    def to_mir_type(self) -> mir.FloatType:
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return mir.FloatType(self.bits)
 
     def is_subtype_of(self, other: Type) -> bool:
@@ -881,10 +973,20 @@ class PointerType(Type):
         return (self.elem,)
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        # a pointer always has a size, even one to a dynamically-sized type
+        if not isinstance(self.is_const, bool) or self.elem.classify() == SpecialTypeKind.COMPTIME:
+            return SpecialTypeKind.COMPTIME
+        return SpecialTypeKind.NONE
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         if not isinstance(self.is_const, bool):
             return None
-        child = self.elem.to_mir_type()
+        if self.elem.is_zst():
+            # the pointee has no value of its own: the pointer is a void pointer
+            return mir.PointerType(mir.VOID, self.is_const)
+        child = self.elem.to_mir_type(cache)
         if child is None:
             return None
         return mir.PointerType(child, self.is_const)
@@ -964,18 +1066,37 @@ class ArrayType(Type):
         return self.length == 0 or self.elem.is_copyable()
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        length = self.length_int
+        if length is None:
+            # the length is not known yet, so nothing is known about the layout
+            return SpecialTypeKind.COMPTIME
+        if length == 0:
+            # a zero-length array holds no storage whatever its element type
+            return SpecialTypeKind.ZST
+        match self.elem.classify():
+            case SpecialTypeKind.COMPTIME:
+                return SpecialTypeKind.COMPTIME
+            case SpecialTypeKind.DST:
+                return SpecialTypeKind.DST
+            case SpecialTypeKind.ZST:
+                return SpecialTypeKind.ZST
+            case _:
+                return SpecialTypeKind.NONE
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         length = self.length_int
         if length is None:
             return None
         if length == 0 or self.elem.is_zst():
             # a zero-sized array holds no storage whatever its length: it has
             # no mirror of its own
-            return mir.VOID
-        elem = self.elem.to_mir_type()
-        if elem is None or isinstance(elem, mir.VoidType):
-            # an element with no mirror of its own (the zero-sized case is
-            # already handled above) leaves the array without one either
+            return None
+        elem = self.elem.to_mir_type(cache)
+        if elem is None:
+            # an element with no mirror of its own leaves the array without
+            # one either
             return None
         return mir.ArrayType(elem, length)
 
@@ -1017,8 +1138,14 @@ class ValueType(Type):
         return other.resolve_peer_type(self)
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
-        return mir.VoidType()
+    def classify(self) -> SpecialTypeKind:
+        # the type of an untyped literal: a compile-time value the runtime
+        # location it is written to has to declare the type of
+        return SpecialTypeKind.ZST
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
 
     def __str__(self) -> str:
         return f"Literal({self.value})"
@@ -1059,22 +1186,31 @@ class FunctionType(Type):
         return TypeType(level)
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        # a function type is dynamically sized: a value of it has no size of its
+        # own, so only a pointer to one is a value (see ``SpecialTypeKind``)
+        return SpecialTypeKind.DST
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         args: list[mir.Type] = []
         for arg in self.args:
-            mir_type = arg.type.to_mir_type()
+            if arg.type.is_zst():
+                continue
+            mir_type = arg.type.to_mir_type(cache)
             if mir_type is None:
                 return None
-            if not isinstance(mir_type, mir.VoidType):
-                args.append(mir_type)
+            args.append(mir_type)
         ret_type: mir.MayBeVoidType = mir.VOID
         for leaf in iter_ret_leaves(self.ret_spec):
-            mir_type = leaf.type.to_mir_type()
+            if leaf.type.is_zst():
+                # a zero-sized result is delivered as its unit value, not
+                # through the by-value slot
+                continue
+            mir_type = leaf.type.to_mir_type(cache)
             if mir_type is None:
                 return None
             if leaf.via_result_ptr:
-                if isinstance(mir_type, mir.VoidType):
-                    return None
                 args.append(mir.PointerType(mir_type, False))
             else:
                 ret_type = mir_type
@@ -1150,7 +1286,13 @@ class StructTypeHead(Type, IdentityObj):
         return ret
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        # a template denotes no value of its own: only a specialization is a
+        # type
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         raise CompileError(
             f'{self} is a struct template: a struct type is a specialization '
             'of it, and only one has a MIR mirror'
@@ -1179,7 +1321,10 @@ class StructType(Type):
         self.generic_args = generic_args
 
         self._fields: IndexedMap[str, StructField] | None = None
-        self._mir: mir.MayBeVoidType | None = None
+        # the mirror (None while it is not computed yet, and for a zero-sized
+        # struct, which has none of its own); ``_field_mir_indices`` being set
+        # is what tells a computed mirror from a missing one
+        self._mir: mir.Type | None = None
         # whether the mirror is the mirror of the struct's own single stored
         # field rather than a wrapper struct (see ``mirror_is_a_field``)
         self._mir_is_a_field = False
@@ -1269,20 +1414,44 @@ class StructType(Type):
         return tuple(f.type for f in self.fields().values())
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
-        return self.get_mir_type()
+    def classify(self) -> SpecialTypeKind:
+        dst = False
+        zst = True
+        for field in self.fields().values():
+            match field.type.classify():
+                case SpecialTypeKind.COMPTIME:
+                    # a compile-time-only field leaves the struct with no runtime
+                    # representation at all
+                    return SpecialTypeKind.COMPTIME
+                case SpecialTypeKind.DST:
+                    # a dynamically-sized field leaves the struct with no size of
+                    # its own (like a C struct with a flexible array member)
+                    dst = True
+                    zst = False
+                case SpecialTypeKind.ZST:
+                    pass
+                case _:
+                    zst = False
+        if dst:
+            return SpecialTypeKind.DST
+        return SpecialTypeKind.ZST if zst else SpecialTypeKind.NONE
 
-    def _calculate_mir(self) -> None:
-        if self._mir is not None:
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return self.get_mir_type(cache)
+
+    def _calculate_mir(self, cache: MirLowerCache) -> None:
+        if self._field_mir_indices is not None:
             return
-        assert self._field_mir_indices is None
 
         # the fields that occupy storage, each with the mirror of its type:
         # a zero-sized field occupies none and has no mirror position
         fields = self.fields().values()
         mirrored: list[tuple[int, StructField, mir.Type]] = []
         for index, field in enumerate(fields):
-            field_mir = field.type.to_mir_type()
+            if field.type.is_zst():
+                continue
+            field_mir = field.type.to_mir_type(cache)
             if field_mir is None:
                 # a field has to have a runtime representation: a struct
                 # whose field has none (a compile-time-only type, such as the
@@ -1291,8 +1460,7 @@ class StructType(Type):
                     f"field '{field.name}' of {self} has type {field.type}, "
                     f"which has no runtime representation"
                 )
-            if not isinstance(field_mir, mir.VoidType):
-                mirrored.append((index, field, field_mir))
+            mirrored.append((index, field, field_mir))
 
         # an ``extern_c`` struct is laid out for the C ABI: the mirror holds
         # its fields in declaration order.  A spy struct is laid out by the
@@ -1300,7 +1468,7 @@ class StructType(Type):
         # first (the mirror then packs tighter), a non-``extern_c`` struct
         # that holds exactly one field *is* that field - its mirror is the
         # field's own mirror, with no wrapper struct - and one that holds
-        # none is a zero-sized type, mirroring to the void type
+        # none is a zero-sized type, with no mirror of its own
         if not self.modifiers.extern_c:
             mirrored.sort(key=lambda field: estimated_alignment_of(field[1].type))
 
@@ -1310,7 +1478,7 @@ class StructType(Type):
         self._field_mir_indices = tuple(indices)
 
         if len(mirrored) == 0:
-            self._mir = mir.VoidType()
+            self._mir = None
         elif len(mirrored) == 1 and not self.modifiers.extern_c:
             self._mir = mirrored[0][2]
             self._mir_is_a_field = True
@@ -1323,29 +1491,29 @@ class StructType(Type):
                 ),
             )
 
-    def get_mir_type(self) -> mir.MayBeVoidType:
+    def get_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         """The (cached) MIR mirror of the struct: the one ``mir`` type every
         value of the struct mirrors to (created lazily, shared by all users),
-        with the zero-sized fields dropped.  An ``extern_c`` struct mirrors
-        to a ``mir.StructType`` of its declaration order; a spy struct orders
-        the fields by alignment instead, mirrors to the type of its own field
-        when it holds exactly one, and to the void type when it holds none."""
-        self._calculate_mir()
-        assert self._mir is not None
+        with the zero-sized fields dropped, or ``None`` when the struct is
+        zero-sized (it has no storage and so no mirror of its own).  An
+        ``extern_c`` struct mirrors to a ``mir.StructType`` of its declaration
+        order; a spy struct orders the fields by alignment instead, and mirrors
+        to the type of its own field when it holds exactly one."""
+        self._calculate_mir(cache)
         return self._mir
 
-    def get_field_mir_indices(self) -> tuple[int | None, ...]:
+    def get_field_mir_indices(self, cache: MirLowerCache) -> tuple[int | None, ...]:
         """The mirror position of every field, in declaration order: the
         i-th entry is the position of the i-th field in the mirror returned
         by :meth:`get_mir_type` - a zero-sized field occupies no position
         and maps to ``None``.  A mirror that is the type of the struct's own
         field (see :meth:`_calculate_mir`) has that field at position 0, and
         the field sits at the address of the value itself."""
-        self._calculate_mir()
+        self._calculate_mir(cache)
         assert self._field_mir_indices is not None
         return self._field_mir_indices
 
-    def mirror_is_a_field(self) -> bool:
+    def mirror_is_a_field(self, cache: MirLowerCache) -> bool:
         """Whether the MIR mirror of this struct is the mirror of the
         struct's own single stored field rather than a wrapper struct (see
         :meth:`_calculate_mir`): that field then sits at the address of the
@@ -1353,7 +1521,7 @@ class StructType(Type):
         Note that the field's mirror may itself be a ``mir.StructType`` -
         the mirror of a *wrapper* struct and the mirror that *is* the field
         cannot be told apart by that type alone."""
-        self._calculate_mir()
+        self._calculate_mir(cache)
         return self._mir_is_a_field
 
     def __eq__(self, value: object, /) -> bool:
@@ -1380,7 +1548,11 @@ class AnyFunction(Type):
         return TYPE_TYPE
 
     @override
-    def to_mir_type(self) -> mir.MayBeVoidType | None:
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
     def __str__(self) -> str:
@@ -1751,9 +1923,13 @@ def pass_by_ref(type: Type) -> bool:
 
     The policy mirrors :func:`returns_via_result_ptr`: an aggregate too
     large to be passed in registers (larger than the by-value limit) is
-    passed as a pointer, everything else by value.  The caller otherwise
-    passes a parameter by reference when its formal declares it as one
-    (``fn.SignatureFormalArg.by_ref``), whatever its type."""
+    passed as a pointer, everything else by value.  A dynamically-sized type
+    (a function type) has no size to pass, so it is always passed as a
+    pointer.  The caller otherwise passes a parameter by reference when its
+    formal declares it as one (``fn.SignatureFormalArg.by_ref``), whatever
+    its type."""
+    if type.classify() == SpecialTypeKind.DST:
+        return True
     match type:
         case StructType() | ArrayType() | OptionType() | UnionType():
             if _mentions_type_var(type):
@@ -2199,21 +2375,6 @@ def replace_type_vars_value(value: AnyValue | None, reps: Mapping[TypeVar, AnyVa
     if value is None:
         return None
     return replace_type_var(value, reps)
-
-def is_comptime_only_type(type: Type) -> bool:
-    match type:
-        case AnyIntType() | TypeType():
-            return True
-        case ArrayType():
-            # an array of a compile-time-only type holds no value that could
-            # live in memory, whatever its length
-            return is_comptime_only_type(type.elem)
-        case OptionType():
-            # an option of a compile-time-only type has no representation
-            # either: it mirrors to nothing (see ``OptionType.to_mir_type``)
-            return is_comptime_only_type(type.child)
-        case _:
-            return False
 
 def is_numeric_type(type: Type):
     match type:

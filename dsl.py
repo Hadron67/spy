@@ -119,6 +119,7 @@ def _call_multi_value(
     native_fn: NativeFn,
     py_args: list[Any],
     ret_spec: sval.RetSpec,
+    mir_lower_cache: sval.MirLowerCache,
 ) -> tuple[Any, ...]:
     """Call a native artifact that returns several values from Python.  The
     lowered function returns one result directly and delivers every other
@@ -133,7 +134,7 @@ def _call_multi_value(
     from Python, that is not supported yet."""
     by_value = sval.ret_returned_type(ret_spec)
     if by_value is not None:
-        mir_ret = by_value.to_mir_type()
+        mir_ret = by_value.to_mir_type(mir_lower_cache)
         if isinstance(mir_ret, (mir.StructType, mir.ArrayType)):
             raise SpyError(
                 'cannot call a function that returns several values from Python '
@@ -144,8 +145,8 @@ def _call_multi_value(
     for leaf in sval.iter_ret_leaves(ret_spec):
         if not leaf.via_result_ptr:
             continue
-        mir_type = leaf.type.to_mir_type()
-        assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+        mir_type = leaf.type.to_mir_type(mir_lower_cache)
+        assert mir_type is not None and not leaf.type.is_zst()
         buffer = to_ctype(mir_type)()
         buffers.append(buffer)
         call_args.append(ctypes.c_void_p(ctypes.addressof(buffer)))
@@ -221,7 +222,7 @@ class _RegisteredFn:
         arg_types: ArgList[sval.Type | None] = arglist.map(lambda a: sval.type_of(a, _INT_LITERAL_BITS))
         call_sig, ret_sig = entry.hir.signature.specialize(arg_types)
 
-        analyser = Analyser(self.context)
+        analyser = Analyser(self.context, self.context.mir_lower_cache)
         analyser.analyse_function(entry, call_sig, ret_sig)
         sym = analyser.finish()
         sym.compile(self.context._symbol_table, self.context.backend)
@@ -251,7 +252,7 @@ class _RegisteredFn:
         # values alone, which never include the zero-sized empty error union
         value_spec = ret_sig.ret_type_spec
         assert value_spec is not None
-        return _call_multi_value(native_fn, py_args, value_spec)
+        return _call_multi_value(native_fn, py_args, value_spec, self.context.mir_lower_cache)
 
     def get_entry(self):
         if self.entry is None:
@@ -401,6 +402,9 @@ class _Context(GlobalResolver):
         # from a spy body, by function object
         self._inline_cache: dict[Any, FunctionValue] = {}
         self._symbol_table = SymbolTable()
+        # the MIR-mirror interning table of this context, shared by every
+        # analysis it runs (see ``sval.MirLowerCache``)
+        self.mir_lower_cache = sval.MirLowerCache()
 
     def _local_fn(self, handle: _RegisteredFn) -> _RegisteredFn:
         # this context's handle of the Python function ``handle`` names: a
@@ -453,7 +457,7 @@ class _Context(GlobalResolver):
     def _resolve_call(
         self, fn: FunctionValue, call_sig: CallSignature, ret_sig: PartialReturnSignature
     ):
-        analyser = Analyser(self)
+        analyser = Analyser(self, self.mir_lower_cache)
         analyser.analyse_function(fn, call_sig, ret_sig)
         sym = analyser.finish()
         sym.compile(self._symbol_table, self.backend)

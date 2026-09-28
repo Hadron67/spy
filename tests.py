@@ -22,7 +22,7 @@ from contextlib import redirect_stdout
 from typing import Any, Literal, Never, cast
 from unittest import TestCase
 
-from spy.dsl import _Context, func, struct
+from spy.dsl import _GLOBAL_CONTEXT, _Context, func, struct
 
 from . import (
     CompileError,
@@ -938,6 +938,20 @@ def spy_type(annotation: Any) -> sval.Type:
     type = sval.as_value(annotation)
     assert isinstance(type, sval.Type)
     return type
+
+
+# the MIR-mirror interning table of the global host context: the MIR types the
+# tests compare against are the ones it created (see ``sval.MirLowerCache``)
+MIR_CACHE = _GLOBAL_CONTEXT.mir_lower_cache
+
+
+def struct_mirror(handle: Any) -> mir.Type:
+    """The MIR mirror of the struct type a handle declares (see
+    ``sval.StructType.get_mir_type``); the structs a test takes the mirror of
+    have storage, so it has one."""
+    mirror = struct_type(handle).get_mir_type(MIR_CACHE)
+    assert mirror is not None
+    return mirror
 
 
 @struct()
@@ -3479,43 +3493,43 @@ class SpyStructMirrorTest(TestCase):
 
     def test_single_field_mirrors_to_the_field(self) -> None:
         one = struct_type(One)
-        self.assertEqual(one.get_mir_type(), mir.IntType(32, True))
-        self.assertEqual(one.get_field_mir_indices(), (0,))
+        self.assertEqual(one.get_mir_type(MIR_CACHE), mir.IntType(32, True))
+        self.assertEqual(one.get_field_mir_indices(MIR_CACHE), (0,))
         # ... and so does a struct of one struct field, whose own mirror is
         # the mirror of the field it holds
-        self.assertEqual(struct_type(Nested).get_mir_type(), mir.IntType(32, True))
+        self.assertEqual(struct_type(Nested).get_mir_type(MIR_CACHE), mir.IntType(32, True))
 
     def test_single_struct_field_mirror(self) -> None:
         # the mirror of a struct of one struct field is the mirror of the
         # field it holds - which may itself be a struct type, and the field
         # still sits at the address of the value itself
         outer = struct_type(OuterTwo)
-        self.assertIsInstance(outer.get_mir_type(), mir.StructType)
-        self.assertTrue(outer.mirror_is_a_field())
-        self.assertEqual(outer.get_field_mir_indices(), (0,))
+        self.assertIsInstance(outer.get_mir_type(MIR_CACHE), mir.StructType)
+        self.assertTrue(outer.mirror_is_a_field(MIR_CACHE))
+        self.assertEqual(outer.get_field_mir_indices(MIR_CACHE), (0,))
 
     def test_fields_are_ordered_by_alignment(self) -> None:
         mixed = struct_type(Mixed)
-        mirror = mixed.get_mir_type()
+        mirror = mixed.get_mir_type(MIR_CACHE)
         assert isinstance(mirror, mir.StructType)
         self.assertEqual([f.name for f in mirror.fields], ['narrow', 'wide'])
-        self.assertEqual(mixed.get_field_mir_indices(), (1, 0))
+        self.assertEqual(mixed.get_field_mir_indices(MIR_CACHE), (1, 0))
 
         # a pointer is word-aligned, like an integer of that width
         with_pointer = WithPointer.specialize(())
-        mirror = with_pointer.get_mir_type()
+        mirror = with_pointer.get_mir_type(MIR_CACHE)
         assert isinstance(mirror, mir.StructType)
         self.assertEqual([f.name for f in mirror.fields], ['n', 'p'])
 
     def test_extern_c_keeps_the_declaration_order(self) -> None:
         extern_mixed = struct_type(ExternMixed)
-        mirror = extern_mixed.get_mir_type()
+        mirror = extern_mixed.get_mir_type(MIR_CACHE)
         assert isinstance(mirror, mir.StructType)
         self.assertEqual([f.name for f in mirror.fields], ['wide', 'narrow'])
-        self.assertEqual(extern_mixed.get_field_mir_indices(), (0, 1))
+        self.assertEqual(extern_mixed.get_field_mir_indices(MIR_CACHE), (0, 1))
         # an ``extern_c`` struct of one field keeps its wrapper struct, so
         # that the C layout is the one the declaration asks for
-        self.assertIsInstance(struct_type(ExternOne).get_mir_type(), mir.StructType)
+        self.assertIsInstance(struct_type(ExternOne).get_mir_type(MIR_CACHE), mir.StructType)
 
 
 class SpyTupleTest(TestCase):
@@ -3976,7 +3990,7 @@ class SpyOptionNestingTest(TestCase):
         self.assertIsNone(sval.find_first_pointer_type_pos(opt_ptr))
         # ... so the outer one has to carry a ``bool`` tag
         outer = sval.OptionType(opt_ptr)
-        self.assertIsInstance(outer.to_mir_type(), mir.StructType)
+        self.assertIsInstance(outer.to_mir_type(MIR_CACHE), mir.StructType)
         self.assertEqual(sval.estimated_size_of(outer), 2 * sval.estimated_size_of(ptr))
 
     def test_the_outer_option_takes_the_second_pointer(self) -> None:
@@ -3988,7 +4002,7 @@ class SpyOptionNestingTest(TestCase):
         # ... so the outer one tags on ``b``
         self.assertEqual(sval.find_first_pointer_type_pos(inner), (0, 1))
         # the two share the representation of the child ...
-        self.assertIs(outer.to_mir_type(), two.get_mir_type())
+        self.assertIs(outer.to_mir_type(MIR_CACHE), two.get_mir_type(MIR_CACHE))
         # ... and a further level has no pointer left
         self.assertIsNone(sval.find_first_pointer_type_pos(outer))
 
@@ -4237,8 +4251,8 @@ class SpyMultiReturnTest(TestCase):
             args[1:],
             (
                 mir.PointerType(i32_mir, False),
-                mir.PointerType(struct_type(Large).get_mir_type(), False),
-                mir.PointerType(struct_type(Small).get_mir_type(), False),
+                mir.PointerType(struct_mirror(Large), False),
+                mir.PointerType(struct_mirror(Small), False),
             ),
         )
 
@@ -4250,7 +4264,7 @@ class SpyMultiReturnTest(TestCase):
         self.assertEqual(
             args[1:],
             (
-                mir.PointerType(struct_type(Large).get_mir_type(), False),
+                mir.PointerType(struct_mirror(Large), False),
                 mir.PointerType(i32_mir, False),
             ),
         )
@@ -4285,8 +4299,8 @@ class SpyMultiReturnTest(TestCase):
         self.assertEqual(
             args[1:],
             (
-                mir.PointerType(struct_type(Large).get_mir_type(), False),
-                mir.PointerType(struct_type(Small).get_mir_type(), False),
+                mir.PointerType(struct_mirror(Large), False),
+                mir.PointerType(struct_mirror(Small), False),
             ),
         )
 
@@ -4297,7 +4311,7 @@ class SpyMultiReturnTest(TestCase):
         self.assertEqual(ret, mir.IntType(32, True))
         self.assertEqual(
             args[1:],
-            (mir.PointerType(struct_type(Large).get_mir_type(), False),),
+            (mir.PointerType(struct_mirror(Large), False),),
         )
 
     def test_every_result_through_a_pointer_returns_void(self) -> None:
@@ -4372,7 +4386,7 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         self.assertEqual(empty.tag_bits, 0)
         self.assertEqual(empty.code_type, sval.IntType(0, False))
         self.assertIsNotNone(empty.get_unit_value())
-        self.assertIsNone(empty.to_mir_type())
+        self.assertIsNone(empty.to_mir_type(MIR_CACHE))
 
     def test_error_code_width_is_the_smallest(self) -> None:
         small = struct_type(Small)
@@ -4398,8 +4412,8 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         one = sval.UnionType((small, large))
         two = sval.UnionType((small, large))
         self.assertIs(one.storage_variant(), large)
-        self.assertIs(one.to_mir_type(), two.to_mir_type())
-        self.assertIs(sval.UnionType(()).to_mir_type(), mir.VOID)
+        self.assertIs(one.to_mir_type(MIR_CACHE), two.to_mir_type(MIR_CACHE))
+        self.assertIsNone(sval.UnionType(()).to_mir_type(MIR_CACHE))
         self.assertEqual(sval.UnionType(()).get_unit_value(), sval.UnionValue(sval.UnionType(())))
 
     def test_make_ret_spec_spreads_the_error_union(self) -> None:
@@ -5487,6 +5501,170 @@ class SpyCrossContextTest(TestCase):
         self.assertEqual(len(own.specs), 1)  # pyright: ignore
 
 
+@func()
+def dst_target_fn(x: i32) -> i32:
+    return x + 1
+
+
+@func()
+def dst_local(n: i32) -> i32:
+    # a function value has no runtime representation of its own: a runtime
+    # location (the local's memory) cannot hold one
+    _f: spy_typeof(dst_target_fn) = dst_target_fn  # pyright: ignore
+    return n
+
+
+@func()
+def dst_return():
+    # ... and neither can a return deliver one
+    return dst_target_fn
+
+
+def _make_struct(*fields: tuple[str, sval.Type]) -> sval.StructType:
+    head = sval.StructTypeHead('T')
+    for name, type in fields:
+        head.add_field(name, type)
+    return head.specialize(())
+
+
+def _fn_type() -> sval.FunctionType:
+    return sval.FunctionType((), sval.VoidType())
+
+
+class SpyTypeClassifyTest(TestCase):
+    """``Type.classify``: how a spy type maps onto runtime code, computed from
+    the type alone (it never asks for the MIR mirror).  The composite kinds
+    follow their members, a compile-time-only member outranking a
+    dynamically-sized one, which outranks the zero-sized case."""
+
+    def test_ordinary_types(self) -> None:
+        for type in (sval.BoolType(), sval.FloatType(64), sval.IntType(32, True),
+                     _make_struct(('a', sval.IntType(32, True)))):
+            self.assertEqual(type.classify(), sval.SpecialTypeKind.NONE)
+            self.assertFalse(type.is_zst())
+
+    def test_zero_sized_types(self) -> None:
+        for type in (sval.VoidType(), sval.NullType(), sval.EmptyType(),
+                     sval.IntType(0, False), sval.ValueType(3),
+                     _make_struct(('v', sval.VoidType()))):
+            self.assertTrue(type.is_zst())
+
+    def test_compile_time_only_types(self) -> None:
+        for type in (sval.TypeType(0), sval.TypeVar('C'), sval.AnyIntType(),
+                     sval.TupleType((sval.IntType(32, True),), False),
+                     sval.ResultType(sval.VoidType(), ()), sval.AnyFunction()):
+            self.assertEqual(type.classify(), sval.SpecialTypeKind.COMPTIME)
+            self.assertFalse(type.is_zst())
+
+    def test_a_function_type_is_dynamically_sized(self) -> None:
+        self.assertEqual(_fn_type().classify(), sval.SpecialTypeKind.DST)
+        self.assertFalse(_fn_type().is_zst())
+
+    def test_a_pointer_is_always_sized(self) -> None:
+        # ... even one to a dynamically-sized type: only its value form is
+        # unsized
+        self.assertEqual(sval.PointerType(_fn_type()).classify(), sval.SpecialTypeKind.NONE)
+        self.assertEqual(
+            sval.PointerType(sval.IntType(32, True), sval.TypeVar('C')).classify(),
+            sval.SpecialTypeKind.COMPTIME,
+        )
+
+    def test_array_kinds(self) -> None:
+        i32_type = sval.IntType(32, True)
+        self.assertEqual(sval.ArrayType(i32_type, 3).classify(), sval.SpecialTypeKind.NONE)
+        # a zero-length array holds no storage whatever its element type
+        self.assertTrue(sval.ArrayType(_fn_type(), 0).is_zst())
+        self.assertTrue(sval.ArrayType(sval.TypeType(0), 0).is_zst())
+        self.assertTrue(sval.ArrayType(sval.VoidType(), 3).is_zst())
+        self.assertEqual(
+            sval.ArrayType(_fn_type(), 3).classify(), sval.SpecialTypeKind.DST
+        )
+        self.assertEqual(
+            sval.ArrayType(sval.TypeType(0), 3).classify(), sval.SpecialTypeKind.COMPTIME
+        )
+        # a length that is not solved yet leaves the layout unknown
+        self.assertEqual(
+            sval.ArrayType(i32_type, sval.TypeVar('L')).classify(),
+            sval.SpecialTypeKind.COMPTIME,
+        )
+
+    def test_option_kinds(self) -> None:
+        self.assertEqual(
+            sval.OptionType(sval.IntType(32, True)).classify(), sval.SpecialTypeKind.NONE
+        )
+        # an option is never zero-sized: it keeps whether a value is there
+        self.assertEqual(
+            sval.OptionType(sval.VoidType()).classify(), sval.SpecialTypeKind.NONE
+        )
+        self.assertEqual(
+            sval.OptionType(_fn_type()).classify(), sval.SpecialTypeKind.DST
+        )
+        self.assertEqual(
+            sval.OptionType(sval.TypeType(0)).classify(), sval.SpecialTypeKind.COMPTIME
+        )
+
+    def test_union_kinds(self) -> None:
+        i32_type = sval.IntType(32, True)
+        self.assertTrue(sval.UnionType(()).is_zst())
+        self.assertTrue(sval.UnionType((sval.VoidType(),)).is_zst())
+        self.assertEqual(sval.UnionType((i32_type,)).classify(), sval.SpecialTypeKind.NONE)
+        self.assertEqual(
+            sval.UnionType((_fn_type(),)).classify(), sval.SpecialTypeKind.DST
+        )
+        self.assertEqual(
+            sval.UnionType((sval.TypeType(0),)).classify(), sval.SpecialTypeKind.COMPTIME
+        )
+
+    def test_struct_kinds(self) -> None:
+        i32_type = sval.IntType(32, True)
+        self.assertTrue(_make_struct().is_zst())
+        self.assertEqual(
+            _make_struct(('f', _fn_type())).classify(), sval.SpecialTypeKind.DST
+        )
+        self.assertEqual(
+            _make_struct(('t', sval.TypeType(0))).classify(), sval.SpecialTypeKind.COMPTIME
+        )
+        # the compile-time kind outranks the dynamically-sized one
+        self.assertEqual(
+            _make_struct(('f', _fn_type()), ('t', sval.TypeType(0))).classify(),
+            sval.SpecialTypeKind.COMPTIME,
+        )
+        # ... and the dynamically-sized one outranks a field with storage
+        self.assertEqual(
+            _make_struct(('a', i32_type), ('f', _fn_type())).classify(),
+            sval.SpecialTypeKind.DST,
+        )
+
+    def test_a_function_type_is_passed_by_reference(self) -> None:
+        self.assertTrue(sval.pass_by_ref(_fn_type()))
+        self.assertFalse(sval.pass_by_ref(sval.IntType(32, True)))
+
+    def test_the_mir_cache_is_the_contexts_own(self) -> None:
+        # the interning table belongs to a host context, so two contexts do not
+        # share the MIR types they intern
+        self.assertIsNot(_GLOBAL_CONTEXT.mir_lower_cache, _CROSS_CONTEXT.mir_lower_cache)
+        union = sval.UnionType((sval.IntType(32, True),))
+        global_mir = union.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache)
+        # ... while one context reuses the one it made
+        self.assertIs(union.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache), global_mir)
+        self.assertIsNot(union.to_mir_type(_CROSS_CONTEXT.mir_lower_cache), global_mir)
+
+
+class SpyDstTest(TestCase):
+    """A dynamically-sized type (a function type) has no runtime value: a
+    runtime location cannot hold one and a return cannot deliver one."""
+
+    def test_a_local_of_a_function_type_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            dst_local(3)
+        self.assertIn('dynamically-sized', str(ctx.exception))
+
+    def test_returning_a_function_value_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            dst_return()
+        self.assertIn('dynamically-sized', str(ctx.exception))
+
+
 all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
@@ -5517,4 +5695,6 @@ all_tests = [
     SpyInferTest,
     SpyNoReturnTest,
     SpyCrossContextTest,
+    SpyTypeClassifyTest,
+    SpyDstTest,
 ]

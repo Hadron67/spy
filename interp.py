@@ -886,18 +886,20 @@ def _struct_construction_type(
 
 def _no_runtime_type(type: sval.Type) -> CompileError:
     """The error for a runtime location whose type has no representation
-    of its own.  A compile-time-only type (the type of an untyped integer
-    literal) is called out by name: the location has to declare its type,
-    since such a literal is only ever resolvable at compile time."""
-    if sval.is_comptime_only_type(type):
-        return CompileError(
-            f'{type} is the type of an untyped literal: a runtime location '
-            f'cannot hold it and must declare its type'
-        )
+    of its own: a compile-time-only type (the type of an untyped integer
+    literal, a type variable, ...) is called out by name, since the location
+    has to declare the type such a value is resolvable at compile time with.
+    A zero-sized type never gets here: it has a value (its unit value) and no
+    runtime location needs to hold it."""
     if isinstance(type, sval.TupleType):
         return CompileError(
             'a multi-value result must be destructured (``a, b = f()``) or held '
             'by a compile-time variable (``a: Comptime = f()``)'
+        )
+    if type.classify() == sval.SpecialTypeKind.COMPTIME:
+        return CompileError(
+            f'{type} is a compile-time-only type: a runtime location cannot '
+            f'hold it and must declare its type'
         )
     return CompileError(f'cannot give a value of type {type} a runtime representation')
 
@@ -927,7 +929,7 @@ def _comptime_py_value(value: Any) -> Any:
     return value.value if isinstance(value, (sval.Int, sval.Float)) else value
 
 def _convert_inst(
-    value: mir.Value, from_type: sval.Type, to_type: sval.Type
+    value: mir.Value, from_type: sval.Type, to_type: sval.Type, cache: sval.MirLowerCache
 ) -> mir.Inst | None:
     """Build (but do not emit) the conversion of ``value`` from
     ``from_type`` to ``to_type``; returns ``None`` when no conversion
@@ -942,8 +944,8 @@ def _convert_inst(
             f'cannot convert a {from_type} value to {to_type}: the storage of a '
             f'union is written through a pointer to it'
         )
-    mir_to_type = to_type.to_mir_type()
-    assert mir_to_type is not None and not isinstance(mir_to_type, mir.VoidType)
+    mir_to_type = to_type.to_mir_type(cache)
+    assert mir_to_type is not None and not to_type.is_zst()
     if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.IntType):
         if from_type.bits < to_type.bits:
             kind = 'sext' if from_type.signed else 'zext'
@@ -1015,6 +1017,9 @@ class HirRunner:
 
     def __init__(self, analyser: Analyser, fn_instance: FunctionInstance) -> None:
         self._analyser = analyser
+        # the host's MIR-mirror interning table (see ``Analyser``), through
+        # which every mirror a type is lowered to is made
+        self._mir_cache = analyser.mir_lower_cache
         # the frames of the function bodies under execution: the function
         # proper at the bottom, one frame per inlined plain function
         # above it (see ``_in_function_proper``; each frame carries the
@@ -1121,8 +1126,8 @@ class HirRunner:
             case SpecializedComptimeArg():
                 return ComptimeVal(sval.ConstRef(node.value))
             case SpecializedRuntimeArg():
-                mir_type = node.type.to_mir_type()
-                if mir_type is None or isinstance(mir_type, mir.VoidType):
+                mir_type = node.type.to_mir_type(self._mir_cache)
+                if mir_type is None or node.type.is_zst():
                     raise _no_runtime_type(node.type)
                 index = len(mir_args)
                 if node.is_ref:
@@ -1264,22 +1269,28 @@ class HirRunner:
         formal to the lowered signature), or None when the leaf is returned by
         value (which fixes the MIR return type)."""
         assert isinstance(leaf, RetValue)
+        if leaf.type.classify() == sval.SpecialTypeKind.DST:
+            # a dynamically-sized type has no runtime value a return could
+            # deliver: only a pointer to one can be returned
+            raise CompileError(
+                f'cannot return a value of the dynamically-sized type {leaf.type}'
+            )
         mir_fn = self._fn_instance.mir
         if leaf.via_result_ptr:
-            mir_type = leaf.type.to_mir_type()
-            if mir_type is None or isinstance(mir_type, mir.VoidType):
+            mir_type = leaf.type.to_mir_type(self._mir_cache)
+            if mir_type is None or leaf.type.is_zst():
                 raise CompileError(f'cannot return {leaf.type} through a result pointer')
             ptr_type = mir.PointerType(mir_type, False)
             index = len(mir_fn.args)
             mir_fn.args.append(ptr_type)
             mir_fn.arg_names.append('$result')
             return mir.Param(index, ptr_type)
-        mir_ret = leaf.type.to_mir_type()
-        if mir_ret is None:
-            raise _no_runtime_type(leaf.type)
-        if not isinstance(mir_ret, mir.VoidType):
+        if not leaf.type.is_zst():
             # a zero-sized result is delivered as its unit value; only a
             # result with storage fixes the MIR return type
+            mir_ret = leaf.type.to_mir_type(self._mir_cache)
+            if mir_ret is None:
+                raise _no_runtime_type(leaf.type)
             mir_fn.ret_type = mir_ret
         return None
 
@@ -1465,8 +1476,8 @@ class HirRunner:
         ptr_type = _type_of(place)
         if not isinstance(ptr_type, sval.PointerType):
             raise CompileError(f'cannot take a variant of {place!r}')
-        mir_struct = struct_type.to_mir_type()
-        assert mir_struct is not None and not isinstance(mir_struct, mir.VoidType)
+        mir_struct = struct_type.to_mir_type(self._mir_cache)
+        assert mir_struct is not None and not struct_type.is_zst()
         bitcast = self._emit(mir.BitCast(self._to_runtime(place), mir.PointerType(mir_struct)))
         return RuntimeVal(bitcast, sval.PointerType(struct_type, is_const=False))
 
@@ -2001,7 +2012,8 @@ class HirRunner:
         block = data.clause_blocks[index]
         assert block is not None
         union = sval.UnionType(tuple(exception for _, _, _, exception in records))
-        union_mir = union.to_mir_type()
+        assert not union.is_zst(), 'a bare clause has a payload pointer'
+        union_mir = union.to_mir_type(self._mir_cache)
         assert isinstance(union_mir, mir.UnionType)
         code_mir = mir.IntType(len(records).bit_length(), False)
         payload_phi: mir.Phi | None = None
@@ -2324,6 +2336,10 @@ class HirRunner:
                 # the value it refers to
                 return ComptimeVal(obj.value)
             case RuntimeVal():
+                if type.elem.classify() == sval.SpecialTypeKind.DST:
+                    raise CompileError(
+                        f'cannot load a value of the dynamically-sized type {type.elem}'
+                    )
                 return RuntimeVal(self._emit(mir.Load(ptr.value)), type.elem)
         raise CompileError('cannot load from a compile-time pointer')
 
@@ -2601,8 +2617,8 @@ class HirRunner:
                 node = node.child
                 continue
             if isinstance(node, sval.StructType):
-                if not node.mirror_is_a_field():
-                    mir_index = node.get_field_mir_indices()[index]
+                if not node.mirror_is_a_field(self._mir_cache):
+                    mir_index = node.get_field_mir_indices(self._mir_cache)[index]
                     assert mir_index is not None, 'a field holding a pointer has a mirror position'
                     cur = self._emit(mir.Gep(cur, mir_index))
                 node = node.fields().get_by_id(index).type
@@ -2621,7 +2637,7 @@ class HirRunner:
         tag = self._option_tag_addr(dst, option)
         assert tag is not None, 'the option has a pointer tag'
         tag_ptr, tag_type = tag
-        mir_type = tag_type.to_mir_type()
+        mir_type = tag_type.to_mir_type(self._mir_cache)
         assert isinstance(mir_type, mir.PointerType)
         self._emit(mir.Store(tag_ptr, mir.NullValue(mir_type)))
 
@@ -2645,15 +2661,15 @@ class HirRunner:
         if sval.find_first_pointer_type_pos(child) is not None:
             if not null:
                 return self._coerce(ev, child)
-            mir_type = option.to_mir_type()
-            assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+            mir_type = option.to_mir_type(self._mir_cache)
+            assert mir_type is not None and not option.is_zst()
             if isinstance(mir_type, mir.PointerType):
                 # the option itself is the tagging pointer: a null pointer is
                 # the absent value
                 return RuntimeVal(mir.NullValue(mir_type), option)
         # build the representation in a temporary and load it back
-        mir_type = option.to_mir_type()
-        assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+        mir_type = option.to_mir_type(self._mir_cache)
+        assert mir_type is not None and not option.is_zst()
         alloca = self._emit(mir.Alloca(mir_type))
         self._write_option(alloca, ev, option)
         return RuntimeVal(self._emit(mir.Load(alloca)), option)
@@ -2789,8 +2805,8 @@ class HirRunner:
                         'cannot take the address of a field of a compile-time value'
                     )
                 case RuntimeVal():
-                    if not container_type.mirror_is_a_field():
-                        mir_index = container_type.get_field_mir_indices()[index_int]
+                    if not container_type.mirror_is_a_field(self._mir_cache):
+                        mir_index = container_type.get_field_mir_indices(self._mir_cache)[index_int]
                         assert mir_index is not None, 'a field with storage has a mirror position'
                         return RuntimeVal(
                             self._emit(mir.Gep(ptr.value, mir_index), at), field_ptr_type
@@ -2994,7 +3010,7 @@ class HirRunner:
     def _convert(
         self, value: mir.Value, from_type: sval.Type, to_type: sval.Type
     ) -> mir.Value:
-        converted = _convert_inst(value, from_type, to_type)
+        converted = _convert_inst(value, from_type, to_type, self._mir_cache)
         if converted is None:
             return value
         return self._emit(converted)
@@ -3049,8 +3065,8 @@ class HirRunner:
             lc = self._coerce(lv, type)
             rc = self._coerce(rv, type)
             signed = isinstance(type, sval.IntType) and type.signed
-            mir_type = type.to_mir_type()
-            assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+            mir_type = type.to_mir_type(self._mir_cache)
+            assert mir_type is not None and not type.is_zst()
             value = self._emit(
                 mir.Arith(op, signed, self._to_runtime(lc), self._to_runtime(rc), mir_type)
             )
@@ -3139,8 +3155,8 @@ class HirRunner:
             self.store(ret, RuntimeVal(value, sval.BoolType()))
             return PollResult.AGAIN
         if op == '-':
-            mir_type = type.to_mir_type()
-            assert mir_type is not None and not isinstance(mir_type, mir.VoidType)
+            mir_type = type.to_mir_type(self._mir_cache)
+            assert mir_type is not None and not type.is_zst()
             if isinstance(type, sval.FloatType):
                 assert isinstance(mir_type, mir.FloatType)
                 zero: mir.Value = mir.Float(0.0, mir_type)
@@ -3280,8 +3296,14 @@ class HirRunner:
                 return
             val.committed = ComptimeBox(type, ComptimeVal(unit))
             return
-        mir_type = type.to_mir_type()
-        if mir_type is None or isinstance(mir_type, mir.VoidType):
+        if type.classify() == sval.SpecialTypeKind.DST:
+            # a dynamically-sized type has no size to allocate and no mirror a
+            # value of it could live in (only a pointer to one is a value)
+            raise CompileError(
+                f'cannot allocate a runtime location of the dynamically-sized type {type}'
+            )
+        mir_type = type.to_mir_type(self._mir_cache)
+        if mir_type is None or type.is_zst():
             raise _no_runtime_type(type)
         alloca = mir.Alloca(mir_type)
         val.insertion.insts.append(alloca)
@@ -3373,8 +3395,8 @@ class HirRunner:
         if unit is not None:
             self.store(slot, ComptimeVal(unit))
             return ComptimeVal(sval.Undefined(sval.PointerType(type, is_const=False)))
-        mir_type = type.to_mir_type()
-        if mir_type is None or isinstance(mir_type, mir.VoidType):
+        mir_type = type.to_mir_type(self._mir_cache)
+        if mir_type is None or type.is_zst():
             raise _no_runtime_type(type)
         output = mir.Insertion([], None, mir.PointerType(mir_type))
         self._emit(output)
@@ -3416,8 +3438,8 @@ class HirRunner:
             # lives at offset 0, and the superset's storage holds it)
             if not (_union_contains(from_type, to_type) or _union_contains(to_type, from_type)):
                 raise CompileError(f'cannot convert a {from_type} pointer to {to_type}')
-            to_mir = to_type.to_mir_type()
-            assert to_mir is not None and not isinstance(to_mir, mir.VoidType)
+            to_mir = to_type.to_mir_type(self._mir_cache)
+            assert to_mir is not None and not to_type.is_zst()
             bitcast = self._emit(mir.BitCast(self._to_runtime(ptr), mir.PointerType(to_mir)))
             return RuntimeVal(bitcast, sval.PointerType(to_type, is_const=False))
         if isinstance(from_type, sval.OptionType):
@@ -4019,8 +4041,8 @@ class HirRunner:
         if not use_ret_payload:
             self._commit_pending_slot(payload_place)
         code_type = callee_result.code_type
-        mir_code_type = code_type.to_mir_type()
-        zero_sized = mir_code_type is None or isinstance(mir_code_type, mir.VoidType)
+        mir_code_type = code_type.to_mir_type(self._mir_cache)
+        zero_sized = code_type.is_zst()
         cont_block = mir.BasicBlock() if not value_is_empty else None
         if zero_sized:
             # the callee uses no code at all: its single exception is the only
@@ -4104,10 +4126,7 @@ class HirRunner:
                     target = self._convert_result_ptr(target, leaf.type)
                 result_args.append(self._to_runtime(_shallow_normalize(target)))
                 continue
-            mir_type = leaf.type.to_mir_type()
-            if mir_type is None:
-                raise _no_runtime_type(leaf.type)
-            if isinstance(mir_type, mir.VoidType):
+            if leaf.type.is_zst():
                 # a zero-sized result produces no register: deliver its unit
                 # value.  The location of a call whose result is dropped (an
                 # expression statement) would otherwise stay untyped, and the
@@ -4117,6 +4136,9 @@ class HirRunner:
                 if unit is not None:
                     self.store(place, ComptimeVal(unit))
                 continue
+            mir_type = leaf.type.to_mir_type(self._mir_cache)
+            if mir_type is None:
+                raise _no_runtime_type(leaf.type)
             ret_type = mir_type
             by_value = (place, leaf.type)
 
@@ -4336,11 +4358,11 @@ class HirRunner:
         if len(self._pending_error_code_writes) == 0:
             return
         code_type = result_type.code_type
-        mir_code_type = code_type.to_mir_type()
-        if mir_code_type is None or isinstance(mir_code_type, mir.VoidType):
+        if code_type.is_zst():
             # a zero-sized code holds no storage: the only code a value-less
             # function ever writes is 0, which is what ``u0`` is anyway
             return
+        mir_code_type = code_type.to_mir_type(self._mir_cache)
         assert isinstance(mir_code_type, mir.IntType)
         code = _shallow_normalize(self._function_result().code)
         assert isinstance(code, RuntimeVal), 'an error code with storage is memory'
@@ -4351,8 +4373,11 @@ class HirRunner:
             )
 
 class Analyser:
-    def __init__(self, resolver: GlobalResolver) -> None:
+    def __init__(self, resolver: GlobalResolver, mir_lower_cache: sval.MirLowerCache) -> None:
         self._resolver = resolver
+        # the host's MIR-mirror interning table, which every mirror a body
+        # creates is made through (see ``sval.MirLowerCache``)
+        self.mir_lower_cache = mir_lower_cache
         self._analyse_stack: list[HirRunner] = []
         self._symbol_table = CompileBatch(
             extern_anon_symbols={},
