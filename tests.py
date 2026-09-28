@@ -19,7 +19,7 @@ function no earlier test has compiled.
 import ctypes
 import io
 from contextlib import redirect_stdout
-from typing import Any, Literal, Never
+from typing import Any, Literal, Never, cast
 from unittest import TestCase
 
 from spy.dsl import func, struct
@@ -599,6 +599,15 @@ def for_step(n: i32) -> i32:
 
 
 @func()
+def for_defaults(n: i32) -> i32:
+    # ``start`` and ``step`` are left out: the field defaults fill them
+    total: i32 = 0
+    for i in range(n):
+        total = total + i
+    return total
+
+
+@func()
 def for_nested(n: i32) -> i32:
     total: i32 = 0
     for i in range(n, 0, 1):
@@ -801,6 +810,107 @@ def inline_loop_misuse(n: i32) -> i32:
 
 
 # ---------------------------------------------------------------------------
+# compile-time ``for`` loops: the iterable (and so the loop variable) of a loop
+# marked with ``syntax.unroll()`` is a compile-time value, so the desugared
+# iterator loop unrolls at compile time - ``__next__`` raises ``StopIteration``
+# while the interpreter runs, and the ``break`` its ``except`` clause runs ends
+# the unrolled sequence (see ``astgen._gen_for``)
+# ---------------------------------------------------------------------------
+
+
+@func()
+def unroll_for_sum() -> i32:
+    # the literals have no runtime type of their own: the whole loop is
+    # compile-time
+    total: i32 = 0
+    syntax.unroll()
+    for i in range(4, 0, 1):
+        total = total + i
+    return total
+
+
+@func()
+def unroll_for_defaults() -> i32:
+    # ``start``/``step`` are left out: the field defaults fill them
+    total: i32 = 0
+    syntax.unroll()
+    for i in range(4):
+        total = total + i
+    return total
+
+
+@func()
+def unroll_for_else() -> i32:
+    total: i32 = 0
+    syntax.unroll()
+    for i in range(3, 0, 1):
+        total = total + i
+    else:  # noqa: PLW0120 - the else clause is the point of the fixture
+        total = total + 100
+    return total
+
+
+@func()
+def unroll_for_break(n: i32) -> i32:
+    # a runtime-conditional break leaves every remaining unrolled body (and the
+    # else clause, like Python)
+    total: i32 = 0
+    syntax.unroll()
+    for i in range(10, 0, 1):
+        if i == n:
+            break
+        total = total + i
+    else:
+        total = total + 100
+    return total
+
+
+@func()
+def unroll_for_continue() -> i32:
+    total: i32 = 0
+    syntax.unroll()
+    for i in range(5, 0, 1):
+        if i == 2:
+            continue
+        total = total + i
+    return total
+
+
+@func()
+def unroll_for_nested() -> i32:
+    total: i32 = 0
+    syntax.unroll()
+    for i in range(3, 0, 1):
+        syntax.unroll()
+        for j in range(2, 0, 1):
+            total = total + i * 10 + j
+    return total
+
+
+@func()
+def unroll_for_typed_var() -> i32:
+    # a compile-time iterator *variable*, of an explicit element type with a
+    # runtime representation (``range`` names ``std.range``, so it is
+    # subscriptable in spy but not in the Python type system)
+    r: Comptime[range[i32]] = range(3, 0, 1)  # pyright: ignore
+    total: i32 = 0
+    syntax.unroll()
+    for i in r:
+        total = total + i
+    return total
+
+
+@func()
+def unroll_for_runtime_iter(n: i32) -> i32:
+    # a runtime iterator cannot be unrolled: the unroll cap reports it
+    total: i32 = 0
+    syntax.unroll()
+    for i in range(n, 0, 1):
+        total = total + i
+    return total
+
+
+# ---------------------------------------------------------------------------
 # struct values: a struct is declared by decorating a class with ``@struct()``
 # - its annotated class attributes are the fields, in declaration order, and
 # the functions of its body are its methods - and is laid out by the mirror
@@ -918,6 +1028,33 @@ class Blank:
     v: void
 
 
+# a struct whose fields declare defaults: a construction may leave them out, and
+# the field takes the value the class body assigned to it (see
+# ``sval.StructField``/``interp.finish_struct``)
+@struct()
+class Defaulted:
+    x: i32
+    y: i32 = 7
+    z: i32 = 9
+
+
+# a struct whose zero-sized field declares a default too: leaving it out stores
+# nothing, since every value of a zero-sized type is its unit value
+@struct()
+class DefaultedZst:
+    v: void = None
+    n: i32 = 3
+
+
+# a generic struct with a defaulted field: the default is coerced to the type
+# the field got from the specialization (``cast`` keeps the Python type checker
+# happy about a type parameter's default, like ``std.range``'s fields)
+@struct()
+class GenericDefault[T]:
+    value: T
+    other: T = cast(T, 0)
+
+
 # a struct whose void methods are called for their effect alone, one
 # registered (``reset``, compiled into a native call) and one plain
 # (``clear``, inlined)
@@ -938,6 +1075,45 @@ class Sink:
 WithPointer: Any = sval.StructTypeHead('WithPointer')
 WithPointer.add_field('p', sval.PointerType(i32))  # pyright: ignore[reportArgumentType]
 WithPointer.add_field('n', i8)
+
+
+@func()
+def struct_defaults(x: i32) -> i32:
+    # every field left out is filled from its default
+    p = Defaulted(x)
+    return p.x + p.y + p.z
+
+
+@func()
+def struct_defaults_partial(x: i32) -> i32:
+    p = Defaulted(x, 100)
+    return p.x + p.y + p.z
+
+
+@func()
+def struct_defaults_comptime(x: i32) -> i32:
+    # the defaults fill an inline (compile-time) aggregate too
+    p: Comptime = Defaulted(x, 1)
+    return p.x + p.y + p.z
+
+
+@func()
+def struct_defaults_zst() -> i32:
+    p = DefaultedZst()
+    return p.n
+
+
+@func()
+def struct_defaults_generic(x: i32) -> i32:
+    g = GenericDefault[i32](x)
+    return g.value + g.other
+
+
+@func()
+def struct_missing_a_value() -> i32:
+    # a field with no default may not be left out
+    p = Defaulted()  # pyright: ignore[reportCallIssue]
+    return p.x
 
 
 @func()
@@ -2476,6 +2652,44 @@ class SpyInlineLoopTest(TestCase):
             inline_loop_misuse(3)
 
 
+class SpyUnrollForTest(TestCase):
+    """Compile-time ``for`` loops: the iterable of a loop marked with
+    ``syntax.unroll()`` is a compile-time value (the loop variable may have no
+    runtime representation at all), so the desugared iterator loop unrolls at
+    compile time; ``break`` leaves the whole unrolled sequence and ``continue``
+    jumps to the next unrolled body."""
+
+    def test_unrolled(self) -> None:
+        self.assertEqual(unroll_for_sum(), 0 + 1 + 2 + 3)
+
+    def test_defaulted_fields(self) -> None:
+        self.assertEqual(unroll_for_defaults(), 0 + 1 + 2 + 3)
+
+    def test_else(self) -> None:
+        self.assertEqual(unroll_for_else(), 0 + 1 + 2 + 100)
+
+    def test_break_skips_the_remaining_bodies_and_the_else(self) -> None:
+        self.assertEqual(unroll_for_break(2), 0 + 1)
+        # a break never taken runs the whole loop and the else
+        self.assertEqual(unroll_for_break(100), 0 + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 100)
+
+    def test_continue_jumps_to_the_next_body(self) -> None:
+        self.assertEqual(unroll_for_continue(), 0 + 1 + 3 + 4)
+
+    def test_nested_unrolled_loops(self) -> None:
+        self.assertEqual(unroll_for_nested(), 1 + 21 + 41)
+
+    def test_a_compile_time_iterator_variable(self) -> None:
+        self.assertEqual(unroll_for_typed_var(), 0 + 1 + 2)
+
+    def test_a_runtime_iterator_is_reported(self) -> None:
+        # the loop only ends when a ``StopIteration`` reaches the except clause
+        # at compile time, which a runtime iterator never does: the unroll cap
+        # reports it instead of unrolling forever
+        with self.assertRaises(CompileError):
+            unroll_for_runtime_iter(3)
+
+
 class SpyForTest(TestCase):
     """``for`` loops: the iterable is iterated with ``__iter__``/``__next__``
     (``range`` names ``std.range``), a ``break`` leaves the loop, a
@@ -2499,6 +2713,11 @@ class SpyForTest(TestCase):
 
     def test_start_and_step(self) -> None:
         self.assertEqual(for_step(7), 1 + 3 + 5)
+
+    def test_defaulted_start_and_step(self) -> None:
+        # ``range(n)`` leaves ``start`` and ``step`` to their defaults
+        self.assertEqual(for_defaults(4), 0 + 1 + 2 + 3)
+        self.assertEqual(for_defaults(0), 0)
 
     def test_nested(self) -> None:
         # the inner loop runs ``range(i, 0, 1)`` = ``0 .. i - 1``
@@ -2627,6 +2846,34 @@ class SpyStructTest(TestCase):
         # a struct of one struct field whose mirror is itself a struct type:
         # the field is still at the address of the value itself
         self.assertEqual(nested_struct_field(5), 5)
+
+
+class SpyStructDefaultsTest(TestCase):
+    """Struct field defaults: a construction may leave out a field the class
+    body gave a value, and the field takes it (coerced to its type), exactly
+    like a provided argument.  A field with no default still has to be given a
+    value."""
+
+    def test_a_left_out_field_takes_its_default(self) -> None:
+        self.assertEqual(struct_defaults(1), 1 + 7 + 9)
+
+    def test_a_provided_field_overrides_its_default(self) -> None:
+        self.assertEqual(struct_defaults_partial(1), 1 + 100 + 9)
+
+    def test_defaults_in_a_compile_time_aggregate(self) -> None:
+        self.assertEqual(struct_defaults_comptime(1), 1 + 1 + 9)
+
+    def test_a_zero_sized_default_stores_nothing(self) -> None:
+        self.assertEqual(struct_defaults_zst(), 3)
+
+    def test_a_default_is_coerced_to_the_field_type(self) -> None:
+        # the default is the untyped literal ``0``, written into an ``i32`` field
+        self.assertEqual(struct_defaults_generic(5), 5)
+
+    def test_a_field_without_a_default_may_not_be_left_out(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            struct_missing_a_value()
+        self.assertIn("missing a value for field 'x'", str(ctx.exception))
 
 
 class SpyComptimeStructTest(TestCase):
@@ -4796,8 +5043,10 @@ all_tests = [
     SpyForTest,
     SpyMethodSelfTest,
     SpyInlineLoopTest,
+    SpyUnrollForTest,
     SpyAnnotationTest,
     SpyStructTest,
+    SpyStructDefaultsTest,
     SpyComptimeStructTest,
     SpyComptimeArrayTest,
     SpyStructMirrorTest,

@@ -241,12 +241,12 @@ class FinishStruct(Inst):
     fields were generated into.  ``indices`` are the addresses the
     positional arguments were written into, in the order they were given,
     and ``names`` the ones the keyword arguments were written into, by
-    field name; every field has to be written - a field may only be left
-    out when it has a default, which is not implemented yet - so a missing
-    field is an error, a zero-sized one included.  The parser only has to
-    know the syntax, not the field layout: the interpreter resolves the
-    struct type (inferring the generic arguments a template was not given)
-    from ``struct`` and the field addresses."""
+    field name; a field that is left out takes its declared default (a
+    zero-sized one included - it has no storage to write), so only a field
+    that has no default is a missing field, which is an error.  The parser
+    only has to know the syntax, not the field layout: the interpreter
+    resolves the struct type (inferring the generic arguments a template
+    was not given) from ``struct`` and the field addresses."""
 
     struct: Value
     dest: Value

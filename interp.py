@@ -2318,7 +2318,12 @@ class HirRunner:
         """Write ``value`` into the slot or through the pointer ``ptr``.
         A store into a still uncommitted slot only records a store point
         (see :class:`PendingSlot`): the slot's final type is not known
-        until it is committed, and the actual store is inserted then."""
+        until it is committed, and the actual store is inserted then.
+
+        A zero-sized type has no storage, so no store is *emitted* for one at
+        runtime; a compile-time place (a box, the field of a compile-time
+        aggregate) still records the value, since the type of such a place may
+        have no runtime representation at all."""
         if isinstance(ptr, ComptimeTuple):
             # a destructuring target: a tuple of element *addresses*, one
             # per element of the value it is stored with (a nested tuple
@@ -2378,8 +2383,6 @@ class HirRunner:
         if not isinstance(ptr_type, sval.PointerType):
             raise CompileError(f"cannot store to a {ptr_type} value")
         elem = ptr_type.elem
-        if elem.is_zst():
-            return
         if isinstance(elem, sval.UnionType) and _is_union_unit(value):
             # a union value carries no storage - it says nothing but which union
             # it belongs to - so a storage destination has nothing to write
@@ -2408,7 +2411,9 @@ class HirRunner:
             # a whole aggregate is written place by place, into the place of each
             # field (or element) - memory storage or a compile-time aggregate -
             # which is how a copy into an existing storage works (see
-            # ``ComptimeAggregate``)
+            # ``ComptimeAggregate``).  This comes before any question about the
+            # type's runtime representation: an aggregate's places exist whether
+            # or not the aggregate has a mirror of its own
             place_types = _aggregate_place_types(elem)
             if len(aggregate.values) != len(place_types):
                 raise CompileError(
@@ -2418,16 +2423,33 @@ class HirRunner:
             for index, place_value in enumerate(aggregate.values):
                 self.store(self.field_index_addr(ptr, _index_value(index)), place_value)
             return
-        coerced = self._coerce(value, elem)
+        if isinstance(ptr, ComptimeVal) and isinstance(ptr.obj, sval.Undefined):
+            # a compile-time pointer with no storage at all: the address of a
+            # zero-sized field or element (see ``field_index_addr``), or of a
+            # zero-sized exception's variant (see ``_union_variant_ptr``).
+            # Every value of the type it points at is the type's unit value, so
+            # a store into it records nothing
+            return
+        unit = elem.get_unit_value()
         match ptr:
             case ComptimeBox():
                 if _is_aggregate(ptr.type):
                     # an aggregate is held by its own places, never by a box (see
                     # ``ComptimeAggregatePtr``)
                     raise CompileError(f'a compile-time box cannot hold the aggregate {ptr.type}')
-                ptr.value = coerced
+                if unit is not None:
+                    # a zero-sized type has one value - its unit value - which
+                    # is what a place of it holds whatever is stored into it (no
+                    # coercion: the value stored need not even be of the type)
+                    ptr.value = ComptimeVal(unit)
+                else:
+                    ptr.value = self._coerce(value, elem)
             case RuntimeVal():
-                self._emit(mir.Store(ptr.value, self._to_runtime(coerced)))
+                if unit is not None:
+                    # a zero-sized type has no storage: nothing is emitted at
+                    # runtime (a compile-time place still records its value)
+                    return
+                self._emit(mir.Store(ptr.value, self._to_runtime(self._coerce(value, elem))))
             case _:
                 raise CompileError('cannot store through a compile-time pointer')
 
@@ -3467,12 +3489,17 @@ class HirRunner:
         template written without its arguments - the one the storage declares
         or the field values determine (see ``_struct_construction_type``).  A
         positional argument binds the field of the same declaration index, a
-        keyword one the field of that name, and any other field is an error: a
-        field may only be left out when it has a default, which is not
-        implemented yet (a zero-sized field included).  Just like
-        ``finish_array``, the storage takes the struct type through a deferral,
-        so its type is *recorded* on the slot rather than fixed on it, and
-        every field place that is still pending becomes the address of its
+        keyword one the field of that name, and any other field must have a
+        default, which the class body declared (see ``sval.StructField``): the
+        default value is written into the field, coerced to its type, exactly
+        like a provided argument.  A zero-sized field has no storage, so its
+        default records nothing (every value of the type equals its unit
+        value).  Defaults do not take part in inferring the generic arguments -
+        a type parameter only a defaulted field names cannot be inferred.
+
+        Just like ``finish_array``, the storage takes the struct type through a
+        deferral, so its type is *recorded* on the slot rather than fixed on it,
+        and every field place that is still pending becomes the address of its
         field in the storage (its value is written through that address, in
         place).
 
@@ -3511,10 +3538,8 @@ class HirRunner:
                 f'argument(s) but {len(indices)} were given'
             )
         for index, field0 in enumerate(fields.values()):
-            if index not in provided:
-                # a field may only be left out when it has a default, and struct
-                # field defaults are not implemented yet: every field - a
-                # zero-sized one included - has to be given a value
+            if index not in provided and field0.default is None:
+                # a field may only be left out when it has a default
                 raise CompileError(f'missing a value for field {field0.name!r}')
 
         if isinstance(dest, PendingSlot) and dest.committed is None and dest.is_inline(struct_type):
@@ -3522,13 +3547,27 @@ class HirRunner:
             # construction only hands them to the storage slot, whose commit
             # materializes the aggregate (see ``init_inline_aggregate``)
             if self._pending_aggregate(dest) is None:
-                places = tuple(provided[index] for index in range(len(fields.by_id)))
+                places = tuple(
+                    provided[index] if index in provided
+                    else self._default_field_place(dest, index, fields.get_by_id(index))
+                    for index in range(len(fields.by_id))
+                )
                 self._record_pending_action(dest, _PendingAggregate(struct_type, places))
+            else:
+                # a second construction into the same storage (the branches of
+                # an ``if`` expression): the places are recorded already, so
+                # only the fields it leaves out are filled
+                for index in range(len(fields.by_id)):
+                    if index not in provided:
+                        self._default_field_place(dest, index, fields.get_by_id(index))
             return
         if isinstance(_shallow_normalize(dest), ComptimeAggregatePtr):
             # the aggregate is already materialized (a ``Comptime`` variable that
             # was assigned before): every field already is a place, which the
             # arguments wrote through (see ``field_index_addr``)
+            for index, field0 in enumerate(fields.values()):
+                if index not in provided:
+                    self._default_field_place(dest, index, field0)
             return
 
         if isinstance(dest, PendingSlot) and dest.committed is None:
@@ -3554,6 +3593,23 @@ class HirRunner:
             addr = self.field_index_addr(dest_ptr, _index_value(index), at=place.insertion)
             assert isinstance(addr, RuntimeVal), 'a field with storage has an address'
             self._bind_slot(place, addr.value, field_type)
+        for index, field0 in enumerate(fields.values()):
+            if index not in provided:
+                self._default_field_place(dest_ptr, index, field0)
+
+    def _default_field_place(self, dest: InterpVal, index: int, field: sval.StructField) -> InterpVal:
+        """The place a left-out field's default is written through: the same
+        place a provided argument is generated into (see ``field_index_addr``
+        with ``is_aggregate_init``), so a default fills its field exactly like
+        an argument - in a compile-time aggregate's own place, at the field's
+        address in memory, or in the fresh place an inline construction records
+        for its commit (see ``finish_struct``).  The place is returned so that
+        the inline storage can hand it to its pending aggregate.  A zero-sized
+        field has no storage, so its default records nothing."""
+        assert field.default is not None, 'a field without a default is never left out'
+        place = self.field_index_addr(dest, _index_value(index), is_aggregate_init=True)
+        self.store(place, ComptimeVal(field.default))
+        return place
 
     # -- array values ----------------------------------------------------------
 

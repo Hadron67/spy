@@ -1,6 +1,7 @@
 from typing import Protocol, Self, cast
 
 from .dsl import struct
+from .syntax import Comptime
 
 
 class Numeric(Protocol):
@@ -21,7 +22,7 @@ class StopIteration(Exception):
 class range[T: Numeric]:
     end: T
     start: T = cast(T, 0)
-    step: T = cast(T, 0)
+    step: T = cast(T, 1)
 
     def __iter__(self) -> range[T]:
         return self
@@ -29,6 +30,10 @@ class range[T: Numeric]:
     def __next__(self) -> T:
         if self.start >= self.end:
             raise StopIteration()
-        result = self.start
+        # ``result`` holds a value that may have no runtime representation (the
+        # element of a compile-time iterator, e.g. an untyped integer literal),
+        # so it is kept inline: a compile-time ``for`` over a compile-time range
+        # iterates at compile time (see ``astgen._gen_for``)
+        result: Comptime[T] = self.start  # pyright: ignore[reportAssignmentType]
         self.start += self.step
-        return result
+        return result  # pyright: ignore[reportReturnType]

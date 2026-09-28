@@ -373,11 +373,23 @@ class _Builder:
         directly (skipping the else clause), like Python, and a ``continue``
         starts the next iteration.  The ``syntax.unroll()`` marker immediately
         before the ``for`` opens the loop as a compile-time one (see
-        ``interp``)."""
+        ``interp``): the iterable and the loop variable(s) of a compile-time
+        loop are *compile-time values*, so both are built into inline slots -
+        a compile-time iterable is an aggregate with no runtime representation
+        of its own, which an ordinary expression temporary may not hold."""
         # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
         # iteration would restart the iteration)
         it = self.add(hir.Alloca(hir.InlineMode.FULL if is_inline else hir.InlineMode.NON_AGGREGATE))
-        base = self._as_ref(self._gen_expr(node.iter)[0])
+        if is_inline:
+            # a compile-time iterable is evaluated into an inline slot of its
+            # own (result-location semantics), so that it never goes through an
+            # expression temporary
+            iter_slot = self.add(hir.Alloca(hir.InlineMode.FULL))
+            self._gen_result_loc(node.iter, iter_slot)
+            self.add(hir.CommitSlot(iter_slot))
+            base = iter_slot
+        else:
+            base = self._as_ref(self._gen_expr(node.iter)[0])
         self.add(hir.CallMethodInplace(base, '__iter__', RawArgList((), frozendict()), it))
         self.add(hir.CommitSlot(it))
         # the loop body, in a block of its own: the loop variable(s) are
@@ -386,7 +398,10 @@ class _Builder:
         sub.add(hir.Loop(is_inline=is_inline))
         sub.add(hir.Try((None,)))
         new_slots: list[hir.Value] = []
-        place = sub._gen_lhs(node.target, new_slots)
+        place = sub._gen_lhs(
+            node.target, new_slots,
+            hir.InlineMode.FULL if is_inline else hir.InlineMode.NONE,
+        )
         sub.add(hir.CallMethodInplace(it, '__next__', RawArgList((), frozendict()), place))
         for slot in new_slots:
             sub.add(hir.CommitSlot(slot))
@@ -454,21 +469,25 @@ class _Builder:
 
     # -- variables ------------------------------------------------------------
 
-    def _gen_lhs(self, target: ast.expr, new_slots: list[hir.Value]) -> hir.Value:
+    def _gen_lhs(self, target: ast.expr, new_slots: list[hir.Value], inline_mode: hir.InlineMode = hir.InlineMode.NONE) -> hir.Value:
         """The place - or, for a destructuring target, the ``hir.Tuple`` of
         places - a target denotes, declaring every name it binds nowhere (their
         fresh slots are appended to ``new_slots``).  It is the first half of an
         assignment, shared by ``_gen_assign`` and the ``for`` desugaring (see
         ``_gen_for``): the caller generates the value into the returned place
-        with result-location semantics and then commits ``new_slots``."""
+        with result-location semantics and then commits ``new_slots``.
+
+        ``inline_mode`` is how much of the value the fresh slots may keep inline
+        (see ``hir.Alloca``): the loop variable of a compile-time ``for`` is a
+        compile-time value, so it is bound to an inline slot."""
         if isinstance(target, ast.Tuple):
             # a destructuring target is a tuple of addresses, one per element:
             # the right-hand side is generated straight into them (result-
             # location semantics), so no intermediate tuple value is built
-            return self._gen_target_tuple(target, new_slots)
+            return self._gen_target_tuple(target, new_slots, inline_mode)
         if isinstance(target, ast.Name) and self._scope.lookup(target.id) is None:
             # the name is bound nowhere: declare it here, in the current block
-            slot = self.add(hir.Alloca())
+            slot = self.add(hir.Alloca(inline_mode))
             self._scope.bindings[target.id] = slot
             new_slots.append(slot)
             return slot
@@ -546,18 +565,19 @@ class _Builder:
             return True, node.slice
         return False, node
 
-    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value]) -> hir.Value:
+    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], inline_mode: hir.InlineMode = hir.InlineMode.NONE) -> hir.Value:
         """The tuple of addresses a destructuring target denotes: a plain
         target contributes the address of its slot (or field), a nested
         tuple target contributes its own tuple of addresses.  Only a name
-        that is bound nowhere is declared (see ``_gen_assign``)."""
+        that is bound nowhere is declared (see ``_gen_assign``); its fresh slot
+        keeps values inline as ``inline_mode`` says (see ``_gen_lhs``)."""
         elems: list[ArgEntry[hir.Value]] = []
         for elt in target.elts:
             if isinstance(elt, ast.Tuple):
-                elems.append(ArgEntry(self._gen_target_tuple(elt, new_slots), False))
+                elems.append(ArgEntry(self._gen_target_tuple(elt, new_slots, inline_mode), False))
                 continue
             if isinstance(elt, ast.Name) and self._scope.lookup(elt.id) is None:
-                slot = self.add(hir.Alloca())
+                slot = self.add(hir.Alloca(inline_mode))
                 self._scope.bindings[elt.id] = slot
                 new_slots.append(slot)
             ref = self._gen_expr(elt, False)[0]

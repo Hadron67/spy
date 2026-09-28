@@ -1088,6 +1088,11 @@ class FunctionType(Type):
 class StructField:
     name: str
     type: Type
+    # the value a construction leaves the field at when it is not given
+    # (``None`` when the field has no default): the value the class body
+    # assigned to the annotated attribute (see ``dsl``), as a spy value, which
+    # a construction coerces to the field's type (see ``interp.finish_struct``)
+    default: AnyValue | None = None
 
 @dataclass(frozen=True)
 class AggregateValue(Value):
@@ -1123,10 +1128,11 @@ class StructTypeHead(Type, IdentityObj):
         self.methods: dict[str, Any] = {}
         self._specs: dict[tuple[Value, ...], StructType] = {}
 
-    def add_field(self, name: str, type: Type) -> None:
-        """Declare one field, appended after the fields declared so far."""
+    def add_field(self, name: str, type: Type, default: AnyValue | None = None) -> None:
+        """Declare one field, appended after the fields declared so far, with
+        the spy value a construction leaves it at when it is not given."""
         assert name not in self.fields.by_key, f'{self.name_base} already has a field {name!r}'
-        self.fields.add(name, StructField(name, type))
+        self.fields.add(name, StructField(name, type, default))
 
     def specialize(self, generic_args: tuple[Value, ...]) -> StructType:
         """The struct type this head declares for ``generic_args``: the one
@@ -1198,7 +1204,13 @@ class StructType(Type):
         this specialization's arguments.  Computed once and cached."""
         if self._fields is None:
             reps = {k: v for k, v in zip(self.head.generic_args, self.generic_args)}
-            self._fields = self.head.fields.map(lambda f: StructField(f.name, replace_type_vars_type(f.type, reps)))
+            self._fields = self.head.fields.map(
+                lambda f: StructField(
+                    f.name,
+                    replace_type_vars_type(f.type, reps),
+                    replace_type_vars_value(f.default, reps),
+                )
+            )
         return self._fields
 
     @override
@@ -2165,6 +2177,14 @@ def replace_type_vars_type(type: Type, reps: Mapping[TypeVar, AnyValue]) -> Type
     ret = replace_type_var(type, reps)
     assert isinstance(ret, Type)
     return ret
+
+def replace_type_vars_value(value: AnyValue | None, reps: Mapping[TypeVar, AnyValue]) -> AnyValue | None:
+    """A compile-time value (a struct field's default, e.g.) with the type
+    parameters ``reps`` names replaced by their type arguments; ``None`` - a
+    field that has no default - stays ``None``."""
+    if value is None:
+        return None
+    return replace_type_var(value, reps)
 
 def is_comptime_only_type(type: Type) -> bool:
     match type:

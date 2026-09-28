@@ -309,7 +309,17 @@ class _RegisteredClass(StructDecl):
                 type = sval.as_value(annotation, self.class_type_vars, resolver=self.context)
                 if type is None or not isinstance(type, sval.Type):
                     raise CompileError(f'cannot convert annotation {annotation!r} to a value')
-                head.add_field(name, type)
+                # the value the class body assigned to the annotated attribute
+                # is the field's default, which a construction leaves it at when
+                # it is not given (``None`` - no value written - is the null
+                # value, so it marks a default like any other; a field with no
+                # default has no entry in the class body at all)
+                default: sval.AnyValue | None = None
+                if name in self.cls.__dict__:
+                    default = sval.as_value(
+                        self.cls.__dict__[name], self.class_type_vars, resolver=self.context,
+                    )
+                head.add_field(name, type, default)
             # the ``self`` of every method is the struct *template*: a
             # specialization whose type arguments are the struct's own
             # parameters, so that a call substitutes the arguments of the
