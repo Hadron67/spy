@@ -97,9 +97,12 @@ class InlineMode(IntEnum):
     runtime representation.  ``NON_AGGREGATE`` may keep any value inline
     except an *aggregate* (a struct or an array), which has no inline storage
     of its own here (see ``ComptimeAggregatePtr``).  ``FULL`` may keep
-    anything inline - it is what a ``Comptime`` variable declares.  A
-    zero-sized value has no runtime representation at all, so its slot only
-    records its unit value whatever the mode is."""
+    anything inline - it is what a ``Comptime`` variable declares, and an
+    aggregate in one is always held by its fields' places, whatever the
+    values of those fields are; only a delivery that needs the slot's own
+    single address forces it into memory (see ``interp``).  A zero-sized
+    value has no runtime representation at all, so its slot only records its
+    unit value whatever the mode is."""
 
     NONE = auto()
     NON_AGGREGATE = auto()

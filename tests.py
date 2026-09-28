@@ -2454,6 +2454,88 @@ def comptime_struct_nested_copy() -> i32:
 
 
 @func()
+def comptime_struct_from_a_runtime_value(x: i32) -> i32:
+    # a whole *runtime* struct value assigned to a compile-time variable: such a
+    # variable holds its fields as places of their own (see
+    # ``ComptimeAggregatePtr``), so the value is split into one store per field -
+    # the runtime field lands in memory, a compile-time one in a box
+    s = Small(x, 2)
+    c: Comptime = s
+    return c.a + c.b
+
+
+@func()
+def comptime_struct_declared_from_a_runtime_value(x: i32) -> i32:
+    # ... the same into a declared compile-time variable, whose field places
+    # already exist
+    s = Small(x, 2)
+    c: Comptime[Small] = s
+    return c.a + c.b
+
+
+@func()
+def comptime_struct_reassigned_from_a_runtime_value(x: i32) -> i32:
+    # ... and a whole runtime value assigned after a construction wrote the
+    # field places
+    c: Comptime = Small(x, 1)
+    s = Small(x, 3)
+    c = s
+    return c.a + c.b
+
+
+@func()
+def comptime_struct_runtime_field_by_ref(x: i32) -> i32:
+    # the runtime field of a compile-time aggregate is a runtime place of its
+    # own, so its address can be handed to a native function (which writes
+    # through it)
+    s: Comptime = Small(x, 2)
+    incr_ptr(ref(s.a))
+    return s.a
+
+
+@func()
+def comptime_struct_field_written_in_branches(c: spy_bool, x: i32) -> i32:
+    # the runtime field of a compile-time aggregate written in both branches of a
+    # runtime ``if``: both runtime paths have to write the same place, so it is
+    # memory - a compile-time box would keep only the value the walk wrote last
+    s: Comptime = Small(x, 1)
+    if c:
+        s.a = 5
+    else:
+        s.a = 9
+    return s.a + s.b
+
+
+@func()
+def comptime_struct_from_a_nested_runtime_value(x: i32) -> i32:
+    # a nested aggregate field holding a runtime struct is split the same way,
+    # recursively
+    inner = Pair[i32](x, 2)
+    h: Comptime = StructHolder(inner, 3)
+    return h.p.a + h.p.b + h.extra
+
+
+@func()
+def comptime_struct_from_a_runtime_choice(c: spy_bool, x: i32) -> i32:
+    # both branches assign a whole runtime value into one compile-time variable:
+    # the field places are the ones the first store recorded, and each runtime
+    # branch writes its own value into them (unlike the compile-time values of
+    # ``comptime_struct_choose``, whose last write wins)
+    a = Small(x, 2)
+    b = Small(x, 3)
+    s: Comptime = a if c else b
+    return s.a + s.b
+
+
+@func()
+def comptime_struct_argument_from_a_variable(x: i32) -> i32:
+    # a compile-time aggregate with a runtime field handed to a native function:
+    # its fields are materialized into memory (see ``_materialize_aggregate``)
+    s: Comptime = Small(x, 2)
+    return sum_small(s)
+
+
+@func()
 def comptime_struct_field_comparison() -> spy_bool:
     # a field read is a compile-time constant, so an operator on it is folded
     # in Python
@@ -2977,7 +3059,7 @@ class SpyComptimeMarkerTest(TestCase):
         self.assertEqual(comptime_marker_in_a_branch(False), 0)
 
     def test_it_must_be_followed_by_a_declaration(self) -> None:
-        with self.assertRaises(CompileError) as ctx:
+        with self.assertRaises(CompileError):
             comptime_marker_before_a_non_declaration()
         with self.assertRaises(CompileError):
             comptime_marker_at_the_end()
@@ -3140,6 +3222,39 @@ class SpyComptimeStructTest(TestCase):
 
     def test_nested_aggregate_copy(self) -> None:
         self.assertEqual(comptime_struct_nested_copy(), 123)
+
+    def test_a_whole_runtime_value_into_a_comptime_variable(self) -> None:
+        # the value is split into one store per field, so the variable is still
+        # an aggregate of places rather than a struct in memory
+        self.assertEqual(comptime_struct_from_a_runtime_value(5), 7)
+
+    def test_a_whole_runtime_value_into_a_declared_comptime_variable(self) -> None:
+        self.assertEqual(comptime_struct_declared_from_a_runtime_value(5), 7)
+
+    def test_a_whole_runtime_value_after_a_construction(self) -> None:
+        self.assertEqual(comptime_struct_reassigned_from_a_runtime_value(5), 8)
+
+    def test_a_runtime_field_of_such_a_variable_is_addressable(self) -> None:
+        # the runtime field is memory, not a box: a native callee writes it
+        self.assertEqual(comptime_struct_runtime_field_by_ref(5), 6)
+
+    def test_a_runtime_field_written_in_branches(self) -> None:
+        # both runtime paths write the same memory place, so each keeps its own
+        # value (a box would have kept the one the walk wrote last)
+        self.assertEqual(comptime_struct_field_written_in_branches(True, 3), 6)
+        self.assertEqual(comptime_struct_field_written_in_branches(False, 3), 10)
+
+    def test_a_nested_runtime_aggregate_field(self) -> None:
+        self.assertEqual(comptime_struct_from_a_nested_runtime_value(5), 10)
+
+    def test_a_runtime_choice_of_whole_values(self) -> None:
+        # each branch writes its own whole value into the recorded field places,
+        # so the choice is a runtime one here (the values are runtime values)
+        self.assertEqual(comptime_struct_from_a_runtime_choice(True, 5), 7)
+        self.assertEqual(comptime_struct_from_a_runtime_choice(False, 5), 8)
+
+    def test_a_native_argument_from_a_comptime_variable(self) -> None:
+        self.assertEqual(comptime_struct_argument_from_a_variable(5), 7)
 
     def test_field_comparison(self) -> None:
         self.assertTrue(comptime_struct_field_comparison())

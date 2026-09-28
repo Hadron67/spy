@@ -288,13 +288,26 @@ class PendingSlot(InterpVal):
     def is_inline(self, type: sval.Type) -> bool:
         """Whether the slot may hold the value of type ``type`` inline (in a
         :class:`ComptimeBox`, or as a :class:`ComptimeAggregatePtr` for an
-        aggregate) rather than in memory: its mode allows it (see
-        ``InlineMode``), every store into it is of an inline value (see
-        ``_is_inline_val``), and a ``NON_AGGREGATE`` slot holds no aggregate - a
-        zero-sized value has no runtime representation at all, so any mode
-        keeps its unit value."""
+        aggregate) rather than in memory.  A ``FULL`` slot holds *any* aggregate
+        that way, whatever the values of its fields are - a compile-time
+        aggregate is its fields' own places (see ``ComptimeAggregatePtr``) -
+        unless a delivery into the slot needs an address of its own: a result
+        pointer a callee writes through (see ``_defer_ptr_convertion``), which a
+        place held by its fields has no single address to hand over.  Otherwise
+        the mode has to allow it (see ``InlineMode``) and every store into the
+        slot has to be of an inline value (see ``_is_inline_val``) - a runtime
+        value written into a ``NON_AGGREGATE`` slot or into the field of a
+        compile-time aggregate has to land in memory, since the runtime paths
+        that write it (the two branches of a runtime ``if``, e.g.) only join
+        there - and a ``NON_AGGREGATE`` slot holds no aggregate at all.  A
+        zero-sized value has no runtime representation, so any mode keeps its
+        unit value."""
         if self.inline_mode == InlineMode.NONE:
             return False
+        if self.inline_mode == InlineMode.FULL and _is_aggregate(type):
+            return not any(
+                isinstance(store.data, _PendingPtrConvertion) for store in self.stores
+            )
         if not all(store.data.info()[1] for store in self.stores):
             return False
         return not (self.inline_mode == InlineMode.NON_AGGREGATE and _is_aggregate(type))
@@ -2324,6 +2337,7 @@ class HirRunner:
         runtime; a compile-time place (a box, the field of a compile-time
         aggregate) still records the value, since the type of such a place may
         have no runtime representation at all."""
+        value = _shallow_normalize(value)
         if isinstance(ptr, ComptimeTuple):
             # a destructuring target: a tuple of element *addresses*, one
             # per element of the value it is stored with (a nested tuple
@@ -2369,6 +2383,30 @@ class HirRunner:
             value_type = _type_of(value)
             if value_type is None:
                 raise CompileError('cannot store a value that has no spy type')
+            if ptr.inline_mode == InlineMode.FULL and _is_aggregate(value_type) and not _is_inline_val(value):
+                # a *runtime* aggregate value into a compile-time variable: such a
+                # variable holds its fields as places of their own (see
+                # ``ComptimeAggregatePtr``), so the value is split into one place
+                # (and one store) per field - each of which then lands where its
+                # own kind says, in memory for a runtime field and in a box
+                # otherwise
+                recorded = self._pending_aggregate(ptr)
+                if recorded is None:
+                    self._record_pending_action(
+                        ptr,
+                        _PendingAggregate(
+                            value_type, self._split_runtime_aggregate(value, value_type),
+                        ),
+                    )
+                else:
+                    # a second value into the same storage (the branches of an
+                    # ``if`` expression): its fields are places already, which
+                    # the field values are written into
+                    for index, field_value in enumerate(
+                        self._runtime_aggregate_field_values(value, value_type)
+                    ):
+                        self.store(recorded.places[index], field_value)
+                return
             self._record_pending_action(
                 ptr,
                 _PendingStore(
@@ -2423,6 +2461,14 @@ class HirRunner:
             for index, place_value in enumerate(aggregate.values):
                 self.store(self.field_index_addr(ptr, _index_value(index)), place_value)
             return
+        if isinstance(ptr, ComptimeAggregatePtr) and _is_aggregate(elem) and isinstance(value, RuntimeVal):
+            # a *runtime* aggregate value into a compile-time aggregate that
+            # exists already (a declared ``Comptime[T]``, or one assigned
+            # before): every field already is a place, which the field values are
+            # written into
+            for index, field_value in enumerate(self._runtime_aggregate_field_values(value, elem)):
+                self.store(self.field_index_addr(ptr, _index_value(index)), field_value)
+            return
         if isinstance(ptr, ComptimeVal) and isinstance(ptr.obj, sval.Undefined):
             # a compile-time pointer with no storage at all: the address of a
             # zero-sized field or element (see ``field_index_addr``), or of a
@@ -2452,6 +2498,33 @@ class HirRunner:
                 self._emit(mir.Store(ptr.value, self._to_runtime(self._coerce(value, elem))))
             case _:
                 raise CompileError('cannot store through a compile-time pointer')
+
+    def _runtime_aggregate_field_values(self, value: InterpVal, type: sval.Type) -> list[InterpVal]:
+        """The value of every field (or element) of the *runtime* aggregate
+        ``value``, read out of a copy of it materialized in memory: an aggregate
+        value has no address of its own, so a copy is what its fields are read
+        from (the same copy a whole-value store of one makes anyway)."""
+        src = self.alloca(InlineMode.NONE)
+        self._commit_pending_slot(src, type)
+        self.store(src, value)
+        src_ptr = _shallow_normalize(src)
+        return [
+            self.load(self.field_index_addr(src_ptr, _index_value(index)))
+            for index in range(len(_aggregate_place_types(type)))
+        ]
+
+    def _split_runtime_aggregate(self, value: InterpVal, type: sval.Type) -> tuple[InterpVal, ...]:
+        """One fresh place per field (or element) of the *runtime* aggregate
+        ``value``, written with the field read out of it - the places a
+        compile-time aggregate holds (see ``ComptimeAggregatePtr``).  A nested
+        aggregate field is split the same way, recursively (its own place is a
+        ``FULL`` slot holding a runtime aggregate, see ``store``)."""
+        places: list[InterpVal] = []
+        for field_value in self._runtime_aggregate_field_values(value, type):
+            place = self.alloca(InlineMode.FULL)
+            self.store(place, field_value)
+            places.append(place)
+        return tuple(places)
 
     def store_void_retloc(self) -> None:
         """Deliver the void unit value into the result location (see
