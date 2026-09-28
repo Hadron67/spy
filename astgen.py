@@ -57,6 +57,7 @@ import builtins
 import inspect
 import textwrap
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Literal, TypeVar, cast
 
 from . import hir, syntax
@@ -106,7 +107,7 @@ _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
 # the ``syntax.*`` markers that are *calls* in the source and are recognized by
 # identity (unlike ``syntax.array`` and ``syntax.Comptime``, which are resolved
 # through ``_gen_call``/``_split_comptime``)
-_SYNTAX_CALLS = (syntax.ref, syntax.unroll)
+_SYNTAX_CALLS = (syntax.ref, syntax.unroll, syntax.comptime)
 
 
 def _is_struct_class(obj: Any) -> bool:
@@ -142,6 +143,19 @@ class _Scope:
             scope = scope.parent
         return None
 
+class _Pragma:
+    pass
+
+@dataclass(frozen=True, slots=True)
+class _Unroll(_Pragma):
+    pass
+
+@dataclass(frozen=True, slots=True)
+class _Comptime(_Pragma):
+    pass
+
+_UNROLL = _Unroll()
+_COMPTIME = _Comptime()
 
 class _Builder:
     """Translates the AST of one function body into one linear
@@ -167,10 +181,7 @@ class _Builder:
         # unevaluated - be resolved (see ``_gen_ann_assign``)
         self._type_vars = type_vars
         self._generic_names: dict[str, Value] = {tp.__name__: v for tp, v in type_vars.items()}
-        # the ``syntax.unroll()`` marker seen since the last statement: the loop
-        # that immediately follows consumes it, any other statement rejects it
-        # (see ``_gen_stmt``)
-        self._inline: bool = False
+        self._pragmas: set[_Pragma] = set()
         self.insts: list[hir.Inst] = []
 
     def add(self, inst: hir.Inst) -> hir.Inst:
@@ -179,54 +190,55 @@ class _Builder:
 
     # -- statements -----------------------------------------------------------
 
-    def _consume_inline(self) -> bool:
-        """Whether a ``syntax.unroll()`` marker seen since the last statement
-        marks this loop as a compile-time one; the flag is cleared either way."""
-        inline = self._inline
-        self._inline = False
-        return inline
-
-    def _check_no_inline(self) -> None:
-        """Reject a pending ``syntax.unroll()`` marker that no loop follows."""
-        if self._inline:
-            raise CompileError('syntax.unroll() must be followed by a loop')
-
-    def _is_unroll_marker(self, node: ast.stmt) -> bool:
-        """Whether ``node`` is the statement ``syntax.unroll()`` (recognized by
-        the global the callee names, like the other ``syntax`` markers)."""
-        return (
-            isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and self._try_resolve_object(node.value.func) is syntax.unroll
-        )
+    def _as_marker(self, node: ast.stmt) -> _Pragma | None:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            fn = self._try_resolve_object(node.value.func)
+            if fn is syntax.unroll:
+                return _UNROLL
+            if fn is syntax.comptime:
+                return _COMPTIME
+        return None
 
     def _gen_body(self, stmts: list[ast.stmt]) -> None:
-        """Generate a whole statement list, rejecting a marker that no loop
-        follows at its end."""
+        """Generate a whole statement list, rejecting a marker that no loop or
+        declaration follows at its end."""
         for stmt in stmts:
             self._gen_stmt(stmt)
-        self._check_no_inline()
+        if self._pragmas:
+            raise CompileError('unused pragmas')
 
     def _gen_stmt(self, node: ast.stmt) -> None:
+        if (marker := self._as_marker(node)) is not None:
+            self._pragmas.add(marker)
+            return
+        is_unroll = _UNROLL in self._pragmas
+        is_comptime = _COMPTIME in self._pragmas
+        self._pragmas.clear()
+
         fn_name = self._fn_ir.name
         match node:
             case ast.While():
-                self._gen_while(node, self._consume_inline())
+                if is_comptime:
+                    raise CompileError('comptime not allowed here')
+                self._gen_while(node, is_unroll)
                 return
             case ast.For():
-                self._gen_for(node, self._consume_inline())
+                if is_comptime:
+                    raise CompileError('comptime not allowed here')
+                self._gen_for(node, is_unroll)
                 return
-        # every non-loop statement rejects a pending marker: the
-        # ``syntax.unroll()`` before it is not followed by a loop
-        self._check_no_inline()
-        if self._is_unroll_marker(node):
-            assert isinstance(node, ast.Expr)
-            value = node.value
-            assert isinstance(value, ast.Call)
-            if len(value.args) != 0 or len(value.keywords) != 0:
-                raise CompileError('syntax.unroll takes no arguments')
-            self._inline = True
-            return
+            case ast.AnnAssign():
+                if is_unroll:
+                    raise CompileError('unroll not allowed here')
+                self._gen_ann_assign(node, is_comptime)
+                return
+            case ast.Assign():
+                if is_unroll:
+                    raise CompileError('unroll not allowed here')
+                self._gen_assign(node.targets[0], node.value, is_comptime)
+                return
+        if is_unroll or is_comptime:
+            raise CompileError('comptime/unroll not allowed here')
         match node:
             case ast.Return():
                 # the return expression is generated into the function's
@@ -254,14 +266,6 @@ class _Builder:
                 pass
             case ast.Expr():
                 self._gen_expr(node.value)[0]
-            case ast.Assign():
-                if len(node.targets) != 1:
-                    raise CompileError(
-                        f"chained assignments are not supported yet in spy function {fn_name}"
-                    )
-                self._gen_assign(node.targets[0], node.value)
-            case ast.AnnAssign():
-                self._gen_ann_assign(node)
             case ast.AugAssign():
                 self._gen_augassign(node)
             case ast.If():
@@ -496,7 +500,7 @@ class _Builder:
             raise CompileError(f"the target of an assignment must be a variable, got {target}")
         return lhs.value
 
-    def _gen_assign(self, target: ast.expr, value: ast.expr) -> None:
+    def _gen_assign(self, target: ast.expr, value: ast.expr, by_marker: bool = False) -> None:
         """One ``target = expr`` statement.  An assignment to a name that
         is already bound - in this block, or in an enclosing one, a
         parameter included - stores into that slot, and reads that same
@@ -509,24 +513,53 @@ class _Builder:
         unbound local.  A call on the right hand side writes its result
         straight into the target slot (result-location semantics): a
         constructor ``x = Bar(...)`` fills the fields of the slot in
-        place, and a scalar call result is only recorded in it."""
+        place, and a scalar call result is only recorded in it.
+
+        ``by_marker`` says a ``syntax.comptime()`` marker precedes the
+        statement: the name it declares is a compile-time variable - a box
+        rather than memory, exactly like ``name: Comptime`` (see
+        ``_gen_ann_assign``)."""
+        if by_marker and not self._declares_a_fresh_name(target):
+            raise CompileError(
+                'syntax.comptime() marks a declaration: it must be followed by an '
+                'assignment that declares a fresh variable'
+            )
         new_slots: list[hir.Value] = []
-        place = self._gen_lhs(target, new_slots)
+        place = self._gen_lhs(
+            target, new_slots,
+            hir.InlineMode.FULL if by_marker else hir.InlineMode.NONE,
+        )
         self._gen_result_loc(value, place)
         for slot in new_slots:
             self.add(hir.CommitSlot(slot))
 
-    def _gen_ann_assign(self, node: ast.AnnAssign) -> None:
+    def _declares_a_fresh_name(self, target: ast.expr) -> bool:
+        """Whether an assignment to ``target`` declares a name that is bound
+        nowhere - a declaration, which is what a ``syntax.comptime()`` marker
+        marks (see ``_gen_assign`` and ``_gen_lhs``, whose declaration rule this
+        mirrors)."""
+        match target:
+            case ast.Name():
+                return self._scope.lookup(target.id) is None
+            case ast.Tuple():
+                return all(self._declares_a_fresh_name(elt) for elt in target.elts)
+            case _:
+                return False
+
+    def _gen_ann_assign(self, node: ast.AnnAssign, by_marker: bool = False) -> None:
         """One annotated declaration ``name: T`` or ``name: T = expr``.  The
         annotation declares the type of the variable: ``name: T`` declares the
         type ``T``, ``name: Comptime`` a compile-time variable whose type its
         value determines, and ``name: Comptime[T]`` a compile-time variable of
-        the declared type ``T`` (see ``hir.Alloca``).  The variable gets a
-        fresh slot - the annotation's type is the compile-time value
-        ``_gen_expr`` produces for it, which the interpreter resolves against
-        the call's type arguments - and, when a value is written, is
-        initialized with it (result-location semantics, like a plain
-        declaration; see ``_gen_assign``)."""
+        the declared type ``T`` (see ``hir.Alloca``).  A ``syntax.comptime()``
+        marker before the declaration (``by_marker``) says the same: the
+        variable is a compile-time one, of the annotated type - or of the type
+        its value determines when it declares none.  The variable gets a fresh
+        slot - the annotation's type is the compile-time value ``_gen_expr``
+        produces for it, which the interpreter resolves against the call's type
+        arguments - and, when a value is written, is initialized with it
+        (result-location semantics, like a plain declaration; see
+        ``_gen_assign``)."""
         fn_name = self._fn_ir.name
         target = node.target
         if not isinstance(target, ast.Name):
@@ -540,6 +573,12 @@ class _Builder:
                 f"an annotated declaration introduces a new variable"
             )
         is_comptime, type_node = self._split_comptime(node.annotation)
+        if is_comptime and by_marker:
+            raise CompileError(
+                f"'{target.id}' is already declared compile-time by its "
+                f"annotation; drop the syntax.comptime() marker before it"
+            )
+        is_comptime = is_comptime or by_marker
         declared = None if type_node is None else self._as_value(self._gen_expr(type_node)[0])
         slot = self.add(hir.Alloca(
             hir.InlineMode.FULL if is_comptime else hir.InlineMode.NONE, declared
@@ -808,6 +847,14 @@ class _Builder:
             # ``_gen_stmt``), not a value
             raise CompileError(
                 'syntax.unroll() is a statement marker and must be followed by a loop'
+            )
+
+        if callee is syntax.comptime:
+            # it is a *statement* marker placed before a variable declaration
+            # (see ``_gen_stmt``), not a value
+            raise CompileError(
+                'syntax.comptime() is a statement marker and must be followed by '
+                'a variable declaration'
             )
 
         raise CompileError(f'unsupported syntax call {callee}')

@@ -1,7 +1,7 @@
 from typing import Protocol, Self, cast
 
 from .dsl import struct
-from .syntax import Comptime
+from .syntax import comptime
 
 
 class Numeric(Protocol):
@@ -34,6 +34,7 @@ class range[T: Numeric]:
         # element of a compile-time iterator, e.g. an untyped integer literal),
         # so it is kept inline: a compile-time ``for`` over a compile-time range
         # iterates at compile time (see ``astgen._gen_for``)
-        result: Comptime[T] = self.start  # pyright: ignore[reportAssignmentType]
+        comptime()
+        result = self.start
         self.start += self.step
-        return result  # pyright: ignore[reportReturnType]
+        return result
