@@ -506,13 +506,15 @@ class TryExceptBlockData(BlockFrameData):
     clause ``i``'s error payload pointer is delivered through (the clause's
     ``binds[i]``, an :class:`hir.ExceptBind`, reads it) and ``code_phi[i]`` the
     ``Phi`` carrying the remapped error code of a *bare* clause.  ``join`` is the
-    block the falling regions continue in, and ``binds`` holds the ``as`` bind
-    of every clause (see ``hir.Try``)."""
+    block the falling regions continue in, ``binds`` holds the ``as`` bind
+    of every clause and ``except_types`` every clause's type expression -
+    evaluated before the ``Try`` - (see ``hir.Try``)."""
 
     insts: tuple[hir.Inst, ...]
     p_excepts: list[int]
     p_end: int
     binds: tuple[hir.Value | None, ...]
+    except_types: tuple[hir.Value | None, ...]
     join: mir.BasicBlock
     clause_blocks: list[mir.BasicBlock | None] = field(default_factory=list)
     payload_phi: list[mir.Phi | None] = field(default_factory=list)
@@ -1346,10 +1348,8 @@ class HirRunner:
                 data = bf.data
                 if not isinstance(data, TryExceptBlockData) or data.body_done:
                     continue
-                for index, position in enumerate(data.p_excepts):
-                    inst = data.insts[position]
-                    assert isinstance(inst, hir.Except)
-                    clause_type = self._except_struct_type(inst.type)
+                for index, type_operand in enumerate(data.except_types):
+                    clause_type = self._except_struct_type(type_operand)
                     if clause_type is None or clause_type == exception:
                         return data, index
         return None
@@ -1548,9 +1548,7 @@ class HirRunner:
         self._cur_block.emit(mir.Jmp(block))
 
     def _clause_is_bare(self, data: TryExceptBlockData, index: int) -> bool:
-        inst = data.insts[data.p_excepts[index]]
-        assert isinstance(inst, hir.Except)
-        return self._except_struct_type(inst.type) is None
+        return self._except_struct_type(data.except_types[index]) is None
 
     def _deliver_uncaught_call(self, exception: sval.StructType, payload_place: InterpVal, use_ret_payload: bool) -> None:
         """Deliver a call's error no clause catches into the function's error
@@ -1698,9 +1696,7 @@ class HirRunner:
                 frame0 = self._frames[-1]
                 data0 = frame0.block_stack[-1].data
                 assert isinstance(data0, TryExceptBlockData)
-                clause = data0.insts[data0.p_excepts[data0.region - 1]]
-                assert isinstance(clause, hir.Except)
-                exception = self._except_struct_type(clause.type)
+                exception = self._except_struct_type(data0.except_types[data0.region - 1])
                 assert exception is not None
                 phi = data0.payload_phi[data0.region - 1]
                 if phi is None:
@@ -1951,6 +1947,7 @@ class HirRunner:
         data = TryExceptBlockData(
             insts=frame.insts,
             p_excepts=p_excepts, p_end=p_end, binds=inst.binds,
+            except_types=inst.except_types,
             join=mir.BasicBlock(),
             clause_blocks=[None] * len(p_excepts),
             payload_phi=[None] * len(p_excepts),
@@ -1973,9 +1970,7 @@ class HirRunner:
         if index is None:
             frame.pc = data.p_end
             return
-        clause = data.insts[data.p_excepts[index]]
-        assert isinstance(clause, hir.Except)
-        self._begin_except_clause(data, index, clause)
+        self._begin_except_clause(data, index)
         data.region = index + 1
         frame.pc = data.p_excepts[index] + 1
 
@@ -1988,7 +1983,7 @@ class HirRunner:
                 return index
         return None
 
-    def _begin_except_clause(self, data: TryExceptBlockData, index: int, inst: hir.Except) -> None:
+    def _begin_except_clause(self, data: TryExceptBlockData, index: int) -> None:
         """Start typing the except clause ``index``: its entry block - reached
         from every dispatch the clause caught, with the payload ``Phi`` they
         delivered - is entered, and the clause's ``as`` bind reads that phi (see
@@ -1996,7 +1991,7 @@ class HirRunner:
         here, once the whole body has been walked."""
         block = data.clause_blocks[index]
         assert block is not None
-        if self._except_struct_type(inst.type) is None:
+        if self._except_struct_type(data.except_types[index]) is None:
             self._finalize_bare_clause(data, index)
         self._cur_block = block
 
@@ -2045,15 +2040,16 @@ class HirRunner:
         data.payload_phi[index] = payload_phi
         data.code_phi[index] = code_phi
 
-    def _except_struct_type(self, node: hir.Value | None) -> sval.StructType | None:
-        """The exception struct an ``except`` clause names (None for a bare
-        ``except:``)."""
-        if node is None:
+    def _except_struct_type(self, type_operand: hir.Value | None) -> sval.StructType | None:
+        """The exception struct a clause's type expression denotes (None for a
+        bare ``except:``): the operand is that expression, evaluated as a value
+        before the ``Try`` opened (see ``hir.Try.except_types``)."""
+        if type_operand is None:
             return None
-        obj = _callee_object(self.operand(node))
-        if isinstance(obj, sval.StructType):
-            return obj
-        raise CompileError(f'{obj!r} is not an exception struct')
+        value: InterpVal = self.operand(type_operand)
+        if isinstance(value, ComptimeVal) and isinstance(value.obj, sval.StructType):
+            return value.obj
+        raise CompileError(f'{value!r} is not an exception struct')
 
     def _exec_end(self) -> PollResult:
         """The walk fell off the end of a region and reached the ``End``
@@ -2178,9 +2174,7 @@ class HirRunner:
                 data.body_done = True
                 index = self._next_live_clause(data, data.region)
                 if index is not None:
-                    inst = frame.insts[data.p_excepts[index]]
-                    assert isinstance(inst, hir.Except)
-                    self._begin_except_clause(data, index, inst)
+                    self._begin_except_clause(data, index)
                     data.region = index + 1
                     frame.pc = data.p_excepts[index] + 1
                     return PollResult.AGAIN
@@ -2278,7 +2272,7 @@ class HirRunner:
                     resolved = self._analyser._resolver.resolve_global(obj)
                     if resolved is not None:
                         return ComptimeVal(resolved)
-                return ComptimeVal(sval.as_value(obj))
+                return ComptimeVal(sval.as_value(obj, resolver=self._analyser._resolver))
             case hir.ConstRef():
                 # a reference to an immutable global.  At compile time a
                 # reference to a global behaves exactly like the value it

@@ -382,6 +382,8 @@ class _Builder:
         loop are *compile-time values*, so both are built into inline slots -
         a compile-time iterable is an aggregate with no runtime representation
         of its own, which an ordinary expression temporary may not hold."""
+        from .std import StopIteration
+
         # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
         # iteration would restart the iteration)
         it = self.add(hir.Alloca(hir.InlineMode.FULL if is_inline else hir.InlineMode.NON_AGGREGATE))
@@ -401,7 +403,7 @@ class _Builder:
         # declared there and are not visible after the loop
         sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
         sub.add(hir.Loop(is_inline=is_inline))
-        sub.add(hir.Try((None,)))
+        sub.add(hir.Try((None,), (hir.Const(StopIteration),)))
         new_slots: list[hir.Value] = []
         place = sub._gen_lhs(
             node.target, new_slots,
@@ -411,7 +413,7 @@ class _Builder:
         for slot in new_slots:
             sub.add(hir.CommitSlot(slot))
         sub._gen_body(node.body)
-        sub.add(hir.Except(sub._gen_name('StopIteration'), 0))
+        sub.add(hir.Except(0))
         sub._gen_body(node.orelse)
         sub.add(hir.Break())
         sub.add(hir.End())
@@ -421,10 +423,14 @@ class _Builder:
     def _gen_try(self, node: ast.Try) -> None:
         """Translate one ``try``/``except`` statement: the try body, then one
         ``hir.Except`` marker (and clause body) per handler, closed by an
-        ``hir.End``.  A clause that binds its exception (``as e``) opens with
-        an :class:`hir.ExceptBind`, whose value - the address the caught
-        exception was delivered through - the clause's ``as`` name is bound to
-        (see ``interp``).  ``else``/``finally`` are not supported yet."""
+        ``hir.End``.  Every clause's type expression is evaluated as a value
+        *before* the ``Try`` opens and carried by it (``hir.Try.except_types``):
+        an error is dispatched to a clause while the try body is typed, so the
+        clause types have to be known by then.  A clause that binds its
+        exception (``as e``) opens with an :class:`hir.ExceptBind`, whose value
+        - the address the caught exception was delivered through - the clause's
+        ``as`` name is bound to (see ``interp``).  ``else``/``finally`` are not
+        supported yet."""
         fn_name = self._fn_ir.name
         if len(node.orelse) > 0:
             raise CompileError(f'try-else is not supported in spy function {fn_name}')
@@ -438,10 +444,19 @@ class _Builder:
                 binds.append(hir.ExceptBind())
             else:
                 binds.append(None)
-        self.add(hir.Try(tuple(binds)))
+        # the clause types are evaluated here, before the ``Try``: their
+        # instructions run before any instruction of the try body can dispatch
+        # an error (see ``interp._find_catching_clause``)
+        except_types: list[hir.Value | None] = []
+        for handler in node.handlers:
+            except_types.append(
+                None if handler.type is None
+                else self._as_value(self._gen_expr(handler.type)[0])
+            )
+        self.add(hir.Try(tuple(binds), tuple(except_types)))
         self._gen_body(node.body)
         for index, handler in enumerate(node.handlers):
-            self.add(hir.Except(self._gen_except_type(handler.type), index))
+            self.add(hir.Except(index))
             bind = binds[index]
             if bind is not None:
                 # the bind reads the clause's payload pointer: it is the first
@@ -454,23 +469,6 @@ class _Builder:
             sub._gen_body(handler.body)
             self.insts.extend(sub.insts)
         self.add(hir.End())
-
-    def _gen_except_type(self, node: ast.expr | None) -> hir.Value | None:
-        """The HIR operand naming the exception struct an ``except`` clause
-        catches, or None for a bare ``except:``.  A global name of a struct (or
-        an attribute of one) is supported; a tuple of types, a subscripted
-        struct template, ... are not yet."""
-        if node is None:
-            return None
-        match node:
-            case ast.Name():
-                return self._gen_name(node.id)
-            case ast.Attribute():
-                return self._gen_expr(node)[0].value
-            case _:
-                raise CompileError(
-                    f'unsupported except type {ast.unparse(node)!r}: expected a spy struct'
-                )
 
     # -- variables ------------------------------------------------------------
 

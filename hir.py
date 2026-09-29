@@ -470,20 +470,25 @@ class Try(Inst):
     body), and the matching :class:`End`.  ``binds`` holds the ``as`` name's
     slot of every clause (None when the clause names none), created *before*
     the ``Try`` so that the clause body can read it - the interpreter fills it
-    with the caught exception when the clause runs (see ``interp``)."""
+    with the caught exception when the clause runs (see ``interp``).
+    ``except_types`` holds every clause's type expression, *evaluated as a
+    value* before the ``Try`` (None for a bare ``except:``): it is the
+    exception struct the clause catches, which the interpreter resolves once
+    the ``Try`` runs - every dispatch asks it which clause catches an error
+    (see ``interp``)."""
 
     binds: tuple[Value | None, ...]
+    except_types: tuple[Value | None, ...]
 
 
 @dataclass(eq=False)
 class Except(Inst):
     """The marker that starts one ``except`` clause of the innermost open
-    :class:`Try` block: ``type`` names the exception struct the clause catches
-    (None for a bare ``except:``), and ``index`` is the clause's position among
-    the try's clauses (its handler and ``as`` slot are held by the enclosing
-    block's ``TryExceptBlockData``)."""
+    :class:`Try` block: ``index`` is the clause's position among the try's
+    clauses (its exception type, handler and ``as`` slot are held by the
+    enclosing block's ``TryExceptBlockData``; the type is carried by
+    ``hir.Try.except_types``)."""
 
-    type: Value | None
     index: int
 
 
