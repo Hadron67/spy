@@ -47,7 +47,7 @@ from . import typeof as spy_typeof
 from .lower import LLVMBackend
 from .std import Numeric
 from .syntax import Array, Comptime, Option, Ptr, array, ref
-from .util import StrBiMap
+from .util import StrBiMap, TriState
 
 # ---------------------------------------------------------------------------
 # functions under test
@@ -3588,7 +3588,7 @@ class SpyZeroSizedResultTest(TestCase):
     def test_zero_sized_struct_result(self) -> None:
         # every field of ``Nothing`` is zero-sized, so the struct itself is: it
         # has no layout (the size and alignment estimates of a layoutless type,
-        # ``sval.estimated_size_of``, decide how one is returned) and a call
+        # ``mir.estimated_size_of``, decide how one is returned) and a call
         # returning one delivers no value, only the type's unit value
         self.assertEqual(use_nothing(7), 7)
 
@@ -3990,8 +3990,15 @@ class SpyOptionNestingTest(TestCase):
         self.assertIsNone(sval.find_first_pointer_type_pos(opt_ptr))
         # ... so the outer one has to carry a ``bool`` tag
         outer = sval.OptionType(opt_ptr)
-        self.assertIsInstance(outer.to_mir_type(MIR_CACHE), mir.StructType)
-        self.assertEqual(sval.estimated_size_of(outer), 2 * sval.estimated_size_of(ptr))
+        outer_mir = outer.to_mir_type(MIR_CACHE)
+        ptr_mir = ptr.to_mir_type(MIR_CACHE)
+        assert isinstance(outer_mir, mir.StructType)
+        assert isinstance(ptr_mir, mir.PointerType)
+        pointer_size = MIR_CACHE.target.pointer_size
+        self.assertEqual(
+            mir.estimated_size_of(outer_mir, pointer_size),
+            2 * mir.estimated_size_of(ptr_mir, pointer_size),
+        )
 
     def test_the_outer_option_takes_the_second_pointer(self) -> None:
         two = struct_type(TwoPtrs)
@@ -4411,7 +4418,7 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         large = struct_type(Large)
         one = sval.UnionType((small, large))
         two = sval.UnionType((small, large))
-        self.assertIs(one.storage_variant(), large)
+        self.assertIs(one.storage_variant(MIR_CACHE), large)
         self.assertIs(one.to_mir_type(MIR_CACHE), two.to_mir_type(MIR_CACHE))
         self.assertIsNone(sval.UnionType(()).to_mir_type(MIR_CACHE))
         self.assertEqual(sval.UnionType(()).get_unit_value(), sval.UnionValue(sval.UnionType(())))
@@ -4420,7 +4427,7 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         small = struct_type(Small)
         i32_type = sval.IntType(32, True)
         type = sval.ResultType(i32_type, (small,))
-        spec = sval.make_ret_spec(type)
+        spec = sval.make_ret_spec(type, MIR_CACHE)
         assert isinstance(spec, sval.RetTuple)
         self.assertIs(spec.type, type)
         result, code, payload = spec.values
@@ -4441,7 +4448,7 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         # no value to return, one exception: the code is ``u0`` (zero-sized) and
         # the payload union takes the by-value slot
         type = sval.ResultType(sval.EmptyType(), (small,))
-        spec = sval.make_ret_spec(type)
+        spec = sval.make_ret_spec(type, MIR_CACHE)
         assert isinstance(spec, sval.RetTuple)
         _value, code, payload = spec.values
         assert isinstance(code, sval.RetValue)
@@ -5636,8 +5643,8 @@ class SpyTypeClassifyTest(TestCase):
         )
 
     def test_a_function_type_is_passed_by_reference(self) -> None:
-        self.assertTrue(sval.pass_by_ref(_fn_type()))
-        self.assertFalse(sval.pass_by_ref(sval.IntType(32, True)))
+        self.assertIs(sval.pass_by_ref(_fn_type(), MIR_CACHE), TriState.TRUE)
+        self.assertIs(sval.pass_by_ref(sval.IntType(32, True), MIR_CACHE), TriState.FALSE)
 
     def test_the_mir_cache_is_the_contexts_own(self) -> None:
         # the interning table belongs to a host context, so two contexts do not

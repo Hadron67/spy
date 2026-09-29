@@ -113,7 +113,7 @@ from .sval import (
     iter_ret_leaves,
     ret_by_value_index,
 )
-from .util import ArraySet, frozendict
+from .util import ArraySet, TriState, frozendict
 
 _MAX_INLINE_DEPTH = 64
 
@@ -1112,7 +1112,7 @@ class HirRunner:
         if ret_sig is not None and ret_sig.is_complete():
             # the value and the error part are both declared: the result
             # location is the one the effective spec names
-            loc = self._ret_spec_place(ret_sig.complete().ret_spec())
+            loc = self._ret_spec_place(ret_sig.complete().ret_spec(self._mir_cache))
             assert isinstance(loc, ComptimeResult)
             return loc
         if declared_value is not None:
@@ -1213,12 +1213,12 @@ class HirRunner:
         The convention is a property of the result types
         (``sval.make_ret_spec``) unless the signature declares it.
         """
-        spec = sig.ret_spec()
+        spec = sig.ret_spec(self._mir_cache)
         if self.ret_sig is not None:
             if self.ret_sig != sig:
                 raise CompileError(
                     f"function returns values of conflicting types "
-                    f"{[leaf.type for leaf in iter_ret_leaves(self.ret_sig.ret_spec())]} and "
+                    f"{[leaf.type for leaf in iter_ret_leaves(self.ret_sig.ret_spec(self._mir_cache))]} and "
                     f"{[leaf.type for leaf in iter_ret_leaves(spec)]}"
                 )
             return
@@ -1372,7 +1372,7 @@ class HirRunner:
         every result goes through a result pointer."""
         sig = self.ret_sig
         assert sig is not None
-        spec = sig.ret_spec()
+        spec = sig.ret_spec(self._mir_cache)
         places = _result_places(self._frames[0].ret_loc)
         index = ret_by_value_index(spec)
         if index is None:
@@ -3868,7 +3868,10 @@ class HirRunner:
         self_is_ref = True
         if isinstance(fn, FunctionValue):
             first = fn.hir.signature.positional.by_id[0]
-            self_is_ref = first.by_ref or not isinstance(first.type, sval.PointerType)
+            self_is_ref = (
+                first.by_ref is TriState.TRUE
+                or not isinstance(first.type, sval.PointerType)
+            )
 
         return self.call(
             ComptimeVal(sval.ConstRef(method)),
@@ -3920,7 +3923,7 @@ class HirRunner:
                 generic_var_values, value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
             )
         arg_types = binded_args.map(_arg_type_of)
-        spec_sig = sig.specialize(arg_types)
+        spec_sig = sig.specialize(arg_types, self._mir_cache)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
             return self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
@@ -3976,7 +3979,7 @@ class HirRunner:
             for name, arg in args.kwargs.items():
                 convert_one(arg, call_sig.kwargs[name])
 
-        spec = ret_sig.ret_spec()
+        spec = ret_sig.ret_spec(self._mir_cache)
         callee_result = ret_sig.result_type()
         value_is_empty = ret_sig.value_is_empty()
         if len(ret_sig.exceptions) == 0:
@@ -4313,7 +4316,7 @@ class HirRunner:
             # a result location nothing was ever stored into holds no value: its
             # type is the *empty* type, so the function cannot return a value at
             # all (see ``sval.EmptyType``)
-            value_spec = sval.make_ret_spec(location.committed_type())
+            value_spec = sval.make_ret_spec(location.committed_type(), self._mir_cache)
         exceptions = partial.exceptions if partial is not None else None
         if exceptions is None:
             exceptions = ArraySet()
@@ -4324,7 +4327,7 @@ class HirRunner:
         assert sig is not None
         result_type = sig.result_type()
         self._write_deferred_error_codes(result_type)
-        spec = sig.ret_spec()
+        spec = sig.ret_spec(self._mir_cache)
         places = _result_places(self._current_result_loc())
         index = ret_by_value_index(spec)
         for block in self._deferred_returns:

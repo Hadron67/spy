@@ -13,6 +13,7 @@ from .sval import (
     AnyValue,
     FormalArg,
     FunctionType,
+    MirLowerCache,
     ResultType,
     RetSpec,
     RetValue,
@@ -26,7 +27,7 @@ from .sval import (
     ret_spec_value_is_empty,
     type_of,
 )
-from .util import ArraySet, IndexedMap, StrBiMap, frozendict, sanitize_name
+from .util import ArraySet, IndexedMap, StrBiMap, TriState, frozendict, sanitize_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,18 +38,22 @@ class SignatureFormalArg:
     # None when the parameter is unannotated.
     type: Type | None
     is_comptime: bool
-    # whether pass this parameter by reference (i.e. as a constant pointer)
-    by_ref: bool
     # The evaluated default value of the parameter, in the spy domain
     # (see ``Signature``); None when the parameter has no default.
     default_value: AnyValue | None
+    # Whether the parameter is passed by reference (i.e. as a constant
+    # pointer): what the definition says about it (``sval.pass_by_ref`` of
+    # the declared type), which is ``UNKNOWN`` when the annotation names a
+    # type parameter - its layout is not known before a call substitutes it,
+    # so the specialization decides (see ``Signature.specialize``).
+    by_ref: TriState = TriState.UNKNOWN
 
     def map_type(self, f: Callable[[Type], Type]) -> SignatureFormalArg:
         return SignatureFormalArg(
             None if self.type is None else f(self.type),
             self.is_comptime,
-            self.by_ref,
             self.default_value,
+            self.by_ref,
         )
 
 @dataclass(frozen=True, slots=True)
@@ -154,13 +159,15 @@ class ReturnSignature:
     ret_type_spec: RetSpec
     exceptions: ArraySet[Type]
 
-    def ret_spec(self) -> RetSpec:
+    def ret_spec(self, cache: MirLowerCache) -> RetSpec:
         """The effective return spec: the declared return spec with the value's
         result type - its error code and its payload union - spread into the
         leaves.  The error part is always present - a function that raises
         nothing has the empty ``ResultType``, whose code and payload are
-        zero-sized and so never reach the MIR."""
-        return make_ret_spec(self.result_type())
+        zero-sized and so never reach the MIR.  ``cache`` is the MIR-mirror
+        cache of the host the function is compiled for: which leaf is returned
+        by value is decided by its layout (see ``sval.make_ret_spec``)."""
+        return make_ret_spec(self.result_type(), cache)
 
     def result_type(self) -> ResultType:
         """The result type of this function: the value it returns normally and
@@ -406,18 +413,20 @@ class Signature:
             exceptions=None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute),
         )
 
-    def specialize(self, provided: ArgList[Type | None]) -> tuple[CallSignature, PartialReturnSignature]:
+    def specialize(self, provided: ArgList[Type | None], cache: MirLowerCache) -> tuple[CallSignature, PartialReturnSignature]:
         """Specialize one call of this signature: the concrete typing of
         its arguments and the return convention this signature declares.
 
         The declared generic type parameters are solved from ``provided``
         (see :meth:`solve_param_types`) and substituted into every
         annotation.  A parameter's type is then, in order of precedence:
-        its (substituted) annotation, the marshaled type of the argument
-        the call provides for it, or the spy type of its default value.
-        The compiler decides the calling convention here too: a parameter
-        whose type is a large aggregate, or whose formal declares it as a
-        reference, is passed by reference (see ``sval.pass_by_ref``).  A
+        A parameter's type is then, in order of precedence: its (substituted)
+        annotation, the marshaled type of the argument the call provides for
+        it, or the spy type of its default value.  Whether it is passed by
+        reference is settled here from the type the call substitutes - what
+        the formal says (``SignatureFormalArg.by_ref``, unknown while the
+        type is still a type parameter) and what ``sval.pass_by_ref`` says of
+        the substituted type, combined (see :meth:`util.TriState.or_`).  A
         zero-sized parameter is dropped from the runtime signature - it
         carries its unit value as a compile-time argument.
 
@@ -425,7 +434,9 @@ class Signature:
         the specialization - and the return convention as far as the
         definition declares it: a part it leaves out is missing (``None``),
         and the interpreter infers it from the body (see
-        ``PartialReturnSignature``)."""
+        ``PartialReturnSignature``).  ``cache`` is the MIR-mirror cache of
+        the host the call is compiled for: the return convention needs the
+        layout a mirror carries (see ``sval.make_ret_spec``)."""
         type_var_values = self.solve_param_types(provided)
         reps: dict[TypeVar, AnyValue] = dict(zip(self.generic_args, type_var_values))
 
@@ -455,7 +466,11 @@ class Signature:
                 raise TypeMismatchError(
                     f"compile-time parameter '{name}' must have a zero-sized type"
                 )
-            return SpecializedRuntimeArg(resolved, param.by_ref or pass_by_ref(resolved))
+            # the convention the formal declares (unknown while its type was a
+            # type parameter) and the one the substituted type asks for: by
+            # reference unless one of them says otherwise
+            by_ref = TriState.or_(param.by_ref, pass_by_ref(resolved, cache))
+            return SpecializedRuntimeArg(resolved, by_ref is not TriState.FALSE)
 
         positional = tuple(
             (name, resolve(name, param, cand))
@@ -483,7 +498,7 @@ class Signature:
 
         # the parts the definition declares; the interpreter infers the ones it
         # leaves out from the body
-        ret_type_spec = None if self.ret_type is None else make_ret_spec(substitute(self.ret_type))
+        ret_type_spec = None if self.ret_type is None else make_ret_spec(substitute(self.ret_type), cache)
         exceptions = None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute)
         return call_sig, PartialReturnSignature(ret_type_spec, exceptions)
 

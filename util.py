@@ -391,6 +391,20 @@ class TriState(IntEnum):
             return TriState.TRUE
         return TriState.UNKNOWN
 
+    @staticmethod
+    def or_(a: TriState, b: TriState) -> TriState:
+        """The ``or`` of two states where ``UNKNOWN`` carries *no* information
+        rather than being a third state of its own: the definite side decides
+        (``or_(UNKNOWN, x)`` is ``x``), and when both sides are definite a
+        single ``TRUE`` decides."""
+        if a == TriState.UNKNOWN:
+            return b
+        if b == TriState.UNKNOWN:
+            return a
+        if a == TriState.TRUE or b == TriState.TRUE:
+            return TriState.TRUE
+        return TriState.FALSE
+
 
 class frozendict[K, V]:
     __slots__ = ('_dict', '_hash')

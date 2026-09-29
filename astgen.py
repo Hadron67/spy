@@ -66,6 +66,7 @@ from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
     GlobalResolver,
+    MirLowerCache,
     Null,
     PointerType,
     StructDecl,
@@ -74,13 +75,12 @@ from .sval import (
     Value,
     VoidType,
     as_value,
-    pass_by_ref,
     unwrap_comptime,
 )
 from .sval import (
     TypeVar as SpyTypeVar,
 )
-from .util import ArraySet, IndexedMap, frozendict
+from .util import ArraySet, IndexedMap, TriState, frozendict
 
 _BIN_OPS: dict[type[ast.AST], hir.BinaryOp] = {
     ast.Add: '+',
@@ -1003,6 +1003,7 @@ class _Builder:
 def parse_function(
     fn: Callable,
     resolver: GlobalResolver,
+    mir_lower_cache: MirLowerCache,
     self_type: Type | None = None,
     self_by_value: bool = False,
     context_type_vars: dict[TypeVar, Value] | None = None,
@@ -1031,6 +1032,10 @@ def parse_function(
     structs and functions of the context it is compiled in (see
     ``sval.as_value``); it is required, since a function is always parsed *for*
     a context.
+
+    ``mir_lower_cache`` is that host's MIR-mirror cache: which parameters are
+    passed by reference is decided here, from the layout a mirror carries
+    (see ``sval.pass_by_ref``).
     """
     try:
         source = inspect.getsource(fn)
@@ -1168,17 +1173,14 @@ def parse_function(
         # the type it wraps is the parameter's declared type
         is_comptime, annotated = unwrap_comptime(annotations.get(arg.arg))
         arg_type = annotation_of(annotated)
-        by_ref = False
         if i == 0 and self_type is not None:
             # the ``self`` of a method: its declared type is a pointer to the
             # struct itself (``self_by_value`` passes the object's value
             # instead); the HIR reads the receiver through it (see
             # ``FunctionIR.arg_is_ref`` and ``interp``)
             arg_type = self_type if self_by_value else PointerType(self_type)
-        elif arg_type is not None:
-            by_ref = pass_by_ref(arg_type)
         positional.add(
-            arg.arg, SignatureFormalArg(arg_type, is_comptime, by_ref, default_value)
+            arg.arg, SignatureFormalArg(arg_type, is_comptime, default_value, TriState.UNKNOWN)
         )
         # a method's ``self`` is bound directly to its argument (the receiver's
         # address); every other parameter is passed as the signature says

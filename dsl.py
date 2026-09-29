@@ -64,6 +64,7 @@ from .fn import (
 from .interp import Analyser
 from .lower import LLVMBackend, to_ctype
 from .sval import GlobalResolver, StructDecl
+from .target import TargetInfo
 from .util import frozendict
 
 # the ``spy.*`` builtins, by the name the interpreter knows them by
@@ -220,7 +221,9 @@ class _RegisteredFn:
             lambda e: e,
         )
         arg_types: ArgList[sval.Type | None] = arglist.map(lambda a: sval.type_of(a, _INT_LITERAL_BITS))
-        call_sig, ret_sig = entry.hir.signature.specialize(arg_types)
+        call_sig, ret_sig = entry.hir.signature.specialize(
+            arg_types, self.context.mir_lower_cache,
+        )
 
         analyser = Analyser(self.context, self.context.mir_lower_cache)
         analyser.analyse_function(entry, call_sig, ret_sig)
@@ -257,8 +260,8 @@ class _RegisteredFn:
     def get_entry(self):
         if self.entry is None:
             hir = astgen.parse_function(
-                self.fn, self.context, self.cls, self.meta.sfv, self.context_type_vars,
-                self.meta.exceptions,
+                self.fn, self.context, self.context.mir_lower_cache, self.cls,
+                self.meta.sfv, self.context_type_vars, self.meta.exceptions,
             )
             self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
         return self.entry
@@ -391,8 +394,10 @@ class _RegisteredClass(StructDecl):
 
 
 class _Context(GlobalResolver):
-    def __init__(self, backend: Backend) -> None:
+    def __init__(self, backend: Backend, target: TargetInfo | None = None) -> None:
         self.backend = backend
+        # the parameters of the compile target this context compiles for (the
+        # pointer size, which the layout of every type depends on)
         self._fn_anotation_cache: dict[Any, _RegisteredFn] = {}
         self._cls_annotation_cache: dict[type, _RegisteredClass] = {}
         # the inline entries of the undecorated Python functions reached
@@ -400,8 +405,9 @@ class _Context(GlobalResolver):
         self._inline_cache: dict[Any, FunctionValue] = {}
         self._symbol_table = SymbolTable()
         # the MIR-mirror interning table of this context, shared by every
-        # analysis it runs (see ``sval.MirLowerCache``)
-        self.mir_lower_cache = sval.MirLowerCache()
+        # analysis it runs and bound to the target it compiles for (see
+        # ``sval.MirLowerCache``)
+        self.mir_lower_cache = sval.MirLowerCache(TargetInfo())
 
     def _local_fn(self, handle: _RegisteredFn) -> _RegisteredFn:
         # this context's handle of the Python function ``handle`` names: a
@@ -443,7 +449,7 @@ class _Context(GlobalResolver):
                 # it is called (it contributes no native specialization)
                 entry = self._inline_cache.get(value)
                 if entry is None:
-                    hir = astgen.parse_function(value, self)
+                    hir = astgen.parse_function(value, self, self.mir_lower_cache)
                     entry = FunctionValue(value.__qualname__, hir, force_inline=True)
                     self._inline_cache[value] = entry
                 return entry

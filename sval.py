@@ -19,7 +19,6 @@ the compile-time comparisons in ``spy.typeof(a) == spy.u64`` work.
 
 from __future__ import annotations
 
-import ctypes
 import typing
 from abc import abstractmethod
 from collections.abc import Iterator, Mapping
@@ -28,10 +27,11 @@ from enum import IntEnum, auto
 from types import NoneType
 from typing import Any, Literal, override
 
-from spy.util import IdentityObj, IndexedMap, frozendict
+from spy.util import IdentityObj, IndexedMap, TriState, frozendict
 
 from . import mir, syntax
-from .errors import CompileError, SpyError
+from .errors import CompileError
+from .target import TargetInfo
 
 INT_DEFAULT_BITS = 32
 """The signedness/width of the default spy integer type: the type a
@@ -89,10 +89,13 @@ class MirLowerCache:
     *interned*: a ``mir.StructType``/``mir.UnionType`` is an identity object
     and a module declares one LLVM struct/union per MIR type, so two equal spy
     ``Option[T]``/unions have to lower to one MIR type.  One cache belongs to
-    one host context (``dsl._Context``), so the contexts of one process do not
-    share the types they intern."""
+    one host context (``dsl._Context``) and, with it, to one *target*: the
+    target's pointer size decides the layout a mirror is built from (the order
+    of a struct's fields, the variant a union holds), so the types of one
+    target are not the types of another."""
 
-    def __init__(self) -> None:
+    def __init__(self, target: TargetInfo) -> None:
+        self.target = target
         self._union_mirs: dict[UnionType, mir.UnionType] = {}
         self._option_struct_mirs: dict[Type, mir.StructType] = {}
 
@@ -316,16 +319,26 @@ class UnionType(Type):
                 return None
         return UnionValue(self)
 
-    def storage_variant(self) -> Type | None:
+    def storage_variant(self, cache: MirLowerCache) -> Type | None:
         """The variant whose storage the union uses: the largest one (and,
         among equally large ones, the most aligned), or None when every
-        variant is zero-sized."""
+        variant is zero-sized.  The sizes are those of the variants'
+        *mirrors*: the layout of a variant is the one the lowered code uses
+        (see ``mir.estimated_size_of``)."""
+        pointer_size = cache.target.pointer_size
         best: Type | None = None
         best_key: tuple[int, int] | None = None
         for type in self.types:
-            if type.get_unit_value() is not None:
+            variant_mir = type.to_mir_type(cache)
+            if variant_mir is None:
+                # a variant with no storage of its own - a zero-sized one (or a
+                # compile-time-only one, which has no runtime representation
+                # either) - never takes the union's storage
                 continue
-            key = (estimated_size_of(type), estimated_alignment_of(type))
+            key = (
+                mir.estimated_size_of(variant_mir, pointer_size),
+                mir.estimated_alignment_of(variant_mir, pointer_size),
+            )
             if best_key is None or key > best_key:
                 best = type
                 best_key = key
@@ -343,7 +356,7 @@ class UnionType(Type):
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
-        payload = self.storage_variant()
+        payload = self.storage_variant(cache)
         if payload is None:
             # every variant is zero-sized: the union holds no storage
             return None
@@ -1166,11 +1179,11 @@ class FunctionType(Type):
     # :func:`make_ret_spec`)
     return_type: Type
 
-    @property
-    def ret_spec(self) -> RetSpec:
+    def ret_spec(self, cache: MirLowerCache) -> RetSpec:
         """How a call of a function of this signature delivers its result
-        (see :func:`make_ret_spec`)."""
-        return make_ret_spec(self.return_type)
+        (see :func:`make_ret_spec`); ``cache`` is the MIR-mirror cache of the
+        host the call is compiled for."""
+        return make_ret_spec(self.return_type, cache)
 
     @override
     def get_type(self) -> Type:
@@ -1179,8 +1192,8 @@ class FunctionType(Type):
             child = arg.type.get_type()
             assert isinstance(child, TypeType)
             level = max(level, child.level)
-        for leaf in iter_ret_leaves(self.ret_spec):
-            child = leaf.type.get_type()
+        for leaf_type in result_leaves(self.return_type):
+            child = leaf_type.get_type()
             assert isinstance(child, TypeType)
             level = max(level, child.level)
         return TypeType(level)
@@ -1202,7 +1215,7 @@ class FunctionType(Type):
                 return None
             args.append(mir_type)
         ret_type: mir.MayBeVoidType = mir.VOID
-        for leaf in iter_ret_leaves(self.ret_spec):
+        for leaf in iter_ret_leaves(self.ret_spec(cache)):
             if leaf.type.is_zst():
                 # a zero-sized result is delivered as its unit value, not
                 # through the by-value slot
@@ -1470,7 +1483,10 @@ class StructType(Type):
         # field's own mirror, with no wrapper struct - and one that holds
         # none is a zero-sized type, with no mirror of its own
         if not self.modifiers.extern_c:
-            mirrored.sort(key=lambda field: estimated_alignment_of(field[1].type))
+            pointer_size = cache.target.pointer_size
+            mirrored.sort(
+                key=lambda entry: mir.estimated_alignment_of(entry[2], pointer_size),
+            )
 
         indices: list[int | None] = [None] * len(fields)
         for position, (index, _, _) in enumerate(mirrored):
@@ -1607,114 +1623,6 @@ def min_int_type(lower: int, upper: int) -> IntType:
 # size that the C ABIs of the supported targets pass in registers)
 _AGGREGATE_VALUE_RETURN_LIMIT = 16
 
-_POINTER_BYTES = ctypes.sizeof(ctypes.c_void_p)
-"""The size (and alignment) of a pointer of the host: the addresses the
-compiled code works with are the host's (see ``lower``)."""
-
-def estimated_size_of(type: Type) -> int:
-    """Returns the estimated size of a type in bytes. The size is obtained
-    using ctypes size rule, but is not guaranteed to be the actual size of
-    the type. A zero-sized type - ``void``, a zero-bit integer, a struct
-    that holds no storage - returns 0; literal types have no layout and
-    raise :class:`SpyError`."""
-    match type:
-        case VoidType() | EmptyType():
-            return 0
-        case BoolType():
-            return 1
-        case IntType():
-            return (type.bits + 7) // 8
-        case FloatType():
-            return (type.bits + 7) // 8
-        case PointerType():
-            return _POINTER_BYTES
-        case ArrayType():
-            # an array is as big as its elements together, and holds no
-            # storage at all when it has no element
-            length = type.length_int
-            if length is None:
-                raise SpyError(f"array {type} has no constant length")
-            if length == 0 or type.elem.is_zst():
-                return 0
-            return length * estimated_size_of(type.elem)
-        case OptionType():
-            # an option is laid out like its MIR mirror (see
-            # ``OptionType.to_mir_type``): a ``bool`` when the child is
-            # zero-sized, the child itself when it holds a pointer, and a
-            # struct of the tag and the value otherwise
-            child = type.child
-            if child.is_zst():
-                return 1
-            if find_first_pointer_type_pos(child) is not None:
-                return estimated_size_of(child)
-            align = estimated_alignment_of(child)
-            offset = (1 + align - 1) // align * align
-            size = offset + estimated_size_of(child)
-            return (size + align - 1) // align * align
-        case StructType():
-            offset = 0
-            for field in type.fields().values():
-                # a zero-sized field occupies no storage: it has no size and
-                # imposes no alignment requirement on what follows it
-                align = estimated_alignment_of(field.type)
-                offset = (offset + align - 1) // align * align
-                offset += estimated_size_of(field.type)
-            align = estimated_alignment_of(type)
-            return (offset + align - 1) // align * align
-        case UnionType():
-            # a union holds its largest variant's storage (no tag of its own)
-            return max((estimated_size_of(t) for t in type.types), default=0)
-        case _:
-            raise SpyError(f"type {type} has no layout")
-
-def estimated_alignment_of(type: Type) -> int:
-    """Estimated alignment of a type in bytes. Like :func:`estimated_size_of`,
-    this is not guaranteed to be the actual alignment of the type. A
-    zero-sized type - ``void``, a zero-bit integer, a struct that holds no
-    storage - has alignment 1; literal types have no layout and raise
-    :class:`SpyError`."""
-    match type:
-        case VoidType() | EmptyType():
-            return 1
-        case BoolType():
-            return 1
-        case IntType():
-            return type.bits // 8 if type.bits != 0 else 1
-        case FloatType():
-            return type.bits // 8
-        case PointerType():
-            return _POINTER_BYTES
-        case ArrayType():
-            length = type.length_int
-            if length is None:
-                raise SpyError(f"array {type} has no constant length")
-            if length == 0 or type.elem.is_zst():
-                return 1
-            return estimated_alignment_of(type.elem)
-        case OptionType():
-            # the tag of a zero-sized child, and a tag next to the value,
-            # impose no alignment of their own; the rest follows the child
-            if type.child.is_zst():
-                return 1
-            return estimated_alignment_of(type.child)
-        case StructType():
-            return max(
-                (
-                    estimated_alignment_of(f.type)
-                    for f in type.fields().values()
-                    if not f.type.is_zst()
-                ),
-                default=1,
-            )
-        case UnionType():
-            # a union's alignment is the maximum of its variants'
-            return max(
-                (estimated_alignment_of(t) for t in type.types),
-                default=1,
-            )
-        case _:
-            raise SpyError(f"type {type} has no layout")
-
 def _mentions_type_var(type: Type) -> bool:
     """Whether ``type`` still names a type parameter somewhere inside it,
     so that its layout - and with it its calling convention - is not known
@@ -1728,7 +1636,7 @@ def _mentions_type_var(type: Type) -> bool:
     return False
 
 
-def returns_via_result_ptr(type: Type) -> bool:
+def returns_via_result_ptr(type: Type, cache: MirLowerCache) -> bool:
     """Whether a function returning ``type`` delivers its result by
     writing into a caller-provided result location (a hidden result
     pointer parameter) instead of returning the value directly.
@@ -1738,7 +1646,9 @@ def returns_via_result_ptr(type: Type) -> bool:
     :data:`_AGGREGATE_VALUE_RETURN_LIMIT` bytes) and through a result
     pointer once it outgrows it, and a new aggregate kind (arrays) only
     needs to extend this function.  Scalars are always returned by
-    value.  A signature may override the default
+    value.  The size is the one of the type's MIR mirror - the layout the
+    lowered code uses (see ``mir.estimated_size_of``) - for pointers of
+    the target the cache belongs to.  A signature may override the default
     (``fn.ReturnSignature.ret_spec``)."""
     match type:
         case StructType() | ArrayType() | OptionType() | UnionType():
@@ -1746,7 +1656,15 @@ def returns_via_result_ptr(type: Type) -> bool:
                 # the layout is not known until the call substitutes the
                 # type parameter: assumed small now, re-decided on substitution
                 return False
-            return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
+            mir_type = type.to_mir_type(cache)
+            if mir_type is None:
+                # an aggregate with no mirror of its own is zero-sized: it is
+                # delivered as its unit value, not through a result pointer
+                return False
+            return (
+                mir.estimated_size_of(mir_type, cache.target.pointer_size)
+                > _AGGREGATE_VALUE_RETURN_LIMIT
+            )
         case _:
             return False
 
@@ -1826,23 +1744,12 @@ def ret_spec_value_is_empty(spec: RetSpec | None) -> bool:
     return isinstance(spec, RetValue) and isinstance(spec.type, EmptyType)
 
 
-def make_ret_spec(type: Type) -> RetSpec:
-    """The return convention of a function whose return annotation is the spy
-    type ``type`` (a ``tuple[...]`` for several values, nested at whatever
-    depth it is written): the annotation as one :class:`RetSpec` tree.  A
-    ``tuple[...]`` - at the top level or nested - becomes a :class:`RetTuple`
-    of its elements, a ``ResultType[...]`` a :class:`RetTuple` of the value it
-    returns, its error code and its payload union (in that order), and every
-    other type a :class:`RetValue` leaf.
-
-    At most one leaf is returned *by value* - the first one that fits in
-    registers (``returns_via_result_ptr`` says so) - and every other leaf is
-    delivered by writing through a hidden result pointer; when no leaf
-    qualifies the function returns void.  A zero-sized leaf has no value to
-    return: it is delivered as its unit value and never takes the by-value
-    slot (a value-less function's payload union can take the slot of the code
-    its exception set needs no longer)."""
-    # the leaf types, in declaration order (depth first)
+def result_leaves(type: Type) -> list[Type]:
+    """The leaf types of a return annotation ``type``, in declaration order
+    (depth first): the shapes ``tuple[...]`` and ``ResultType[...]`` spread
+    into their elements, every other type is a leaf of its own (see
+    :func:`make_ret_spec`).  The leaves are a property of the *type* alone -
+    no layout is needed, only the *delivery* of each one has one."""
     leaves: list[Type] = []
     work: list[Type] = [type]
     while work:
@@ -1862,13 +1769,34 @@ def make_ret_spec(type: Type) -> RetSpec:
                 work.append(item.return_type)
             case _:
                 leaves.append(item)
+    return leaves
+
+
+def make_ret_spec(type: Type, cache: MirLowerCache) -> RetSpec:
+    """The return convention of a function whose return annotation is the spy
+    type ``type`` (a ``tuple[...]`` for several values, nested at whatever
+    depth it is written): the annotation as one :class:`RetSpec` tree.  A
+    ``tuple[...]`` - at the top level or nested - becomes a :class:`RetTuple`
+    of its elements, a ``ResultType[...]`` a :class:`RetTuple` of the value it
+    returns, its error code and its payload union (in that order), and every
+    other type a :class:`RetValue` leaf.
+
+    At most one leaf is returned *by value* - the first one that fits in
+    registers (``returns_via_result_ptr`` says so) - and every other leaf is
+    delivered by writing through a hidden result pointer; when no leaf
+    qualifies the function returns void.  A zero-sized leaf has no value to
+    return: it is delivered as its unit value and never takes the by-value
+    slot (a value-less function's payload union can take the slot of the code
+    its exception set needs no longer)."""
+    # the leaf types, in declaration order (depth first)
+    leaves = result_leaves(type)
     chosen: int | None = None
     for index, leaf_type in enumerate(leaves):
         if leaf_type.get_unit_value() is not None:
             # a zero-sized value is delivered as its unit value, not
             # through the by-value slot
             continue
-        if not returns_via_result_ptr(leaf_type):
+        if not returns_via_result_ptr(leaf_type, cache):
             chosen = index
             break
     via = tuple(
@@ -1916,30 +1844,37 @@ def make_ret_spec(type: Type) -> RetSpec:
     return groups[0][0]
 
 
-def pass_by_ref(type: Type) -> bool:
+def pass_by_ref(type: Type, cache: MirLowerCache) -> TriState:
     """Whether a parameter of spy type ``type`` is passed by reference
     (as a const pointer) rather than by value: the calling convention of
     one argument, decided by the compiler.
 
     The policy mirrors :func:`returns_via_result_ptr`: an aggregate too
     large to be passed in registers (larger than the by-value limit) is
-    passed as a pointer, everything else by value.  A dynamically-sized type
-    (a function type) has no size to pass, so it is always passed as a
-    pointer.  The caller otherwise passes a parameter by reference when its
-    formal declares it as one (``fn.SignatureFormalArg.by_ref``), whatever
-    its type."""
-    if type.classify() == SpecialTypeKind.DST:
-        return True
-    match type:
-        case StructType() | ArrayType() | OptionType() | UnionType():
-            if _mentions_type_var(type):
-                # the layout is not known until the call substitutes the type
-                # parameter: assumed small now, re-decided on substitution
-                return False
-            return estimated_size_of(type) > _AGGREGATE_VALUE_RETURN_LIMIT
-        case _:
-            return False
+    passed as a pointer, everything else by value; the size is the one of
+    the type's MIR mirror, for pointers of the cache's target.  A
+    dynamically-sized type (a function type) has no size to pass, so it is
+    always passed as a pointer.
 
+    A type that still names a type parameter has no layout to size, so the
+    answer is ``UNKNOWN``: the convention is settled when a call substitutes
+    the parameter (see ``fn.Signature.specialize``, which combines the
+    answer with what the formal declares)."""
+    if _mentions_type_var(type):
+        # the layout is not known until a call substitutes the type parameter:
+        # left to the specialization to decide
+        return TriState.UNKNOWN
+    match type.classify():
+        case SpecialTypeKind.DST:
+            return TriState.TRUE
+        case SpecialTypeKind.COMPTIME:
+            return TriState.TRUE
+        case SpecialTypeKind.ZST:
+            return TriState.FALSE
+        case SpecialTypeKind.NONE:
+            mir_type = type.to_mir_type(cache)
+            assert mir_type is not None
+            return TriState.TRUE if mir.estimated_size_of(mir_type, cache.target.pointer_size) > _AGGREGATE_VALUE_RETURN_LIMIT else TriState.FALSE
 
 # ---------------------------------------------------------------------------
 # mapping Python values to spy types

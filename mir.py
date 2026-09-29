@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Self, override
 
 from .binop import BinaryOp, CompareOp
-from .errors import CompileError
+from .errors import CompileError, SpyError
 
 # ---------------------------------------------------------------------------
 # static types
@@ -174,6 +174,71 @@ class FunctionType(Type):
 
     def get_children(self) -> tuple[Any, ...]:
         return (*self.args, self.return_type)
+
+
+# ---------------------------------------------------------------------------
+# layouts
+# ---------------------------------------------------------------------------
+
+
+def estimated_size_of(type: Type, pointer_size: int) -> int:
+    """The estimated size of the MIR type ``type`` in bytes, laid out with
+    pointers of ``pointer_size`` bytes.  The MIR type *is* the layout: it
+    holds a struct's fields in the order the layout puts them in (see
+    ``sval.StructType._calculate_mir``) and a union's storage variant already
+    selected, so this is the size of the value the lowered code works with.
+    A type that has no layout at all - a function type, which is dynamically
+    sized - raises :class:`SpyError`."""
+    match type:
+        case BoolType():
+            return 1
+        case IntType():
+            return (type.bits + 7) // 8
+        case FloatType():
+            return (type.bits + 7) // 8
+        case PointerType():
+            return pointer_size
+        case ArrayType():
+            return type.length * estimated_size_of(type.elem, pointer_size)
+        case StructType():
+            offset = 0
+            for field in type.fields:
+                align = estimated_alignment_of(field.type, pointer_size)
+                offset = (offset + align - 1) // align * align
+                offset += estimated_size_of(field.type, pointer_size)
+            align = estimated_alignment_of(type, pointer_size)
+            return (offset + align - 1) // align * align
+        case UnionType():
+            # a union holds its storage variant's storage (no tag of its own)
+            return estimated_size_of(type.payload, pointer_size)
+        case _:
+            raise SpyError(f"type {type} has no layout")
+
+
+def estimated_alignment_of(type: Type, pointer_size: int) -> int:
+    """The estimated alignment of the MIR type ``type`` in bytes, for pointers
+    of ``pointer_size`` bytes (see :func:`estimated_size_of`).  A type that has
+    no layout at all (a function type) raises :class:`SpyError`."""
+    match type:
+        case BoolType():
+            return 1
+        case IntType():
+            return max(1, type.bits // 8)
+        case FloatType():
+            return type.bits // 8
+        case PointerType():
+            return pointer_size
+        case ArrayType():
+            return estimated_alignment_of(type.elem, pointer_size)
+        case StructType():
+            return max(
+                (estimated_alignment_of(field.type, pointer_size) for field in type.fields),
+                default=1,
+            )
+        case UnionType():
+            return estimated_alignment_of(type.payload, pointer_size)
+        case _:
+            raise SpyError(f"type {type} has no layout")
 
 
 # ---------------------------------------------------------------------------
