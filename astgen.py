@@ -1002,11 +1002,11 @@ class _Builder:
 
 def parse_function(
     fn: Callable,
+    resolver: GlobalResolver,
     self_type: Type | None = None,
     self_by_value: bool = False,
     context_type_vars: dict[TypeVar, Value] | None = None,
     exceptions: set[Any] | Literal["infer"] | None = None,
-    resolver: GlobalResolver | None = None,
 ) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
@@ -1029,7 +1029,8 @@ def parse_function(
     resolved in: a struct class or function handle the annotation names is
     resolved to *that host's* object, so that a function parses against the
     structs and functions of the context it is compiled in (see
-    ``sval.as_value``).
+    ``sval.as_value``); it is required, since a function is always parsed *for*
+    a context.
     """
     try:
         source = inspect.getsource(fn)
@@ -1114,7 +1115,7 @@ def parse_function(
         if annotation is None:
             return None
         try:
-            return as_value(annotation, type_vars, resolver)
+            return as_value(annotation, resolver, type_vars)
         except Exception as e:
             raise CompileError(
                 f"cannot use {annotation!r} as {what} of function {node.name}: {e}"
@@ -1145,7 +1146,7 @@ def parse_function(
             return None
         ret: ArraySet[Type] = ArraySet()
         for exception in exceptions:
-            value = as_value(exception, type_vars, resolver)
+            value = as_value(exception, resolver, type_vars)
             if not isinstance(value, StructType):
                 raise CompileError(
                     f'cannot use {exception!r} as an exception of function '

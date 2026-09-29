@@ -935,7 +935,7 @@ def struct_type(handle: Any) -> sval.StructType:
 
 def spy_type(annotation: Any) -> sval.Type:
     """The spy type a Python annotation evaluates to (see ``sval.as_value``)."""
-    type = sval.as_value(annotation)
+    type = sval.as_value(annotation, _GLOBAL_CONTEXT)
     assert isinstance(type, sval.Type)
     return type
 

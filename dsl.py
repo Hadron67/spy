@@ -214,8 +214,8 @@ class _RegisteredFn:
         entry = self.get_entry()
         arglist = entry.hir.signature.bind_arg_pos(
             RawArgList(
-                tuple(sval.as_value(a) for a in args),
-                frozendict((k, sval.as_value(v)) for k, v in kwds.items()),
+                tuple(sval.as_value(a, self.context) for a in args),
+                frozendict((k, sval.as_value(v, self.context)) for k, v in kwds.items()),
             ),
             lambda e: e,
         )
@@ -257,14 +257,11 @@ class _RegisteredFn:
     def get_entry(self):
         if self.entry is None:
             hir = astgen.parse_function(
-                self.fn, self.cls, self.meta.sfv, self.context_type_vars,
-                self.meta.exceptions, self.context,
+                self.fn, self.context, self.cls, self.meta.sfv, self.context_type_vars,
+                self.meta.exceptions,
             )
             self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
         return self.entry
-
-    def as_spy_value(self) -> sval.AnyValue:
-        return self.get_entry()
 
 class _RegisteredClass(StructDecl):
     """One class decorated with ``@struct()``, bound to its name in place of
@@ -317,7 +314,7 @@ class _RegisteredClass(StructDecl):
             # one of them (``inner: Pair[T]``) evaluates to an application
             # that resolves against the class' type parameters here
             for name, annotation in self.cls.__annotations__.items():
-                type = sval.as_value(annotation, self.class_type_vars, resolver=self.context)
+                type = sval.as_value(annotation, self.context, self.class_type_vars)
                 if type is None or not isinstance(type, sval.Type):
                     raise CompileError(f'cannot convert annotation {annotation!r} to a value')
                 # the value the class body assigned to the annotated attribute
@@ -328,7 +325,7 @@ class _RegisteredClass(StructDecl):
                 default: sval.AnyValue | None = None
                 if name in self.cls.__dict__:
                     default = sval.as_value(
-                        self.cls.__dict__[name], self.class_type_vars, resolver=self.context,
+                        self.cls.__dict__[name], self.context, self.class_type_vars,
                     )
                 head.add_field(name, type, default)
             # the ``self`` of every method is the struct *template*: a
@@ -376,11 +373,11 @@ class _RegisteredClass(StructDecl):
         args = key if isinstance(key, tuple) else (key,)
         return sval.StructTypeApplication(self, args)
 
-    @override
     def as_spy_value(self) -> sval.AnyValue:
-        """The spy value of this class: the struct type it declares (see
-        ``sval.as_value``, which asks for it).  The name of a *generic* struct
-        stands for its template, which a call has to specialize."""
+        """The spy value of this class: the struct type it declares, built in
+        the context that resolves it (see ``_Context.resolve_global``).  The
+        name of a *generic* struct stands for its template, which a call has to
+        specialize."""
         entry = self.get_entry()
         if len(entry.generic_args) == 0:
             return entry.specialize(())
@@ -446,7 +443,7 @@ class _Context(GlobalResolver):
                 # it is called (it contributes no native specialization)
                 entry = self._inline_cache.get(value)
                 if entry is None:
-                    hir = astgen.parse_function(value, resolver=self)
+                    hir = astgen.parse_function(value, self)
                     entry = FunctionValue(value.__qualname__, hir, force_inline=True)
                     self._inline_cache[value] = entry
                 return entry
