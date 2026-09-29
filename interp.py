@@ -106,7 +106,7 @@ from .fn import (
 )
 from .hir import InlineMode
 from .sval import (
-    GlobalResolver,
+    CompileContext,
     RetSpec,
     RetTuple,
     RetValue,
@@ -2272,7 +2272,7 @@ class HirRunner:
                     resolved = self._analyser._resolver.resolve_global(obj)
                     if resolved is not None:
                         return ComptimeVal(resolved)
-                return ComptimeVal(sval.as_value(obj, resolver=self._analyser._resolver))
+                return ComptimeVal(sval.as_value(obj, ctx=self._analyser._resolver))
             case hir.ConstRef():
                 # a reference to an immutable global.  At compile time a
                 # reference to a global behaves exactly like the value it
@@ -4370,7 +4370,7 @@ class HirRunner:
             )
 
 class Analyser:
-    def __init__(self, resolver: GlobalResolver, mir_lower_cache: sval.MirLowerCache) -> None:
+    def __init__(self, resolver: CompileContext, mir_lower_cache: sval.MirLowerCache) -> None:
         self._resolver = resolver
         # the host's MIR-mirror interning table, which every mirror a body
         # creates is made through (see ``sval.MirLowerCache``)

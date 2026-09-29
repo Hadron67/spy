@@ -16,6 +16,12 @@ class MultiPtr[T, C: bool = Literal[False]]:
     def __setitem__(self, value: EllipsisType, val: T) -> None:
         ...
 
+    def __add__(self, amount: int) -> MultiPtr[T, C]:
+        ...
+
+    def __iadd__(self, amount: int) -> None:
+        ...
+
 class Array[T, L: int]:
     def __getitem__(self, value: int) -> T:
         ...
@@ -47,3 +53,9 @@ def comptime():
 
 def unroll():
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+class USize:
+    pass
+
+class ISize:
+    pass

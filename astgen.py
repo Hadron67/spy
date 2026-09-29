@@ -65,7 +65,7 @@ from .errors import CompileError
 from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
-    GlobalResolver,
+    CompileContext,
     MirLowerCache,
     Null,
     PointerType,
@@ -1002,7 +1002,7 @@ class _Builder:
 
 def parse_function(
     fn: Callable,
-    resolver: GlobalResolver,
+    resolver: CompileContext,
     mir_lower_cache: MirLowerCache,
     self_type: Type | None = None,
     self_by_value: bool = False,

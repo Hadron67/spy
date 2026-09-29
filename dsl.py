@@ -63,7 +63,7 @@ from .fn import (
 )
 from .interp import Analyser
 from .lower import LLVMBackend, to_ctype
-from .sval import GlobalResolver, StructDecl
+from .sval import CompileContext, MirLowerCache, StructDecl
 from .target import TargetInfo
 from .util import frozendict
 
@@ -393,7 +393,7 @@ class _RegisteredClass(StructDecl):
         )
 
 
-class _Context(GlobalResolver):
+class _Context(CompileContext):
     def __init__(self, backend: Backend, target: TargetInfo | None = None) -> None:
         self.backend = backend
         # the parameters of the compile target this context compiles for (the
@@ -456,6 +456,14 @@ class _Context(GlobalResolver):
             case _:
                 # any other object stays a plain compile-time Python value
                 return None
+
+    @override
+    def target_info(self) -> TargetInfo:
+        return self.mir_lower_cache.target
+
+    @override
+    def mir_cache(self) -> MirLowerCache:
+        return self.mir_lower_cache
 
     def _resolve_call(
         self, fn: FunctionValue, call_sig: CallSignature, ret_sig: PartialReturnSignature

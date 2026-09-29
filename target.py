@@ -24,3 +24,4 @@ class TargetInfo:
     alignment)."""
 
     pointer_size: int = HOST_POINTER_SIZE
+    usize_bits: int = HOST_POINTER_SIZE * 8

@@ -26,6 +26,7 @@ from . import builtins as _builtins
 from .dsl import func, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
+from .syntax import ISize, USize
 
 typeof = _builtins.spy_typeof  # ``spy.typeof`` is evaluated at compile time
 compile_log = _builtins.spy_compile_log
@@ -46,6 +47,8 @@ if TYPE_CHECKING:
     i64 = int
     f32 = float
     f64 = float
+    usize = int
+    isize = int
     bool = pybuiltins.bool
     void = NoneType
 else:
@@ -58,6 +61,8 @@ else:
     i16 = IntType(16, True)
     i32 = IntType(32, True)
     i64 = IntType(64, True)
+    usize = USize
+    isize = ISize
     f32 = FloatType(32)
     f64 = FloatType(64)
     bool = BoolType()

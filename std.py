@@ -1,9 +1,8 @@
 from typing import Literal, Protocol, Self, cast
 
-from spy import u64
-
+from . import usize
 from .dsl import struct
-from .syntax import MultiPtr, comptime
+from .syntax import MultiPtr, Option, comptime
 
 
 class Numeric(Protocol):
@@ -19,6 +18,12 @@ class Numeric(Protocol):
 class StopIteration(Exception):
     """The exception ``range.__next__`` raises when the sequence is exhausted:
     the ``for`` desugaring catches it to end the loop (see ``astgen._gen_for``)."""
+
+@struct()
+class slice[T: Numeric]:
+    start: T
+    end: T
+    step: Option[T] = None
 
 @struct()
 class range[T: Numeric]:
@@ -42,6 +47,11 @@ class range[T: Numeric]:
         return result
 
 @struct()
-class Slice[T, C: bool = Literal[False]]:
+class SlicePtr[T, C: bool = Literal[False]]:
     ptr: MultiPtr[T, C]
-    length: u64
+    length: usize
+
+def multi_ptr_slice[T, C: bool](ptr: MultiPtr[T, C], subscript):
+    if isinstance(subscript, slice):
+        return SlicePtr(ptr + subscript.start, subscript.end - subscript.start)
+    return ptr + subscript

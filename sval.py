@@ -1927,7 +1927,7 @@ class StructTypeApplication:
     struct: StructDecl
     generic_vars: tuple[Any, ...]
 
-def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVar, Value] | None = None) -> AnyValue:
+def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Value] | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
     scalars and ``sval.Value`` objects pass through, and ``None`` is the
     ``Null`` value (the absent value of an option, the unit value of the
@@ -1952,6 +1952,10 @@ def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVa
         return PointerType(IntType(8, False), is_const=True)
     if value is bool:
         return BoolType()
+    if value is syntax.USize:
+        return IntType(ctx.target_info().usize_bits, False)
+    if value is syntax.ISize:
+        return IntType(ctx.target_info().usize_bits, True)
     if value is typing.Never or value is typing.NoReturn:
         # ``Never`` (and its deprecated alias ``NoReturn``): a function that
         # returns it never returns a value at all (see :class:`EmptyType`)
@@ -1964,12 +1968,12 @@ def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVa
         # ``Foo[T]``: resolve the template in the host (a struct declared by
         # another context resolves to this context's copy), then its arguments
         # in the scope it was written in, then specialize it
-        head = resolver.resolve_global(value.struct)
+        head = ctx.resolve_global(value.struct)
         if not isinstance(head, StructTypeHead):
             raise TypeError(f'cannot use {value.struct} as a generic struct template')
         resolved: list[Value] = []
         for arg in value.generic_vars:
-            arg_value = as_value(arg, resolver, type_vars)
+            arg_value = as_value(arg, ctx, type_vars)
             if not isinstance(arg_value, Value):
                 raise TypeError(
                     f'cannot use {arg!r} as a generic argument of {value.struct}'
@@ -1987,7 +1991,7 @@ def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVa
         elems = raw[:-1] if has_ellipsis else raw
         types: list[Type] = []
         for arg in elems:
-            type = as_value(arg, resolver, type_vars)
+            type = as_value(arg, ctx, type_vars)
             if not isinstance(type, Type):
                 raise TypeError(f'{arg!r} is not a type')
             types.append(type)
@@ -2008,11 +2012,11 @@ def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVa
         args = typing.get_args(value)
         if len(args) not in (1, 2):
             raise TypeError(f'cannot convert {value!r} to a value')
-        elem = as_value(args[0], resolver, type_vars)
+        elem = as_value(args[0], ctx, type_vars)
         if not isinstance(elem, Type):
             raise TypeError(f'{args[0]!r} is not a type')
         if len(args) == 2:
-            return PointerType(elem, _as_constness(args[1], type_vars, resolver))
+            return PointerType(elem, _as_constness(args[1], type_vars, ctx))
         return PointerType(elem, False)
     if typing.get_origin(value) is syntax.Array:
         # ``Array[T, L]``: ``L`` values of type ``T``.  The length is a *value*
@@ -2023,10 +2027,10 @@ def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVa
         args = typing.get_args(value)
         if len(args) != 2:
             raise TypeError(f'cannot convert {value!r} to a value')
-        elem = as_value(args[0], resolver, type_vars)
+        elem = as_value(args[0], ctx, type_vars)
         if not isinstance(elem, Type):
             raise TypeError(f'{args[0]!r} is not a type')
-        return ArrayType(elem, as_value(args[1], resolver, type_vars))
+        return ArrayType(elem, as_value(args[1], ctx, type_vars))
     if typing.get_origin(value) is syntax.Option:
         # ``Option[T]``: ``T`` or the ``Null`` value.  The alias
         # ``type Option[T] = T | None`` evaluates a subscripted use to a
@@ -2034,7 +2038,7 @@ def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVa
         args = typing.get_args(value)
         if len(args) != 1:
             raise TypeError(f'cannot convert {value!r} to a value')
-        child = as_value(args[0], resolver, type_vars)
+        child = as_value(args[0], ctx, type_vars)
         if not isinstance(child, Type):
             raise TypeError(f'{args[0]!r} is not a type')
         return OptionType(child)
@@ -2046,7 +2050,7 @@ def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVa
         rest = tuple(a for a in args if a is not NoneType)
         if len(rest) != len(args) - 1 or len(rest) != 1:
             raise TypeError(f'cannot convert {value!r} to a value')
-        child = as_value(rest[0], resolver, type_vars)
+        child = as_value(rest[0], ctx, type_vars)
         if not isinstance(child, Type):
             raise TypeError(f'{rest[0]!r} is not a type')
         return OptionType(child)
@@ -2054,7 +2058,7 @@ def as_value(value: Any, resolver: GlobalResolver, type_vars: dict[typing.TypeVa
     # anything else is asked of the host: an object it knows (a struct class
     # or a registered function handle) resolves in *this* context, so that
     # every context sees its own handle (see ``dsl._Context.resolve_global``)
-    host_value = resolver.resolve_global(value)
+    host_value = ctx.resolve_global(value)
     if host_value is not None:
         return host_value
     raise TypeError(f'cannot convert {value} to a value')
@@ -2082,7 +2086,7 @@ def unwrap_comptime(annotation: Any) -> tuple[bool, Any]:
         return True, args[0]
     return False, annotation
 
-def _as_constness(value: Any, type_vars: dict[typing.TypeVar, Value] | None, resolver: GlobalResolver) -> AnyValue:
+def _as_constness(value: Any, type_vars: dict[typing.TypeVar, Value] | None, resolver: CompileContext) -> AnyValue:
     """The spy value of the constness argument of a pointer type: a Python
     ``bool``, or the type parameter it is written as, which a call then
     solves to one of the two (see ``TypeVarSolver``)."""
@@ -2392,7 +2396,7 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
                 f"cannot create a constant of type {type} from {value}"
             )
 
-class GlobalResolver:
+class CompileContext:
     @abstractmethod
     def resolve_global(self, value: Any) -> AnyValue | None:
         """The spy value a global object referenced inside a function
@@ -2404,4 +2408,10 @@ class GlobalResolver:
         Python functions it inlines; any other object is not a spy value
         of this host and returns ``None`` (the object stays a plain
         compile-time Python value)."""
+        ...
+
+    def target_info(self) -> TargetInfo:
+        ...
+
+    def mir_cache(self) -> MirLowerCache:
         ...
