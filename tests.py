@@ -2335,6 +2335,59 @@ def bad_subscript_overload(x: i32) -> i32:
     return b[1]
 
 
+# ---------------------------------------------------------------------------
+# iterating a slice: ``__iter__`` of ``SlicePtr``/``ConstSlicePtr`` yields the
+# elements by value, ``refs()`` a pointer to each of them
+# ---------------------------------------------------------------------------
+
+
+@func()
+def iterate_slice_sum(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    total: i32 = 0
+    for v in s:
+        total += v
+    return total
+
+
+@func()
+def iterate_slice_refs_write(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    for p in s.refs():
+        p[...] = 99
+    return a[0] + a[1] + a[2] + a[3]
+
+
+@func()
+def iterate_const_slice_sum(p: Array[i32, Literal[4]]) -> i32:
+    s = const_arr_slice(ref(p))
+    total: i32 = 0
+    for v in s:
+        total += v
+    return total
+
+
+@func()
+def call_iterate_const_slice_sum(x: i32) -> i32:
+    return iterate_const_slice_sum(array(x, x + 1, x + 2, x + 3, length=4))
+
+
+@func()
+def iterate_const_slice_refs_sum(p: Array[i32, Literal[4]]) -> i32:
+    s = const_arr_slice(ref(p))
+    total: i32 = 0
+    for q in s.refs():
+        total += q[...]
+    return total
+
+
+@func()
+def call_iterate_const_slice_refs_sum(x: i32) -> i32:
+    return iterate_const_slice_refs_sum(array(x, x + 1, x + 2, x + 3, length=4))
+
+
 @func()
 def comptime_slice_element() -> i32:
     # the array *is* compile-time: its elements are their own places, the slice
@@ -4002,6 +4055,25 @@ class SpyMultiPointerTest(TestCase):
         with self.assertRaises(CompileError) as ctx:
             single_ptr_is_not_multi(1)
         self.assertIn('cannot convert', str(ctx.exception))
+
+
+class SpySliceIteratorTest(TestCase):
+    """Iterating a ``std.SlicePtr``/``std.ConstSlicePtr``: ``__iter__`` yields
+    the elements by value and ``refs()`` a pointer to each of them (see
+    ``std._ConstSliceIterator``/``_SliceRefIterator``)."""
+
+    def test_iterating_a_slice_yields_its_elements(self) -> None:
+        self.assertEqual(iterate_slice_sum(10), 10 + 11 + 12 + 13)
+
+    def test_refs_yields_each_element_place(self) -> None:
+        # the pointers name the array's own elements, so a write lands in it
+        self.assertEqual(iterate_slice_refs_write(10), 99 * 4)
+
+    def test_iterating_a_const_slice(self) -> None:
+        self.assertEqual(call_iterate_const_slice_sum(10), 10 + 11 + 12 + 13)
+
+    def test_refs_of_a_const_slice(self) -> None:
+        self.assertEqual(call_iterate_const_slice_refs_sum(10), 10 + 11 + 12 + 13)
 
 
 class SpySlicePtrTest(TestCase):

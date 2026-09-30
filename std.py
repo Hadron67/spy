@@ -4,7 +4,16 @@ from spy import syntax
 
 from . import usize
 from .dsl import struct
-from .syntax import Array, ConstPtr, Option, Ptr, comptime, ptr_cast
+from .syntax import (
+    Array,
+    ConstMultiPtr,
+    ConstPtr,
+    MultiPtr,
+    Option,
+    Ptr,
+    comptime,
+    ptr_cast,
+)
 
 
 class Numeric(Protocol):
@@ -57,8 +66,14 @@ class ConstSlicePtr[T]:
     """The slice of a *const* multi pointer - the value ``const_arr_slice``
     builds (see ``syntax._ConstSlicePtr`` for the type-checking shape)."""
 
-    ptr: syntax.ConstMultiPtr[T]
+    ptr: ConstMultiPtr[T]
     length: usize
+
+    def __iter__(self) -> _SliceValueIterator[T]:
+        return _SliceValueIterator(self.ptr, self.length)
+
+    def refs(self) -> _ConstSliceRefIterator[T]:
+        return _ConstSliceRefIterator(self.ptr, self.length)
 
 @struct()
 class SlicePtr[T]:
@@ -66,11 +81,65 @@ class SlicePtr[T]:
     and the value a slice subscript (``p[a:b]``) produces (see
     ``syntax._SlicePtr``)."""
 
-    ptr: syntax.MultiPtr[T]
+    ptr: MultiPtr[T]
     length: usize
 
     def as_const(self) -> ConstSlicePtr[T]:
         return ConstSlicePtr(self.ptr, self.length)
+
+    def __iter__(self) -> _SliceValueIterator[T]:
+        return _SliceValueIterator(self.ptr, self.length)
+
+    def refs(self) -> _SliceRefIterator[T]:
+        return _SliceRefIterator(self.ptr, self.length)
+
+@struct()
+class _SliceValueIterator[T]:
+    cursor: ConstMultiPtr[T]
+    remaining: usize
+
+    def __iter__(self) -> _SliceValueIterator[T]:
+        return self
+
+    def __next__(self) -> T:
+        if self.remaining == 0:
+            raise StopIteration()
+        self.remaining = self.remaining - 1
+        result = self.cursor[...]
+        self.cursor += 1
+        return result
+
+@struct()
+class _ConstSliceRefIterator[T]:
+    cursor: ConstMultiPtr[T]
+    remaining: usize
+
+    def __iter__(self) -> _ConstSliceRefIterator[T]:
+        return self
+
+    def __next__(self) -> ConstPtr[T]:
+        if self.remaining == 0:
+            raise StopIteration()
+        self.remaining = self.remaining - 1
+        result = self.cursor
+        self.cursor += 1
+        return result
+
+@struct()
+class _SliceRefIterator[T]:
+    cursor: MultiPtr[T]
+    remaining: usize
+
+    def __iter__(self) -> _SliceRefIterator[T]:
+        return self
+
+    def __next__(self) -> Ptr[T]:
+        if self.remaining == 0:
+            raise StopIteration()
+        self.remaining = self.remaining - 1
+        result = self.cursor
+        self.cursor += 1
+        return result
 
 def arr_slice[T, N: int](arr: Ptr[Array[T, N]]) -> SlicePtr[T]:
     """The slice of the whole array the pointer ``arr`` names: the
