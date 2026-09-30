@@ -305,6 +305,42 @@ class Subscript(Inst):
     base: Value
     index: ArgEntry[Value]
 
+
+@dataclass(eq=False)
+class PointerType(Inst):
+    """Build the spy pointer type an expression such as ``syntax.Ptr[T]`` or
+    ``syntax.ConstMultiPtr[T]`` names: ``elem`` is the element type (a value
+    operand) and ``is_const``/``is_multi`` say which of the four spellings it
+    is.  The result is a compile-time type value (see ``interp``)."""
+
+    elem: Value
+    is_const: bool
+    is_multi: bool
+
+@dataclass(eq=False)
+class ArrayType(Inst):
+    """Build the spy array type ``syntax.Array[T, N]``: ``length`` values of
+    the element type ``elem`` (both value operands; the length is a *value*,
+    which may be a type parameter the call solves)."""
+
+    elem: Value
+    length: Value
+
+@dataclass(eq=False)
+class OptionType(Inst):
+    """Build the spy option type ``syntax.Option[T]``: the child type ``child``
+    (a value operand)."""
+
+    child: Value
+
+@dataclass(eq=False)
+class PtrCast(Inst):
+    """``syntax.ptr_cast(ptr, T)``: reinterpret the pointer ``value`` as the
+    pointer type the value operand ``type`` names (see ``interp``)."""
+
+    value: Value
+    type: Value
+
 @dataclass(eq=False)
 class InitTuple(Inst):
     tuple_ptr: Value
@@ -479,6 +515,19 @@ class Try(Inst):
 
     binds: tuple[Value | None, ...]
     except_types: tuple[Value | None, ...]
+
+
+@dataclass(eq=False)
+class Slice(Inst):
+    """Build the ``std.slice`` object of a slice subscript (``p[a:b:c]``): its
+    result is the slice *object* - a compile-time aggregate of the bounds, of no
+    runtime shape of its own - which the subscript of a multi pointer then turns
+    into a ``SlicePtr`` (see ``interp``).  The bounds are value operands; a bound
+    the source left out is a constant (a ``0`` lower bound, a null step)."""
+
+    lower: Value
+    upper: Value
+    step: Value
 
 
 @dataclass(eq=False)

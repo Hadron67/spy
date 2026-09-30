@@ -353,10 +353,21 @@ class _Lowerer:
             case mir.Gep():
                 ptr = self._value(inst.ptr, arg_values)
                 index = inst.index
-                if isinstance(index, int):
-                    result = block.get_element_ptr(ptr, 0, index)
+                index_value = index if isinstance(index, int) else self._value(index, arg_values)
+                pointee_type = inst.ptr.get_type()
+                pointee = (
+                    self._to_llvm(pointee_type.elem)
+                    if isinstance(pointee_type, mir.PointerType) else None
+                )
+                if isinstance(pointee, (sllvm.StructType, sllvm.ArrayType)):
+                    # a field/element of the value the pointer points at: LLVM
+                    # addresses it with the leading zero index
+                    result = block.get_element_ptr(ptr, 0, index_value)
                 else:
-                    result = block.get_element_ptr(ptr, 0, self._value(index, arg_values))
+                    # an offset *by whole pointees* (a ``MultiPtr``, ``mptr + n``)
+                    result = block.get_element_ptr(ptr, index_value)
+            case mir.ExtractValue():
+                result = block.extract_value(self._value(inst.value, arg_values), inst.index)
             case mir.Arith():
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)

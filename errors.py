@@ -19,5 +19,13 @@ class CompileError(SpyError):
     pass
 
 
+class CoerceError(CompileError):
+    """A value could not be materialized as a requested spy type (see
+    ``interp.HirRunner._coerce``).  It is the failure of one *coercion*, and
+    callers that only want to know whether a coercion is possible catch it
+    (``interp.HirRunner._try_coerce``); every other compile error keeps being a
+    plain ``CompileError``."""
+
+
 class TypeMismatchError(TypeError, SpyError):
     pass

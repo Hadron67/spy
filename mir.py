@@ -483,10 +483,10 @@ class Gep(Inst):
                 raise CompileError(f'element index {index} is out of bounds for {elem}')
             self.type = PointerType(elem.elem)
             return
-        raise CompileError(
-            f'cannot take an element of a {ptype} value '
-            '(element access requires a struct or array value)'
-        )
+        # a pointer to anything else is *offset* by the index: the address of
+        # that many pointees after it, an element of an array of them (what a
+        # ``MultiPtr`` and ``mptr + n`` are)
+        self.type = PointerType(elem)
 
     @override
     def get_type(self) -> Type:
@@ -503,6 +503,47 @@ class Gep(Inst):
         if ptr is self.ptr and index is self.index:
             return self
         return replace(self, ptr=ptr, index=index)
+
+
+@dataclass(eq=False)
+class ExtractValue(Inst):
+    """The field ``index`` of the struct (or the element ``index`` of the
+    array) *value* ``value``: ``Gep``'s counterpart in the value domain - it
+    reads a field out of an aggregate value instead of taking the address of
+    one (an aggregate passed by value has no address of its own).  ``index`` is
+    the position in the *mirror* of the struct (the declaration index mapped by
+    ``sval.StructType.get_field_mir_indices``), or an array element position.
+    The result type is the field's/element's own type."""
+
+    value: Value
+    index: int
+
+    def __init__(self, value: Value, index: int) -> None:
+        self.value = value
+        self.index = index
+        vtype = value.get_type()
+        if isinstance(vtype, StructType):
+            if index < 0 or index >= len(vtype.fields):
+                raise CompileError(f'field index {index} is out of bounds for {vtype}')
+            self.type: Type = vtype.fields[index].type
+            return
+        if isinstance(vtype, ArrayType):
+            if not 0 <= index < vtype.length:
+                raise CompileError(f'element index {index} is out of bounds for {vtype}')
+            self.type = vtype.elem
+            return
+        raise CompileError(f'cannot extract a field of a {vtype} value')
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
 
 
 @dataclass(eq=False)

@@ -1,38 +1,67 @@
 from types import EllipsisType
-from typing import Any, Literal
+from typing import Any, Self, overload
 
 
-class Ptr[T, C: bool = Literal[False]]:
+class ConstPtr[T]:
     def __getitem__(self, value: EllipsisType) -> T:
         ...
 
+class Ptr[T](ConstPtr[T]):
     def __setitem__(self, value: EllipsisType, val: T) -> None:
         ...
 
-class MultiPtr[T, C: bool = Literal[False]]:
-    def __getitem__(self, value: EllipsisType) -> T:
+class _ConstSlicePtr[T]:
+    """The slice of a *const* multi pointer: the pointer itself and the number
+    of elements it carries.  Only used for type checking - the real slice types
+    live in ``std`` (``ConstSlicePtr``/``SlicePtr``); ``ptr`` is a read-only
+    property so that the mutable slice may narrow it covariantly."""
+
+    @property
+    def ptr(self) -> ConstMultiPtr[T]:
+        raise NotImplementedError
+
+    length: int
+
+class _SlicePtr[T](_ConstSlicePtr[T]):
+    @property
+    def ptr(self) -> MultiPtr[T]:
+        raise NotImplementedError
+
+
+class ConstMultiPtr[T](ConstPtr[T]):
+    @overload
+    def __getitem__(self, value: int | EllipsisType) -> T:
         ...
 
-    def __setitem__(self, value: EllipsisType, val: T) -> None:
+    @overload
+    def __getitem__(self, value: slice) -> _ConstSlicePtr[T]:
         ...
 
-    def __add__(self, amount: int) -> MultiPtr[T, C]:
+    def __getitem__(self, value: int | EllipsisType | slice) -> T | _ConstSlicePtr[T]:
         ...
 
-    def __iadd__(self, amount: int) -> None:
+    def __add__(self, amount: int) -> Self:
+        ...
+
+    def __iadd__(self, amount: int) -> Self:
+        ...
+
+class MultiPtr[T](ConstMultiPtr[T], Ptr[T]):
+    @overload
+    def __getitem__(self, value: int | EllipsisType) -> T:
+        ...
+
+    @overload
+    def __getitem__(self, value: slice) -> _SlicePtr[T]:
+        ...
+
+    def __getitem__(self, value: int | EllipsisType | slice) -> T | _SlicePtr[T]:
+        ...
+
+    def __setitem__(self, value: int | EllipsisType, val: T) -> None:
         ...
 
 class Array[T, L: int]:
-    def __getitem__(self, value: int) -> T:
-        ...
-
-    def __setitem__(self, value: int, val: T) -> None:
-        ...
-
-class Slice[T, C: bool = Literal[False]]:
-    ptr: MultiPtr[T, C]
-    len: int
-
     def __getitem__(self, value: int) -> T:
         ...
 
@@ -52,6 +81,9 @@ def comptime():
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
 def unroll():
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+def ptr_cast[T](ptr: Any, target: type[T]) -> T:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
 class USize:

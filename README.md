@@ -168,7 +168,7 @@ def use_pair(x: spy.i32) -> spy.i32:
 
 ## 指针
 
-`syntax.Ptr[T]` 是 C 的 `T*`：`Ptr[T, C]` 的 `C` 是 const 性（默认 `False`，const 时写 `Literal[True]`），也可以是一个在调用时求解的类型参数。`syntax.ref(a)` 取 `a` 的地址（C 的 `&a`），`p[...]` 解引用（C 的 `*p`）：
+`syntax.Ptr[T]` 是 C 的 `T*`（const 的写法是 `syntax.ConstPtr[T]`）。`syntax.ref(a)` 取 `a` 的地址（C 的 `&a`），`p[...]` 解引用（C 的 `*p`）：
 
 ```python
 import spy
@@ -186,11 +186,12 @@ def use_incr(x: spy.i32) -> spy.i32:
     return v * 100 + r          # 6 * 100 + 6
 ```
 
-- **类型**：注解里的 `Ptr[T]` 被 `sval.as_value` 转成 `sval.PointerType`（元素类型 `T`、const 性 `C`）；未求解的 `C`（还是个类型参数）没有运行时表示。
+- **类型**：注解里的 `Ptr[T]` 被 `sval.as_value` 转成 `sval.PointerType`（元素类型 `T`、非 const）；`ConstPtr[T]` 转成 const 的指针类型。**多指针** `MultiPtr[T]`（const 的写法 `ConstMultiPtr[T]`）是同一地址，但可以像数组一样下标（见「数组」）。
 - **取地址**：`ref(a)` 是一个值（指针），内容就是 `a` 的地址——`a` 可寻址（变量、形参、字段、`p[...]`）时直接就是它的地址，否则（字面量、算术结果等）先落进一个临时 slot 再取。
 - **解引用**：`p[...]` 表示 `p` 指向的那个位置，和变量一样是一个**引用**（左值）：可读、可赋值（`p[...] = v`）、可 `+=`、可传给按引用传递的形参。`p.x`（自动解引用）与 `p[...].x` 取到的都是同一个字段。
-- **const**：可变指针可以隐式转成 const 指针，反过来不行。
-- **泛型**：指针类型参与类型参数求解——`Ptr[T]` 求解 `T`，`Ptr[T, C]` 连 const 性一起求解（`C` 解成 `True`/`False`）。
+- **const**：可变指针（`Ptr`/`MultiPtr`）可以隐式转成对应的 const 指针（`ConstPtr`/`ConstMultiPtr`），反过来不行。
+- **`ptr_cast`**：`syntax.ptr_cast(p, T)` 把指针 `p` 强制重解释成指针类型 `T`（运行期就是一次地址重解释，不做检查）；`std.arr_slice`/`std.const_arr_slice` 用它把指向数组的指针变成数组的切片（见「数组」）。
+- **泛型**：指针类型参与类型参数求解——`Ptr[T]` 求解 `T`（const 性不再是一个类型参数：它是类型本身，用 `Ptr`/`ConstPtr` 区分）。
 
 ## 数组
 
@@ -212,7 +213,8 @@ def use_array(x: spy.i32) -> spy.i32:
     return total(a) + a[0]
 ```
 
-- **类型**：注解里的 `Array[T, N]` 被 `sval.as_value` 转成 `sval.ArrayType`（元素类型 `T`、长度 `N`）。长度是一个**值**类型参数，所以写的时候要用 `Literal[N]`（和指针的 const 性写 `Literal[True]` 一样）；元素类型也可以是未求解的类型参数。
+- **类型**：注解里的 `Array[T, N]` 被 `sval.as_value` 转成 `sval.ArrayType`（元素类型 `T`、长度 `N`）。长度是一个**值**类型参数，所以写的时候要用 `Literal[N]`；元素类型也可以是未求解的类型参数。
+- **切片**：`std.arr_slice(p)` / `std.const_arr_slice(p)` 把一个指向数组的指针 `p`（`Ptr[Array[T, N]]` / `ConstPtr[Array[T, N]]`）变成数组整体的切片 `std.SlicePtr[T]` / `std.ConstSlicePtr[T]`（用 `ptr_cast` 把指向数组的指针重解释成元素的多指针，长度取 `N`）。多指针（`MultiPtr[T]`，例如切片的 `ptr` 字段）也可以直接下标/偏移：`p[i]`、`p + n`；对多指针切片 `p[a:b]` 会构造一个切片。切片本身是 `{ptr, length}` 的结构体。
 - **构造**：`array(a1, a2, ...)` 与结构体构造一样是 result-location 构造调用——元素按顺序直接写进数组的存储，嵌套构造（数组套数组、结构体里的数组字段）不产生拷贝。**长度取实参的个数**；元素类型取目标位置已声明的类型，否则取所有元素的共同类型（每个元素都得有一个能落地的类型，所以 `array(1, 2)` 这种没写类型的整数字面量会报错）。因为 Python 类型系统无法从实参推出长度，`array` 签名里带一个**只为类型检查**服务的 `length: N = 0` 关键字（不写时 pyright 认为长度是 0）；编译以实参个数为准，并且忽略这个关键字。
 - **下标**：`a[i]` 是第 `i` 个元素的**位置**（左值）——可读、可赋值、可 `+=`，也可以继续取字段（`a[0].x`）或继续下标（`a[0][1]`）。下标类型暂时固定为 `u64`（将来的 `usize` 会按目标平台取具体整数类型）；编译期常量下标会检查越界，运行期下标不检查。指向数组的指针同样可以下标：`p[...][i]`。
 - **ZST**：元素是 ZST、或长度为 0 的数组本身是 ZST——没有存储、没有运行时表示：每个元素都等于元素类型的单位值，`a[i]` 不产生地址（`a[i] = v` 也就什么都不写）。
@@ -239,6 +241,7 @@ def maybe_add(x: spy.i32, y: spy.i32, c: spy.bool) -> Option[spy.i32]:
 - **泛型**：`Option[T]` 里的类型参数照常求解（`Option[T]` 实参对 `Option[U]` 形参约束 `T` 对 `U`；只给一个 `T` 值也可以解出 `T`）。
 - **内存表示**（`sval.OptionType.to_mir_type` + `find_first_pointer_type_pos`）：如果 `T` 里还有**未被内层 `Option` 占用**的指针（Zig 风格的非空 `Ptr[T]`），就借用它当“是否缺席”的标签，因此 `Option[Ptr[T]]` 的内存布局与 `Ptr[T]` **完全一致**，读到的是空指针即为 `Null`；`T` 是 ZST 时只用一位 `bool`；否则用一个 `(bool, T)` 的结构体（`bool` 是标签，`T` 是值）。**每个 `Option` 层占用一个指针**：`T` 有 `n` 个可用指针，`Option[T]` 就只剩 `n - 1` 个，所以 `Option[Option[T]]` 的外层用 `T` 的**第二个**指针做标签（内存布局仍是 `T` 本身），指针用完后才退回 `bool`/结构体（例：`Option[Option[Ptr[T]]]` 退回 `(bool, Ptr[T])`）。`find_first_pointer_type_pos` 同时决定了有没有可用指针与标签的位置；缺席值 `Null` 落到运行时就是相应的空指针 / `false` 标签。
 - **result location**：往 `Option[T]` 的存储里交付一个 `T`（如构造体、return）时，`HirRunner._convert_result_ptr` 把指针转成此时选项 payload 的地址（并按表示设置标签），构造就地在 payload 上进行。
+- **读取**：`HirRunner._is_null`（是否缺席）与 `_option_payload`（present 值的 payload）已能对**运行时**选项值按其表示求出（ZST child 的 `bool`、指针标签、`(bool, T)` 的 tag/payload），但它们还没有对应的语法入口。
 - **尚未实现**：还没有解包 / 模式匹配（无法从 `Option[T]` 取出 `T` 或判断是否为 `None`），因此现在只能在编译期拿 `spy.typeof(x)` 观察选项类型，或在函数间传递。
 
 ## 多返回值
@@ -276,8 +279,8 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 | `lower.py` | MIR → LLVM IR → 机器码（llvmlite MCJIT） |
 | `fn.py` | 函数签名（`Signature`：形参绑定、类型参数求解、返回类型推导）、函数值与编译产物、链接名表（`SymbolTable`）与函数入口 thunk |
 | `sval.py` | spy 类型系统（含结构体类型）、编译期值、Python 值 → spy 域的映射（`as_value`）与类型参数约束求解（`TypeVarSolver`） |
-| `syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`、取地址 `ref`、数组类型 `Array` 与构造 `array`、编译期变量标注 `Comptime` |
-| `errors.py` | `SpyError`、`CompileError`、`TypeMismatchError`（同时是 `TypeError` 子类） |
+| `syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`/`ConstPtr`/`MultiPtr`/`ConstMultiPtr`、取地址 `ref`、指针强转 `ptr_cast`、数组类型 `Array` 与构造 `array`、`Option`、编译期变量标注 `Comptime` |
+| `errors.py` | `SpyError`、`CompileError`、`CoerceError`、`TypeMismatchError`（同时是 `TypeError` 子类） |
 | `binop.py` | 运算符的字面量类型 |
 | `builtins.py` | 函数体内使用的 `spy.*` builtin |
 | `util.py` | 共用工具 |
@@ -287,11 +290,11 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 
 - 运行时 `and`/`or`（目前只支持编译期操作数）。
 - 赋值仅支持 `=`（含元组解包）与 `+=`（无链式赋值 `a = b = e`、其它增强赋值）。
-- `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、对**指针**的下标 `p[i]`（指针只有解引用 `p[...]` 可用；数组的 `a[i]` 已实现）。
+- `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、对**单指针**的下标 `p[i]`（单指针只有解引用 `p[...]` 可用；多指针的 `p[i]` 与数组的 `a[i]` 已实现）。
 - 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字符串的运算。
 - 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、通过类名访问方法（如 `Foo[i32].m(x)`）、结构体整体比较。
-- 数组：运行时长度的数组（`syntax.MultiPtr`）、切片、数组之间的转换（如 `i32[2]` → `i64[2]`）、以及 Python 侧实例表示（带数组参数/返回值的函数还不能从 Python 侧直接调用）。
-- 类型标注：局部变量的标注按函数体内的表达式求值，因此目前只支持能当值求出的类型（具体类型、类型参数、结构体及结构体特化）与 `Comptime` 标记；`Ptr[T]`/`Array[T, N]`/`Option[T]` 这类 `syntax` 类型标记还只能写在形参、返回值与结构体字段注解里（它们在函数体里还不是可用作值的表达式）。
+- 数组：运行时长度的数组、数组之间的转换（如 `i32[2]` → `i64[2]`）、以及 Python 侧实例表示（带数组参数/返回值的函数还不能从 Python 侧直接调用）。切片已由 `std.arr_slice`/`std.const_arr_slice` 提供。
+- 类型标注：局部变量的标注按函数体内的表达式求值，支持能当值求出的类型（具体类型、类型参数、结构体及结构体特化）与 `Comptime` 标记；`Ptr[T]`/`ConstPtr[T]`/`MultiPtr[T]`/`ConstMultiPtr[T]`/`Array[T, N]`/`Option[T]` 这类 `syntax` 类型标记在函数体里也是可用作值的表达式（由 `hir.PointerType`/`hir.ArrayType`/`hir.OptionType` 在编译期构造），此外也能写在形参、返回值与结构体字段注解里。
 - 多返回值：不能嵌套元组返回值（`-> tuple[i32, tuple[i32, i32]]`），且按值返回的聚合结果还不能从 Python 侧调用。
 - Option：还不能解包（从 `Option[T]` 取出 `T`、或判断是否为 `None`），因此选项值只能在函数间传递、用 `spy.typeof` 观察类型；以 `T` 的某个指针当标签的表示下，`T` 自身令该指针为空值（或内层选项为缺席）时会被误读为外层缺席（与 Zig/Rust 的 niche 优化同样的局限）。
 - 普通 Python 函数的内联不支持运行期递归（递归驱动参数是运行期值时会在内联嵌套上限处报错，而非编译期展开）；运行期的函数值调用（把函数存进变量/字段后再调用）也尚未实现。

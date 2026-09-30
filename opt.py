@@ -125,6 +125,8 @@ def simplify(fn: mir.Function) -> None:
                 inst.value = resolve(inst.value)
             case mir.BitCast():
                 inst.value = resolve(inst.value)
+            case mir.ExtractValue():
+                inst.value = resolve(inst.value)
             case mir.Cmp():
                 inst.lhs = resolve(inst.lhs)
                 inst.rhs = resolve(inst.rhs)
@@ -218,6 +220,8 @@ def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
         case mir.Convert():
             return ((inst.value, 'use'),)
         case mir.BitCast():
+            return ((inst.value, 'use'),)
+        case mir.ExtractValue():
             return ((inst.value, 'use'),)
         case mir.Cmp():
             return ((inst.lhs, 'use'), (inst.rhs, 'use'))

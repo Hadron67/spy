@@ -124,6 +124,32 @@ class MirLowerCache:
         return ret
 
 
+class SpecialTypes:
+    """The spy types the type rules need but the type system cannot build on
+    its own, because they live in ``std`` (a host library): the ``slice`` struct
+    a subscript of a multi pointer builds, and the ``SlicePtr``/``ConstSlicePtr``
+    structs a slice of a pointer is.  One belongs to each host context (see
+    :meth:`CompileContext.special_types`) and is handed to every type function
+    that has to know them."""
+
+    def __init__(
+        self,
+        slice_type: StructTypeHead,
+        slice_ptr_type: StructTypeHead,
+        const_slice_ptr_type: StructTypeHead,
+    ) -> None:
+        self.slice_type = slice_type
+        self.slice_ptr_type = slice_ptr_type
+        self.const_slice_ptr_type = const_slice_ptr_type
+
+    def slice_ptr_of(self, elem: Type, is_const: AnyValue) -> StructType:
+        """The slice of a pointer to the element type ``elem``: ``SlicePtr``
+        when the pointer is mutable and ``ConstSlicePtr`` when it is const (the
+        constness of the slice is its *type*, not a type argument)."""
+        head = self.const_slice_ptr_type if is_const is True else self.slice_ptr_type
+        return head.specialize((elem,))
+
+
 class Type(Value):
     def get_unit_value(self) -> AnyValue | None:
         """The canonical *unit value* of a zero-sized type (ZST): ``None``
@@ -685,6 +711,28 @@ class Null(Value):
     def __str__(self) -> str:
         return 'null'
 
+@dataclass(frozen=True, slots=True)
+class TypedNull(Value):
+    """The absent value of an ``Option[T]``, *typed*: the compile-time form of
+    a missing option value, where the untyped :class:`Null` is what the Python
+    literal ``None`` evaluates to and peers with every type.  A compile-time
+    option value is either this - absent - or an ``interp.ComptimeOption`` -
+    present; a compile-time aggregate field of an option type holds one of the
+    two (see ``std.slice``).
+
+    The type argument is the option's *child*, so the absent value of an option
+    of an option is expressible as well (its static type is
+    ``Option[child]``)."""
+
+    child: Type
+
+    @override
+    def get_type(self) -> Type:
+        return OptionType(self.child)
+
+    def __str__(self) -> str:
+        return f'null[{self.child}]'
+
 @dataclass(frozen=True)
 class OptionType(Type):
     """The optional type ``Option[T]``: a value of the type ``T``, or the
@@ -799,6 +847,21 @@ def find_first_pointer_type_pos(type: Type, shift: int = 0) -> tuple[int, ...] |
         for index in range(len(children) - 1, -1, -1):
             todo.append((children[index], pos + (index,)))
     return None
+
+
+def aggregate_type_length(type: Type) -> int:
+    """The number of fields (or elements) of an aggregate type, in declaration
+    (element) order.  An ``Option`` is *not* an aggregate (its representation
+    is chosen from its child, see :meth:`OptionType.to_mir_type`), so asking it
+    for one is an error."""
+    if isinstance(type, StructType):
+        return len(type.fields().by_id)
+    if isinstance(type, ArrayType):
+        length = type.length_int
+        if length is None:
+            raise CompileError(f'cannot tell how many elements {type} holds')
+        return length
+    raise CompileError(f'{type} is not an aggregate')
 
 @dataclass
 class ConstRef(Value):
@@ -965,11 +1028,80 @@ class PointerVariant(IntEnum):
     SINGLE = auto()
     MULTI = auto()
 
+def _peer_const(a: AnyValue, b: AnyValue) -> AnyValue:
+    # the constness two pointers peer to: the const one (a ``*T`` converts to a
+    # const ``*T``, not the other way around).  A constness that is still a type
+    # parameter is kept as it is - the solver constrains it (see
+    # ``TypeVarSolver.add_constraint``)
+    if isinstance(a, bool) and isinstance(b, bool):
+        return a or b
+    return a if isinstance(a, Type) else b
+
+
+def _points_at_elements_of(ptr: PointerType, other: PointerType) -> bool:
+    """Whether the pointer ``ptr`` - a pointer to an array - is the *multi*
+    pointer ``other`` of the array's elements: a pointer to an array points at its
+    first element, and its elements follow one another, so the two carry the same
+    address."""
+    return (
+        ptr.variant == PointerVariant.SINGLE
+        and other.variant == PointerVariant.MULTI
+        and isinstance(ptr.elem, ArrayType)
+        and ptr.elem.elem == other.elem
+    )
+
+
 @dataclass(frozen=True)
 class PointerType(Type):
     elem: Type
     is_const: AnyValue = False # bool
     variant: PointerVariant = PointerVariant.SINGLE
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        """One pointer is a subtype of another when the address it carries may
+        be used as the other's: the pointee type has to be the same (pointers do
+        not convert between pointee types), the constness may only be added (a
+        ``*T`` is a ``const *T``), and a *multi* pointer is a single one (a
+        multi pointer may be dereferenced like a single one, but not the other
+        way around: indexing needs the multi form).  A pointer to an array is an
+        exception to the pointee rule: it is also a *multi* pointer to the
+        array's elements (its first element is the array's address and the
+        elements follow one another)."""
+        if not isinstance(other, PointerType):
+            return False
+        if self.elem == other.elem:
+            if self.variant == PointerVariant.SINGLE and other.variant == PointerVariant.MULTI:
+                # a single pointer is not a multi one: indexing it is meaningless
+                return False
+        elif not _points_at_elements_of(self, other):
+            return False
+        # the constness may not be dropped: a ``const *T`` does not convert to a
+        # ``*T``
+        return not (self.is_const is True and other.is_const is not True)
+
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        """The peer of two pointers is the one both convert to: the pointee
+        types have to match, the result is const when either is, and it is a
+        single pointer as soon as either is (a multi pointer converts to a
+        single one, not the other way around)."""
+        if isinstance(other, NullType):
+            return OptionType(self)
+        if isinstance(other, OptionType):
+            return _resolve_option_peer(self, other)
+        if isinstance(other, PointerType):
+            if self.elem != other.elem:
+                return None
+            is_const = _peer_const(self.is_const, other.is_const)
+            if self.variant == other.variant:
+                variant = self.variant
+            else:
+                # a multi pointer and a single one: the single one is what both
+                # convert to
+                variant = PointerVariant.SINGLE
+            return PointerType(self.elem, is_const, variant)
+        return other if self.is_subtype_of(other) else None
 
     @override
     def get_type(self) -> Type:
@@ -1005,7 +1137,10 @@ class PointerType(Type):
         return mir.PointerType(child, self.is_const)
 
     def __str__(self) -> str:
-        return f"{'ptr' if not self.is_const else 'cptr'}({self.elem})"
+        variant = 'mptr' if self.variant == PointerVariant.MULTI else 'ptr'
+        if self.is_const is True:
+            variant = 'c' + variant
+        return f"{variant}({self.elem})"
 
 @dataclass(frozen=True, slots=True)
 class ArrayType(Type):
@@ -1269,13 +1404,16 @@ class StructTypeHead(Type, IdentityObj):
     of a generic struct (a template is not a type of any value yet).
     """
 
-    def __init__(self, name_base: str, generic_args: tuple[TypeVar, ...] = (), modifiers: StructModifiers | None = None) -> None:
+    def __init__(self, name_base: str, generic_args: tuple[TypeVar, ...] = (), modifiers: StructModifiers | None = None, generic_defaults: tuple[AnyValue | None, ...] = ()) -> None:
         self.name_base = name_base
         self.generic_args = generic_args
+        # the declared default of every type parameter (None for one that has
+        # none): a use that leaves the last arguments out takes them
+        self.generic_defaults = generic_defaults
         self.modifiers = modifiers or StructModifiers()
         self.fields: IndexedMap[str, StructField] = IndexedMap()
         self.methods: dict[str, Any] = {}
-        self._specs: dict[tuple[Value, ...], StructType] = {}
+        self._specs: dict[tuple[AnyValue, ...], StructType] = {}
 
     def add_field(self, name: str, type: Type, default: AnyValue | None = None) -> None:
         """Declare one field, appended after the fields declared so far, with
@@ -1283,10 +1421,23 @@ class StructTypeHead(Type, IdentityObj):
         assert name not in self.fields.by_key, f'{self.name_base} already has a field {name!r}'
         self.fields.add(name, StructField(name, type, default))
 
-    def specialize(self, generic_args: tuple[Value, ...]) -> StructType:
+    def specialize(self, generic_args: tuple[AnyValue, ...]) -> StructType:
         """The struct type this head declares for ``generic_args``: the one
         specialization of the head for those arguments (created lazily, so
         that every reference to the same struct type names one object)."""
+        if len(generic_args) < len(self.generic_args):
+            # a trailing type parameter the use left out takes its declared
+            # default (see ``dsl._RegisteredClass.get_entry``)
+            padded = list(generic_args)
+            for index in range(len(padded), len(self.generic_args)):
+                default = (
+                    self.generic_defaults[index]
+                    if index < len(self.generic_defaults) else None
+                )
+                if default is None:
+                    break
+                padded.append(default)
+            generic_args = tuple(padded)
         if len(generic_args) != len(self.generic_args):
             raise CompileError(
                 f'{self.name_base} takes {len(self.generic_args)} generic '
@@ -1329,7 +1480,7 @@ class StructType(Type):
     so naming the same struct twice names the same object.
     """
 
-    def __init__(self, head: StructTypeHead, generic_args: tuple[Value, ...]) -> None:
+    def __init__(self, head: StructTypeHead, generic_args: tuple[AnyValue, ...]) -> None:
         self.head = head
         self.generic_args = generic_args
 
@@ -1589,7 +1740,7 @@ class BoundMethod(Value):
     :class:`AnyValue` because ``sval`` cannot depend on ``fn``."""
 
     fn: AnyValue
-    generic_var_values: frozendict[TypeVar, Value]
+    generic_var_values: frozendict[TypeVar, AnyValue]
 
     @override
     def get_type(self) -> Type:
@@ -1927,6 +2078,11 @@ class StructTypeApplication:
     struct: StructDecl
     generic_vars: tuple[Any, ...]
 
+_POINTER_TYPES = (syntax.Ptr, syntax.ConstPtr, syntax.MultiPtr, syntax.ConstMultiPtr)
+"""The ``syntax`` classes that name a pointer type: ``ConstPtr``/``ConstMultiPtr``
+are the const spellings, ``MultiPtr``/``ConstMultiPtr`` the multi ones (see
+``PointerVariant``)."""
+
 def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Value] | None = None) -> AnyValue:
     """The spy-domain value of a Python compile-time object: Python
     scalars and ``sval.Value`` objects pass through, and ``None`` is the
@@ -1971,13 +2127,11 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         head = ctx.resolve_global(value.struct)
         if not isinstance(head, StructTypeHead):
             raise TypeError(f'cannot use {value.struct} as a generic struct template')
-        resolved: list[Value] = []
+        resolved: list[AnyValue] = []
         for arg in value.generic_vars:
             arg_value = as_value(arg, ctx, type_vars)
-            if not isinstance(arg_value, Value):
-                raise TypeError(
-                    f'cannot use {arg!r} as a generic argument of {value.struct}'
-                )
+            # a generic argument is any compile-time value: a type, or a plain
+            # value a type parameter of the struct stands for
             resolved.append(arg_value)
         return head.specialize(tuple(resolved))
     if typing.get_origin(value) is tuple:
@@ -2004,20 +2158,24 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         if len(args) == 1 and isinstance(args[0], (bool, int, str)):
             return args[0]
         raise TypeError(f'cannot convert {value!r} to a value')
-    if typing.get_origin(value) is syntax.Ptr:
-        # ``Ptr[T]``/``Ptr[T, C]``: C's pointer type.  The second argument is
-        # the constness of the pointer (see ``_as_constness``); Python
-        # inserts the default declared by the class when it is left out, so
-        # a ``Ptr[T]`` annotation arrives with a ``Literal[False]``
+    if typing.get_origin(value) in _POINTER_TYPES:
+        # ``Ptr[T]``/``ConstPtr[T]``: a pointer to ``T`` that may be
+        # dereferenced (a single one); ``MultiPtr[T]``/``ConstMultiPtr[T]`` the
+        # same address, which may also be indexed like an array (see
+        # ``PointerVariant``).  The constness is the *class*, not a type
+        # argument: ``ConstPtr``/``ConstMultiPtr`` are the const spellings
         args = typing.get_args(value)
-        if len(args) not in (1, 2):
+        if len(args) != 1:
             raise TypeError(f'cannot convert {value!r} to a value')
         elem = as_value(args[0], ctx, type_vars)
         if not isinstance(elem, Type):
             raise TypeError(f'{args[0]!r} is not a type')
-        if len(args) == 2:
-            return PointerType(elem, _as_constness(args[1], type_vars, ctx))
-        return PointerType(elem, False)
+        origin = typing.get_origin(value)
+        return PointerType(
+            elem,
+            origin in (syntax.ConstPtr, syntax.ConstMultiPtr),
+            PointerVariant.MULTI if origin in (syntax.MultiPtr, syntax.ConstMultiPtr) else PointerVariant.SINGLE,
+        )
     if typing.get_origin(value) is syntax.Array:
         # ``Array[T, L]``: ``L`` values of type ``T``.  The length is a *value*
         # (a Python ``int``, or the type parameter it is written as); the
@@ -2086,19 +2244,11 @@ def unwrap_comptime(annotation: Any) -> tuple[bool, Any]:
         return True, args[0]
     return False, annotation
 
-def _as_constness(value: Any, type_vars: dict[typing.TypeVar, Value] | None, resolver: CompileContext) -> AnyValue:
-    """The spy value of the constness argument of a pointer type: a Python
-    ``bool``, or the type parameter it is written as, which a call then
-    solves to one of the two (see ``TypeVarSolver``)."""
-    result = as_value(value, resolver, type_vars)
-    if isinstance(result, (bool, Value)):
-        return result
-    raise TypeError(f'cannot use {value!r} as the constness of a pointer')
-
 def negate(value: AnyValue) -> AnyValue | None:
     if isinstance(value, (int, float)):
         return -value
     return None
+
 
 @dataclass(frozen=True)
 class _Constraint:
@@ -2227,6 +2377,11 @@ class TypeVarSolver:
                 todo.append((lhs.elem, rhs.elem, False))
                 if isinstance(lhs.is_const, Value) or isinstance(rhs.is_const, Value):
                     todo.append((lhs.is_const, rhs.is_const, False))
+            if isinstance(lhs, ArrayType) and isinstance(rhs, ArrayType):
+                # an array constrains its element type and its length (a length
+                # that is still a type parameter is solved to the value itself)
+                todo.append((lhs.elem, rhs.elem, False))
+                todo.append((lhs.length, rhs.length, False))
 
             self._add_unsatisfied(lhs, rhs, is_subtype)
 
@@ -2255,11 +2410,12 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
         case TypeVar():
             return reps.get(value, value)
         case PointerType():
-            # the constness is substituted too: it may be a type parameter
-            # (``Ptr[T, C]``), which a call solves to a ``bool``
+            # the pointee is substituted; the constness is a plain ``bool``
+            # (the pointer class spells it), and is kept as it is
             return PointerType(
                 replace_type_vars_type(value.elem, reps),
-                replace_type_var(value.is_const, reps),
+                value.is_const,
+                value.variant,
             )
         case ArrayType():
             # the length is substituted too: it may be a type parameter
@@ -2285,13 +2441,12 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
         case StructType():
             # a struct type carries its type arguments: substituting into it
             # rebuilds the specialization (and keeps the identity of the one
-            # the head caches, so equal references stay equal).  The
-            # arguments of a struct are always types
-            args: list[Value] = []
+            # the head caches, so equal references stay equal).  An argument is
+            # any compile-time value: a type, or a plain one a type parameter
+            # stands for
+            args: list[AnyValue] = []
             for arg in value.generic_args:
-                substituted = replace_type_var(arg, reps)
-                assert isinstance(substituted, Value)
-                args.append(substituted)
+                args.append(replace_type_var(arg, reps))
             if all(new is old for new, old in zip(args, value.generic_args)):
                 return value
             return value.head.specialize(tuple(args))
@@ -2370,7 +2525,14 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             return value
         case OptionType():
             # a value of an option is either the null value, or a value of the
-            # child type (which the interpreter then tags as present)
+            # child type (which the interpreter then tags as present).  A
+            # *typed* null has to be the absent value of this very option
+            if isinstance(value, TypedNull):
+                if value.child != type.child:
+                    raise CompileError(
+                        f"cannot use {value!r} as a constant of {type}"
+                    )
+                return value
             if isinstance(value, Null):
                 return value
             return coerce_const(value, type.child)
@@ -2414,4 +2576,7 @@ class CompileContext:
         ...
 
     def mir_cache(self) -> MirLowerCache:
+        ...
+
+    def special_types(self) -> SpecialTypes:
         ...

@@ -1,8 +1,10 @@
-from typing import Literal, Protocol, Self, cast
+from typing import Protocol, Self, cast
+
+from spy import syntax
 
 from . import usize
 from .dsl import struct
-from .syntax import MultiPtr, Option, comptime
+from .syntax import Array, ConstPtr, Option, Ptr, comptime, ptr_cast
 
 
 class Numeric(Protocol):
@@ -47,11 +49,28 @@ class range[T: Numeric]:
         return result
 
 @struct()
-class SlicePtr[T, C: bool = Literal[False]]:
-    ptr: MultiPtr[T, C]
+class ConstSlicePtr[T]:
+    """The slice of a *const* multi pointer - the value ``const_arr_slice``
+    builds (see ``syntax._ConstSlicePtr`` for the type-checking shape)."""
+
+    ptr: syntax.ConstMultiPtr[T]
     length: usize
 
-def multi_ptr_slice[T, C: bool](ptr: MultiPtr[T, C], subscript):
-    if isinstance(subscript, slice):
-        return SlicePtr(ptr + subscript.start, subscript.end - subscript.start)
-    return ptr + subscript
+@struct()
+class SlicePtr[T]:
+    """The slice of a mutable multi pointer - the value ``arr_slice`` builds,
+    and the value a slice subscript (``p[a:b]``) produces (see
+    ``syntax._SlicePtr``)."""
+
+    ptr: syntax.MultiPtr[T]
+    length: usize
+
+def arr_slice[T, N: int](arr: Ptr[Array[T, N]]) -> SlicePtr[T]:
+    """The slice of the whole array the pointer ``arr`` names: the
+    ``*[N]T -> SlicePtr[T]`` conversion, written out with ``ptr_cast`` (a
+    pointer to an array already carries the address of its first element)."""
+    return cast(SlicePtr[T], SlicePtr(ptr_cast(arr, syntax.MultiPtr[T]), cast(int, N)))
+
+def const_arr_slice[T, N: int](arr: ConstPtr[Array[T, N]]) -> ConstSlicePtr[T]:
+    """Likewise for a const pointer: the slice of it is a ``ConstSlicePtr``."""
+    return cast(ConstSlicePtr[T], ConstSlicePtr(ptr_cast(arr, syntax.ConstMultiPtr[T]), cast(int, N)))

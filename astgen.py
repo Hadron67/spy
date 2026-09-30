@@ -66,7 +66,6 @@ from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
     AnyValue,
     CompileContext,
-    MirLowerCache,
     Null,
     PointerType,
     StructDecl,
@@ -108,7 +107,17 @@ _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
 # the ``syntax.*`` markers that are *calls* in the source and are recognized by
 # identity (unlike ``syntax.array`` and ``syntax.Comptime``, which are resolved
 # through ``_gen_call``/``_split_comptime``)
-_SYNTAX_CALLS = (syntax.ref, syntax.unroll, syntax.comptime)
+_SYNTAX_CALLS = (syntax.ref, syntax.unroll, syntax.comptime, syntax.ptr_cast)
+
+# the ``syntax.*`` classes that name a pointer type, by the (is_const, is_multi)
+# of the pointer each one is; ``Array``/``Option`` are handled alongside them in
+# ``_Builder._gen_type_ctor``
+_POINTER_MARKERS: tuple[tuple[Any, bool, bool], ...] = (
+    (syntax.Ptr, False, False),
+    (syntax.ConstPtr, True, False),
+    (syntax.MultiPtr, False, True),
+    (syntax.ConstMultiPtr, True, True),
+)
 
 
 def _is_struct_class(obj: Any) -> bool:
@@ -813,9 +822,42 @@ class _Builder:
                     # points at.  It denotes a *reference* like a name does, so a
                     # store may target it (``p[...] = v``)
                     return ArgEntry(self._as_value(self._gen_expr(node.value)[0]), True), False
+                marker = self._try_resolve_object(node.value)
+                if marker is not None:
+                    # ``Ptr[T]``/``Array[T, N]``/``Option[T]``/...: a ``syntax``
+                    # type marker used as a value.  The type is built by the
+                    # interpreter from the executing frame's type parameters
+                    # (see ``hir.PointerType`` and friends).
+                    built = self._gen_type_ctor(marker, node.slice)
+                    if built is not None:
+                        return ArgEntry(built, False), False
                 base, base_is_struct = self._gen_expr(node.value)
                 if not base.is_ref:
                     raise CompileError(f"subscript of non-reference {base}")
+                if isinstance(node.slice, ast.Slice):
+                    # ``p[a:b]`` / ``p[a:b:c]``: the slice *object* the subscript
+                    # turns into a ``SlicePtr`` when the base is a multi pointer
+                    # (see ``hir.Slice`` and ``interp``).  A missing lower bound
+                    # is 0; a missing upper bound has no meaning for a bare
+                    # pointer and a step is checked where the slice is used
+                    if node.slice.upper is None:
+                        raise CompileError(
+                            'a slice subscript needs an upper bound in a spy function'
+                        )
+                    lower = (
+                        hir.Const(0)
+                        if node.slice.lower is None
+                        else self._as_value(self._gen_expr(node.slice.lower)[0])
+                    )
+                    upper = self._as_value(self._gen_expr(node.slice.upper)[0])
+                    step = (
+                        hir.Const(None)
+                        if node.slice.step is None
+                        else self._as_value(self._gen_expr(node.slice.step)[0])
+                    )
+                    slice_obj = self.add(hir.Slice(lower, upper, step))
+                    sub = self.add(hir.Subscript(base.value, ArgEntry(slice_obj, False)))
+                    return ArgEntry(sub, True), False
                 index = self._gen_expr(node.slice)[0]
                 sub = self.add(hir.Subscript(base.value, index))
                 if isinstance(base.value, hir.ConstRef):
@@ -841,6 +883,15 @@ class _Builder:
                 raise CompileError('ref takes exactly one argument')
             return ArgEntry(self._as_ref(self._gen_expr(args[0])[0]), False), False
 
+        if callee is syntax.ptr_cast:
+            # ``ptr_cast(ptr, T)``: the pointer value ``ptr`` reinterpreted as the
+            # pointer type ``T`` names (see ``hir.PtrCast`` and ``interp``)
+            if len(args) != 2:
+                raise CompileError('ptr_cast takes exactly two arguments')
+            value = self._as_value(self._gen_expr(args[0])[0])
+            target = self._as_value(self._gen_expr(args[1])[0])
+            return ArgEntry(self.add(hir.PtrCast(value, target)), False), False
+
         if callee is syntax.unroll:
             # it is a *statement* marker placed before a loop (see
             # ``_gen_stmt``), not a value
@@ -857,6 +908,37 @@ class _Builder:
             )
 
         raise CompileError(f'unsupported syntax call {callee}')
+
+    def _gen_type_ctor(self, marker: Any, slice_node: ast.expr) -> hir.Inst | None:
+        """The type value a ``syntax`` type marker used as an expression builds
+        (``Ptr[T]``, ``Array[T, N]``, ``Option[T]``, ...), or None when
+        ``marker`` names no such type.  The result is a compile-time type value
+        the interpreter builds from the executing frame's type parameters (see
+        (``hir.PointerType``/``hir.ArrayType``/``hir.OptionType``)."""
+        for cls, is_const, is_multi in _POINTER_MARKERS:
+            if marker is cls:
+                elem_node = self._type_args(slice_node, marker, 1)[0]
+                elem = self._as_value(self._gen_expr(elem_node)[0])
+                return self.add(hir.PointerType(elem, is_const, is_multi))
+        if marker is syntax.Array:
+            elem_node, length_node = self._type_args(slice_node, marker, 2)
+            elem = self._as_value(self._gen_expr(elem_node)[0])
+            length = self._as_value(self._gen_expr(length_node)[0])
+            return self.add(hir.ArrayType(elem, length))
+        if marker is syntax.Option:
+            child_node = self._type_args(slice_node, marker, 1)[0]
+            child = self._as_value(self._gen_expr(child_node)[0])
+            return self.add(hir.OptionType(child))
+        return None
+
+    def _type_args(self, slice_node: ast.expr, marker: Any, count: int) -> list[ast.expr]:
+        """The arguments of a subscripted ``syntax`` type marker: the elements of
+        a tuple subscript, or the single subscript itself."""
+        args = list(slice_node.elts) if isinstance(slice_node, ast.Tuple) else [slice_node]
+        if len(args) != count:
+            name = getattr(marker, '__name__', marker)
+            raise CompileError(f'{name} takes exactly {count} type argument(s)')
+        return args
     # -- struct values ---------------------------------------------------------
 
     def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value, allow_fall_back: bool = True) -> None:
@@ -939,11 +1021,21 @@ class _Builder:
         construction ``Foo(...)`` or ``array(...)``, a method call ``x.h(...)``
         on a runtime struct value, or an ordinary call (a spy function, an
         inlined plain function or a spy builtin)."""
-        if self._try_resolve_object(node.func) is syntax.array:
-            # an array construction: like a struct one, the elements are
-            # generated straight into the array's storage
-            self._gen_array_ctor(node.args, node.keywords, result_loc)
-            return
+        fn_global = self._try_resolve_object(node.func)
+        if fn_global is not None:
+            if fn_global is cast:
+                # ``cast(T, value)`` is a no-op: the type is only there for the
+                # Python type checker (``std.arr_slice`` names its result type this
+                # way), and the first argument is never evaluated
+                if len(node.args) != 2 or len(node.keywords) > 0:
+                    raise CompileError('cast takes exactly two positional arguments')
+                self._gen_result_loc(node.args[1], result_loc)
+                return
+            if fn_global is syntax.array:
+                # an array construction: like a struct one, the elements are
+                # generated straight into the array's storage
+                self._gen_array_ctor(node.args, node.keywords, result_loc)
+                return
         if isinstance(node.func, ast.Attribute):
             # a method of the struct ``base``: the method and its self
             # parameter are resolved by the interpreter from the static
@@ -1003,7 +1095,6 @@ class _Builder:
 def parse_function(
     fn: Callable,
     resolver: CompileContext,
-    mir_lower_cache: MirLowerCache,
     self_type: Type | None = None,
     self_by_value: bool = False,
     context_type_vars: dict[TypeVar, Value] | None = None,

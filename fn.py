@@ -331,8 +331,8 @@ class Signature:
         argument to that type (see :meth:`specialize`).  A missing
         argument can still solve a type parameter when its default value
         has a spy type.  A parameter that stands for something other than
-        a type - the constness of a pointer (``Ptr[T, C]``) - is solved to
-        the value itself (a ``bool``)."""
+        a type - the length of an ``Array[T, N]`` - is solved to the value
+        itself (the Python integer)."""
         assert len(provided.positional) == len(self.positional.by_id), 'argument count mismatch'
         # unify the type parameters over the provided arguments:
         # arguments of parameters annotated with the same type parameter
@@ -391,7 +391,7 @@ class Signature:
             formal.append(FormalArg(name, arg.type, arg.default_value))
         return FunctionType(tuple(formal), self.ret_type)
 
-    def substitute_type_vars(self, reps: dict[TypeVar, Value]) -> Signature:
+    def substitute_type_vars(self, reps: dict[TypeVar, AnyValue]) -> Signature:
         """A copy of this signature with every type parameter of ``reps``
         replaced by its value.  A method of a generic struct names the
         struct's type parameters in its annotations (its ``self`` is typed as

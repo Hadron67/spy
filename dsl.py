@@ -44,7 +44,7 @@ time.
 import ctypes
 import types as pytypes
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar, cast, dataclass_transform, override
+from typing import Any, Literal, NoDefault, TypeVar, cast, dataclass_transform, override
 
 from . import astgen, mir, sval
 from .builtins import spy_as, spy_compile_log, spy_typeof
@@ -260,7 +260,7 @@ class _RegisteredFn:
     def get_entry(self):
         if self.entry is None:
             hir = astgen.parse_function(
-                self.fn, self.context, self.context.mir_lower_cache, self.cls,
+                self.fn, self.context, self.cls,
                 self.meta.sfv, self.context_type_vars, self.meta.exceptions,
             )
             self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
@@ -295,6 +295,10 @@ class _RegisteredClass(StructDecl):
             # ``sval.TypeVar`` per parameter, which the annotations of the
             # class and of its methods name
             generic_args: list[sval.TypeVar] = []
+            # the declared default of every type parameter (``[C: bool =
+            # Literal[False]]``): a use that leaves the trailing arguments out
+            # takes them (see ``sval.StructTypeHead.specialize``)
+            generic_defaults: list[sval.AnyValue | None] = []
             for type_param in getattr(self.cls, '__type_params__', ()):
                 if not isinstance(type_param, TypeVar):
                     raise CompileError(
@@ -304,10 +308,16 @@ class _RegisteredClass(StructDecl):
                 spy_type = sval.TypeVar(type_param.__name__)
                 generic_args.append(spy_type)
                 self.class_type_vars[type_param] = spy_type
+                declared_default = getattr(type_param, '__default__', NoDefault)
+                generic_defaults.append(
+                    None if declared_default is NoDefault
+                    else sval.as_value(declared_default, self.context)
+                )
             head = sval.StructTypeHead(
                 self.cls.__name__,
                 tuple(generic_args),
                 modifiers=sval.StructModifiers(extern_c=self.meta.extern_c),
+                generic_defaults=tuple(generic_defaults),
             )
             # the head is bound before the class body is read: a field may
             # name the struct itself, or one of its methods ``self``
@@ -398,6 +408,7 @@ class _Context(CompileContext):
         self.backend = backend
         # the parameters of the compile target this context compiles for (the
         # pointer size, which the layout of every type depends on)
+        target_info = TargetInfo() if target is None else target
         self._fn_anotation_cache: dict[Any, _RegisteredFn] = {}
         self._cls_annotation_cache: dict[type, _RegisteredClass] = {}
         # the inline entries of the undecorated Python functions reached
@@ -407,7 +418,10 @@ class _Context(CompileContext):
         # the MIR-mirror interning table of this context, shared by every
         # analysis it runs and bound to the target it compiles for (see
         # ``sval.MirLowerCache``)
-        self.mir_lower_cache = sval.MirLowerCache(TargetInfo())
+        self.mir_lower_cache = sval.MirLowerCache(target_info)
+        # the ``std`` types the type rules need, resolved lazily on the first
+        # request (see ``sval.SpecialTypes``)
+        self._special_types: sval.SpecialTypes | None = None
 
     def _local_fn(self, handle: _RegisteredFn) -> _RegisteredFn:
         # this context's handle of the Python function ``handle`` names: a
@@ -449,7 +463,7 @@ class _Context(CompileContext):
                 # it is called (it contributes no native specialization)
                 entry = self._inline_cache.get(value)
                 if entry is None:
-                    hir = astgen.parse_function(value, self, self.mir_lower_cache)
+                    hir = astgen.parse_function(value, self)
                     entry = FunctionValue(value.__qualname__, hir, force_inline=True)
                     self._inline_cache[value] = entry
                 return entry
@@ -460,6 +474,25 @@ class _Context(CompileContext):
     @override
     def target_info(self) -> TargetInfo:
         return self.mir_lower_cache.target
+
+    def _struct_head(self, handle: Any) -> sval.StructTypeHead:
+        # the head this context declares for a ``std`` struct: the handle is
+        # re-bound to this context (see ``resolve_global``), so the struct type
+        # rules reach is this context's own
+        head = self.resolve_global(handle)
+        assert isinstance(head, sval.StructTypeHead)
+        return head
+
+    @override
+    def special_types(self) -> sval.SpecialTypes:
+        if self._special_types is None:
+            from . import std
+            self._special_types = sval.SpecialTypes(
+                self._struct_head(std.slice),
+                self._struct_head(std.SlicePtr),
+                self._struct_head(std.ConstSlicePtr),
+            )
+        return self._special_types
 
     @override
     def mir_cache(self) -> MirLowerCache:
