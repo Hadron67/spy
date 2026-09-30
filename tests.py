@@ -2231,6 +2231,25 @@ def slice_of_a_slice_with_a_step(x: i32) -> u64:
 
 
 @func()
+def slice_of_a_slice_without_a_lower(x: i32) -> i32:
+    # a bound the source left out is absent; a slice of a *pointer* takes a
+    # missing lower bound as 0
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    t = s.ptr[:2]
+    return t.ptr[0] + t.ptr[1]
+
+
+@func()
+def slice_of_a_slice_without_an_upper(x: i32) -> u64:
+    # a slice of a *pointer* has no length to slice to the end, so an upper
+    # bound is required
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    return s.ptr[1:].length
+
+
+@func()
 def comptime_slice_element() -> i32:
     # the array *is* compile-time: its elements are their own places, the slice
     # names them, and indexing it is folded in Python
@@ -3928,6 +3947,16 @@ class SpySlicePtrTest(TestCase):
         with self.assertRaises(CompileError) as ctx:
             slice_of_a_slice_with_a_step(10)
         self.assertIn('has no step', str(ctx.exception))
+
+    def test_a_missing_lower_bound_is_zero(self) -> None:
+        # a bound the source left out is absent; the slice of a pointer takes a
+        # missing lower bound as 0
+        self.assertEqual(slice_of_a_slice_without_a_lower(10), 10 + 11)
+
+    def test_a_slice_of_a_pointer_needs_an_upper_bound(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            slice_of_a_slice_without_an_upper(10)
+        self.assertIn('needs an upper bound', str(ctx.exception))
 
     def test_a_slice_argument(self) -> None:
         self.assertEqual(slice_argument(10), 4)

@@ -523,7 +523,8 @@ class Slice(Inst):
     result is the slice *object* - a compile-time aggregate of the bounds, of no
     runtime shape of its own - which the subscript of a multi pointer then turns
     into a ``SlicePtr`` (see ``interp``).  The bounds are value operands; a bound
-    the source left out is a constant (a ``0`` lower bound, a null step)."""
+    the source left out is a null constant, held as the absent option value of
+    the ``std.slice`` field (see ``interp``)."""
 
     lower: Value
     upper: Value

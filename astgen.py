@@ -837,19 +837,21 @@ class _Builder:
                 if isinstance(node.slice, ast.Slice):
                     # ``p[a:b]`` / ``p[a:b:c]``: the slice *object* the subscript
                     # turns into a ``SlicePtr`` when the base is a multi pointer
-                    # (see ``hir.Slice`` and ``interp``).  A missing lower bound
-                    # is 0; a missing upper bound has no meaning for a bare
-                    # pointer and a step is checked where the slice is used
-                    if node.slice.upper is None:
-                        raise CompileError(
-                            'a slice subscript needs an upper bound in a spy function'
-                        )
+                    # (see ``hir.Slice`` and ``interp``).  Every bound is optional
+                    # - a bound the source left out is a null constant - and it is
+                    # the consumer that gives a missing one its meaning: a slice
+                    # of a pointer takes a missing lower bound as 0 and requires
+                    # an upper one, and a step is checked where the slice is used
                     lower = (
-                        hir.Const(0)
+                        hir.Const(None)
                         if node.slice.lower is None
                         else self._as_value(self._gen_expr(node.slice.lower)[0])
                     )
-                    upper = self._as_value(self._gen_expr(node.slice.upper)[0])
+                    upper = (
+                        hir.Const(None)
+                        if node.slice.upper is None
+                        else self._as_value(self._gen_expr(node.slice.upper)[0])
+                    )
                     step = (
                         hir.Const(None)
                         if node.slice.step is None

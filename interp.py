@@ -3960,23 +3960,38 @@ class HirRunner:
     def slice_object(self, inst: hir.Slice) -> ComptimeAggregate:
         """The ``std.slice`` object a slice subscript builds (see
         ``hir.Slice``): a compile-time aggregate of its bounds, of the type
-        ``std.slice[usize]`` - a slice of a pointer counts its elements.  A
-        missing step is the *typed* absent value of ``Option[usize]`` (see
-        ``sval.TypedNull``) and a present one an ``Option`` value (see
-        ``ComptimeOption``): an option has no runtime shape of its own, so this
-        is how the field is held."""
+        ``std.slice[usize]`` - a slice of a pointer counts its elements.  Every
+        bound is an *option*: a bound the source left out (a null constant) is
+        the *typed* absent value of ``Option[usize]`` (see ``sval.TypedNull``)
+        and a present one an ``Option`` value (see ``ComptimeOption``): an option
+        has no runtime shape of its own, so this is how a field is held.  Which
+        meaning an absent bound has is decided where the slice is used (see
+        ``slice_ptr``)."""
         usize = self._usize_type()
-        start = self._coerce(self.operand(inst.lower), usize)
-        end = self._coerce(self.operand(inst.upper), usize)
-        step_ev = self.operand(inst.step)
-        step: InterpVal
-        if _comptime_bool(self._is_null(step_ev), 'the step of a slice'):
-            step = ComptimeVal(sval.TypedNull(usize))
-        else:
-            step = ComptimeOption(self._coerce(step_ev, usize))
+        start = self._slice_bound_field(self.operand(inst.lower), usize, 'the start of a slice')
+        end = self._slice_bound_field(self.operand(inst.upper), usize, 'the end of a slice')
+        step = self._slice_bound_field(self.operand(inst.step), usize, 'the step of a slice')
         return ComptimeAggregate(
             self._special_type.slice_type.specialize((usize,)), (start, end, step),
         )
+
+    def _slice_bound_field(self, ev: InterpVal, usize: sval.Type, what: str) -> InterpVal:
+        """One bound of the ``std.slice`` object a slice subscript builds, as an
+        option value: the absent value when ``ev`` is a null constant, a present
+        option holding it coerced to ``usize`` otherwise."""
+        if _comptime_bool(self._is_null(ev), what):
+            return ComptimeVal(sval.TypedNull(usize))
+        return ComptimeOption(self._coerce(ev, usize))
+
+    def _slice_bound_value(self, ev: InterpVal, what: str) -> InterpVal | None:
+        """The value of a bound of the ``std.slice`` object a slice subscript
+        built, or None when it is absent (see ``slice_object``)."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, ComptimeOption):
+            return ev.value
+        if _comptime_bool(self._is_null(ev), what):
+            return None
+        return ev
 
     def slice_ptr(self, base: InterpVal, ptr_type: sval.PointerType, slice_obj: ComptimeAggregate) -> ComptimeAggregatePtr:
         """The ``SlicePtr`` a slice subscript of the multi pointer ``ptr_type``
@@ -3988,14 +4003,24 @@ class HirRunner:
         places the slice names when the base is compile-time storage), the
         length field the number of elements.
 
-        The step has to be a compile-time 1: only the elements of a pointer, one
-        after another, are a slice of it."""
+        A missing lower bound is 0; a missing upper bound has no meaning for a
+        bare pointer - it has no length to slice to the end - and a step has to
+        be a compile-time 1: only the elements of a pointer, one after another,
+        are a slice of it."""
         if ptr_type.variant != sval.PointerVariant.MULTI:
             raise CompileError(
                 f'cannot slice {ptr_type}: only a multi pointer is sliceable'
             )
-        start_ev, end_ev, step_ev = slice_obj.values
-        self._check_slice_step(step_ev)
+        usize = self._usize_type()
+        start_raw, end_raw, step_raw = slice_obj.values
+        start_ev = self._slice_bound_value(start_raw, 'the start of a slice')
+        if start_ev is None:
+            # a missing lower bound is 0
+            start_ev = ComptimeVal(sval.Int(0, usize))
+        end_ev = self._slice_bound_value(end_raw, 'the end of a slice')
+        if end_ev is None:
+            raise CompileError('a slice of a pointer needs an upper bound')
+        self._check_slice_step(self._slice_bound_value(step_raw, 'the step of a slice'))
         elem = ptr_type.elem
         is_const = ptr_type.is_const
         base_ev = self.load(base)
@@ -4023,7 +4048,6 @@ class HirRunner:
             raise CompileError('cannot slice a compile-time pointer')
         start_int = _comptime_int(start_ev)
         end_int = _comptime_int(end_ev)
-        usize = self._usize_type()
         length: InterpVal
         if start_int is not None and end_int is not None:
             self._check_slice_range(start_int, end_int)
@@ -4049,9 +4073,10 @@ class HirRunner:
             ),
         )
 
-    def _check_slice_step(self, step_ev: InterpVal) -> None:
-        # a slice of a pointer has no step: the elements follow one another
-        if _comptime_bool(self._is_null(step_ev), 'the step of a slice'):
+    def _check_slice_step(self, step_ev: InterpVal | None) -> None:
+        # a slice of a pointer has no step: the elements follow one another, so
+        # only a missing step (None) or a step of exactly 1 is allowed
+        if step_ev is None:
             return
         if _comptime_int(step_ev) != 1:
             raise CompileError('a slice of a pointer has no step')

@@ -23,8 +23,12 @@ class StopIteration(Exception):
 
 @struct()
 class slice[T: Numeric]:
-    start: T
-    end: T
+    """The object a slice subscript (``p[a:b:c]``) builds: the bounds are all
+    optional, so a bound the source left out is ``None`` (the interpreter turns
+    a missing ``start`` of a pointer slice into 0, see ``interp``)."""
+
+    start: Option[T]
+    end: Option[T]
     step: Option[T] = None
 
 @struct()
