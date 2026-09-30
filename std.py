@@ -69,6 +69,9 @@ class SlicePtr[T]:
     ptr: syntax.MultiPtr[T]
     length: usize
 
+    def as_const(self) -> ConstSlicePtr[T]:
+        return ConstSlicePtr(self.ptr, self.length)
+
 def arr_slice[T, N: int](arr: Ptr[Array[T, N]]) -> SlicePtr[T]:
     """The slice of the whole array the pointer ``arr`` names: the
     ``*[N]T -> SlicePtr[T]`` conversion, written out with ``ptr_cast`` (a

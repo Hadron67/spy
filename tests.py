@@ -19,7 +19,7 @@ function no earlier test has compiled.
 import ctypes
 import io
 from contextlib import redirect_stdout
-from typing import Any, Literal, Never, cast
+from typing import TYPE_CHECKING, Any, Literal, Never, cast
 from unittest import TestCase
 
 from spy.dsl import _GLOBAL_CONTEXT, _Context, func, struct
@@ -2249,6 +2249,92 @@ def slice_of_a_slice_without_an_upper(x: i32) -> u64:
     return s.ptr[1:].length
 
 
+# ---------------------------------------------------------------------------
+# subscript overloading: a struct value is subscripted through its own
+# ``__spy_getitemptr__`` method, which gives the *place* of the element
+# (see ``interp.HirRunner.subscript``)
+# ---------------------------------------------------------------------------
+
+
+@struct()
+class Indexable:
+    """A struct that overloads the subscript with an inlined plain method."""
+
+    ptr: MultiPtr[i32]
+
+    def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
+        return self.ptr + index
+
+    if TYPE_CHECKING:
+        # only so that the Python type checker accepts the ``p[i]`` spellings
+        # below: the subscript compiles to ``hir.Subscript`` and never reaches
+        # these (see ``interp.HirRunner.subscript``), so they are not struct
+        # methods
+        def __getitem__(self, index: int) -> i32: ...
+        def __setitem__(self, index: int, value: i32) -> None: ...
+
+
+@struct()
+class RegisteredIndexable:
+    """Likewise, with a registered (compiled) method."""
+
+    ptr: MultiPtr[i32]
+
+    @func()
+    def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
+        return self.ptr + index
+
+    if TYPE_CHECKING:
+        def __getitem__(self, index: int) -> i32: ...
+        def __setitem__(self, index: int, value: i32) -> None: ...
+
+
+@struct()
+class BadIndexable:
+    """A struct whose ``__spy_getitemptr__`` returns a value, not a place."""
+
+    ptr: MultiPtr[i32]
+
+    def __spy_getitemptr__(self, index: i64) -> i32:
+        return self.ptr[index]
+
+    if TYPE_CHECKING:
+        def __getitem__(self, index: int) -> i32: ...
+
+
+@func()
+def subscript_overload_read(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    p = Indexable(s.ptr)
+    return p[2]
+
+
+@func()
+def subscript_overload_write(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    p = Indexable(s.ptr)
+    p[1] = 99
+    return a[1]
+
+
+@func()
+def registered_subscript_overload(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    p = RegisteredIndexable(s.ptr)
+    return p[0] + p[3]
+
+
+@func()
+def bad_subscript_overload(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    b = BadIndexable(s.ptr)
+    return b[1]
+
+
 @func()
 def comptime_slice_element() -> i32:
     # the array *is* compile-time: its elements are their own places, the slice
@@ -3988,6 +4074,28 @@ class SpySlicePtrTest(TestCase):
         with self.assertRaises(CompileError) as ctx:
             runtime_index_into_comptime_storage(1)
         self.assertIn('compile-time integer', str(ctx.exception))
+
+
+class SpySubscriptOverloadTest(TestCase):
+    """A struct value overloads the subscript with ``__spy_getitemptr__``: the
+    place the method returns is what ``x[i]`` denotes, whether the method is
+    inlined or compiled into a specialization of its own (see
+    ``interp.HirRunner.subscript``)."""
+
+    def test_a_subscript_reads_through_the_method(self) -> None:
+        self.assertEqual(subscript_overload_read(10), 12)
+
+    def test_a_subscript_writes_through_the_method(self) -> None:
+        # the place the method returned is written through, landing in the array
+        self.assertEqual(subscript_overload_write(10), 99)
+
+    def test_a_registered_method_overloads_the_subscript(self) -> None:
+        self.assertEqual(registered_subscript_overload(10), 10 + 13)
+
+    def test_a_method_that_returns_a_value_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            bad_subscript_overload(10)
+        self.assertIn('must return a pointer', str(ctx.exception))
 
 
 class SpyTypeValueTest(TestCase):

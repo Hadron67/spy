@@ -573,7 +573,7 @@ class BlockFrame:
     data: BlockFrameData
 
 class InlineFrame:
-    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResult, insts: tuple[hir.Inst, ...], value_is_empty: bool = False) -> None:
+    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResult, insts: tuple[hir.Inst, ...], value_is_empty: bool = False, on_done: Callable[[], None] | None = None) -> None:
         self.generic_var_values = generic_var_values
         self.arg_values = arg_values
         # the frame's result location: the place its result is delivered into and
@@ -584,6 +584,11 @@ class InlineFrame:
         # one of an inlined plain-Python body; the function proper's own type is
         # asked for when it runs, see ``HirRunner._current_value_is_empty``)
         self.value_is_empty = value_is_empty
+        # what the call the body was inlined into has to do once the body
+        # delivered its result (a subscript resolved through a method needs to
+        # move it into the instruction's register, see ``HirRunner.subscript``);
+        # None for the function proper and for a call that wants nothing more
+        self.on_done: Callable[[], None] | None = on_done
         self.insts = insts
         self.pc: int = 0
         self.block_stack: list[BlockFrame] = []
@@ -1715,6 +1720,11 @@ class HirRunner:
         if exit_block is None:
             return False
         self._cur_block = exit_block
+        if frame.on_done is not None:
+            # the body returned normally and delivered its result: finish what
+            # the call it was inlined into had to do with it (see
+            # ``subscript``)
+            frame.on_done()
         return True
 
     def _step(self) -> PollResult:
@@ -1863,7 +1873,7 @@ class HirRunner:
                 # the slice object a slice subscript carries (see ``hir.Slice``)
                 regs[inst] = self.slice_object(inst)
             case hir.Subscript():
-                self.subscript(self.operand(inst.base), self.operand_arg(inst.index), inst)
+                return self.subscript(self.operand(inst.base), self.operand_arg(inst.index), inst)
             case hir.PointerType():
                 regs[inst] = ComptimeVal(sval.PointerType(
                     self.type_operand(inst.elem, 'the element type of a pointer'),
@@ -3455,13 +3465,17 @@ class HirRunner:
 
     # -- calls ----------------------------------------------------------------
 
-    def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+    def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None) -> PollResult:
         """Resolve one call by its callee value and run it.  Spy
         functions compile to a native ``call`` producing a typed
         register, plain Python functions are inlined, and the spy
         builtins are evaluated at compile time.  The callee constant of a
         registered spy function already resolved to its entry when the
         callee operand was evaluated (see ``operand``).
+
+        ``on_return`` is invoked once the callee delivered its result
+        (see ``_call_function_entry``); None when the caller wants nothing
+        more.
 
         Returns ``PollResult.AGAIN`` when the call completed here (an
         inlined callee's body writes into the result location directly),
@@ -3472,16 +3486,19 @@ class HirRunner:
         target = _callee_object(callee)
         if target is not None:
             if isinstance(target, FunctionValue):
-                return self._call_function_entry(target, args, ret)
+                return self._call_function_entry(target, args, ret, on_return=on_return)
             if isinstance(target, sval.BoundMethod):
                 # a method of a generic struct resolved from a value: the
                 # struct's type-argument values are substituted into the
                 # method's signature (see ``_call_function_entry``)
                 fn = target.fn
                 assert isinstance(fn, FunctionValue), 'a bound method holds a function value'
-                return self._call_function_entry(fn, args, ret, target.generic_var_values)
+                return self._call_function_entry(fn, args, ret, target.generic_var_values, on_return=on_return)
             if isinstance(target, sval.BuiltinFn):
-                return self._call_builtin(target, args, ret)
+                res = self._call_builtin(target, args, ret)
+                if res == PollResult.AGAIN and on_return is not None:
+                    on_return()
+                return res
         raise CompileError(
             f"cannot compile a call to {callee!r}; only spy functions, plain Python "
             "functions and the spy builtins can be called"
@@ -3881,7 +3898,14 @@ class HirRunner:
 
         ``mptr[a:b]``: the ``SlicePtr`` of the elements the slice names, built
         as a compile-time aggregate pointer (see ``slice_ptr``) - a subscript
-        always yields a pointer."""
+        always yields a pointer.
+
+        ``s[i]`` where ``s`` is a struct value that defines
+        ``__spy_getitemptr__``: the place that method returns, the struct's own
+        definition of what an element of it is (e.g. ``std.SlicePtr``).  The
+        method is called with the subscript's own ``ret`` register as a
+        callback target, since a method call delivers into a result location
+        rather than a register (see ``_call_function_entry``)."""
         array_type = _array_elem_type_of(base)
         if array_type is not None:
             index_value = self._coerce(self._arg_value(index), self._usize_type())
@@ -3900,6 +3924,36 @@ class HirRunner:
         base_type = _type_of(base)
         if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.PointerType):
             return self._subscript_pointer(base, base_type.elem, index, ret)
+
+        if (
+            isinstance(base_type, sval.PointerType)
+            and isinstance(base_type.elem, sval.StructType)
+            and self._resolve_method(base_type.elem, '__spy_getitemptr__') is not None
+        ):
+            # the struct overloads the subscript: the place its own
+            # ``__spy_getitemptr__`` returns is what an element of it is.  A
+            # method call delivers into a result location, not a register, so
+            # the result is written into a fresh slot and moved into the
+            # subscript's register once the call returned - whether the method
+            # is inlined or compiled into a specialization of its own
+            slot = self.alloca(InlineMode.FULL)
+            regs = self._frames[-1].regs
+            struct = base_type.elem
+
+            def on_return() -> None:
+                self._commit_pending_slot(slot)
+                place = self.load(slot)
+                place_type = _type_of(place)
+                if not isinstance(place_type, sval.PointerType):
+                    raise CompileError(
+                        f'__spy_getitemptr__ of {struct} must return a pointer '
+                        f'(the place of the element), got {place_type}'
+                    )
+                regs[ret] = place
+
+            return self.call_method(
+                base, '__spy_getitemptr__', RawArgList((index,), frozendict()), slot, on_return,
+            )
 
         if not (isinstance(base, ComptimeVal) and isinstance(base.obj, sval.ConstRef) and isinstance(base.obj.value, sval.StructTypeHead)):
             raise CompileError(
@@ -4393,7 +4447,7 @@ class HirRunner:
             case _:
                 return None
 
-    def call_method(self, ptr: InterpVal, method_name: str, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+    def call_method(self, ptr: InterpVal, method_name: str, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None) -> PollResult:
         base = _shallow_normalize(ptr)
         # ``Foo[i32].m(x)`` - a method accessed through the class name - is
         # not supported yet.  Such a base is a compile-time struct *type*
@@ -4431,6 +4485,7 @@ class HirRunner:
             ComptimeVal(sval.ConstRef(method)),
             RawArgList((ArgEntry(ptr, self_is_ref),) + args.positional, args.kwargs),
             ret,
+            on_return,
         )
 
     def operand_arglist(self, args: RawArgList[ArgEntry[hir.Value]]) -> RawArgList[ArgEntry[InterpVal]]:
@@ -4448,6 +4503,7 @@ class HirRunner:
         args: RawArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
         generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
+        on_return: Callable[[], None] | None = None,
     ) -> PollResult:
         """A call of a registered spy function with the given (already
         evaluated) argument values - the common tail of an ordinary
@@ -4457,6 +4513,13 @@ class HirRunner:
         an unannotated one is typed by its argument); a plain Python
         callee (``force_inline``) is inlined into the current stream
         instead of being compiled into a native specialization.
+
+        ``on_return`` is invoked once the callee delivered its result into
+        ``ret`` - directly for an inlined body (see ``_start_inline``), or
+        after ``_make_runtime_call`` in the ``_resumer`` of a compiled one -
+        so that a caller that has more to do with the result than store it
+        (``subscript``) can do so; the callee's own result location is
+        unaffected.
 
         ``generic_var_values`` are the type-argument values of the struct
         the callee is a method of (see :class:`sval.BoundMethod`): the
@@ -4484,12 +4547,18 @@ class HirRunner:
                 fn.hir.body, fn.hir.arg_is_ref, binded_args, ret,
                 frozendict(frame_values),
                 value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
+                on_done=on_return,
             )
         arg_types = binded_args.map(_arg_type_of)
         spec_sig = sig.specialize(arg_types, self._mir_cache)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
-            return self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
+            res = self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
+            if on_return is not None and not ret_sig.value_is_empty():
+                # the callee delivered its value into ``ret``: finish what the
+                # caller had to do with it (see ``subscript``)
+                on_return()
+            return res
 
         self._fn_req_resumer = _resumer
         res = self._analyser._request_function(fn, spec_sig[0], spec_sig[1], generic_var_values)
@@ -4807,6 +4876,7 @@ class HirRunner:
         ret: InterpVal,
         generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
         value_is_empty: bool = False,
+        on_done: Callable[[], None] | None = None,
     ) -> PollResult:
         """Start the inlined body of a plain Python callee: convert its
         bound arguments into addressable values (the callee's ``hir.Arg``
@@ -4857,7 +4927,7 @@ class HirRunner:
         frame = InlineFrame(
             frame_values, tuple(arg_values),
             ComptimeResult(ret, error.code, error.payload),
-            body, value_is_empty=value_is_empty,
+            body, value_is_empty=value_is_empty, on_done=on_done,
         )
         self._frames.append(frame)
         return PollResult.AGAIN
