@@ -750,13 +750,6 @@ def _comptime_int(ev: InterpVal) -> int | None:
     return None
 
 
-def _is_slice_object(ev: InterpVal, special_type: sval.SpecialTypes) -> bool:
-    """Whether the value ``ev`` is a ``std.slice`` object: the slice a slice
-    subscript builds (see ``hir.Slice``) - a compile-time aggregate of the slice
-    struct - or a runtime *value* of the slice struct."""
-    type = _type_of(ev)
-    return isinstance(type, sval.StructType) and type.head is special_type.slice_type
-
 
 def _comptime_bool(ev: InterpVal, what: str = 'a bool') -> bool:
     """The Python bool a compile-time bool *value* denotes (a decision a caller
@@ -780,13 +773,6 @@ def _arg_type_of(arg: ArgEntry[InterpVal]) -> sval.Type | None:
     assert isinstance(type, sval.PointerType), f"pointer expected, got {type}"
     return type.elem
 
-def _struct_generic_var_values(struct: sval.StructType) -> frozendict[sval.TypeVar, sval.AnyValue]:
-    """The type-argument values of one struct *specialization*: its generic
-    type parameters -> the values this specialization binds them to (empty
-    for a non-generic struct).  A method resolved through the struct carries
-    them, so that a call can substitute them into the method's signature
-    (see :class:`sval.BoundMethod`)."""
-    return frozendict(zip(struct.head.generic_args, struct.generic_args))
 
 # ---------------------------------------------------------------------------
 # stateless helpers of field/element access, struct/array construction and the
@@ -1520,15 +1506,6 @@ class HirRunner:
         else:
             self._cur_block.emit(mir.Ret(self._to_runtime(self.load(places[index]))))
 
-    def _set_error_code_zero(self) -> None:
-        """Record a successful outcome: the function proper's error code is
-        cleared (a ``return`` path is defined to carry no error, and a path that
-        returns a value cannot be one of a value-less function).  The store is
-        made with at least one bit so that it takes part in the code slot's type
-        even when no exception has been delivered yet - an inferred set may
-        still grow later, and the successful path must clear the code either
-        way."""
-        self.store(self._function_result().code, ComptimeVal(sval.Int(0, sval.IntType(0, False))))
 
     def _end_error_path(self) -> None:
         """End a path at the function boundary (an error escaping the function):
@@ -1626,13 +1603,6 @@ class HirRunner:
         error location ``error``."""
         return self._union_variant_ptr(error.payload, struct_type)
 
-    def _raise_error(self, result: ComptimeResult, exception: sval.StructType, value: InterpVal) -> None:
-        """Deliver one exception value into the error location ``result`` (a
-        ``raise`` through a result location): tag it and write it into the
-        payload."""
-        self._add_function_exception(exception)
-        self._defer_error_code_write(exception)
-        self.store(self._error_payload_ptr(result, exception), value)
 
     def _payload_variant_ptr(self, exception: sval.StructType) -> InterpVal:
         """The address the variant ``exception`` lives at in the function's
@@ -1667,7 +1637,7 @@ class HirRunner:
         if block is None:
             block = mir.BasicBlock()
             data.clause_blocks[index] = block
-        if self._clause_is_bare(data, index):
+        if self._except_struct_type(data.except_types[index]) is None:
             case_block = mir.BasicBlock()
             self._cur_block.emit(mir.Jmp(case_block))
             data.bare_pending.append((index, case_block, incoming, exception))
@@ -1687,8 +1657,6 @@ class HirRunner:
             phi.add_incoming(value, self._cur_block)
         self._cur_block.emit(mir.Jmp(block))
 
-    def _clause_is_bare(self, data: TryExceptBlockData, index: int) -> bool:
-        return self._except_struct_type(data.except_types[index]) is None
 
     def _deliver_uncaught_call(self, exception: sval.StructType, payload_place: InterpVal, use_ret_payload: bool) -> None:
         """Deliver a call's error no clause catches into the function's error
@@ -1821,7 +1789,7 @@ class HirRunner:
                     if not self._cur_block.is_finished:
                         self._cur_block.emit(mir.Jmp(frame.continuation()))
                     return self._cut()
-                self._set_error_code_zero()
+                self.store(self._function_result().code, ComptimeVal(sval.Int(0, sval.IntType(0, False))))
                 if self.ret_sig is None:
                     # the return convention is not fixed yet (an unannotated
                     # return type, or an inferred exception set): the ``mir.Ret``
@@ -2665,7 +2633,9 @@ class HirRunner:
             type = _type_of(value)
             if not isinstance(type, sval.StructType):
                 raise CompileError(f'cannot raise {type}: an exception must be a struct')
-            self._raise_error(ptr, type, value)
+            self._add_function_exception(type)
+            self._defer_error_code_write(type)
+            self.store(self._error_payload_ptr(ptr, type), value)
             return
 
         if isinstance(ptr, PendingSlot) and ptr.committed is None:
@@ -2719,7 +2689,11 @@ class HirRunner:
             # through the representation of ``elem`` (see ``_write_option``)
             match ptr:
                 case ComptimeOptionPtr():
-                    self._write_comptime_option(ptr, value, elem)
+                    is_null = self._is_null(value)
+                    ptr.is_null = is_null
+                    if _to_comptime(is_null) is not True:
+                        # present: write the payload value into its place
+                        self.store(ptr.payload_ptr, self._option_payload_for_write(value, elem))
                 case ComptimeBox():
                     obj = _to_comptime(value)
                     if obj is None:
@@ -2976,15 +2950,6 @@ class HirRunner:
             return self._option_payload(value, option)
         return value
 
-    def _write_comptime_option(self, ptr: ComptimeOptionPtr, value: InterpVal, option: sval.OptionType) -> None:
-        """Write an option value into compile-time storage: the tag, a value,
-        apart from the payload, a place (see ``ComptimeOptionPtr``)."""
-        is_null = self._is_null(value)
-        ptr.is_null = is_null
-        if _to_comptime(is_null) is True:
-            # absent: the payload place is left as it is (nothing reads it)
-            return
-        self.store(ptr.payload_ptr, self._option_payload_for_write(value, option))
 
     def _option_tag_addr(
         self, ptr: mir.Value, opt_child_type: sval.Type, tag_path: tuple[int, ...]
@@ -4354,7 +4319,8 @@ class HirRunner:
         ``ComptimeAggregatePtr``).  A single pointer has one place only, its
         pointee, and is dereferenced with ``p[...]``."""
         index_ev = self._arg_value(index)
-        if _is_slice_object(index_ev, self._special_type):
+        index_type = _type_of(index_ev)
+        if isinstance(index_type, sval.StructType) and index_type.head is self._special_type.slice_type:
             self._frames[-1].regs[ret] = self.slice_ptr(
                 base, ptr_type, self.as_comptime_aggregate(index_ev)
             )
@@ -4443,7 +4409,11 @@ class HirRunner:
         end_ev = self._slice_bound_value(end_raw, 'the end of a slice')
         if end_ev is None:
             raise CompileError('a slice of a pointer needs an upper bound')
-        self._check_slice_step(self._slice_bound_value(step_raw, 'the step of a slice'))
+        # a slice of a pointer has no step: the elements follow one another, so
+        # only a missing step (None) or a step of exactly 1 is allowed
+        step_ev = self._slice_bound_value(step_raw, 'the step of a slice')
+        if step_ev is not None and _comptime_int(step_ev) != 1:
+            raise CompileError('a slice of a pointer has no step')
         elem = ptr_type.elem
         is_const = ptr_type.is_const
         base_ev = self.load(base)
@@ -4496,13 +4466,6 @@ class HirRunner:
             ),
         )
 
-    def _check_slice_step(self, step_ev: InterpVal | None) -> None:
-        # a slice of a pointer has no step: the elements follow one another, so
-        # only a missing step (None) or a step of exactly 1 is allowed
-        if step_ev is None:
-            return
-        if _comptime_int(step_ev) != 1:
-            raise CompileError('a slice of a pointer has no step')
 
     def _check_slice_range(self, start: int, end: int) -> None:
         if end < start:
@@ -4821,7 +4784,7 @@ class HirRunner:
         resolved = self._analyser._resolver.resolve_global(method)
         if resolved is None:
             return None
-        generic_var_values = _struct_generic_var_values(struct)
+        generic_var_values = frozendict(zip(struct.head.generic_args, struct.generic_args))
         if len(generic_var_values) == 0:
             return resolved
         return sval.BoundMethod(resolved, generic_var_values)
