@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, TypeVar, cast
 
 from . import hir, syntax
+from .binop import BoolOp
 from .errors import CompileError
 from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
 from .sval import (
@@ -91,9 +92,9 @@ _BIN_OPS: dict[type[ast.AST], hir.BinaryOp] = {
     ast.Pow: '**',
 }
 
-_BOOL_OPS: dict[type[ast.AST], hir.BoolOpType] = {ast.And: 'and', ast.Or: 'or'}
+_BOOL_OPS: dict[type[ast.AST], BoolOp] = {ast.And: 'and', ast.Or: 'or'}
 
-_UNARY_OPS: dict[type[ast.AST], hir.UnaryOp] = {ast.USub: '-', ast.Not: 'not'}
+_UNARY_OPS: dict[type[ast.AST], hir.UnaryOp] = {ast.USub: '-'}
 
 _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
     ast.Eq: '==',
@@ -340,15 +341,11 @@ class _Builder:
         interpreter unrolls the body once per compile-time iteration instead of
         emitting a back edge (see ``interp``)."""
         self.add(hir.Loop(is_inline=is_inline))
-        cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
-        # ``%2 = not %1``: the negated condition is materialized in an inline
-        # slot (the same way any other unary expression is) and read back into a
-        # register, so that the ``if`` sees a boolean value whether the
+        # ``%2 = not %1``: negating a boolean is a value -> value instruction
+        # (``hir.Not``), so the ``if`` sees a boolean value whether the
         # condition is compile-time or not
-        negated = self.add(hir.Alloca(hir.InlineMode.NON_AGGREGATE))
-        self.add(hir.Unary('not', ArgEntry(cond, False), negated))
-        self.add(hir.CommitSlot(negated))
-        self.add(hir.If(self.add(hir.Load(negated))))
+        cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
+        self.add(hir.If(self.add(hir.Not(cond))))
         else_clause = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
         else_clause._gen_body(node.orelse)
         self.insts.extend(else_clause.insts)
@@ -783,19 +780,10 @@ class _Builder:
                 if isinstance(node.value, (int, float, str, bool)) or node.value is None:
                     return ArgEntry(hir.Const(node.value), False), False
                 raise CompileError(f"unsupported constant {node.value!r}")
-            case ast.BoolOp():
-                op = _BOOL_OPS.get(type(node.op))
-                if op is None:
-                    raise CompileError(
-                        f"unsupported boolean operator {type(node.op).__name__}"
-                    )
-                if len(node.values) != 2:
-                    raise CompileError(
-                        "chained boolean operators are not supported yet"
-                    )
-                lhs = self._gen_expr(node.values[0])[0]
-                rhs = self._gen_expr(node.values[1])[0]
-                return ArgEntry(self.add(hir.BoolOp(op, lhs, rhs)), False), False
+            case ast.UnaryOp(op=ast.Not()):
+                # ``not`` is value -> value (``hir.Not``), so it needs no result
+                # location: ``not expr`` is ``Not(AsBool(expr))``
+                return ArgEntry(self.add(hir.Not(self.add(hir.AsBool(self._gen_expr(node.operand)[0])))), False), False
             case ast.Compare():
                 if len(node.ops) != 1 or len(node.comparators) != 1:
                     raise CompileError(
@@ -950,7 +938,7 @@ class _Builder:
         match node:
             case ast.Call() if not self._is_syntax_call(node.func):
                 self._gen_call(node, result_loc)
-            case ast.UnaryOp():
+            case ast.UnaryOp() if not isinstance(node.op, ast.Not):
                 op = _UNARY_OPS.get(type(node.op))
                 if op is None:
                     raise CompileError(
@@ -966,6 +954,8 @@ class _Builder:
                 lhs = self._gen_expr(node.left)[0]
                 rhs = self._gen_expr(node.right)[0]
                 self.add(hir.Binary(op, lhs, rhs, result_loc))
+            case ast.BoolOp():
+                self._gen_boolop(node, result_loc)
             case ast.Tuple():
                 self.add(hir.InitTuple(result_loc, len(node.elts)))
                 for i, elt in enumerate(node.elts):
@@ -979,13 +969,76 @@ class _Builder:
                 self.add(hir.End())
             case _:
                 # every other expression computes its value first and
-                # stores it into the result location; only a call, a
-                # unary and a binary operation (the cases above) write
-                # through the location without materializing a value
+                # stores it into the result location; only a call, a unary
+                # ``-``, a binary operation, an if-expression and a boolean
+                # operator (the cases above) write through the location
+                # without materializing a value
                 if not allow_fall_back:
                     raise CompileError(f"unsupported expression {node}")
                 value = self._as_value(self._gen_expr(node)[0])
                 self.add(hir.Store(result_loc, value))
+
+    def _gen_boolop(self, node: ast.BoolOp, result_loc: hir.Value) -> None:
+        """Lower ``a and b``/``a or b`` (any length of chain) into
+        short-circuiting ``if`` blocks that write the result into
+        ``result_loc``.  With the operands ``a1, a2, ..., aN``, every one
+        but the last is tested and the last is the result:
+
+        .. code-block:: text
+
+            if <a1 as bool>:               # ``or`` tests the negation
+                if <a2 as bool>:
+                    <result_loc> = ...
+                    if <aN-1 as bool>:
+                        <result_loc> = aN  # the last operand, no copy
+                    else:
+                        <result_loc> = aN-1
+                    end
+                else:
+                    <result_loc> = a2
+                end
+            else:
+                <result_loc> = a1
+            end
+
+        The last operand is generated with result-location semantics (its
+        value is built straight into ``result_loc``); every *other* operand
+        is first evaluated into an expression temporary - its value is
+        needed both for the test and, when it turns out to be the result,
+        for the store - and copied into ``result_loc`` in the ``else``
+        branch of the ``if`` that tested it.  That copy is unavoidable in
+        this lowering: a result location is written *through*, never read
+        back before it is committed (see ``_gen_result_loc``), so the value
+        the test needs cannot be taken out of ``result_loc`` directly.
+
+        A compile-time operand that is not the last interrupts the chain:
+        the interpreter never walks the ``if`` branch its value does not
+        choose, so the rest of the chain is dead and none of it runs.  A
+        runtime operand leaves the rest of the chain to its own branch, so
+        ``b`` of ``a and b`` runs only when ``a`` is true."""
+        op = _BOOL_OPS.get(type(node.op))
+        if op is None:
+            raise CompileError(f"unsupported boolean operator {type(node.op).__name__}")
+        values = node.values
+        # one ``if`` per tested operand (every operand but the last); the
+        # operand is generated before the ``if`` that tests it
+        operands: list[ArgEntry[hir.Value]] = []
+        for value in values[:-1]:
+            operand = self._gen_expr(value)[0]
+            operands.append(operand)
+            cond = self.add(hir.AsBool(operand))
+            if op == 'or':
+                # ``or`` short-circuits on a *false* operand: test the negation
+                cond = self.add(hir.Not(cond))
+            self.add(hir.If(cond))
+        # the innermost block: the last operand is the result (no copy)
+        self._gen_result_loc(values[-1], result_loc)
+        # close the blocks from the inside out; each ``else`` keeps the operand
+        # its ``if`` tested as the result
+        for operand in reversed(operands):
+            self.add(hir.Else())
+            self.add(hir.Store(result_loc, self._as_value(operand)))
+            self.add(hir.End())
 
     def _gen_arglist(self, args: list[ast.expr], keywords: list[ast.keyword]) -> RawArgList[ArgEntry[hir.Value]]:
         positional = tuple(self._gen_expr(a)[0] for a in args)

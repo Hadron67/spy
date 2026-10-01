@@ -82,7 +82,6 @@ from enum import IntEnum, auto
 from typing import Any
 
 from .binop import BinaryOp, CompareOp, UnaryOp
-from .binop import BoolOp as BoolOpType
 from .fn import ArgEntry, RawArgList, frozendict
 
 
@@ -387,19 +386,19 @@ class Compare(Inst):
 
 
 @dataclass(eq=False)
-class BoolOp(Inst):
-    """Short-circuit 'and'/'or'.  Only compile-time operands are
-    supported for now; the operands are evaluated eagerly when the HIR
-    runs, so both sides of a compile-time ``and`` are always computed."""
+class Not(Inst):
+    """Boolean negation, value -> value: the negation of the boolean
+    ``value`` (``astgen`` feeds it the :class:`AsBool` of the source
+    operand, so it already holds a ``bool``).  Unlike :class:`Unary` it has
+    no result location; the instruction itself is the register holding the
+    ``bool`` result."""
 
-    op: BoolOpType
-    lhs: ArgEntry[Value]
-    rhs: ArgEntry[Value]
+    value: Value
 
 
 @dataclass(eq=False)
 class Unary(Inst):
-    """Unary operator: '-', 'not'."""
+    """Unary operator: '-'."""
 
     op: UnaryOp
     operand: ArgEntry[Value]

@@ -86,7 +86,7 @@ from enum import IntEnum, auto
 from typing import Any, Self, override
 
 from . import hir, mir, sval
-from .binop import BinaryOp, BoolOp, CompareOp, UnaryOp
+from .binop import BinaryOp, CompareOp, UnaryOp
 from .errors import CoerceError, CompileError
 from .fn import (
     ArgEntry,
@@ -1844,8 +1844,8 @@ class HirRunner:
                 return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self.operand(inst.ret))
             case hir.Compare():
                 return self._eval_cmp(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), inst)
-            case hir.BoolOp():
-                return self._eval_boolop(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), inst)
+            case hir.Not():
+                return self._eval_not(self.operand(inst.value), inst)
             case hir.Unary():
                 return self._eval_unary(inst.op, self.operand_arg(inst.operand), self.operand(inst.ret))
             case hir.CallInplace():
@@ -3396,48 +3396,41 @@ class HirRunner:
         else:
             raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
 
-    def _eval_boolop(self, op: BoolOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret_reg: hir.Inst) -> PollResult:
-        if _is_comptime_val(lhs.value) and _is_comptime_val(rhs.value):
-            lv = self._arg_value(lhs)
-            rv = self._arg_value(rhs)
-            assert isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal)
-            result = (lv.obj and rv.obj) if op == 'and' else (lv.obj or rv.obj)
-            self._frames[-1].regs[ret_reg] = ComptimeVal(bool(result))
+    def _eval_not(self, operand: InterpVal, ret: hir.Inst) -> PollResult:
+        """Boolean negation (``hir.Not``, value -> value): the negation of the
+        boolean *value* the operand holds (the ``AsBool`` of the source operand,
+        so it is already a ``bool``).  A compile-time operand folds in Python, a
+        runtime one becomes a comparison against ``false``."""
+        if _is_comptime_val(operand):
+            assert isinstance(operand, ComptimeVal)
+            self._frames[-1].regs[ret] = ComptimeVal(not operand.obj)
             return PollResult.AGAIN
-        raise CompileError(
-            f"'{op}' between runtime values is not supported yet "
-            '(only compile-time operands)'
+        type = _type_of(operand)
+        if not isinstance(type, sval.BoolType):
+            raise CompileError(f"cannot apply 'not' to a {type} value")
+        coerced = self._coerce(operand, type)
+        value = self._emit(
+            mir.Cmp('==', False, 'int', self._to_runtime(coerced), mir.BoolValue(False))
         )
+        self._frames[-1].regs[ret] = RuntimeVal(value, sval.BoolType())
+        return PollResult.AGAIN
 
     def _eval_unary(self, op: UnaryOp, operand: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
         if _is_comptime_val(operand.value):
             ev = self._arg_value(operand)
             assert isinstance(ev, ComptimeVal)
             obj = ev.obj
-            if op == 'not':
-                result: sval.AnyValue = not obj
-            elif op == '-':
+            if op == '-':
                 negated = sval.negate(obj)
                 if negated is None:
                     raise CompileError(f'cannot negate {obj!r} at compile time')
-                result = negated
-            else:
-                raise CompileError(f"unsupported unary operator '{op}'")
-            self.store(ret, ComptimeVal(result))
-            return PollResult.AGAIN
+                self.store(ret, ComptimeVal(negated))
+                return PollResult.AGAIN
+            raise CompileError(f"unsupported unary operator '{op}'")
 
         type = _arg_type_of(operand)
         if type is None:
             raise CompileError(f"cannot apply unary '{op}' to a value that has no type yet")
-        if op == 'not':
-            if not isinstance(type, sval.BoolType):
-                raise CompileError(f"cannot apply 'not' to a {type} value")
-            coerced = self._coerce(self._arg_value(operand), type)
-            value = self._emit(
-                mir.Cmp('==', False, 'int', self._to_runtime(coerced), mir.BoolValue(False))
-            )
-            self.store(ret, RuntimeVal(value, sval.BoolType()))
-            return PollResult.AGAIN
         if op == '-':
             mir_type = type.to_mir_type(self._mir_cache)
             assert mir_type is not None and not type.is_zst()
