@@ -717,6 +717,69 @@ class BitCast(Inst):
 
 
 @dataclass(eq=False)
+class AsUnion(Inst):
+    """A value of one of a union's variants reinterpreted as a value of the
+    union itself (the union's storage holds the variant): a non-union value to a
+    union value.  ``type`` is the target ``UnionType``; the source value's type
+    is the variant."""
+
+    value: Value
+    type: Type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
+
+
+@dataclass(eq=False)
+class ExtractUnion(Inst):
+    """A variant value read out of a union value: a union value to a non-union
+    value.  ``type`` is the variant's type."""
+
+    value: Value
+    type: Type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
+
+
+@dataclass(eq=False)
+class UnionCast(Inst):
+    """A union value reinterpreted as another union value (whose variants are a
+    subset or a superset of its own): a union value to a union value.  ``type``
+    is the target ``UnionType``."""
+
+    value: Value
+    type: Type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
+
+
+@dataclass(eq=False)
 class Cmp(Inst):
     """A comparison producing a bool; ``op`` is one of '==', '!=', '<',
     '<=', '>', '>='.  ``kind`` is the domain the operands live in: 'int' and

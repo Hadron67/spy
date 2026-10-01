@@ -302,6 +302,8 @@ class _Builder:
                 self.add(hir.Continue())
             case ast.Try():
                 self._gen_try(node)
+            case ast.Match():
+                self._gen_match(node)
             case _:
                 raise CompileError(
                     f"unsupported statement {type(node).__name__} in spy function {fn_name}"
@@ -792,6 +794,10 @@ class _Builder:
         if builtin is range or builtin is StopIteration:
             from . import std
             return std.range if builtin is range else std.StopIteration
+        if builtin is isinstance:
+            # ``isinstance(value, T)`` against a tagged union: the parser lowers
+            # it to the tag test itself (see ``_gen_isinstance``)
+            return builtin
         raise CompileError(
             f"name '{name}' is not defined in the scope of function {self._fn_ir.name}"
         )
@@ -875,6 +881,8 @@ class _Builder:
                 # ``not`` is value -> value (``hir.Not``), so it needs no result
                 # location: ``not expr`` is ``Not(AsBool(expr))``
                 return ArgEntry(self.add(hir.Not(self.add(hir.AsBool(self._gen_expr(node.operand)[0])))), False), False
+            case ast.BinOp(op=ast.BitOr()):
+                return ArgEntry(self._gen_bitor(node), False), False
             case ast.Compare():
                 if len(node.ops) != 1 or len(node.comparators) != 1:
                     raise CompileError(
@@ -1022,6 +1030,101 @@ class _Builder:
             )
         self._declare(name, value)
 
+    def _gen_bitor(self, node: ast.BinOp) -> hir.Inst:
+        """``a | b``: a tagged-union type value (both operands are compile-time
+        type values), or - later - a bitwise or.  Both operands are generated as
+        values; the interpreter decides which of the two the syntax spells (see
+        ``interp``)."""
+        lhs = self._as_value(self._gen_expr(node.left)[0])
+        rhs = self._as_value(self._gen_expr(node.right)[0])
+        return self.add(hir.BitOr(lhs, rhs))
+
+    def _gen_isinstance(self, node: ast.Call, result_loc: hir.Value) -> None:
+        """``isinstance(value, T)`` against a tagged union: the boolean the test
+        yields, and - in the ``isinstance(e := value, T)`` form - the unwrap that
+        binds ``e`` to the payload of the variant ``T`` (like the option's
+        ``(e := opt) is not None``).  The interpreter checks that ``value``
+        really is a tagged union and that ``T`` is one of its variants."""
+        if len(node.args) != 2 or len(node.keywords) > 0:
+            raise CompileError('isinstance takes exactly two positional arguments')
+        value_node = node.args[0]
+        type_value = self._as_value(self._gen_expr(node.args[1])[0])
+        place: hir.Value
+        if isinstance(value_node, ast.NamedExpr):
+            if not isinstance(value_node.target, ast.Name):
+                raise CompileError('the target of ``:=`` has to be a name')
+            place = self._as_ref(self._gen_expr(value_node.value)[0])
+            payload = self.add(hir.TaggedUnionPayloadPtr(place, type_value))
+            self._declare_walrus(value_node.target.id, payload)
+        else:
+            place = self._as_ref(self._gen_expr(value_node)[0])
+        test = self.add(hir.IsInstance(ArgEntry(place, True), type_value))
+        self.add(hir.Store(result_loc, test))
+
+    def _gen_match(self, node: ast.Match) -> None:
+        """``match (e := union): case T1(): ... case T2(): ...`` over a tagged
+        union: each ``case Ti()`` is the tag test ``isinstance(e, Ti)`` and binds
+        its body's ``e`` to the payload of ``Ti``; ``case _:`` is the fallback,
+        which has to come last.  The name is only visible in the case that binds
+        it - it is not declared outside the cases."""
+        fn_name = self._fn_ir.name
+        subject = node.subject
+        name: str
+        value_node: ast.expr
+        if isinstance(subject, ast.NamedExpr):
+            if not isinstance(subject.target, ast.Name):
+                raise CompileError('the target of ``:=`` has to be a name')
+            name = subject.target.id
+            value_node = subject.value
+        elif isinstance(subject, ast.Name):
+            name = subject.id
+            value_node = subject
+        else:
+            raise CompileError(
+                f'a ``match`` subject must be a name or ``(name := value)`` '
+                f'in spy function {fn_name}'
+            )
+        place = self._as_ref(self._gen_expr(value_node)[0])
+        if_count = 0
+        wildcard_seen = False
+        for case in node.cases:
+            if case.guard is not None:
+                raise CompileError('a ``match`` case guard is not supported yet')
+            type_node = self._match_case_type(case)
+            if type_node is None:
+                # the wildcard fallback: everything after it would be dead
+                wildcard_seen = True
+                self._scopes.append(_Scope())
+                self._gen_block(case.body)
+                self._scopes.pop()
+                continue
+            if wildcard_seen:
+                raise CompileError('the wildcard ``case _:`` must come last')
+            type_value = self._as_value(self._gen_expr(type_node)[0])
+            test = self.add(hir.IsInstance(ArgEntry(place, True), type_value))
+            self.add(hir.If(self.add(hir.AsBool(ArgEntry(test, False)))))
+            self._scopes.append(_Scope())
+            payload = self.add(hir.TaggedUnionPayloadPtr(place, type_value))
+            self._declare(name, payload)
+            self._gen_block(case.body)
+            self._scopes.pop()
+            self.add(hir.Else())
+            if_count += 1
+        for _ in range(if_count):
+            self.add(hir.End())
+
+    def _match_case_type(self, case: ast.match_case) -> ast.expr | None:
+        """The variant type a ``match`` case names (``case T():``), or None for
+        the wildcard ``case _:``."""
+        pattern = case.pattern
+        if isinstance(pattern, ast.MatchClass):
+            if len(pattern.patterns) > 0 or len(pattern.kwd_attrs) > 0 or len(pattern.kwd_patterns) > 0:
+                raise CompileError('a ``match`` case takes no arguments')
+            return pattern.cls
+        if isinstance(pattern, ast.MatchAs) and pattern.pattern is None and pattern.name is None:
+            return None
+        raise CompileError(f'unsupported ``match`` pattern {ast.unparse(pattern)!r}')
+
     def _gen_syntax_call(self, callee: Any, args: list[ast.expr]) -> tuple[ArgEntry[hir.Value], bool]:
         if callee is syntax.ref:
             if len(args) != 1:
@@ -1100,6 +1203,8 @@ class _Builder:
                         f"unsupported unary operator {type(node.op).__name__} in spy function {fn_name}"
                     )
                 self.add(hir.Unary(op, self._gen_expr(node.operand)[0], result_loc))
+            case ast.BinOp() if isinstance(node.op, ast.BitOr):
+                self.add(hir.Store(result_loc, self._gen_bitor(node)))
             case ast.BinOp():
                 op = _BIN_OPS.get(type(node.op))
                 if op is None:
@@ -1237,6 +1342,11 @@ class _Builder:
                 # an array construction: like a struct one, the elements are
                 # generated straight into the array's storage
                 self._gen_array_ctor(node.args, node.keywords, result_loc)
+                return
+            if fn_global is isinstance:
+                # ``isinstance(value, T)`` against a tagged union (see
+                # ``_gen_isinstance``)
+                self._gen_isinstance(node, result_loc)
                 return
         if isinstance(node.func, ast.Attribute):
             # a method of the struct ``base``: the method and its self

@@ -98,6 +98,7 @@ class MirLowerCache:
         self.target = target
         self._union_mirs: dict[UnionType, mir.UnionType] = {}
         self._option_struct_mirs: dict[Type, mir.StructType] = {}
+        self._tagged_union_mirs: dict[TaggedUnionType, mir.StructType] = {}
 
     def union_mir(self, type: UnionType, payload: mir.Type) -> mir.UnionType:
         """The (interned) MIR mirror of the payload union ``type``."""
@@ -121,6 +122,18 @@ class MirLowerCache:
                 ),
             )
             self._option_struct_mirs[child] = ret
+        return ret
+
+    def tagged_union_mir(self, type: TaggedUnionType, tag: mir.Type, payload: mir.Type) -> mir.StructType:
+        """The (interned) MIR struct of the tagged union ``type`` whose payload
+        holds storage: a tag and the (untagged) payload union."""
+        ret = self._tagged_union_mirs.get(type)
+        if ret is None:
+            ret = mir.StructType('tagged_union', (
+                mir.FormalArg('tag', tag),
+                mir.FormalArg('payload', payload),
+            ))
+            self._tagged_union_mirs[type] = ret
         return ret
 
 
@@ -180,6 +193,10 @@ class Type(Value):
             return OptionType(self)
         if isinstance(other, OptionType):
             return _resolve_option_peer(self, other)
+        if isinstance(other, TaggedUnionType):
+            # a tagged union on the other side knows which of its variants this
+            # type is: a value of one of them peers with the union itself
+            return other.resolve_peer_type(self)
         return other if self.is_subtype_of(other) else None
 
     @abstractmethod
@@ -214,6 +231,15 @@ class Type(Value):
                 return True
             todo.extend(reversed(current.get_type_children()))
         return False
+
+    def __or__(self, other: Any) -> TaggedUnionApplication:
+        """``A | B`` written in an annotation: a tagged-union application, which
+        :func:`as_value` turns into a :class:`TaggedUnionType` once the scope it
+        was written in is known."""
+        return union_application(self, other)
+
+    def __ror__(self, other: Any) -> TaggedUnionApplication:
+        return union_application(other, self)
 
 @dataclass(frozen=True)
 class TypeType(Type):
@@ -411,6 +437,197 @@ class UnionValue(Value):
 
     def __str__(self) -> str:
         return f"union(({self.type}))"
+
+
+@dataclass(frozen=True, slots=True)
+class TaggedUnionType(Type):
+    """A tagged union ``A | B | C``: a value of exactly one of ``types`` (the
+    variants, in the order written) together with the tag that says which one.
+    The tag is the variant's position, so the order of the variants is part of
+    the type: two tagged unions with the same variants in a different order are
+    each a subtype of the other, and a conversion between them remaps the tag
+    (see ``interp``).
+
+    The representation (see :meth:`to_mir_type`) is a struct of the tag and the
+    payload - the (untagged) :class:`UnionType` of the variants - or, when the
+    payload holds no storage (every variant is zero-sized), just the tag.  A
+    tagged union of a *single* variant is that variant's type: it has no tag of
+    its own, its representation is the variant's, and it is zero-sized when the
+    variant is."""
+
+    types: tuple[Type, ...]
+
+    @property
+    def tag_bits(self) -> int:
+        """The width of the tag: enough bits for the variant's position (none
+        for a single variant, which has no tag of its own)."""
+        return (len(self.types) - 1).bit_length()
+
+    def tag_type(self) -> IntType:
+        return IntType(self.tag_bits, False)
+
+    def payload_type(self) -> UnionType:
+        return UnionType(self.types)
+
+    def has_tag(self) -> bool:
+        return len(self.types) > 1
+
+    def variant_index(self, type: Type) -> int | None:
+        """The position of the variant ``type`` (an exact match), or None."""
+        for index, variant in enumerate(self.types):
+            if variant == type:
+                return index
+        return None
+
+    def variant_index_for(self, type: Type) -> int | None:
+        """The position of the variant ``type`` is a subtype of, or None: which
+        variant a value of the spy type ``type`` belongs to."""
+        for index, variant in enumerate(self.types):
+            if type.is_subtype_of(variant):
+                return index
+        return None
+
+    @override
+    def get_type(self) -> Type:
+        level = 0
+        for type in self.types:
+            child = type.get_type()
+            assert isinstance(child, TypeType)
+            level = max(level, child.level)
+        return TypeType(level)
+
+    @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        return self.types
+
+    @override
+    def get_unit_value(self) -> AnyValue | None:
+        """A tagged union holds no storage when it has a single variant and
+        that variant is zero-sized: every value of it equals the variant's unit
+        value under tag 0."""
+        if len(self.types) != 1:
+            return None
+        unit = self.types[0].get_unit_value()
+        if unit is None:
+            return None
+        return TaggedUnionValue(self, 0, unit)
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        if len(self.types) == 1:
+            # a single variant is that variant's type
+            return self.types[0].classify()
+        if any(type.classify() == SpecialTypeKind.COMPTIME for type in self.types):
+            return SpecialTypeKind.COMPTIME
+        if any(type.classify() == SpecialTypeKind.DST for type in self.types):
+            return SpecialTypeKind.DST
+        # with more than one variant the tag alone holds storage, so a tagged
+        # union is never zero-sized
+        return SpecialTypeKind.NONE
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        """A tagged union is a subtype of a tagged union whose variants include
+        all of its own (a conversion remaps the tag, see ``interp``)."""
+        return (
+            isinstance(other, TaggedUnionType)
+            and all(variant in other.types for variant in self.types)
+        )
+
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, TaggedUnionType):
+            # the union with the smaller variant set is the peer type: a value
+            # of it is a value of the larger one as well (with a remapped tag)
+            if all(variant in other.types for variant in self.types):
+                return other
+            if all(variant in self.types for variant in other.types):
+                return self
+            return None
+        if self.variant_index_for(other) is not None:
+            return self
+        return None
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        if len(self.types) == 1:
+            # a single variant: the representation is the variant's own
+            return self.types[0].to_mir_type(cache)
+        payload = self.payload_type().to_mir_type(cache)
+        tag = self.tag_type().to_mir_type(cache)
+        if payload is None:
+            # every variant is zero-sized: only the tag is stored
+            return tag
+        assert tag is not None
+        return cache.tagged_union_mir(self, tag, payload)
+
+    def __str__(self) -> str:
+        return ' | '.join(str(type) for type in self.types)
+
+
+def tagged_union_of(types: tuple[Type, ...]) -> TaggedUnionType:
+    """The tagged union of ``types``: the variants, in the order written, with
+    the duplicates dropped (the order is part of the type - it is the tag)."""
+    variants: list[Type] = []
+    for type in types:
+        if not any(type == variant for variant in variants):
+            variants.append(type)
+    assert len(variants) > 0, 'a tagged union has at least one variant'
+    return TaggedUnionType(tuple(variants))
+
+
+@dataclass(frozen=True, slots=True)
+class TaggedUnionValue(Value):
+    """The compile-time constant of a tagged union: the value ``value`` of the
+    variant ``index`` (see :func:`coerce_const`).  The interpreter's own
+    compile-time value is ``interp.ComptimeTaggedUnionValue``, exactly like the
+    option's is ``interp.ComptimeOption``: this one is what the type rules can
+    build on (a default field value, e.g.)."""
+
+    type: TaggedUnionType
+    index: int
+    value: AnyValue
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def __str__(self) -> str:
+        return f'{self.type}({self.index}: {self.value!r})'
+
+
+@dataclass(frozen=True, slots=True)
+class TaggedUnionApplication:
+    """A ``|`` chain written in an *annotation*, whose operands are not known
+    yet: Python evaluates the annotation in the annotation scope of the
+    annotated function or class, so the items may name its type parameters,
+    which this handle does not see.  :func:`as_value` turns it into a
+    :class:`TaggedUnionType` once it is given that scope and the host to resolve
+    the items in (a struct declared by another context resolves to that
+    context's copy).
+
+    Not a :class:`Value`: it is a transient Python-level object that never
+    denotes a value of the spy domain."""
+
+    items: tuple[Any, ...]
+
+    def __or__(self, other: Any) -> TaggedUnionApplication:
+        return TaggedUnionApplication((*self.items, other))
+
+    def __ror__(self, other: Any) -> TaggedUnionApplication:
+        return TaggedUnionApplication((other, *self.items))
+
+
+def union_application(a: Any, b: Any) -> TaggedUnionApplication:
+    """The ``a | b`` application: a :class:`TaggedUnionApplication` operand is
+    flattened, so a chain ``A | B | C`` is one application of three items."""
+    items: list[Any] = []
+    for item in (a, b):
+        if isinstance(item, TaggedUnionApplication):
+            items.extend(item.items)
+        else:
+            items.append(item)
+    return TaggedUnionApplication(tuple(items))
 
 
 @dataclass(frozen=True)
@@ -1802,7 +2019,7 @@ def returns_via_result_ptr(type: Type, cache: MirLowerCache) -> bool:
     the target the cache belongs to.  A signature may override the default
     (``fn.ReturnSignature.ret_spec``)."""
     match type:
-        case StructType() | ArrayType() | OptionType() | UnionType():
+        case StructType() | ArrayType() | OptionType() | UnionType() | TaggedUnionType():
             if _mentions_type_var(type):
                 # the layout is not known until the call substitutes the
                 # type parameter: assumed small now, re-decided on substitution
@@ -2056,9 +2273,15 @@ class StructDecl:
     a construction from an ordinary call by the *type* of the callee object
     (see ``astgen``), because asking a function handle for its spy value
     parses the function body - which may reenter the parser (a recursive
-    function).  Its spy value is asked of the host that owns it (see
+    its spy value is asked of the host that owns it (see
     ``GlobalResolver.resolve_global``), so the struct is built in the
     context that resolves the declaration."""
+
+    def __or__(self, other: Any) -> TaggedUnionApplication:
+        return union_application(self, other)
+
+    def __ror__(self, other: Any) -> TaggedUnionApplication:
+        return union_application(other, self)
 
 @dataclass(frozen=True, slots=True)
 class StructTypeApplication:
@@ -2077,6 +2300,12 @@ class StructTypeApplication:
 
     struct: StructDecl
     generic_vars: tuple[Any, ...]
+
+    def __or__(self, other: Any) -> TaggedUnionApplication:
+        return union_application(self, other)
+
+    def __ror__(self, other: Any) -> TaggedUnionApplication:
+        return union_application(other, self)
 
 _POINTER_TYPES = (syntax.Ptr, syntax.ConstPtr, syntax.MultiPtr, syntax.ConstMultiPtr)
 """The ``syntax`` classes that name a pointer type: ``ConstPtr``/``ConstMultiPtr``
@@ -2134,6 +2363,26 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
             # value a type parameter of the struct stands for
             resolved.append(arg_value)
         return head.specialize(tuple(resolved))
+    if isinstance(value, TaggedUnionApplication):
+        # ``A | B | ...`` written in an annotation: the items are resolved in
+        # this context (a struct of another context resolves to this one's
+        # copy).  A single ``None`` among the items makes it an option (the
+        # ``T | None`` spelling), like the ``typing.Union`` case below
+        variants: list[Type] = []
+        none_count = 0
+        for item in value.items:
+            if item is None:
+                none_count += 1
+                continue
+            variant = as_value(item, ctx, type_vars)
+            if not isinstance(variant, Type):
+                raise TypeError(f'{item!r} is not a type')
+            variants.append(variant)
+        if none_count > 0:
+            if none_count != 1 or len(variants) != 1:
+                raise TypeError(f'cannot convert {value!r} to a value')
+            return OptionType(variants[0])
+        return tagged_union_of(tuple(variants))
     if typing.get_origin(value) is tuple:
         # ``tuple[T1, T2, ...]``: the return annotation of a function that
         # returns several values.  ``tuple[T, ...]`` is the variable-length
@@ -2201,17 +2450,27 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
             raise TypeError(f'{args[0]!r} is not a type')
         return OptionType(child)
     if typing.get_origin(value) is typing.Union:
-        # ``T | None``: the same as ``Option[T]`` (the alias is defined that
-        # way), written out directly.  ``None`` in the union is the null
-        # value, never a type of its own
+        # ``A | B | ...`` or ``T | None`` written out directly.  ``None`` in the
+        # union is the null value, never a type of its own: with exactly one
+        # other member the union is the option of it (the ``Option[T]`` alias is
+        # written that way), any other number of members makes a tagged union
         args = typing.get_args(value)
         rest = tuple(a for a in args if a is not NoneType)
-        if len(rest) != len(args) - 1 or len(rest) != 1:
-            raise TypeError(f'cannot convert {value!r} to a value')
-        child = as_value(rest[0], ctx, type_vars)
-        if not isinstance(child, Type):
-            raise TypeError(f'{rest[0]!r} is not a type')
-        return OptionType(child)
+        none_count = len(args) - len(rest)
+        if none_count == 1 and len(rest) == 1:
+            child = as_value(rest[0], ctx, type_vars)
+            if not isinstance(child, Type):
+                raise TypeError(f'{rest[0]!r} is not a type')
+            return OptionType(child)
+        if none_count == 0 and len(rest) >= 1:
+            members: list[Type] = []
+            for arg in rest:
+                variant = as_value(arg, ctx, type_vars)
+                if not isinstance(variant, Type):
+                    raise TypeError(f'{arg!r} is not a type')
+                members.append(variant)
+            return tagged_union_of(tuple(members))
+        raise TypeError(f'cannot convert {value!r} to a value')
 
     # anything else is asked of the host: an object it knows (a struct class
     # or a registered function handle) resolves in *this* context, so that
@@ -2433,6 +2692,8 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
             )
         case UnionType():
             return UnionType(tuple(replace_type_vars_type(t, reps) for t in value.types))
+        case TaggedUnionType():
+            return tagged_union_of(tuple(replace_type_vars_type(t, reps) for t in value.types))
         case ResultType():
             return ResultType(
                 replace_type_vars_type(value.return_type, reps),
@@ -2472,6 +2733,31 @@ def is_numeric_type(type: Type):
             return True
         case _:
             return False
+
+def coerce_const_tagged_union(value: AnyValue, type: TaggedUnionType) -> AnyValue:
+    """A constant of the tagged union ``type``: the value of the variant it
+    belongs to under that variant's tag.  A ``TaggedUnionValue`` of a compatible
+    union (a subset/superset) is remapped to ``type``'s tag."""
+    if isinstance(value, TaggedUnionValue):
+        if not value.type.is_subtype_of(type):
+            raise CompileError(f"cannot use {value!r} as a constant of {type}")
+        index = type.variant_index(value.type.types[value.index])
+        assert index is not None
+        return TaggedUnionValue(type, index, coerce_const(value.value, type.types[index]))
+    value_type = type_of(value)
+    index = None if value_type is None else type.variant_index_for(value_type)
+    if index is None:
+        # an untyped literal (a plain Python int, say) takes the first variant it
+        # fits, like a store through the interpreter does
+        for candidate, variant in enumerate(type.types):
+            try:
+                coerced = coerce_const(value, variant)
+            except CompileError:
+                continue
+            return TaggedUnionValue(type, candidate, coerced)
+        raise CompileError(f"cannot use {value!r} as a constant of {type}")
+    return TaggedUnionValue(type, index, coerce_const(value, type.types[index]))
+
 
 def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     """Turn a Python value into the typed spy value of the spy type
@@ -2541,6 +2827,8 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             if isinstance(value, Null):
                 return value
             return coerce_const(value, type.child)
+        case TaggedUnionType():
+            return coerce_const_tagged_union(value, type)
         case UnionType():
             # a union value carries no variant (the error code next to the
             # payload is the tag), and a constant of it exists only for a

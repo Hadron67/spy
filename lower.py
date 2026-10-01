@@ -34,6 +34,7 @@ from . import llvm as sllvm
 from . import mir
 from .errors import CompileError
 from .fn import Backend, NativeFn
+from .target import HOST_POINTER_SIZE
 from .util import StrBiMap, sanitize_name
 
 llvm.initialize_native_target()
@@ -242,18 +243,30 @@ class _Lowerer:
         # a pointer ``BitCast`` of a stable pointer (an alloca or a parameter)
         # is resolved into the entry block first, so that it is available to
         # every block that takes the address of a union variant through it (it
-        # emits no instruction of its own, see ``_lower_inst``)
+        # emits no instruction of its own, see ``_lower_inst``).  A ``Gep`` of a
+        # stable pointer with a constant index - the payload field of a tagged
+        # union, e.g. - is hoisted the same way, so that the ``BitCast`` of it
+        # can be hoisted in turn
         hoisted = True
         while hoisted:
             hoisted = False
             for block in blocks:
                 for inst in block.insts:
-                    if not isinstance(inst, mir.BitCast) or id(inst) in self._lowered_ids:
+                    if id(inst) in self._lowered_ids:
                         continue
-                    operand = inst.value
-                    if isinstance(operand, mir.Param) or (
-                        isinstance(operand, mir.Inst) and id(operand) in self._lowered_ids
-                    ):
+                    if isinstance(inst, mir.BitCast):
+                        operand = inst.value
+                        stable = isinstance(operand, mir.Param) or (
+                            isinstance(operand, mir.Inst) and id(operand) in self._lowered_ids
+                        )
+                    elif isinstance(inst, mir.Gep) and isinstance(inst.index, int):
+                        operand = inst.ptr
+                        stable = isinstance(operand, mir.Param) or (
+                            isinstance(operand, mir.Inst) and id(operand) in self._lowered_ids
+                        )
+                    else:
+                        continue
+                    if stable:
                         self._lower_inst(llvm_fn.entry, inst, arg_values, block_map)
                         hoisted = True
         # lower every remaining instruction, iterating the blocks until no
@@ -431,6 +444,21 @@ class _Lowerer:
                     result = value
                 else:
                     result = block.bitcast(value, self._to_llvm(inst.type))
+            case mir.AsUnion() | mir.ExtractUnion() | mir.UnionCast():
+                # a union value is laid out as its storage (the largest variant),
+                # and the LLVM pointers are untyped (``ptr``): the conversion is
+                # a store through the largest of the two types and a load of the
+                # target one, which reinterprets the storage
+                value = self._value(inst.value, arg_values)
+                src = inst.value.get_type()
+                assert isinstance(src, mir.Type), 'a union conversion operand has a type'
+                dst = inst.type
+                src_size = mir.estimated_size_of(src, HOST_POINTER_SIZE)
+                dst_size = mir.estimated_size_of(dst, HOST_POINTER_SIZE)
+                wide = dst if dst_size > src_size else src
+                slot = block.alloca(self._to_llvm(wide))
+                block.store(slot, value)
+                result = block.load(slot, self._to_llvm(dst))
             case mir.Cmp():
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)

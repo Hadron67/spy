@@ -360,6 +360,17 @@ class Tuple(Inst):
 class Dict(Inst):
     values: frozendict[str, ArgEntry[Value]]
 
+
+@dataclass(eq=False)
+class BitOr(Inst):
+    """``a | b``: either a tagged-union type value (both operands are
+    compile-time type values) or, later, a bitwise or.  The decision is made by
+    the interpreter (see ``interp``), because the same syntax spells both; the
+    result is a value, so the instruction itself is the register holding it."""
+
+    lhs: Value
+    rhs: Value
+
 @dataclass(eq=False)
 class Binary(Inst):
     """Arithmetic: '+', '-', '*', '/', '//', '%', '**'."""
@@ -459,6 +470,30 @@ class OptionPayloadPtr(Inst):
     is taken)."""
 
     ptr: Value
+
+@dataclass(eq=False)
+class IsInstance(Inst):
+    """Whether the tagged union ``value`` holds is the variant the second
+    operand names (the source ``isinstance(value, T)``): the result is a
+    ``bool`` register.  ``value`` has to be a tagged union and ``type`` one of
+    its variants; any other type is rejected."""
+
+    value: ArgEntry[Value]
+    type: Value
+
+
+@dataclass(eq=False)
+class TaggedUnionPayloadPtr(Inst):
+    """The address of the payload of the variant ``type`` of the tagged union
+    the pointer ``ptr`` points at - what the ``isinstance(e := value, T)``
+    unwrap binds ``e`` to.  ``ptr`` has to point at a tagged union and ``type``
+    has to be one of its variants; the result points at the variant.  Taking the
+    address does not change the tag (the tag was written when the value was
+    stored)."""
+
+    ptr: Value
+    type: Value
+
 
 @dataclass(eq=False)
 class If(Inst):

@@ -113,7 +113,7 @@ from .sval import (
     iter_ret_leaves,
     ret_by_value_index,
 )
-from .util import ArraySet, TriState, frozendict
+from .util import ArraySet, IndexedMap, TriState, frozendict
 
 _MAX_INLINE_DEPTH = 64
 
@@ -391,6 +391,36 @@ class ComptimeOptionPtr(InterpVal):
     is_null: InterpVal
     payload_ptr: InterpVal
 
+
+@dataclass(frozen=True, slots=True)
+class ComptimeTaggedUnionValue(InterpVal):
+    """The value form of a tagged union: a compile-time tagged union holding
+    the variant it is (``tag``, the position of the variant in the union) and
+    that variant's value (``value``, which may itself be a runtime value or a
+    nested aggregate).  It is the tagged-union counterpart of
+    :class:`ComptimeAggregate`."""
+
+    type: sval.TaggedUnionType
+    tag: InterpVal
+    value: InterpVal
+
+
+@dataclass
+class ComptimeTaggedUnionPtr(InterpVal):
+    """The compile-time storage of a tagged union: a pointer ``*Union`` whose
+    tag is a *value* (``tag``, the position of the current variant) rather than
+    an addressable place, and whose payload is a place (``payload_ptr``) of the
+    current variant's type.  It is the tagged-union counterpart of
+    :class:`ComptimeAggregatePtr`: ``HirRunner.load`` reads the union out of it,
+    ``HirRunner.store`` splits a value into the tag and the payload, and
+    ``HirRunner._tagged_union_payload_ptr`` hands the payload place over.  When
+    the variant changes the payload place is rebuilt."""
+
+    type: sval.TaggedUnionType
+    tag: InterpVal
+    payload_ptr: InterpVal
+
+
 @dataclass
 class _PendingErrorCodeWrite:
     """One write of the error code of ``exception`` into the function's own
@@ -434,6 +464,16 @@ def _is_comptime_val(val: InterpVal) -> bool:
             case ComptimeOptionPtr():
                 # and its place form (see ``ComptimeOptionPtr``)
                 todo.append(val.is_null)
+                todo.append(val.payload_ptr)
+            case ComptimeTaggedUnionValue():
+                # a tagged union held compile-time is comptime when both its tag
+                # and the variant value it holds are (see
+                # ``ComptimeTaggedUnionValue``)
+                todo.append(val.tag)
+                todo.append(val.value)
+            case ComptimeTaggedUnionPtr():
+                # and its place form (see ``ComptimeTaggedUnionPtr``)
+                todo.append(val.tag)
                 todo.append(val.payload_ptr)
             case ComptimeTuple():
                 todo.extend(a.value for a in val.values)
@@ -705,6 +745,13 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
             if not isinstance(payload_type, sval.PointerType):
                 return None
             return sval.PointerType(sval.OptionType(payload_type.elem), is_const=False)
+        case ComptimeTaggedUnionValue(type):
+            # a tagged union held compile-time: the union type (see
+            # ``ComptimeTaggedUnionValue``)
+            return type
+        case ComptimeTaggedUnionPtr(type):
+            # the compile-time storage of a tagged union: a pointer to it
+            return sval.PointerType(type, is_const=False)
         case ComptimeAggregate(type):
             # a struct value held compile-time: the struct type (see
             # ``ComptimeAggregate``)
@@ -1583,7 +1630,7 @@ class HirRunner:
             _PendingErrorCodeWrite(exception, insertion)
         )
 
-    def _union_variant_ptr(self, place: InterpVal, struct_type: sval.StructType) -> InterpVal:
+    def _union_variant_ptr(self, place: InterpVal, struct_type: sval.Type) -> InterpVal:
         """The address a value of the union variant ``struct_type`` is written
         to (or read from) in the payload union the place ``place`` points at:
         the place reinterpreted as a pointer to the variant type."""
@@ -1831,6 +1878,33 @@ class HirRunner:
                 if not isinstance(ptr_type, sval.PointerType) or not isinstance(ptr_type.elem, sval.OptionType):
                     raise CompileError(f'a payload address needs an option, got {ptr_type}')
                 regs[inst] = self._option_payload_ptr(place, write_tag=False)
+            case hir.IsInstance():
+                value = self._arg_value(self.operand_arg(inst.value))
+                union_type = _type_of(value)
+                if not isinstance(union_type, sval.TaggedUnionType):
+                    raise CompileError(f'isinstance needs a tagged union, got {union_type}')
+                variant = self.type_operand(inst.type, 'the isinstance type')
+                index = union_type.variant_index(variant)
+                if index is None:
+                    raise CompileError(f'{variant} is not a variant of {union_type}')
+                tag = self._tagged_union_tag(value)
+                tag_obj = _to_comptime(tag)
+                if isinstance(tag_obj, sval.Int):
+                    regs[inst] = ComptimeVal(tag_obj.value == index)
+                else:
+                    tag_mir = union_type.tag_type().to_mir_type(self._mir_cache)
+                    assert isinstance(tag_mir, mir.IntType)
+                    cond = self._emit(mir.Cmp('==', False, 'int', self._to_runtime(tag), mir.Int(index, tag_mir)))
+                    regs[inst] = RuntimeVal(cond, sval.BoolType())
+            case hir.TaggedUnionPayloadPtr():
+                place = self.operand(inst.ptr)
+                ptr_type = _type_of(place)
+                if not isinstance(ptr_type, sval.PointerType) or not isinstance(ptr_type.elem, sval.TaggedUnionType):
+                    raise CompileError(f'a payload address needs a tagged union, got {ptr_type}')
+                variant = self.type_operand(inst.type, 'the payload type')
+                regs[inst] = self._tagged_union_payload_ptr(place, variant)
+            case hir.BitOr():
+                regs[inst] = self._eval_bitor(inst.lhs, inst.rhs)
             case hir.BinaryAssign():
                 return self.binary_assign(inst.op, self.operand(inst.lhs), self.operand_arg(inst.rhs))
             case hir.If():
@@ -2566,6 +2640,11 @@ class HirRunner:
                 # an option is held by its tag and its payload place: loading
                 # one is the value form of the two (see ``ComptimeOptionPtr``)
                 return ComptimeOption(is_null, self.load(payload_ptr))
+            case ComptimeTaggedUnionPtr(union_type, tag, payload_ptr):
+                # a tagged union is held by its tag and its payload place:
+                # loading one is the value form of the two (see
+                # ``ComptimeTaggedUnionPtr``)
+                return ComptimeTaggedUnionValue(union_type, tag, self.load(payload_ptr))
             case ComptimeVal(obj) if isinstance(obj, sval.ConstRef):
                 # a reference to an immutable compile-time global behaves like
                 # the value it refers to
@@ -2706,6 +2785,20 @@ class HirRunner:
                         ptr.value = ComptimeVal(sval.coerce_const(obj, elem))
                 case RuntimeVal():
                     self._write_option(ptr.value, value, elem)
+                case _:
+                    raise CompileError('cannot store through a compile-time pointer')
+            return
+        if isinstance(elem, sval.TaggedUnionType):
+            # a tagged union (and the variant value a store delivers) is written
+            # through its representation (see ``_write_comptime_tagged_union``
+            # and ``_write_tagged_union_runtime``)
+            match ptr:
+                case ComptimeTaggedUnionPtr():
+                    self._write_comptime_tagged_union(ptr, value, elem)
+                case ComptimeBox():
+                    ptr.value = self._coerce_tagged_union_value(value, elem)
+                case RuntimeVal():
+                    self._write_tagged_union_runtime(ptr, value, elem)
                 case _:
                     raise CompileError('cannot store through a compile-time pointer')
             return
@@ -3020,6 +3113,297 @@ class HirRunner:
         # that is a runtime value needs the payload written as well)
         return RuntimeVal(self._option_parts_to_runtime(option, is_null, value), option)
 
+    # -- tagged unions -------------------------------------------------------
+
+    def _tagged_union_shape(self, type: sval.TaggedUnionType) -> str:
+        """How the tagged union ``type`` is represented: ``'single'`` (a single
+        variant, represented as the variant itself), ``'tag_only'`` (every
+        variant is zero-sized, so only the tag is stored) or ``'tag_payload'``
+        (a struct of the tag and the payload union)."""
+        if len(type.types) == 1:
+            return 'single'
+        if type.payload_type().to_mir_type(self._mir_cache) is None:
+            return 'tag_only'
+        return 'tag_payload'
+
+    def _tagged_union_int(self, tag: InterpVal) -> int:
+        """The compile-time int a tag value denotes."""
+        obj = _to_comptime(tag)
+        if not isinstance(obj, sval.Int):
+            raise CompileError(f'expects a tag known at compile time, got {tag!r}')
+        return obj.value
+
+    def _tagged_union_index(self, type: sval.TaggedUnionType, variant_type: sval.Type) -> int:
+        index = type.variant_index(variant_type)
+        if index is None:
+            raise CompileError(f'{variant_type} is not a variant of {type}')
+        return index
+
+    def _tagged_union_variant_index(self, ev: InterpVal, type: sval.TaggedUnionType) -> int:
+        """Which variant of ``type`` the value ``ev`` is: the variant its spy
+        type is (or a subtype of), or - for an untyped compile-time literal -
+        the first variant it coerces to."""
+        ev_type = _type_of(ev)
+        if ev_type is not None:
+            index = type.variant_index_for(ev_type)
+            if index is not None:
+                return index
+        if isinstance(_shallow_normalize(ev), ComptimeVal):
+            for index, variant in enumerate(type.types):
+                try:
+                    self._coerce(ev, variant)
+                except (CoerceError, CompileError):
+                    # a variant the literal does not fit (a pointer, say)
+                    continue
+                return index
+        raise CoerceError(f'cannot materialize a {type} from {ev!r}')
+
+    def init_comptime_tagged_union(self, type: sval.TaggedUnionType) -> ComptimeTaggedUnionPtr:
+        """Fresh compile-time storage for a tagged union, at variant 0 (see
+        ``ComptimeTaggedUnionPtr``)."""
+        variant = type.types[0]
+        payload = self._fresh_place(variant, ComptimeVal(sval.Undefined(variant)))
+        return ComptimeTaggedUnionPtr(type, ComptimeVal(sval.Int(0, type.tag_type())), payload)
+
+    def _tagged_union_tag(self, ev: InterpVal) -> InterpVal:
+        """The tag of the tagged union value ``ev``, as an interpreter int: the
+        compile-time tag of a compile-time value, 0 for a single-variant union,
+        the value itself when the payload is zero-sized (the union *is* the tag)
+        and the first field of the struct otherwise."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, ComptimeTaggedUnionValue):
+            return ev.tag
+        type = _type_of(ev)
+        assert isinstance(type, sval.TaggedUnionType)
+        shape = self._tagged_union_shape(type)
+        if shape == 'single':
+            return ComptimeVal(sval.Int(0, type.tag_type()))
+        assert isinstance(ev, RuntimeVal)
+        if shape == 'tag_only':
+            return RuntimeVal(ev.value, type.tag_type())
+        return RuntimeVal(self._emit(mir.ExtractValue(ev.value, 0)), type.tag_type())
+
+    def _tagged_union_field_ptr(self, ptr: InterpVal) -> InterpVal:
+        """The address of the payload field of the tagged union place ``ptr``,
+        typed as the payload union."""
+        place = _shallow_normalize(ptr)
+        ptr_type = _type_of(place)
+        assert isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.TaggedUnionType)
+        field = self._emit(mir.Gep(self._to_runtime(place), 1))
+        return RuntimeVal(field, sval.PointerType(ptr_type.elem.payload_type(), ptr_type.is_const))
+
+    def _tagged_union_payload_ptr(self, ptr: InterpVal, variant_type: sval.Type) -> InterpVal:
+        """The place of the payload of the variant ``variant_type`` in the
+        tagged union place ``ptr``: the variant's own place for a compile-time
+        storage, and the storage reinterpreted as the variant for a runtime one
+        (see ``_union_variant_ptr``).  A zero-sized variant has no place."""
+        place = _shallow_normalize(ptr)
+        ptr_type = _type_of(place)
+        assert isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.TaggedUnionType)
+        type = ptr_type.elem
+        self._tagged_union_index(type, variant_type)
+        if variant_type.get_unit_value() is not None:
+            return ComptimeVal(sval.Undefined(sval.PointerType(variant_type, is_const=ptr_type.is_const)))
+        if isinstance(place, ComptimeTaggedUnionPtr):
+            payload_type = _type_of(place.payload_ptr)
+            if isinstance(payload_type, sval.PointerType) and payload_type.elem == variant_type:
+                return place.payload_ptr
+            # the current variant differs (a payload is only read once the tag
+            # matched, so such a place is never written through)
+            return self._fresh_place(variant_type, ComptimeVal(sval.Undefined(variant_type)))
+        if self._tagged_union_shape(type) == 'single':
+            return RuntimeVal(self._to_runtime(place), sval.PointerType(variant_type, is_const=ptr_type.is_const))
+        return self._union_variant_ptr(self._tagged_union_field_ptr(place), variant_type)
+
+    def _write_tagged_union_tag(self, ptr: InterpVal, type: sval.TaggedUnionType, index: int) -> InterpVal:
+        """Set the tag of the tagged union place ``ptr`` to the variant
+        ``index`` (a compile-time storage also gets the payload place of that
+        variant) and return the place to write the payload through."""
+        place = _shallow_normalize(ptr)
+        variant = type.types[index]
+        if isinstance(place, ComptimeTaggedUnionPtr):
+            place.tag = ComptimeVal(sval.Int(index, type.tag_type()))
+            if variant.get_unit_value() is None:
+                payload_type = _type_of(place.payload_ptr)
+                if not (isinstance(payload_type, sval.PointerType) and payload_type.elem == variant):
+                    place.payload_ptr = self._fresh_place(variant, ComptimeVal(sval.Undefined(variant)))
+            return place
+        assert isinstance(place, RuntimeVal)
+        shape = self._tagged_union_shape(type)
+        if shape == 'single':
+            return place
+        tag_mir = type.tag_type().to_mir_type(self._mir_cache)
+        assert isinstance(tag_mir, mir.IntType)
+        if shape == 'tag_only':
+            self._emit(mir.Store(place.value, mir.Int(index, tag_mir)))
+            return place
+        tag_ptr = self._emit(mir.Gep(place.value, 0))
+        self._emit(mir.Store(tag_ptr, mir.Int(index, tag_mir)))
+        return place
+
+    def _write_comptime_tagged_union(self, ptr: ComptimeTaggedUnionPtr, value: InterpVal, type: sval.TaggedUnionType) -> None:
+        """Write ``value`` into the compile-time tagged union storage ``ptr``:
+        the tag becomes the variant ``value`` belongs to and the payload place
+        holds the coerced variant value (a fresh place when the variant
+        changes)."""
+        ev = _shallow_normalize(value)
+        index: int
+        payload: InterpVal
+        if isinstance(ev, ComptimeTaggedUnionValue):
+            index = self._tagged_union_index(type, ev.type.types[self._tagged_union_int(ev.tag)])
+            payload = ev.value
+        else:
+            index = self._tagged_union_variant_index(ev, type)
+            payload = ev
+        variant = type.types[index]
+        ptr.tag = ComptimeVal(sval.Int(index, type.tag_type()))
+        if variant.get_unit_value() is not None:
+            ptr.payload_ptr = ComptimeVal(sval.Undefined(sval.PointerType(variant)))
+            return
+        payload_type = _type_of(ptr.payload_ptr)
+        if not (isinstance(payload_type, sval.PointerType) and payload_type.elem == variant):
+            ptr.payload_ptr = self._fresh_place(variant, ComptimeVal(sval.Undefined(variant)))
+        self.store(ptr.payload_ptr, self._coerce(payload, variant))
+
+    def _write_tagged_union_runtime(self, dst: RuntimeVal, value: InterpVal, type: sval.TaggedUnionType) -> None:
+        """Write the tagged union value ``value`` into the runtime storage the
+        pointer ``dst`` points at: the tag and the payload variant (the value
+        form is ``_tagged_union_parts_to_runtime``)."""
+        ev = _shallow_normalize(value)
+        if isinstance(ev, RuntimeVal) and isinstance(_type_of(ev), sval.TaggedUnionType):
+            # the value already is a tagged union: it is converted to the target
+            # one when it differs and its representation stored as a whole
+            ev = self._convert_tagged_union(ev, type)
+            self._emit(mir.Store(dst.value, self._to_runtime(ev)))
+            return
+        shape = self._tagged_union_shape(type)
+        if shape == 'single':
+            self._emit(mir.Store(dst.value, self._to_runtime(self._coerce(ev, type.types[0]))))
+            return
+        index = self._tagged_union_variant_index(ev, type)
+        variant = type.types[index]
+        tag_mir = type.tag_type().to_mir_type(self._mir_cache)
+        assert isinstance(tag_mir, mir.IntType)
+        if shape == 'tag_only':
+            self._emit(mir.Store(dst.value, mir.Int(index, tag_mir)))
+            return
+        tag_ptr = self._emit(mir.Gep(dst.value, 0))
+        self._emit(mir.Store(tag_ptr, mir.Int(index, tag_mir)))
+        payload_ptr = self._union_variant_ptr(self._tagged_union_field_ptr(dst), variant)
+        self._emit(mir.Store(self._to_runtime(payload_ptr), self._to_runtime(self._coerce(ev, variant))))
+
+    def _tagged_union_parts_to_runtime(self, type: sval.TaggedUnionType, index: int, value: InterpVal) -> mir.Value:
+        """Build the runtime value of a tagged union from the variant ``index``
+        and its payload ``value``: the tag and the payload union (an ``AsUnion``
+        of the variant) inserted into an ``undef`` struct, or just the tag when
+        the payload holds no storage."""
+        variant = type.types[index]
+        shape = self._tagged_union_shape(type)
+        if shape == 'single':
+            return self._to_runtime(self._coerce(value, variant))
+        tag_mir = type.tag_type().to_mir_type(self._mir_cache)
+        assert isinstance(tag_mir, mir.IntType)
+        tag: mir.Value = mir.Int(index, tag_mir)
+        if shape == 'tag_only':
+            return tag
+        union_mir = type.payload_type().to_mir_type(self._mir_cache)
+        struct_mir = type.to_mir_type(self._mir_cache)
+        assert union_mir is not None and struct_mir is not None
+        variant_value = self._to_runtime(self._coerce(value, variant))
+        union_value = self._emit(mir.AsUnion(variant_value, union_mir))
+        result = self._emit(mir.InsertValue(mir.UndefValue(struct_mir), tag, 0))
+        return self._emit(mir.InsertValue(result, union_value, 1))
+
+    def _tagged_union_reindex(self, tag: InterpVal, from_type: sval.TaggedUnionType, to_type: sval.TaggedUnionType) -> InterpVal:
+        """The tag ``tag`` of ``from_type`` remapped to ``to_type``'s variant
+        order (a runtime tag becomes a chain of ``mir.Select``)."""
+        mapping: list[tuple[int, int]] = []
+        for index, variant in enumerate(from_type.types):
+            to_index = to_type.variant_index(variant)
+            assert to_index is not None, f'{variant} is not a variant of {to_type}'
+            mapping.append((index, to_index))
+        obj = _to_comptime(tag)
+        if isinstance(obj, sval.Int):
+            return ComptimeVal(sval.Int(dict(mapping)[obj.value], to_type.tag_type()))
+        from_tag_mir = from_type.tag_type().to_mir_type(self._mir_cache)
+        to_tag_mir = to_type.tag_type().to_mir_type(self._mir_cache)
+        assert isinstance(from_tag_mir, mir.IntType) and isinstance(to_tag_mir, mir.IntType)
+        src = self._to_runtime(tag)
+        acc: mir.Value = mir.Int(mapping[0][1], to_tag_mir)
+        for index, to_index in mapping[1:]:
+            cond = self._emit(mir.Cmp('==', False, 'int', src, mir.Int(index, from_tag_mir)))
+            acc = self._emit(mir.Select(cond, mir.Int(to_index, to_tag_mir), acc))
+        return RuntimeVal(acc, to_type.tag_type())
+
+    def _convert_tagged_union(self, ev: RuntimeVal, to_type: sval.TaggedUnionType) -> RuntimeVal:
+        """The runtime tagged union value ``ev`` converted to the compatible
+        union ``to_type``: the payload reinterpreted with ``mir.UnionCast`` and
+        the tag remapped (see ``_tagged_union_reindex``)."""
+        from_type = _type_of(ev)
+        assert isinstance(from_type, sval.TaggedUnionType)
+        if from_type == to_type:
+            return ev
+        from_shape = self._tagged_union_shape(from_type)
+        to_shape = self._tagged_union_shape(to_type)
+        if to_shape == 'single':
+            # a subset of a single-variant union is that variant
+            return RuntimeVal(ev.value, to_type)
+        if from_shape == 'single':
+            variant = from_type.types[0]
+            index = self._tagged_union_index(to_type, variant)
+            return RuntimeVal(
+                self._tagged_union_parts_to_runtime(to_type, index, RuntimeVal(ev.value, variant)),
+                to_type,
+            )
+        tag = self._tagged_union_reindex(self._tagged_union_tag(ev), from_type, to_type)
+        if to_shape == 'tag_only':
+            return RuntimeVal(self._to_runtime(tag), to_type)
+        to_union_mir = to_type.payload_type().to_mir_type(self._mir_cache)
+        to_mir = to_type.to_mir_type(self._mir_cache)
+        assert to_union_mir is not None and to_mir is not None
+        if from_shape == 'tag_payload':
+            from_union = self._emit(mir.ExtractValue(ev.value, 1))
+            payload: mir.Value = self._emit(mir.UnionCast(from_union, to_union_mir))
+        else:
+            # the source variants are all zero-sized: the active payload has no
+            # storage, so nothing is read out of it
+            payload = mir.UndefValue(to_union_mir)
+        result = self._emit(mir.InsertValue(mir.UndefValue(to_mir), self._to_runtime(tag), 0))
+        return RuntimeVal(self._emit(mir.InsertValue(result, payload, 1)), to_type)
+
+    def _coerce_tagged_union_value(self, ev: InterpVal, type: sval.TaggedUnionType) -> InterpVal:
+        """Materialize ``ev`` as a value of the tagged union ``type``: a value of
+        a compatible union is converted, anything else is the variant it belongs
+        to, tagged."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, ComptimeTaggedUnionValue):
+            if ev.type == type:
+                return ev
+            index = self._tagged_union_index(type, ev.type.types[self._tagged_union_int(ev.tag)])
+            return ComptimeTaggedUnionValue(type, ComptimeVal(sval.Int(index, type.tag_type())), ev.value)
+        if isinstance(ev, RuntimeVal) and isinstance(_type_of(ev), sval.TaggedUnionType):
+            return self._convert_tagged_union(ev, type)
+        index = self._tagged_union_variant_index(ev, type)
+        variant_value = self._coerce(ev, type.types[index])
+        return ComptimeTaggedUnionValue(type, ComptimeVal(sval.Int(index, type.tag_type())), variant_value)
+
+    def _eval_bitor(self, lhs: hir.Value, rhs: hir.Value) -> InterpVal:
+        """``a | b``: a tagged-union type value when both operands are
+        compile-time type values (a tagged-union operand contributes its
+        variants), and - later - a bitwise or.  The syntax is shared, so the
+        decision is made here (see ``astgen``)."""
+        lv = _to_comptime(_shallow_normalize(self.operand(lhs)))
+        rv = _to_comptime(_shallow_normalize(self.operand(rhs)))
+        if isinstance(lv, sval.Type) and isinstance(rv, sval.Type):
+            variants: list[sval.Type] = []
+            for type in (lv, rv):
+                if isinstance(type, sval.TaggedUnionType):
+                    variants.extend(type.types)
+                else:
+                    variants.append(type)
+            return ComptimeVal(sval.tagged_union_of(tuple(variants)))
+        raise CompileError('``|`` on non-type values is not supported yet')
+
     def _arg_value(self, arg: ArgEntry[InterpVal]) -> InterpVal:
         """The value an argument denotes: a reference argument is loaded
         out of the address it carries."""
@@ -3131,6 +3515,13 @@ class HirRunner:
                 container_type = type.elem
                 is_const = type.is_const
 
+        if is_aggregate_init and isinstance(container_type, sval.TaggedUnionType):
+            # a construction into a tagged union: which variant the storage holds
+            # is only known from the struct being built (see ``finish_struct``),
+            # so the field gets a pending place the closing ``FinishStruct`` binds
+            # to the variant's field address
+            return self.alloca(InlineMode.NONE)
+
         if isinstance(container_type, sval.StructType):
             index_int = _comptime_index(index)
             fields = container_type.fields()
@@ -3222,6 +3613,11 @@ class HirRunner:
                     # its own place form, a tag value and a payload place (see
                     # ``ComptimeOptionPtr``)
                     slot.committed = self.init_comptime_option(declared)
+                elif isinstance(declared, sval.TaggedUnionType):
+                    # a compile-time variable of a tagged union type: the union has
+                    # its own place form, a tag value and a payload place (see
+                    # ``ComptimeTaggedUnionPtr``)
+                    slot.committed = self.init_comptime_tagged_union(declared)
                 else:
                     # a compile-time variable of a declared type: a box the
                     # value it is assigned is written into
@@ -3281,6 +3677,11 @@ class HirRunner:
             # a ``T``/``Null`` value is coerced through the option's
             # representation (see ``_coerce_option_value``)
             return self._coerce_option_value(ev, target)
+        if isinstance(target, sval.TaggedUnionType):
+            # a variant value (or a compatible tagged union value) is coerced
+            # through the union's representation (see
+            # ``_coerce_tagged_union_value``)
+            return self._coerce_tagged_union_value(ev, target)
         if isinstance(target, sval.TupleType):
             # a tuple has no runtime representation to convert to: the
             # compile-time tuple itself is what a location of the type holds
@@ -3406,6 +3807,22 @@ class HirRunner:
                 assert mir_type is not None
                 alloca = self._emit(mir.Alloca(mir_type))
                 self._write_option(alloca, self.load(ev), option)
+                return alloca
+            case ComptimeTaggedUnionValue(type, tag, value):
+                # the tagged union value form: the tag and the payload union are
+                # joined into the struct representation (see
+                # ``_tagged_union_parts_to_runtime``)
+                return self._tagged_union_parts_to_runtime(type, self._tagged_union_int(tag), value)
+            case ComptimeTaggedUnionPtr(type):
+                # the compile-time *storage* of a tagged union: what a value of
+                # its pointer type delivers is the address of fresh memory the
+                # union is written into (like an option's storage)
+                mir_type = type.to_mir_type(self._mir_cache)
+                assert mir_type is not None
+                alloca = self._emit(mir.Alloca(mir_type))
+                self._write_tagged_union_runtime(
+                    RuntimeVal(alloca, sval.PointerType(type, is_const=False)), self.load(ev), type,
+                )
                 return alloca
             case ComptimeBox():
                 raise CompileError('cannot use a compile-time box as a runtime value')
@@ -3886,6 +4303,10 @@ class HirRunner:
                 # a compile-time option: the tag is a value and the payload a
                 # place of its own (see ``ComptimeOptionPtr``)
                 val.committed = self.init_comptime_option(type)
+            elif isinstance(type, sval.TaggedUnionType):
+                # a compile-time tagged union: the tag is a value and the payload
+                # a place of its own (see ``ComptimeTaggedUnionPtr``)
+                val.committed = self.init_comptime_tagged_union(type)
             else:
                 # a single value in a compile-time box
                 val.committed = ComptimeBox(type, ComptimeVal(sval.Undefined(type)))
@@ -4053,6 +4474,17 @@ class HirRunner:
             # (a ``T`` converts to ``Option[T]``, and so on outward)
             inner = self._option_payload_ptr(ptr)
             return self._convert_result_ptr(inner, to_type)
+        if isinstance(from_type, sval.TaggedUnionType) and from_type.variant_index(to_type) is not None:
+            # a variant written through the address of a tagged union: tag it and
+            # hand back the payload place, which a construction builds its fields
+            # in (see ``_write_tagged_union_tag``)
+            index = self._tagged_union_index(from_type, to_type)
+            ptr = self._write_tagged_union_tag(ptr, from_type, index)
+            return self._tagged_union_payload_ptr(ptr, to_type)
+        if isinstance(from_type, sval.TaggedUnionType) and isinstance(to_type, sval.TaggedUnionType):
+            raise CompileError(
+                f'cannot deliver a {to_type} through a result pointer of {from_type}'
+            )
         raise CompileError(
             f'cannot deliver a {to_type} into a location of type {from_type}'
         )
@@ -4509,6 +4941,8 @@ class HirRunner:
             return self.init_inline_aggregate(type)
         if isinstance(type, sval.OptionType):
             return self.init_comptime_option(type)
+        if isinstance(type, sval.TaggedUnionType):
+            return self.init_comptime_tagged_union(type)
         return ComptimeBox(type, initial)
 
     def init_comptime_option(self, option: sval.OptionType) -> ComptimeOptionPtr:
@@ -4588,6 +5022,16 @@ class HirRunner:
                 # a field may only be left out when it has a default
                 raise CompileError(f'missing a value for field {field0.name!r}')
 
+        dest_ptr_type = _type_of(_shallow_normalize(dest))
+        if isinstance(dest_ptr_type, sval.PointerType) and isinstance(dest_ptr_type.elem, sval.TaggedUnionType):
+            # the construction builds the struct straight into a tagged union: the
+            # union takes the variant the struct is, and every field goes into
+            # that variant's storage
+            self._finish_struct_into_tagged_union(
+                _shallow_normalize(dest), dest_ptr_type.elem, struct_type, provided, fields,
+            )
+            return
+
         if isinstance(dest, PendingSlot) and dest.committed is None and dest.is_inline(struct_type):
             # an inline aggregate: its fields are their own places, so the
             # construction only hands them to the storage slot, whose commit
@@ -4642,6 +5086,43 @@ class HirRunner:
         for index, field0 in enumerate(fields.values()):
             if index not in provided:
                 self._default_field_place(dest_ptr, index, field0)
+
+    def _finish_struct_into_tagged_union(
+        self,
+        dest: InterpVal,
+        union: sval.TaggedUnionType,
+        struct_type: sval.Type,
+        provided: dict[int, InterpVal],
+        fields: IndexedMap[str, sval.StructField],
+    ) -> None:
+        """Close a struct construction whose storage is a tagged union: the union
+        takes the variant the struct is (its tag is set, a compile-time storage
+        gets the variant's payload place) and every field is written into that
+        variant's storage."""
+        index = self._tagged_union_index(union, struct_type)
+        dest = self._write_tagged_union_tag(dest, union, index)
+        variant_ptr = self._tagged_union_payload_ptr(dest, struct_type)
+        for index0, place in provided.items():
+            field_type = fields.get_by_id(index0).type
+            if field_type.is_zst():
+                if isinstance(place, PendingSlot) and place.committed is None:
+                    self._commit_pending_slot(place, field_type)
+                continue
+            at = place.insertion if isinstance(place, PendingSlot) else None
+            addr = self.field_index_addr(variant_ptr, _index_value(index0), at=at)
+            if isinstance(addr, RuntimeVal):
+                if isinstance(place, PendingSlot) and place.committed is None:
+                    self._bind_slot(place, addr.value, field_type)
+            else:
+                # a compile-time variant place: the field's value is copied in
+                if isinstance(place, PendingSlot) and place.committed is None:
+                    self._commit_pending_slot(place, field_type)
+                    self.store(addr, self.load(place))
+                else:
+                    self.store(addr, place)
+        for index0, field0 in enumerate(fields.values()):
+            if index0 not in provided:
+                self._default_field_place(variant_ptr, index0, field0)
 
     def _default_field_place(self, dest: InterpVal, index: int, field: sval.StructField) -> InterpVal:
         """The place a left-out field's default is written through: the same
