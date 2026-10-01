@@ -2480,6 +2480,11 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     builds the MIR constant from it later."""
     if isinstance(value, AsValue):
         value = value.value
+    if isinstance(value, Undefined):
+        # an *undetermined* value - the value of a place that holds nothing yet,
+        # or of one that holds no storage at all - is a value of any type, so
+        # the coercion only re-tags it with the type of its new location
+        return Undefined(type)
     if isinstance(value, (Int, Float)):
         # an already-typed constant (the value a compile-time location holds):
         # the target type governs, like the constant of any other location

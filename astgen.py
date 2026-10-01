@@ -94,6 +94,12 @@ _BIN_OPS: dict[type[ast.AST], hir.BinaryOp] = {
 
 _BOOL_OPS: dict[type[ast.AST], BoolOp] = {ast.And: 'and', ast.Or: 'or'}
 
+
+def _is_none_literal(node: ast.expr) -> bool:
+    """Whether ``node`` is the Python literal ``None`` - the absent value an
+    ``expr is None`` tests against (see ``_Builder._gen_is_none``)."""
+    return isinstance(node, ast.Constant) and node.value is None
+
 _UNARY_OPS: dict[type[ast.AST], hir.UnaryOp] = {ast.USub: '-'}
 
 _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
@@ -141,6 +147,9 @@ class _Scope:
     __slots__ = ('vars',)
 
     def __init__(self) -> None:
+        # every binding names a *pointer to the referenced object*: a
+        # variable's slot, the option a ``:=`` binds, or the payload of one an
+        # unwrap binds (see ``_Builder._gen_walrus``/``_gen_unwrap``)
         self.vars: dict[str, hir.Value] = {}
 
 class _Pragma:
@@ -189,8 +198,8 @@ class _Builder:
         self.insts: list[hir.Inst] = []
 
     def _lookup(self, name: str) -> hir.Value | None:
-        """The Alloca of the nearest binding of ``name``, or None when
-        the name is not bound in any open block."""
+        """The pointer the nearest binding of ``name`` holds, or None when the
+        name is not bound in any open block."""
         for scope in reversed(self._scopes):
             slot = scope.vars.get(name)
             if slot is not None:
@@ -286,17 +295,9 @@ class _Builder:
             case ast.AugAssign():
                 self._gen_augassign(node)
             case ast.If():
-                # the branches are generated into the same flat list,
-                # delimited by the ``Else``/``End`` markers (WASM-style)
-                cond = self._gen_expr(node.test)[0]
-                self.add(hir.If(self.add(hir.AsBool(cond))))
-                self._gen_block(node.body)
-                if len(node.orelse) > 0:
-                    self.add(hir.Else())
-                    self._gen_block(node.orelse)
-                self.add(hir.End())
+                self._gen_if(node)
             case ast.Break():
-                self.add(hir.Break())
+                self.add(hir.BreakLoop())
             case ast.Continue():
                 self.add(hir.Continue())
             case ast.Try():
@@ -317,6 +318,62 @@ class _Builder:
         self._scopes.append(_Scope())
         self._gen_body(stmts)
         self._scopes.pop()
+
+    def _gen_if(self, node: ast.If) -> None:
+        """Translate one ``if``/``elif``/``else``.  A plain condition becomes a
+        WASM-style :class:`hir.If` (its branches follow in the same flat list,
+        delimited by ``hir.Else``/``hir.End``).  An ``and`` chain is lowered
+        with a :class:`hir.Block` instead (see ``_gen_and_condition``), its body
+        sitting inside the block: the operands' ``:=`` bindings then *dominate*
+        the body, which the ``if``'s branches (reached from both sides of every
+        short-circuit) would not give them.
+
+        The condition opens a scope of its own: a ``:=`` declared in it is
+        visible in the then branch (a child scope of the condition's), but
+        neither in the else branch nor after the ``if``."""
+        has_else = len(node.orelse) > 0
+        self._scopes.append(_Scope())
+        if self._is_and_chain(node.test):
+            assert isinstance(node.test, ast.BoolOp)
+            self.add(hir.Block())
+            if has_else:
+                self.add(hir.Block())
+            self._gen_and_condition(node.test)
+            self._gen_block(node.body)
+            if has_else:
+                # the body succeeded: leave both blocks, skipping the else
+                self.add(hir.BreakIf(None, 2))
+                self.add(hir.End())
+                self._scopes.pop()
+                self._gen_block(node.orelse)
+            else:
+                self._scopes.pop()
+            self.add(hir.End())
+            return
+        cond = self._gen_expr(node.test)[0]
+        self.add(hir.If(self.add(hir.AsBool(cond))))
+        self._gen_block(node.body)
+        self._scopes.pop()
+        if has_else:
+            self.add(hir.Else())
+            self._gen_block(node.orelse)
+        self.add(hir.End())
+
+    def _is_and_chain(self, node: ast.expr) -> bool:
+        """Whether ``node`` is an ``and`` chain (a ``BoolOp`` of ``and``): the
+        only condition the ``if``/``while`` lowering inlines into a
+        ``hir.Block`` (see ``_gen_if``/``_gen_and_condition``)."""
+        return isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And)
+
+    def _gen_and_condition(self, node: ast.BoolOp) -> None:
+        """Lower an ``and`` chain used as an ``if``/``while`` condition into
+        ``break_if``s: every operand is tested and a false one leaves the
+        enclosing :class:`hir.Block` (the code after it - the body or the else
+        clause - is skipped).  The operands are *not* scoped apart: their
+        ``:=`` bindings are what the block's body reads."""
+        for value in node.values:
+            cond = self.add(hir.AsBool(self._gen_expr(value)[0]))
+            self.add(hir.BreakIf(self.add(hir.Not(cond)), 1))
 
     def _gen_while(self, node: ast.While, is_inline: bool) -> None:
         """Translate one ``while``/``else`` statement into a dead ``loop``:
@@ -343,20 +400,48 @@ class _Builder:
         the condition.  Both the body and the else clause are lexical
         blocks of their own (children of the enclosing block).
 
+        An ``and`` chain is lowered with a :class:`hir.Block` whose body holds
+        the loop body, so the operands' ``:=`` bindings dominate it (see
+        ``_gen_if``); the body ends with an explicit ``continue`` back to the
+        loop head, and a false operand leaves the block onto the else clause.
+
         The ``syntax.unroll()`` marker immediately before the ``while`` makes it
         a *compile-time* loop: ``is_inline`` marks the ``Loop`` and the
         interpreter unrolls the body once per compile-time iteration instead of
         emitting a back edge (see ``interp``)."""
         self.add(hir.Loop(is_inline=is_inline))
+        # the condition opens a scope of its own: a ``:=`` declared in it is
+        # visible in the body, but not in the ``else`` clause (which runs when
+        # the condition is false, so the walrus may not have run) nor after the
+        # loop.
+        cond_scope = _Scope()
+        self._scopes.append(cond_scope)
+        if self._is_and_chain(node.test) and not is_inline:
+            assert isinstance(node.test, ast.BoolOp)
+            self.add(hir.Block())
+            self._gen_and_condition(node.test)
+            self._gen_block(node.body)
+            # the body fell off its end: loop back (the else clause is reached
+            # only by a false operand leaving the block)
+            self.add(hir.Continue())
+            self.add(hir.End())
+            self._scopes.pop()
+            self._gen_block(node.orelse)
+            self.add(hir.BreakLoop())
+            self.add(hir.End())
+            return
         # ``%2 = not %1``: negating a boolean is a value -> value instruction
         # (``hir.Not``), so the ``if`` sees a boolean value whether the
         # condition is compile-time or not
         cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
         self.add(hir.If(self.add(hir.Not(cond))))
+        self._scopes.pop()
         self._gen_block(node.orelse)
-        self.add(hir.Break())
+        self._scopes.append(cond_scope)
+        self.add(hir.BreakLoop())
         self.add(hir.Else())
         self._gen_block(node.body)
+        self._scopes.pop()
         self.add(hir.End())
         self.add(hir.End())
 
@@ -427,7 +512,7 @@ class _Builder:
         self._gen_body(node.body)
         self.add(hir.Except(0))
         self._gen_body(node.orelse)
-        self.add(hir.Break())
+        self.add(hir.BreakLoop())
         self.add(hir.End())
         self.add(hir.End())
         self._scopes.pop()
@@ -795,14 +880,19 @@ class _Builder:
                     raise CompileError(
                         "chained comparisons are not supported yet"
                     )
-                op = _CMP_OPS.get(type(node.ops[0]))
+                op_type = type(node.ops[0])
+                if op_type in (ast.Is, ast.IsNot):
+                    return self._gen_is_none(node, op_type is ast.IsNot)
+                op = _CMP_OPS.get(op_type)
                 if op is None:
                     raise CompileError(
-                        f"unsupported comparison {type(node.ops[0]).__name__}"
+                        f"unsupported comparison {op_type.__name__}"
                     )
                 lhs = self._gen_expr(node.left)[0]
                 rhs = self._gen_expr(node.comparators[0])[0]
                 return ArgEntry(self.add(hir.Compare(op, lhs, rhs)), False), False
+            case ast.NamedExpr():
+                return self._gen_walrus(node), False
             case ast.Tuple():
                 values = tuple(self._gen_expr(elt)[0] for elt in node.elts)
                 return ArgEntry(self.add(hir.Tuple(values)), False), False
@@ -872,6 +962,65 @@ class _Builder:
                 self._gen_result_loc(node, loc, False)
                 self.add(hir.CommitSlot(loc))
                 return ArgEntry(loc, True), False
+
+    def _gen_is_none(self, node: ast.Compare, negated: bool) -> tuple[ArgEntry[hir.Value], bool]:
+        """``expr is None`` / ``expr is not None``: whether the option ``expr`` is
+        absent (the ``is not None`` negates the test).  The operand has to be an
+        ``Option[T]`` - ``hir.IsNull`` rejects anything else.
+
+        ``(name := expr) is not None`` is the *unwrap* form: it is handled as a
+        whole (see ``_gen_unwrap``), binding ``name`` to the option's *payload*
+        pointer rather than to the option pointer."""
+        left, right = node.left, node.comparators[0]
+        if not _is_none_literal(left) and not _is_none_literal(right):
+            raise CompileError(
+                "``is``/``is not`` can only be compared against None"
+            )
+        if (
+            negated
+            and isinstance(left, ast.NamedExpr)
+            and _is_none_literal(right)
+        ):
+            return self._gen_unwrap(left)
+        operand_node = right if _is_none_literal(left) else left
+        is_null = self.add(hir.IsNull(self._gen_expr(operand_node)[0]))
+        if negated:
+            return ArgEntry(self.add(hir.Not(is_null)), False), False
+        return ArgEntry(is_null, False), False
+
+    def _gen_walrus(self, node: ast.NamedExpr) -> ArgEntry[hir.Value]:
+        """The general ``(name := expr)``: ``name`` is bound to the *option*
+        pointer - an alias of the place ``expr`` denotes, of type ``Option[T]`` -
+        and the expression itself is that reference.  The ``(name := expr) is not
+        None`` form binds the payload pointer instead (see ``_gen_unwrap``)."""
+        if not isinstance(node.target, ast.Name):
+            raise CompileError('the target of ``:=`` has to be a name')
+        opt_ptr = self._as_ref(self._gen_expr(node.value)[0])
+        self._declare_walrus(node.target.id, opt_ptr)
+        return ArgEntry(opt_ptr, True)
+
+    def _gen_unwrap(self, node: ast.NamedExpr) -> tuple[ArgEntry[hir.Value], bool]:
+        """The ``(name := expr) is not None`` form: ``name`` is bound to the
+        option's *payload* pointer - writing through it writes the payload - and
+        the expression itself is the ``is not None`` test."""
+        if not isinstance(node.target, ast.Name):
+            raise CompileError('the target of ``:=`` has to be a name')
+        opt_ptr = self._as_ref(self._gen_expr(node.value)[0])
+        payload = self.add(hir.OptionPayloadPtr(opt_ptr))
+        self._declare_walrus(node.target.id, payload)
+        is_null = self.add(hir.IsNull(ArgEntry(opt_ptr, True)))
+        return ArgEntry(self.add(hir.Not(is_null)), False), False
+
+    def _declare_walrus(self, name: str, value: hir.Value) -> None:
+        """Bind the name a ``:=`` declares in the current scope.  A duplicate is
+        rejected - the target of a walrus introduces a new variable, exactly like
+        an annotated declaration (see ``_gen_ann_assign``)."""
+        if self._lookup(name) is not None:
+            raise CompileError(
+                f"'{name}' is already bound in spy function {self._fn_ir.name}; "
+                f"``:=`` introduces a new variable"
+            )
+        self._declare(name, value)
 
     def _gen_syntax_call(self, callee: Any, args: list[ast.expr]) -> tuple[ArgEntry[hir.Value], bool]:
         if callee is syntax.ref:
@@ -967,11 +1116,17 @@ class _Builder:
                 for i, elt in enumerate(node.elts):
                     self._gen_result_loc(elt, self.add(hir.TuplePtrElement(result_loc, i)))
             case ast.IfExp():
+                # each arm opens a scope of its own: a ``:=`` in an arm is not
+                # visible outside it (the other arm may have run instead)
                 cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
                 self.add(hir.If(cond))
+                self._scopes.append(_Scope())
                 self._gen_result_loc(node.body, result_loc)
+                self._scopes.pop()
                 self.add(hir.Else())
+                self._scopes.append(_Scope())
                 self._gen_result_loc(node.orelse, result_loc)
+                self._scopes.pop()
                 self.add(hir.End())
             case _:
                 # every other expression computes its value first and
@@ -985,66 +1140,52 @@ class _Builder:
                 self.add(hir.Store(result_loc, value))
 
     def _gen_boolop(self, node: ast.BoolOp, result_loc: hir.Value) -> None:
-        """Lower ``a and b``/``a or b`` (any length of chain) into
-        short-circuiting ``if`` blocks that write the result into
-        ``result_loc``.  With the operands ``a1, a2, ..., aN``, every one
-        but the last is tested and the last is the result:
+        """Lower ``a and b``/``a or b`` (any length of chain) into a
+        :class:`hir.Block` whose operands short-circuit by ``break_if``s,
+        writing the result into ``result_loc``.  With the operands ``a1, a2,
+        ..., aN``:
 
         .. code-block:: text
 
-            if <a1 as bool>:               # ``or`` tests the negation
-                if <a2 as bool>:
-                    <result_loc> = ...
-                    if <aN-1 as bool>:
-                        <result_loc> = aN  # the last operand, no copy
-                    else:
-                        <result_loc> = aN-1
-                    end
-                else:
-                    <result_loc> = a2
-                end
-            else:
-                <result_loc> = a1
+            block
+                <a1>; <result_loc> = a1
+                break_if <not a1>           # ``or`` breaks on ``a1`` instead
+                <a2>; <result_loc> = a2
+                break_if <not a2>
+                ...
+                <aN> -> <result_loc>        # the last operand, no copy (RLS)
             end
 
-        The last operand is generated with result-location semantics (its
-        value is built straight into ``result_loc``); every *other* operand
-        is first evaluated into an expression temporary - its value is
-        needed both for the test and, when it turns out to be the result,
-        for the store - and copied into ``result_loc`` in the ``else``
-        branch of the ``if`` that tested it.  That copy is unavoidable in
-        this lowering: a result location is written *through*, never read
-        back before it is committed (see ``_gen_result_loc``), so the value
-        the test needs cannot be taken out of ``result_loc`` directly.
+        Every operand but the last is stored into ``result_loc`` before the
+        break that tests it, so an operand that short-circuits is the result;
+        the last operand is generated with result-location semantics (its value
+        is built straight into ``result_loc``).  A compile-time operand's
+        ``break_if`` folds: a short-circuiting one leaves the block, so the rest
+        of the chain (and the block) is dead.
 
-        A compile-time operand that is not the last interrupts the chain:
-        the interpreter never walks the ``if`` branch its value does not
-        choose, so the rest of the chain is dead and none of it runs.  A
-        runtime operand leaves the rest of the chain to its own branch, so
-        ``b`` of ``a and b`` runs only when ``a`` is true."""
+        Every operand opens a scope of its own: an operand is only evaluated
+        when the earlier ones did not short-circuit, so a ``:=`` in it is not
+        guaranteed to have run outside of it."""
         op = _BOOL_OPS.get(type(node.op))
         if op is None:
             raise CompileError(f"unsupported boolean operator {type(node.op).__name__}")
         values = node.values
-        # one ``if`` per tested operand (every operand but the last); the
-        # operand is generated before the ``if`` that tests it
-        operands: list[ArgEntry[hir.Value]] = []
+        self.add(hir.Block())
         for value in values[:-1]:
+            self._scopes.append(_Scope())
             operand = self._gen_expr(value)[0]
-            operands.append(operand)
-            cond = self.add(hir.AsBool(operand))
-            if op == 'or':
-                # ``or`` short-circuits on a *false* operand: test the negation
-                cond = self.add(hir.Not(cond))
-            self.add(hir.If(cond))
-        # the innermost block: the last operand is the result (no copy)
-        self._gen_result_loc(values[-1], result_loc)
-        # close the blocks from the inside out; each ``else`` keeps the operand
-        # its ``if`` tested as the result
-        for operand in reversed(operands):
-            self.add(hir.Else())
+            self._scopes.pop()
             self.add(hir.Store(result_loc, self._as_value(operand)))
-            self.add(hir.End())
+            cond = self.add(hir.AsBool(operand))
+            if op == 'and':
+                # ``and`` short-circuits on a *false* operand: break on it
+                cond = self.add(hir.Not(cond))
+            self.add(hir.BreakIf(cond, 1))
+        # the last operand is the result (no copy)
+        self._scopes.append(_Scope())
+        self._gen_result_loc(values[-1], result_loc)
+        self._scopes.pop()
+        self.add(hir.End())
 
     def _gen_arglist(self, args: list[ast.expr], keywords: list[ast.keyword]) -> RawArgList[ArgEntry[hir.Value]]:
         positional = tuple(self._gen_expr(a)[0] for a in args)
@@ -1138,10 +1279,11 @@ class _Builder:
         self.add(hir.FinishArray(result_loc, tuple(elements)))
 
     def _gen_name(self, name: str) -> hir.Value:
-        """Always returns a reference to the name ``name``."""
+        """Always returns a reference to the name ``name``: the pointer its
+        binding holds (a variable's slot, the option a ``:=`` bound, or the
+        payload of one an unwrap bound)."""
         slot = self._lookup(name)
         if slot is not None:
-            # reading a variable (parameter or local): load its slot
             return slot
         obj = self._resolve_global(name)
         # a global: its resolved object is the immutable value of the

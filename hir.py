@@ -71,7 +71,7 @@ instructions are never run, so the branch is dead), a runtime ``if``
 types both branches (both survive at runtime).  A loop is a
 :class:`Loop` instruction followed by its body and the ``End`` that
 closes it, like WASM's ``loop ... end``: the interpreter types the body
-once and jumping back to it is the next iteration; a :class:`Break`
+once and jumping back to it is the next iteration; a :class:`BreakLoop`
 leaves the loop (jumping to the code after its ``End``) and a
 :class:`Continue` starts the next iteration (jumping back to the
 ``Loop`` itself).
@@ -440,6 +440,27 @@ class AsBool(Inst):
     value: ArgEntry[Value]
 
 @dataclass(eq=False)
+class IsNull(Inst):
+    """Whether the option value ``opt`` denotes is *absent*: the boolean the
+    source ``expr is None`` tests (``expr is not None`` negates it with
+    :class:`Not`).  The operand has to be an ``Option[T]`` (a bare ``null``
+    counts as the absent one); any other type is rejected.  The result is a
+    ``bool`` register."""
+
+    opt: ArgEntry[Value]
+
+@dataclass(eq=False)
+class OptionPayloadPtr(Inst):
+    """The address of the payload of the option ``ptr`` points at - the place
+    the value of a *present* ``Option[T]`` lives in (see ``interp``).
+    ``ptr`` has to point at an ``Option[T]``; the result points at its child
+    ``T``.  A construction taking a payload address marks the option present;
+    the ``:=`` unwrap does not (the option may still be absent when the address
+    is taken)."""
+
+    ptr: Value
+
+@dataclass(eq=False)
 class If(Inst):
     """Conditional statement (WASM-style): the instructions of the two
     branches follow this instruction in the same list, delimited by the
@@ -469,20 +490,20 @@ class Loop(Inst):
     matching :class:`End`.  The block is a *dead loop*: falling off its
     end jumps back to the ``Loop`` itself (the next iteration, whose head
     re-evaluates whatever the body computes), and it is left only by a
-    :class:`Break` (or a ``return``/``raise``).  The ``Loop`` instruction
+    :class:`BreakLoop` (or a ``return``/``raise``).  The ``Loop`` instruction
     carries nothing; it only delimits the flat instruction stream.
 
     ``is_inline`` marks a *compile-time* loop (a loop preceded by the source
     statement ``syntax.unroll()``): the interpreter does not
     emit a back edge but unrolls the body once per compile-time iteration,
-    so a :class:`Break` leaves the whole unrolled sequence and a
+    so a :class:`BreakLoop` leaves the whole unrolled sequence and a
     :class:`Continue` jumps to the next unrolled body (see ``interp``)."""
 
     is_inline: bool = False
 
 
 @dataclass(eq=False)
-class Break(Inst):
+class BreakLoop(Inst):
     """Leave the innermost open :class:`Loop` unconditionally: the path
     ends at the code after the loop's matching :class:`End`.  Like a
     ``ret`` the instruction carries nothing - the interpreter ends the
@@ -494,8 +515,41 @@ class Continue(Inst):
     """Start the next iteration of the innermost open :class:`Loop`
     unconditionally: the path ends back at the loop's head, so the rest
     of the body (and the ``else`` clause of the ``while``) is skipped and
-    the loop's condition is evaluated again.  Like :class:`Break` the
+    the loop's condition is evaluated again.  Like :class:`BreakLoop` the
     instruction carries nothing."""
+
+
+@dataclass(eq=False)
+class Block(Inst):
+    """The start of a ``block`` (WASM-style, like :class:`If`/:
+    class:`Loop`): the instructions of the body follow it in the same list,
+    closed by the matching :class:`End`.  Unlike a loop it has no back edge:
+    falling off its end continues right after the ``End``, and a
+    :class:`BreakIf` leaves it early - the interpreter types the code after
+    the ``End`` in one block that both the falling end and the breaks reach.
+    The ``Block`` instruction carries nothing; it only delimits the flat
+    instruction stream.
+
+    ``and``/``or`` chains are lowered into one: every operand but the last
+    is stored as the chain's result and tested with a :class:`BreakIf` (the
+    chain short-circuits by leaving the block), and an ``if``/``while`` whose
+    condition is an ``and`` chain puts its branch body inside the block, so
+    the operands' ``:=`` bindings dominate it (see ``astgen``)."""
+
+
+@dataclass(eq=False)
+class BreakIf(Inst):
+    """Leave ``levels`` enclosing :class:`Block` blocks when the boolean
+    ``cond`` is true (``None`` leaves them unconditionally), the incoming
+    control continuing right after the ``End`` of the outermost of them - the
+    ``Block`` counterpart of :class:`BreakLoop`, which leaves a
+    :class:`Loop`.  ``levels`` counts ``Block`` blocks only (1 is the
+    innermost), so a ``break`` of a ``Loop`` inside a ``Block`` is unaffected.
+    A conditional break splits the block being typed: the taken edge leaves
+    the blocks, the other continues in a block of its own (see ``interp``)."""
+
+    cond: Value | None
+    levels: int = 1
 
 
 @dataclass(eq=False)
@@ -544,11 +598,12 @@ class Except(Inst):
 @dataclass(eq=False)
 class End(Inst):
     """The marker that closes a block opened by an :class:`If`, a
-    :class:`Loop` or a :class:`Try`: everything between the ``If`` (or its
-    :class:`Else`) and this marker is one branch body, everything between
-    the ``Loop`` and this marker is the loop body, and the code after
-    this marker is the continuation of the enclosing block.  A marker
-    produces no register; it only delimits the flat instruction stream."""
+    :class:`Loop`, a :class:`Block` or a :class:`Try`: everything between the
+    ``If`` (or its :class:`Else`) and this marker is one branch body,
+    everything between the ``Loop``/``Block`` and this marker is its body, and
+    the code after this marker is the continuation of the enclosing block.  A
+    marker produces no register; it only delimits the flat instruction
+    stream."""
 
 @dataclass(eq=False)
 class CommitSlot(Inst):
@@ -558,16 +613,15 @@ class CommitSlot(Inst):
 def scan_block(insts: tuple[Inst, ...], entry: int) -> tuple[int | None, int]:
     """The positions of the ``Else`` (or None when the block has no
     else branch) and ``End`` markers that close the block opened at
-    ``entry`` (an ``hir.If`` or an ``hir.Loop``) of the executing frame's
-    flat instruction list, found by a balanced scan forward from the
-    entry (nested blocks close their own markers first).  A ``Loop``
-    block has no ``Else`` marker of its own, so its ``Else`` is always
-    None."""
+    entry (an ``hir.If``, an ``hir.Loop`` or an ``hir.Block``) of the executing
+    frame's flat instruction list, found by a balanced scan forward from the
+    entry (nested blocks close their own markers first).  A ``Loop``/``Block``
+    has no ``Else`` marker of its own, so its ``Else`` is always None."""
     depth = 0
     p_else: int | None = None
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, (If, Loop, Try)):
+        if isinstance(inst, (If, Loop, Block, Try)):
             depth += 1
         elif isinstance(inst, End):
             if depth == 0:
@@ -587,7 +641,7 @@ def scan_try(insts: tuple[Inst, ...], entry: int) -> tuple[list[int], int]:
     excepts: list[int] = []
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, (If, Loop, Try)):
+        if isinstance(inst, (If, Loop, Block, Try)):
             depth += 1
         elif isinstance(inst, End):
             if depth == 0:

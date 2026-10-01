@@ -71,7 +71,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 
 - 算术 `+ - * %`（整数）与 `+ - * /`（浮点）、一元负号、`not`（只作用于 `spy.bool`）、比较 `== != < <= > >=`；数值操作若含运行时值，生成原生指令；若两侧都是编译期常量，则直接在编译期算出结果。整数与浮点混用时提升为浮点；整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）尚未实现，会报错。
 - **条件表达式** `a if c else b`：条件必须是 `spy.bool` 值（spy 没有真值转换）。条件为编译期常量时只保留选中的分支，另一个分支不会被编译；否则在 MIR 里就是一个普通的分支，两个分支把各自的值写进**同一个 result location**（因此两侧的类型要能互相 resolve，否则报错）。
-- **`and`/`or`（短路）**：降级成一串短路 `if`，操作数按「链」处理（`a and b and c` 不当作右结合递归）。左操作数的布尔值决定余下部分是否求值：编译期左操作数使未选中的分支整段不被走（不求值、不参与类型推导），运行时左操作数让右侧只落在需要的分支里。操作数与结果都必须是 `spy.bool`（`AsBool` 转换，将来支持 `__bool__` 后同样适用）。最后一个操作数用 result location 直接生成；其余操作数先求值成表达式临时量用于判断，若它成为结果再拷贝进 result location——结果位置是**只写不读回**的（commit 之前读不了），所以这一次拷贝在当前降级下**不可避免**。
+- **`and`/`or`（短路）**：一条链（`a and b and c` 按「链」处理，不是右结合递归）降级成一个 `hir.Block`：每个操作数依次求值、写进 result location，再按它的布尔值 `hir.BreakIf` 跳出块（`and` 在假时跳出、`or` 在真时跳出）——跳出的那个操作数就是结果。编译期操作数让未选中的部分整段不被走（不求值、不参与类型推导）。操作数与结果都必须是 `spy.bool`（`AsBool` 转换，将来支持 `__bool__` 后同样适用）。最后一个操作数用 result location 直接生成（不产生拷贝）；其余操作数先写进 result location 再判断。每个操作数各开一个作用域：其中的 `:=` 不外泄（那个操作数不一定求值过）。
 - **局部变量与块级作用域**：`name = expr` 只存回 `name` 已经绑定的那个 slot（本块或任一外层块的，包括形参），只有完全没绑定过的名字才会**声明**一个块局部变量（新分配一个可寻址 slot）；声明不会逃出所在块，块结束后该名字不再绑定，但块内对**外层**变量的赋值写的就是那个变量本身。未标注的变量在 MIR 里都是 alloca（内存），单次存取的 slot 之后由 `opt` 折回寄存器。HIR 是 wasm 式树状结构、MIR 是基本块图，都无 phi，跨分支或跨迭代的写入与读取靠内存顺序语义（外层变量在分支里被赋值时不能在寄存器里，所以走内存）。块 = 函数体与各 `if` 分支体：函数体是**最外层块**，其作用域初始持有各参数。支持 `name += expr`（只支持 `+=`）与元组解包赋值（`a, b = e`，可嵌套）；赋值目标可以是名字、名字元组，或（运行时结构体值的）字段链。局部变量需要有能落到运行时的类型——用未注解的整数字面量初始化（`x = 1`）会报错，这时用类型标注声明它的类型即可（见下）。
 - **类型标注的局部变量**：`name: T = expr` 声明一个新的块局部变量，并直接给定它的类型 `T`（值会转换到该类型；slot 立即落成运行时内存）。`name: Comptime` 声明一个**编译期变量**（值不在内存里，而在一个编译期 box 里），`name: Comptime[T]` 同时给定它的类型 `T`——这是局部变量持有纯编译期值（如类型：`t: Comptime = spy.typeof(x)`）的方式。标注里的类型就是一个编译期值表达式（可以命名类型参数 `T`，调用时解出具体类型）。标注即声明：同一个名字不能被标注两次。除了写在标注里，也可以用语句标记 `syntax.comptime()` 声明编译期变量（见下文“编译期”）。
 - 一个函数必须保证每条运行路径都以 `return` 结束（否则编译报错），且各 `return` 的类型一致（或与返回注解一致）。**void 函数**（返回注解为 `-> None`，或无返回注解且函数体从不返回值）除外：允许函数体"落穿"结束，也允许裸 `return` 提前退出。
@@ -94,9 +94,9 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
   - 运行时 `if` 把当前块以 `br` 一分为二；每个分支要么以 `return`（`ret`）结束，要么“落穿”到 `if` 之后的代码继续执行（分支块以 `jmp` 跳向汇合块）。两个分支都落穿（汇合）也允许——对**外层**变量的赋值写的就是外层 slot（内存），因此跨汇合的状态无需 phi；
   - 支持分支嵌套、连续 `if`、`elif`（即嵌套 `if`）。
 - 运行时 `if` 也允许出现在**内联函数体内**（普通函数与未装饰的结构体方法）。内联体直接续写调用点所在的块，并为调用方的延续预留一个**出口块**：内联 `return` 把值写入调用方结果位置（内存）后以 `jmp` 跳到出口块，落穿的内联体也汇入出口块，因此在调用点形成内存汇合（同样无需 phi）；若各路径返回类型不一致、或部分路径落穿/裸 `return`，会像函数本身一样报错。
-- **`while`/`while`-`else` 循环**：`while cond: body` 降级为一个死循环块（`hir.Loop`…`hir.End`）：每轮在块头重新求值 `cond`，为真则执行 `body`，块体末尾跳回块头；为假则先执行 `else` 子句（若有）再**跳出**循环。`break` 直接跳到循环之后（因此 `while`-`else` 的 `else` 只在条件自然为假时执行，被 `break` 跳过，与 Python 一致），`continue` 跳回块头（重新求值条件，并跳过本轮剩余 body）。循环在 MIR 里就是带回边的普通块，循环携带的变量是普通 alloca（内存），因此无需 phi。编译期为假的 `while False:` 不会生成 body（只保留选中的分支）。可在循环体内嵌套 `if`/`try`：`break`/`continue` 位于循环内的 `try` 体里时直接跳出/回到块头，except 子句只在该 try 体先抛异常时才走。
+- **`while`/`while`-`else` 循环**：`while cond: body` 降级为一个死循环块（`hir.Loop`…`hir.End`）：每轮在块头重新求值 `cond`，为真则执行 `body`，块体末尾跳回块头；为假则先执行 `else` 子句（若有）再**跳出**循环。`break`（`hir.BreakLoop`）直接跳到循环之后（因此 `while`-`else` 的 `else` 只在条件自然为假时执行，被 `break` 跳过，与 Python 一致），`continue` 跳回块头（重新求值条件，并跳过本轮剩余 body）。循环在 MIR 里就是带回边的普通块，循环携带的变量是普通 alloca（内存），因此无需 phi。条件的 `and` 链另见图下的「`and`/`or` 的短路」。编译期为假的 `while False:` 不会生成 body（只保留选中的分支）。可在循环体内嵌套 `if`/`try`：`break`/`continue` 位于循环内的 `try` 体里时直接跳出/回到块头，except 子句只在该 try 体先抛异常时才走。
 - **`for` 循环**：`for exprs in iter: body`（可带 `else`）在 astgen 里降级为一个显式迭代器循环：循环前先取一次迭代器（`%it = iter.__iter__()` 并 commit），循环体放在一个 `try` 里：`exprs = %it.__next__()`，commit，再执行 `body`；`except StopIteration`（`std.StopIteration`）里先跑 `else` 再 `break`。`__next__` 抛 `StopIteration` 即循环结束（`else` 只在这种情况下执行，`break` 跳过它，与 Python 一致），`continue` 开始下一轮。`__iter__`/`__next__` 由迭代器的静态类型解析（`range` 这个内建名在 astgen 里映射到 `std.range`，`StopIteration` 映射到 `std.StopIteration`）。循环变量绑在循环体的子作用域里，循环之后不可见。循环前有一条 `syntax.unroll()` 语句时，外层 `Loop` 标记为编译期循环（见下面的“编译期循环”）：迭代器和循环变量都是编译期值，于是 `try` 能靠编译期抛出的 `StopIteration` 结束循环，整个循环在编译期展开。
-- **`and`/`or` 的短路**：降级成一串 `if`，左操作数的布尔值决定右侧是否执行（见上文「语言与表达式」）。
+- **`and`/`or` 的短路**：降级成一个 `hir.Block`，操作数用 `hir.BreakIf` 短路跳出（见上文「语言与表达式」）。`if`/`while` 的条件是 `and` 链时，分支体直接放在块里（`break_if` 为假时跳出块去走 `else` 分支或跳出循环；有 `else` 的 `if` 用两层块，body 末尾无条件跳出两层以跳过 `else`），这样条件里 `:=` 解包出的 payload 指针支配 body（普通的两路 `if` 分叉不会）。
 - **编译期循环**：循环前的一条 `syntax.unroll()` 语句把紧跟其后的 `while`/`for` 标记为编译期循环，`interp` 不为它发出回边，而是把循环体按条件的编译期取值**展开**成多个 body 块（条件必须是编译期值，且循环体要让编译期状态推进，否则展开次数超过 `HirRunner.max_loop_unroll`（默认 1024）时报错）。`break` 跳过全部展开的块（到循环之后），`continue` 跳到下一个 body（重新求值条件），`while`-`else` 的 `else` 在条件转假时执行一次。`syntax.unroll()` 必须紧接在它标记的循环之前，中间不能有其它语句（否则报错）。编译期 `for` 的**迭代器和循环变量都建在内联 slot 里**（`astgen._gen_for`）：编译期迭代器是一个没有运行时表示的聚合，普通表达式临时量放不下它；迭代器的 `__iter__`/`__next__` 是未装饰方法（内联），接收者是编译期值时就在编译期执行，于是 `__next__` 耗尽时抛的 `StopIteration` 是**编译期抛出**、被 `except StopIteration` 静态接住，它子句里的 `break` 结束整段展开——运行时迭代器则没有这个出口，会由展开上限报错。`std.range` 的 `__next__` 把结果值放在 `Comptime[T]` 局部量里，同理是为了让元素类型没有运行时表示（`range(3, 0, 1)` 这种未定型字面量）时也能编译期迭代。
 - **异常**：`raise E(...)` 把异常值构造成一个 slot 并发出 `hir.Raise`。函数的返回约定是一个 `sval.ResultType`（正常返回值 + 按错误码排序的异常集），`make_ret_spec` 把它摊成叶子：值、错误码、payload union（结果位置因此是 `ComptimeResult`：value/code/payload 三个位置）。异常不往每个 try 自己的 error space 拷贝，而是在**抛出/调用点**用一个 `switch` 直接分派到最内层能捕获它的 except 子句：每个子句的入口块惰性创建，payload 指针由 `mir.Phi` 汇合送来，`except E as e` 的 `e` 直接绑定到那个指针（`hir.ExceptBind`），不拷贝。被调函数的 error 部分由调用方决定写到哪：若没有外层 try 能捕获、且（当前函数异常集为 infer 或已含被调函数的全部异常），就**直接写进当前函数的返回 payload**（零拷贝；payload 按值返回时也一样——写之前先把目标指针重解释成“到来的那个 union”，因为 union 值之间不能转换，只能重解释存储）；否则写进临时 slot 再按需拷入函数返回位置。没有被任何子句命中的 except 是死代码，其 HIR 不编译不分析；子句按顺序匹配，裸 `except` 的 union 随分派增长、延迟定型（`mir.UnionType`：子集 union 的指针可 bitcast 到超集），目前只把 code/payload 传进去、尚不读取。
 - **错误码的编码**：`ResultType.tag_bits` 取函数用到的 tag 所需的最小宽度：有正常返回值时 tag 是 `0..n`（`0` = 无错误），需要 `n.bit_length()` 位；**值部分是空类型**（`sval.EmptyType`：函数体从不交付值，因此不存在 `return` 路径）时没有“无错误”码，第 i 个异常的 tag 就是 `i`，于是单个异常时错误码是 `u0`（零大小）——调用点无从 `switch`，直接静态分派到那唯一的异常。写错误码（异常离开函数，或经 result location 抛出）依赖这个编码，而函数体跑的时候返回值类型可能还没定型，所以写入推迟成 `_PendingErrorCodeWrite`（`mir.Insertion` 占位），在 `finish_function` 里按最终的 `ResultType` 填上；`return` 路径清的 `0` 不用推迟（能 `return` 就不可能是空类型）。
@@ -241,8 +241,21 @@ def maybe_add(x: spy.i32, y: spy.i32, c: spy.bool) -> Option[spy.i32]:
 - **泛型**：`Option[T]` 里的类型参数照常求解（`Option[T]` 实参对 `Option[U]` 形参约束 `T` 对 `U`；只给一个 `T` 值也可以解出 `T`）。
 - **内存表示**（`sval.OptionType.to_mir_type` + `find_first_pointer_type_pos`）：如果 `T` 里还有**未被内层 `Option` 占用**的指针（Zig 风格的非空 `Ptr[T]`），就借用它当“是否缺席”的标签，因此 `Option[Ptr[T]]` 的内存布局与 `Ptr[T]` **完全一致**，读到的是空指针即为 `Null`；`T` 是 ZST 时只用一位 `bool`；否则用一个 `(bool, T)` 的结构体（`bool` 是标签，`T` 是值）。**每个 `Option` 层占用一个指针**：`T` 有 `n` 个可用指针，`Option[T]` 就只剩 `n - 1` 个，所以 `Option[Option[T]]` 的外层用 `T` 的**第二个**指针做标签（内存布局仍是 `T` 本身），指针用完后才退回 `bool`/结构体（例：`Option[Option[Ptr[T]]]` 退回 `(bool, Ptr[T])`）。`find_first_pointer_type_pos` 同时决定了有没有可用指针与标签的位置；缺席值 `Null` 落到运行时就是相应的空指针 / `false` 标签。
 - **result location**：往 `Option[T]` 的存储里交付一个 `T`（如构造体、return）时，`HirRunner._convert_result_ptr` 把指针转成此时选项 payload 的地址（并按表示设置标签），构造就地在 payload 上进行。
-- **读取**：`HirRunner._is_null`（是否缺席）与 `_option_payload`（present 值的 payload）已能对**运行时**选项值按其表示求出（ZST child 的 `bool`、指针标签、`(bool, T)` 的 tag/payload），但它们还没有对应的语法入口。
-- **尚未实现**：还没有解包 / 模式匹配（无法从 `Option[T]` 取出 `T` 或判断是否为 `None`），因此现在只能在编译期拿 `spy.typeof(x)` 观察选项类型，或在函数间传递。
+- **判断缺席**：`expr is None` / `expr is not None` 判断一个选项是否缺席（`expr` 必须是 `Option[T]`，否则报编译错）。`hir.IsNull` 求“是否缺席”，`is not None` 再对它取反。
+- **解包（海牙语法）**：`(name := expr)` 让 `expr`（一个 `Option[T]`）落成一个可寻址的地方，`name` 绑定到**该选项的指针**上（是它的一个别名），表达式自身也是那个地址。`(name := expr) is not None` 是解包的特例，整体当作一个判断：`name` 改绑到该选项 **payload 的指针**——读 `name` 读出 payload，写 `name`（以及 `name += ...`）写的就是 payload——而表达式的值是“存在”布尔。
+
+  ```python
+  @spy.func()
+  def bump(x: spy.i32, y: spy.i32, c: spy.bool) -> spy.i32:
+      if (v := maybe_add(x, y, c)) is not None:
+          v += 1                 # writes the payload of the option
+          return v
+      return 0
+  ```
+
+  海牙语法可以出现在任何表达式位置。`if`/`while` 的条件是 `and` 链时，条件里的名字在其分支体（body）里可见：链中每个操作数都求值过才会进入 body，而 body 就放在同一个 `hir.Block` 里（见「`and`/`or` 的短路」），条件里的指针因此支配它。`or` 链、一般（值）的 `and`/`or` 链、条件表达式（`a if c else b`）的两个分支各自新开一个作用域（`if`/`while` 的条件作用域也把 `else` 排除在外）：这些地方不保证求值过，名字只在其中可见。
+- **编译期选项**：选项的编译期存储是 `interp.ComptimeOptionPtr`——一个 `*Option[T]`，标签 `is_null` 是一个**值**（标签没有地址）而 payload 是一个自己的 place；读出来是 `interp.ComptimeOption`（标签 + payload），它的运行时表示用 `mir.InsertValue` 从字段拼出（指针标签的缺席值用 `mir.Select` 置空指针）。`Comptime[Option[T]]` 变量、编译期聚合里的选项字段都是这种存储，海牙解包对它们同样可用。
+- **尚未实现**：还没有模式匹配（`match`）；以 `T` 的某个指针当标签的表示下，`T` 自身令该指针为空值（或内层选项为缺席）时会被误读为外层缺席（与 Zig/Rust 的 niche 优化同样的局限）。
 
 ## 多返回值
 
@@ -295,7 +308,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 - 数组：运行时长度的数组、数组之间的转换（如 `i32[2]` → `i64[2]`）、以及 Python 侧实例表示（带数组参数/返回值的函数还不能从 Python 侧直接调用）。切片已由 `std.arr_slice`/`std.const_arr_slice` 提供。
 - 类型标注：局部变量的标注按函数体内的表达式求值，支持能当值求出的类型（具体类型、类型参数、结构体及结构体特化）与 `Comptime` 标记；`Ptr[T]`/`ConstPtr[T]`/`MultiPtr[T]`/`ConstMultiPtr[T]`/`Array[T, N]`/`Option[T]` 这类 `syntax` 类型标记在函数体里也是可用作值的表达式（由 `hir.PointerType`/`hir.ArrayType`/`hir.OptionType` 在编译期构造），此外也能写在形参、返回值与结构体字段注解里。
 - 多返回值：不能嵌套元组返回值（`-> tuple[i32, tuple[i32, i32]]`），且按值返回的聚合结果还不能从 Python 侧调用。
-- Option：还不能解包（从 `Option[T]` 取出 `T`、或判断是否为 `None`），因此选项值只能在函数间传递、用 `spy.typeof` 观察类型；以 `T` 的某个指针当标签的表示下，`T` 自身令该指针为空值（或内层选项为缺席）时会被误读为外层缺席（与 Zig/Rust 的 niche 优化同样的局限）。
+- Option：还没有模式匹配（`match`，解包目前用 `is None` / 海牙语法 `(name := expr) is not None`）；以 `T` 的某个指针当标签的表示下，`T` 自身令该指针为空值（或内层选项为缺席）时会被误读为外层缺席（与 Zig/Rust 的 niche 优化同样的局限）。
 - 普通 Python 函数的内联不支持运行期递归（递归驱动参数是运行期值时会在内联嵌套上限处报错，而非编译期展开）；运行期的函数值调用（把函数存进变量/字段后再调用）也尚未实现。
 
 ## 运行测试

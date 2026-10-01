@@ -127,6 +127,13 @@ def simplify(fn: mir.Function) -> None:
                 inst.value = resolve(inst.value)
             case mir.ExtractValue():
                 inst.value = resolve(inst.value)
+            case mir.InsertValue():
+                inst.value = resolve(inst.value)
+                inst.elem = resolve(inst.elem)
+            case mir.Select():
+                inst.cond = resolve(inst.cond)
+                inst.if_true = resolve(inst.if_true)
+                inst.if_false = resolve(inst.if_false)
             case mir.Cmp():
                 inst.lhs = resolve(inst.lhs)
                 inst.rhs = resolve(inst.rhs)
@@ -223,6 +230,10 @@ def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
             return ((inst.value, 'use'),)
         case mir.ExtractValue():
             return ((inst.value, 'use'),)
+        case mir.InsertValue():
+            return ((inst.value, 'use'), (inst.elem, 'use'))
+        case mir.Select():
+            return ((inst.cond, 'use'), (inst.if_true, 'use'), (inst.if_false, 'use'))
         case mir.Cmp():
             return ((inst.lhs, 'use'), (inst.rhs, 'use'))
         case mir.Call():

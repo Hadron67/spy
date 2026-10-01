@@ -350,6 +350,10 @@ class Undef(Value):
     def __str__(self) -> str:
         return "undef"
 
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
 class Module(NameContext):
     def __init__(self) -> None:
         self._pending_symbols: set[GlobalValue | StructType] = set()
@@ -881,6 +885,9 @@ class BasicBlock(LocalValue):
 
     def insert_value(self, value: Value, elem_value: Value, *indices: int):
         return self.emit(InsertValue(value, elem_value, *indices))
+
+    def select(self, cond: Value, if_true: Value, if_false: Value):
+        return self.emit(Select(cond, if_true, if_false))
 
     def fneg(self, value: Value):
         return self.emit(FNeg(value))
@@ -1575,6 +1582,32 @@ class InsertValue(Inst):
         elem_value = self.elem_value.stringify(name_context, local_counter)
         return f"insertvalue {value}, {elem_value}, {', '.join(str(i) for i in self.indices)}"
 
+@gen_get_children
+class Select(Inst):
+    cond: Value
+    if_true: Value
+    if_false: Value
+    type: Type
+
+    @override
+    def __init__(self, cond: Value, if_true: Value, if_false: Value) -> None:
+        self.cond = cond
+        self.if_true = if_true
+        self.if_false = if_false
+        self.type = if_true.get_type()
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        ty = self.type.stringify(name_context)
+        cond = self.cond.stringify_value(name_context, local_counter)
+        if_true = self.if_true.stringify_value(name_context, local_counter)
+        if_false = self.if_false.stringify_value(name_context, local_counter)
+        return f"select i1 {cond}, {ty} {if_true}, {ty} {if_false}"
+
 class Branch(Inst):
     pass
 
@@ -1720,7 +1753,8 @@ class IcmpOp(Enum):
 
 @gen_get_children
 class Icmp(Inst):
-    type: IntType
+    # an integer, or a pointer for the equality predicates (see ``__init__``)
+    type: Type
     signed: bool
     op: IcmpOp
     lhs: Value
@@ -1730,7 +1764,11 @@ class Icmp(Inst):
     def __init__(self, op: IcmpOp, signed: bool, lhs: Value, rhs: Value) -> None:
         lhs_type = lhs.get_type()
         rhs_type = rhs.get_type()
-        assert isinstance(lhs_type, IntType), f"int type expected, got {lhs_type}"
+        if isinstance(lhs_type, PointerType):
+            # only equality is defined on pointers (``icmp eq/ne ptr, ptr``)
+            assert op in (IcmpOp.EQ, IcmpOp.NE), f"only equality applies to {lhs_type}"
+        else:
+            assert isinstance(lhs_type, IntType), f"int type expected, got {lhs_type}"
         assert lhs_type == rhs_type, f"types mismatch: {lhs_type} and {rhs_type}"
         self.type = lhs_type
         self.signed = signed

@@ -364,15 +364,32 @@ class ComptimeCastedPtr(InterpVal):
 
 @dataclass(frozen=True, slots=True)
 class ComptimeOption(InterpVal):
-    """The value form of an ``Option[T]`` that is *present*: the compile-time
-    representation of an option, holding the value it wraps (which may itself be
-    a runtime value, like a :class:`ComptimeBox`).  An option that is absent is
-    the compile-time value ``sval.TypedNull(T)`` instead - the two exist because
-    an option has no single runtime shape (its representation is chosen from the
-    child type, see ``sval.OptionType.to_mir_type``), and a compile-time
-    aggregate field of an option type has to hold one of them."""
+    """The value form of an ``Option[T]``: a compile-time option, holding
+    whether it is *absent* (``is_null``, a ``bool`` value) and the value it
+    wraps (``value``, which may itself be a runtime value or a nested
+    aggregate).  It is the option counterpart of :class:`ComptimeAggregate`; an
+    option that is absent is still this form (its ``is_null`` is true), with the
+    payload there only to be discarded.  The untyped ``sval.Null``/typed
+    ``sval.TypedNull`` a Python expression evaluates to still occur as
+    ``ComptimeVal``s, but any option *place* holds one of these."""
 
+    is_null: InterpVal
     value: InterpVal
+
+
+@dataclass
+class ComptimeOptionPtr(InterpVal):
+    """The compile-time storage of an ``Option[T]``: a pointer ``*Option[T]``
+    whose tag is a *value* (``is_null``, a ``bool``) rather than an addressable
+    place - the tag has no address of its own, only the payload does - and
+    whose payload is a place (``payload_ptr``), of the child type.  It is the
+    option counterpart of :class:`ComptimeAggregatePtr`: ``HirRunner.load``
+    reads the option out of it, ``HirRunner.store`` splits a value into the tag
+    and the payload, and ``HirRunner._option_payload_ptr`` hands the payload
+    place over.  Both the tag and the payload may be runtime values."""
+
+    is_null: InterpVal
+    payload_ptr: InterpVal
 
 @dataclass
 class _PendingErrorCodeWrite:
@@ -412,7 +429,12 @@ def _is_comptime_val(val: InterpVal) -> bool:
                 todo.append(val.value)
             case ComptimeOption():
                 # likewise for an option value form (see ``ComptimeOption``)
+                todo.append(val.is_null)
                 todo.append(val.value)
+            case ComptimeOptionPtr():
+                # and its place form (see ``ComptimeOptionPtr``)
+                todo.append(val.is_null)
+                todo.append(val.payload_ptr)
             case ComptimeTuple():
                 todo.extend(a.value for a in val.values)
             case ComptimeDict():
@@ -528,6 +550,20 @@ class LoopBlockData(BlockFrameData):
     header_block: mir.BasicBlock | None = None
     exit_block: mir.BasicBlock | None = None
     inline_next: mir.BasicBlock | None = None
+
+@dataclass
+class PlainBlockData(BlockFrameData):
+    """The state of one open ``hir.Block`` of the HIR.
+
+    ``exit_block`` is the block the code after the block's ``End`` is typed in
+    - the target of a ``hir.BreakIf`` that leaves it - created on the first
+    break (or by the falling end, whichever comes first).  ``p_end`` is the
+    position of the matching ``End`` (found by ``_scan_block``).  Unlike a
+    loop, the code after the block is reachable even without a break: the
+    falling end reaches the same ``exit_block``."""
+
+    p_end: int
+    exit_block: mir.BasicBlock | None = None
 
 @dataclass
 class TryExceptBlockData(BlockFrameData):
@@ -657,11 +693,18 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
             # a compile-time writable pointer: const when its box is (a field of
             # a slice, see ``ComptimeBox``)
             return sval.PointerType(ev.type, is_const=ev.is_const)
-        case ComptimeOption(value):
-            # a present option held compile-time: the option of the type of the
-            # value it wraps (see ``ComptimeOption``)
+        case ComptimeOption(_, value):
+            # an option held compile-time: the option of the type of the value
+            # it wraps (see ``ComptimeOption``)
             child = _type_of(value)
             return None if child is None else sval.OptionType(child)
+        case ComptimeOptionPtr(_, payload_ptr):
+            # the compile-time place of an option: a pointer to it, its child
+            # read off the payload place (see ``ComptimeOptionPtr``)
+            payload_type = _type_of(payload_ptr)
+            if not isinstance(payload_type, sval.PointerType):
+                return None
+            return sval.PointerType(sval.OptionType(payload_type.elem), is_const=False)
         case ComptimeAggregate(type):
             # a struct value held compile-time: the struct type (see
             # ``ComptimeAggregate``)
@@ -1808,6 +1851,18 @@ class HirRunner:
                     regs[inst] = RuntimeVal(phi, sval.PointerType(exception, is_const=False))
             case hir.AsBool():
                 return self.as_bool(self.operand_arg(inst.value), inst)
+            case hir.IsNull():
+                value = self._arg_value(self.operand_arg(inst.opt))
+                value_type = _type_of(value)
+                if not isinstance(value_type, (sval.OptionType, sval.NullType)):
+                    raise CompileError(f'``is None`` needs an option, got {value_type}')
+                regs[inst] = self._is_null(value)
+            case hir.OptionPayloadPtr():
+                place = self.operand(inst.ptr)
+                ptr_type = _type_of(place)
+                if not isinstance(ptr_type, sval.PointerType) or not isinstance(ptr_type.elem, sval.OptionType):
+                    raise CompileError(f'a payload address needs an option, got {ptr_type}')
+                regs[inst] = self._option_payload_ptr(place, write_tag=False)
             case hir.BinaryAssign():
                 return self.binary_assign(inst.op, self.operand(inst.lhs), self.operand_arg(inst.rhs))
             case hir.If():
@@ -1818,10 +1873,14 @@ class HirRunner:
                 self._exec_try()
             case hir.Except():
                 self._exec_except(inst)
-            case hir.Break():
-                return self._exec_break()
+            case hir.BreakLoop():
+                return self._exec_break_loop()
             case hir.Continue():
                 return self._exec_continue()
+            case hir.Block():
+                self._exec_block()
+            case hir.BreakIf():
+                return self._exec_break_if(inst)
             case hir.Else():
                 self._exec_else()
             case hir.End():
@@ -1997,13 +2056,14 @@ class HirRunner:
         # loop open so its remaining iterations keep unrolling
         frame.pc = bf.entry + 1
 
-    def _exec_break(self) -> PollResult:
-        """``hir.Break``: end the current path at the innermost loop's exit block,
-        created on demand - the first ``break`` is what makes the code after the
-        loop reachable - and unwind the frame's open blocks like any other ended
-        path (see ``_cut``).  The loop's exit is exactly where a ``_cut`` that
-        reaches the loop continues the walk.  A compile-time loop's ``break``
-        works the same way: it leaves the whole unrolled sequence."""
+    def _exec_break_loop(self) -> PollResult:
+        """``hir.BreakLoop``: end the current path at the innermost loop's exit
+        block, created on demand - the first ``break`` is what makes the code
+        after the loop reachable - and unwind the frame's open blocks like any
+        other ended path (see ``_cut``).  The loop's exit is exactly where a
+        ``_cut`` that reaches the loop continues the walk.  A compile-time
+        loop's ``break`` works the same way: it leaves the whole unrolled
+        sequence."""
         data = self._find_loop()
         exit_block = data.exit_block
         if exit_block is None:
@@ -2029,6 +2089,70 @@ class HirRunner:
             nxt = data.header_block
         if not self._cur_block.is_finished:
             self._cur_block.emit(mir.Jmp(nxt))
+        return self._cut()
+
+    def _exec_block(self) -> None:
+        """Open a ``hir.Block`` (``hir.Block``): its body follows in the flat
+        instruction list, closed by the matching ``hir.End``.  Unlike an
+        ``if`` there is nothing to split here - the current block continues as
+        the body - so a ``hir.BreakIf`` of the body splits it itself (see
+        ``_exec_break_if``), and the falling end and every break join in the
+        block's exit block (see ``PlainBlockData``)."""
+        frame = self._frames[-1]
+        entry = frame.pc - 1
+        p_else, p_end = self._scan_block(entry)
+        assert p_else is None, 'a block body has no else marker'
+        frame.block_stack.append(BlockFrame(entry, PlainBlockData(p_end=p_end)))
+
+    def _block_exit(self, data: PlainBlockData) -> mir.BasicBlock:
+        """The block the code after a ``hir.Block``'s ``End`` is typed in -
+        created on demand."""
+        if data.exit_block is None:
+            data.exit_block = mir.BasicBlock()
+        return data.exit_block
+
+    def _find_block(self, levels: int) -> BlockFrame:
+        """The ``levels``-th enclosing ``hir.Block`` of the executing frame (1
+        is the innermost) - the target of a ``hir.BreakIf``.  Only ``hir.Block``
+        frames count: a ``break``/``continue`` of a loop is unaffected by the
+        blocks a condition of it opened (see ``_find_loop``)."""
+        count = 0
+        for bf in reversed(self._frames[-1].block_stack):
+            if isinstance(bf.data, PlainBlockData):
+                count += 1
+                if count == levels:
+                    return bf
+        raise CompileError('break out of more blocks than are open')
+
+    def _exec_break_if(self, inst: hir.BreakIf) -> PollResult:
+        """``hir.BreakIf``: leave ``inst.levels`` enclosing ``hir.Block``s when
+        ``inst.cond`` holds (unconditionally when it is ``None``).  A compile-
+        time condition folds: a ``false`` one does nothing, and any other taken
+        break ends the path at the target block's exit block like
+        ``break_loop``/``continue`` do (see ``_cut``).  A *runtime* condition
+        splits the block being typed instead: the taken edge jumps to the exit
+        and the walk continues in a fresh block for the rest of the body."""
+        target_bf = self._find_block(inst.levels)
+        if inst.cond is not None:
+            cond = self.operand(inst.cond)
+            if isinstance(cond, ComptimeVal):
+                if not cond.obj:
+                    return PollResult.AGAIN
+            else:
+                target = target_bf.data
+                assert isinstance(target, PlainBlockData)
+                exit_block = self._block_exit(target)
+                cont_block = mir.BasicBlock()
+                self._cur_block.emit(
+                    mir.Br(self._to_runtime(cond), exit_block, cont_block)
+                )
+                self._cur_block = cont_block
+                return PollResult.AGAIN
+        target = target_bf.data
+        assert isinstance(target, PlainBlockData)
+        exit_block = self._block_exit(target)
+        if not self._cur_block.is_finished:
+            self._cur_block.emit(mir.Jmp(exit_block))
         return self._cut()
 
     def _exec_else(self) -> None:
@@ -2214,6 +2338,16 @@ class HirRunner:
             self._cur_block = data.join
             frame.block_stack.pop()
             return PollResult.AGAIN
+        if isinstance(data, PlainBlockData):
+            # a ``hir.Block`` body fell off its end: it joins the code after the
+            # block - the block the breaks of the body jump to (see
+            # ``PlainBlockData``)
+            exit_block = self._block_exit(data)
+            if not self._cur_block.is_finished:
+                self._cur_block.emit(mir.Jmp(exit_block))
+            self._cur_block = exit_block
+            frame.block_stack.pop()
+            return PollResult.AGAIN
         assert isinstance(data, IfBlockData)
         if data.chosen is not None:
             # a compile-time ``if``: the chosen branch fell off its end
@@ -2319,6 +2453,19 @@ class HirRunner:
                 if data.is_inline and data.inline_next is not None:
                     self._unroll_inline_loop(frame, bf, data)
                     return PollResult.AGAIN
+                frame.block_stack.pop()
+                exit_block = data.exit_block
+                if exit_block is None:
+                    continue
+                self._cur_block = exit_block
+                frame.pc = data.p_end + 1
+                return PollResult.AGAIN
+            if isinstance(data, PlainBlockData):
+                # the current path ended inside a ``hir.Block`` (a ``return``, a
+                # ``raise``, or a ``break``/``continue`` of an enclosing loop):
+                # the block is complete.  The code after its ``End`` is still
+                # reachable when some ``hir.BreakIf`` of the body reaches the
+                # block's exit, and dead otherwise - exactly the loop's case
                 frame.block_stack.pop()
                 exit_block = data.exit_block
                 if exit_block is None:
@@ -2447,6 +2594,10 @@ class HirRunner:
                 # an aggregate is held by its fields: loading one loads every
                 # field out of its own place (see ``ComptimeAggregatePtr``)
                 return ComptimeAggregate(aggregate_type, tuple(self.load(p) for p in ptrs))
+            case ComptimeOptionPtr(is_null, payload_ptr):
+                # an option is held by its tag and its payload place: loading
+                # one is the value form of the two (see ``ComptimeOptionPtr``)
+                return ComptimeOption(is_null, self.load(payload_ptr))
             case ComptimeVal(obj) if isinstance(obj, sval.ConstRef):
                 # a reference to an immutable compile-time global behaves like
                 # the value it refers to
@@ -2567,6 +2718,8 @@ class HirRunner:
             # an option (and the ``T``/``Null`` a store delivers) is written
             # through the representation of ``elem`` (see ``_write_option``)
             match ptr:
+                case ComptimeOptionPtr():
+                    self._write_comptime_option(ptr, value, elem)
                 case ComptimeBox():
                     obj = _to_comptime(value)
                     if obj is None:
@@ -2736,34 +2889,106 @@ class HirRunner:
         representation (coerced to the child), and the absent one the null
         representation: a ``bool`` for a zero-sized child, the tagging pointer
         nulled (``_write_option_null``) for a child that has one, and the tag
-        ``false`` for the rest."""
+        ``false`` for the rest.
+
+        A tag that is only known at runtime (a value read out of a runtime
+        option) makes the representation written from the tag *value* instead
+        (see ``_write_option_runtime_tag``)."""
         child = option.child
         if isinstance(value, RuntimeVal) and _type_of(value) == option:
             # the value already is an option of this type (a parameter of one,
             # a load of one): its representation is written as a whole
             self._emit(mir.Store(dst, self._to_runtime(value)))
             return
-        null = _comptime_bool(self._is_null(value), 'the option value')
+        is_null = self._is_null(value)
+        null_const = _to_comptime(is_null)
+        if null_const is None:
+            self._write_option_runtime_tag(dst, option, is_null, self._option_payload_for_write(value, option))
+            return
+        null = bool(null_const)
         if child.is_zst():
             # a zero-sized child carries no value: only whether there is one
             self._emit(mir.Store(dst, mir.BoolValue(not null)))
             return
-        if sval.find_first_pointer_type_pos(child) is not None:
+        tag_path = sval.find_first_pointer_type_pos(child)
+        if tag_path is not None:
             if null:
-                self._write_option_null(dst, option)
+                tag_ptr, tag_type = self._option_tag_addr(dst, child, tag_path)
+                mir_type = tag_type.to_mir_type(self._mir_cache)
+                assert isinstance(mir_type, mir.PointerType)
+                self._emit(mir.Store(tag_ptr, mir.NullValue(mir_type)))
             else:
-                self._emit(mir.Store(dst, self._to_runtime(self._coerce(value, child))))
+                self._emit(mir.Store(dst, self._to_runtime(self._coerce(self._option_payload_for_write(value, option), child))))
             return
         # a struct of the tag and the value: the tag says whether there is one
         tag = self._emit(mir.Gep(dst, 0))
         self._emit(mir.Store(tag, mir.BoolValue(not null)))
         if not null:
             payload = self._emit(mir.Gep(dst, 1))
-            self._emit(mir.Store(payload, self._to_runtime(self._coerce(value, child))))
+            self._emit(mir.Store(payload, self._to_runtime(self._coerce(self._option_payload_for_write(value, option), child))))
+
+    def _write_option_runtime_tag(
+        self, dst: mir.Value, option: sval.OptionType, is_null: InterpVal, payload: InterpVal
+    ) -> None:
+        """Write an option whose tag ``is_null`` is only known at runtime into
+        the memory ``dst``: the tag value (a runtime ``bool``) is stored where
+        the representation keeps it, and the payload - read out of the option
+        the value already is - is written as well.  A representation that tags
+        on a pointer nulls it with a ``mir.Select`` when the option is absent."""
+        child = option.child
+        if child.is_zst():
+            # the option *is* the "is there a value" bool
+            self._emit(mir.Store(dst, self._not_bool(is_null)))
+            return
+        tag_path = sval.find_first_pointer_type_pos(child)
+        if tag_path is None:
+            # the (bool, T) representation: the tag is the first field
+            tag = self._emit(mir.Gep(dst, 0))
+            self._emit(mir.Store(tag, self._not_bool(is_null)))
+            payload_ptr = self._emit(mir.Gep(dst, 1))
+            self._emit(mir.Store(payload_ptr, self._to_runtime(self._coerce(payload, child))))
+            return
+        # the option shares the child's representation: write the present value
+        # and null the pointer that tags it when the option is absent
+        self._emit(mir.Store(dst, self._to_runtime(self._coerce(payload, child))))
+        tag_ptr, tag_type = self._option_tag_addr(dst, option.child, tag_path)
+        mir_type = tag_type.to_mir_type(self._mir_cache)
+        assert isinstance(mir_type, mir.PointerType)
+        current = self._emit(mir.Load(tag_ptr))
+        selected = self._emit(mir.Select(self._to_runtime(is_null), mir.NullValue(mir_type), current))
+        self._emit(mir.Store(tag_ptr, selected))
+
+    def _not_bool(self, value: InterpVal) -> mir.Value:
+        """The negation of a boolean value as a MIR ``bool``: a compile-time one
+        folds, a runtime one becomes a comparison against ``false``."""
+        obj = _to_comptime(value)
+        if isinstance(obj, bool):
+            return mir.BoolValue(not obj)
+        return self._emit(mir.Cmp('==', False, 'int', self._to_runtime(value), mir.BoolValue(False)))
+
+    def _option_payload_for_write(self, value: InterpVal, option: sval.OptionType) -> InterpVal:
+        """The child value a store of ``value`` into an ``option`` writes: the
+        payload a compile-time option or a runtime one of the option's own type
+        carries, and the value itself when it already is a child value."""
+        if isinstance(value, ComptimeOption):
+            return value.value
+        if isinstance(value, RuntimeVal) and _type_of(value) == option:
+            return self._option_payload(value, option)
+        return value
+
+    def _write_comptime_option(self, ptr: ComptimeOptionPtr, value: InterpVal, option: sval.OptionType) -> None:
+        """Write an option value into compile-time storage: the tag, a value,
+        apart from the payload, a place (see ``ComptimeOptionPtr``)."""
+        is_null = self._is_null(value)
+        ptr.is_null = is_null
+        if _to_comptime(is_null) is True:
+            # absent: the payload place is left as it is (nothing reads it)
+            return
+        self.store(ptr.payload_ptr, self._option_payload_for_write(value, option))
 
     def _option_tag_addr(
-        self, ptr: mir.Value, option: sval.OptionType
-    ) -> tuple[mir.Value, sval.PointerType] | None:
+        self, ptr: mir.Value, opt_child_type: sval.Type, tag_path: tuple[int, ...]
+    ) -> tuple[mir.Value, sval.PointerType]:
         """The address of the pointer that tags ``option``, and its type - the
         pointer whose nullness makes the option absent - or ``None`` when the
         option's representation carries a ``bool`` tag instead (see
@@ -2775,12 +3000,9 @@ class HirRunner:
         element is its own position, and stepping into an option costs no
         position (an option that still has a free pointer shares the
         representation of its child)."""
-        path = sval.find_first_pointer_type_pos(option.child)
-        if path is None:
-            return None
-        node: sval.Type = option.child
+        node: sval.Type = opt_child_type
         cur = ptr
-        for index in path:
+        for index in tag_path:
             if isinstance(node, sval.OptionType):
                 node = node.child
                 continue
@@ -2794,20 +3016,10 @@ class HirRunner:
                 cur = self._emit(mir.Gep(cur, index))
                 node = node.elem
             else:
-                raise CompileError(f'cannot take the tag address of {option}')
+                raise CompileError(f'cannot take the tag address of Option[{opt_child_type}]')
         if not isinstance(node, sval.PointerType):
-            raise CompileError(f'cannot take the tag address of {option}')
+            raise CompileError(f'cannot take the tag address of Option[{opt_child_type}]')
         return cur, node
-
-    def _write_option_null(self, dst: mir.Value, option: sval.OptionType) -> None:
-        """Write the absent value of ``option`` into the memory ``dst``: null
-        the pointer that tags it."""
-        tag = self._option_tag_addr(dst, option)
-        assert tag is not None, 'the option has a pointer tag'
-        tag_ptr, tag_type = tag
-        mir_type = tag_type.to_mir_type(self._mir_cache)
-        assert isinstance(mir_type, mir.PointerType)
-        self._emit(mir.Store(tag_ptr, mir.NullValue(mir_type)))
 
     def _coerce_option_value(self, ev: InterpVal, option: sval.OptionType) -> InterpVal:
         """Materialize ``ev`` as a value of the option type ``option``: a value
@@ -2817,33 +3029,31 @@ class HirRunner:
         The result is a value of the option: for a child that has a free pointer
         (whose representation the option shares) the coerced child itself, a
         ``bool`` or a null pointer for the scalar representations, and the
-        ``mir.Load`` of a fresh temporary for the struct representation (a tag
-        and the value have no constant form of their own)."""
+        constructed ``(bool, T)`` representation otherwise (see
+        ``_option_parts_to_runtime``)."""
         ev = _shallow_normalize(ev)
         if isinstance(ev, RuntimeVal) and _type_of(ev) == option:
             return ev
-        if isinstance(ev, ComptimeOption):
-            # a present option held compile-time: its child is what is stored
-            ev = ev.value
         child = option.child
-        null = _comptime_bool(self._is_null(ev), 'the option value')
-        if child.is_zst():
-            return RuntimeVal(mir.BoolValue(not null), option)
-        if sval.find_first_pointer_type_pos(child) is not None:
-            if not null:
-                return self._coerce(ev, child)
-            mir_type = option.to_mir_type(self._mir_cache)
-            assert mir_type is not None and not option.is_zst()
-            if isinstance(mir_type, mir.PointerType):
-                # the option itself is the tagging pointer: a null pointer is
-                # the absent value
-                return RuntimeVal(mir.NullValue(mir_type), option)
-        # build the representation in a temporary and load it back
-        mir_type = option.to_mir_type(self._mir_cache)
-        assert mir_type is not None and not option.is_zst()
-        alloca = self._emit(mir.Alloca(mir_type))
-        self._write_option(alloca, ev, option)
-        return RuntimeVal(self._emit(mir.Load(alloca)), option)
+        is_null = self._is_null(ev)
+        value = self._option_payload_for_write(ev, option)
+        null_const = _to_comptime(is_null)
+        if null_const is not None:
+            null = bool(null_const)
+            if child.is_zst():
+                return RuntimeVal(mir.BoolValue(not null), option)
+            if sval.find_first_pointer_type_pos(child) is not None:
+                if not null:
+                    return self._coerce(value, child)
+                mir_type = option.to_mir_type(self._mir_cache)
+                assert mir_type is not None and not option.is_zst()
+                if isinstance(mir_type, mir.PointerType):
+                    # the option itself is the tagging pointer: a null pointer is
+                    # the absent value
+                    return RuntimeVal(mir.NullValue(mir_type), option)
+        # the (bool, T) representation: the tag and the value are joined (a tag
+        # that is a runtime value needs the payload written as well)
+        return RuntimeVal(self._option_parts_to_runtime(option, is_null, value), option)
 
     def _arg_value(self, arg: ArgEntry[InterpVal]) -> InterpVal:
         """The value an argument denotes: a reference argument is loaded
@@ -2891,7 +3101,7 @@ class HirRunner:
             # are taken in the payload of each of them
             while self._is_option_construction(container_type):
                 assert isinstance(container_type, sval.OptionType)
-                ptr = self._option_payload_ptr(ptr, container_type)
+                ptr = self._option_payload_ptr(ptr)
                 type = _type_of(ptr)
                 assert isinstance(type, sval.PointerType)
                 container_type = type.elem
@@ -2950,7 +3160,7 @@ class HirRunner:
             # marks the option present when its tag is a ``bool``
             while self._is_option_construction(container_type):
                 assert isinstance(container_type, sval.OptionType)
-                ptr = self._option_payload_ptr(ptr, container_type)
+                ptr = self._option_payload_ptr(ptr)
                 type = _type_of(ptr)
                 assert isinstance(type, sval.PointerType)
                 container_type = type.elem
@@ -3042,6 +3252,11 @@ class HirRunner:
                     # is built in place, its fields (or elements) being their own
                     # places
                     slot.committed = self.init_inline_aggregate(declared)
+                elif isinstance(declared, sval.OptionType):
+                    # a compile-time variable of an option type: the option has
+                    # its own place form, a tag value and a payload place (see
+                    # ``ComptimeOptionPtr``)
+                    slot.committed = self.init_comptime_option(declared)
                 else:
                     # a compile-time variable of a declared type: a box the
                     # value it is assigned is written into
@@ -3132,6 +3347,15 @@ class HirRunner:
                         f'cannot materialize a {target} from a compile-time aggregate'
                     )
                 return ev
+            case ComptimeOptionPtr():
+                # the compile-time place of an option is a pointer already (see
+                # ``_type_of``): like a compile-time aggregate, nothing is
+                # converted until a MIR value is actually needed (``_to_runtime``)
+                if not isinstance(target, sval.PointerType):
+                    raise CoerceError(
+                        f'cannot materialize a {target} from a compile-time option'
+                    )
+                return ev
             case ComptimeBox():
                 # a compile-time box already is a value of a pointer type (see
                 # ``_type_of``), and a pointer needs no conversion, just like a
@@ -3199,19 +3423,147 @@ class HirRunner:
                         f'a value of the zero-sized {aggregate_type} has no runtime value'
                     )
                 return self._to_runtime(self._materialize_aggregate(aggregate, aggregate_type))
-            case ComptimeAggregate(aggregate_type, _):
-                if aggregate_type.is_zst():
-                    raise CompileError(
-                        f'a value of the zero-sized {aggregate_type} has no runtime value'
-                    )
-                return self._to_runtime(
-                    self.load(self._materialize_aggregate(ev, aggregate_type))
-                )
+            case ComptimeAggregate():
+                return self._aggregate_to_runtime(ev)
+            case ComptimeOption():
+                option = _type_of(ev)
+                assert isinstance(option, sval.OptionType)
+                return self._option_parts_to_runtime(option, ev.is_null, ev.value)
+            case ComptimeOptionPtr():
+                # the compile-time *storage* of an option: what a value of its
+                # pointer type delivers is the address of fresh memory the option
+                # is written into (like a compile-time aggregate pointer), not
+                # the option value itself
+                ptr_type = _type_of(ev)
+                assert isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.OptionType)
+                option = ptr_type.elem
+                mir_type = option.to_mir_type(self._mir_cache)
+                assert mir_type is not None
+                alloca = self._emit(mir.Alloca(mir_type))
+                self._write_option(alloca, self.load(ev), option)
+                return alloca
             case ComptimeBox():
                 raise CompileError('cannot use a compile-time box as a runtime value')
             case PendingSlot():
                 raise CompileError('cannot use an uncommitted slot as a runtime value')
         raise CompileError('cannot return this value')
+
+    def _aggregate_to_runtime(self, ev: ComptimeAggregate) -> mir.Value:
+        """Build the runtime value of the aggregate ``ev`` from its fields,
+        with a chain of ``mir.InsertValue``: a struct mirror that *is* one of
+        its fields (see ``sval.StructType.mirror_is_a_field``) yields that
+        field's value itself, and a zero-sized aggregate has no runtime value
+        at all."""
+        aggregate_type = ev.type
+        if aggregate_type.is_zst():
+            raise CompileError(
+                f'a value of the zero-sized {aggregate_type} has no runtime value'
+            )
+        mir_type = aggregate_type.to_mir_type(self._mir_cache)
+        if mir_type is None:
+            raise _no_runtime_type(aggregate_type)
+        if isinstance(aggregate_type, sval.StructType):
+            indices = aggregate_type.get_field_mir_indices(self._mir_cache)
+            if aggregate_type.mirror_is_a_field(self._mir_cache):
+                # the mirror of the struct is the mirror of its single stored
+                # field: the value *is* that field's value
+                for index, mir_index in enumerate(indices):
+                    if mir_index is not None:
+                        return self._to_runtime(ev.values[index])
+                raise CompileError(f'{aggregate_type} has no stored field')
+            result: mir.Value = mir.UndefValue(mir_type)
+            for index, mir_index in enumerate(indices):
+                if mir_index is None:
+                    continue
+                result = self._emit(mir.InsertValue(result, self._to_runtime(ev.values[index]), mir_index))
+            return result
+        # an array: the elements sit in element order
+        result = mir.UndefValue(mir_type)
+        for index, value in enumerate(ev.values):
+            result = self._emit(mir.InsertValue(result, self._to_runtime(value), index))
+        return result
+
+    def _option_parts_to_runtime(self, option: sval.OptionType, is_null: InterpVal, value: InterpVal) -> mir.Value:
+        """Build the runtime value of an option from its tag ``is_null`` (which
+        may be a runtime value) and its payload ``value``: the two are joined
+        through the representation the child chooses (see
+        ``sval.OptionType.to_mir_type``).  The ``(bool, T)`` representation
+        inserts both into an ``undef`` struct, a zero-sized child only keeps
+        whether there is one, and a pointer tag nulls the tagging pointer of the
+        payload with a ``mir.Select`` when the option is absent."""
+        child = option.child
+        null_const = _to_comptime(is_null)
+        if child.is_zst():
+            # the option *is* the "is there a value" bool
+            if isinstance(null_const, bool):
+                return mir.BoolValue(not null_const)
+            return self._emit(mir.Select(self._to_runtime(is_null), mir.BoolValue(False), mir.BoolValue(True)))
+        tag_path = sval.find_first_pointer_type_pos(child)
+        if tag_path is None:
+            # the (bool, T) representation: the tag and the value are inserted
+            # into an undefined struct in turn
+            mir_type = option.to_mir_type(self._mir_cache)
+            assert isinstance(mir_type, mir.StructType)
+            if isinstance(null_const, bool):
+                tag: mir.Value = mir.BoolValue(not null_const)
+                payload: mir.Value = (
+                    mir.UndefValue(mir_type.fields[1].type) if null_const
+                    else self._to_runtime(self._coerce(value, child))
+                )
+            else:
+                # the tag is only known at runtime: the payload is always there
+                tag = self._not_bool(is_null)
+                payload = self._to_runtime(self._coerce(value, child))
+            with_tag = self._emit(mir.InsertValue(mir.UndefValue(mir_type), tag, 0))
+            return self._emit(mir.InsertValue(with_tag, payload, 1))
+        # a pointer tag: the option shares the child's representation
+        if isinstance(null_const, bool) and null_const:
+            return self._absent_pathed_runtime_option_value(option.child, tag_path)
+        present = self._to_runtime(self._coerce(value, child))
+        if isinstance(null_const, bool):
+            return present
+        absent = self._absent_pathed_runtime_option_value(option.child, tag_path)
+        return self._emit(mir.Select(self._to_runtime(is_null), absent, present))
+
+    def _absent_pathed_runtime_option_value(self, child: sval.Type, path: tuple[int, ...]) -> mir.Value:
+        """The runtime value an absent option of type ``option`` has: the child
+        value with the pointer that tags the option (its first pointer, see
+        ``sval.find_first_pointer_type_pos``) nulled.  The other fields of the
+        child are undefined - nothing may read the payload of an absent
+        option."""
+        assert path is not None, 'the option has a pointer tag'
+        node: sval.Type = child
+        # the aggregate mirrors along the path, outermost first, that the value
+        # is rebuilt through: a struct whose mirror is a field of its own (see
+        # ``mirror_is_a_field``) or an option layer is stepped through without
+        # one
+        layers: list[tuple[mir.Type, int]] = []
+        for index in path:
+            if isinstance(node, sval.OptionType):
+                node = node.child
+                continue
+            mir_index: int | None
+            if isinstance(node, sval.StructType):
+                if node.mirror_is_a_field(self._mir_cache):
+                    mir_index = None
+                else:
+                    mir_index = node.get_field_mir_indices(self._mir_cache)[index]
+            elif isinstance(node, sval.ArrayType):
+                mir_index = index
+            else:
+                raise CompileError(f'cannot take the tag pointer of Option[{child}]')
+            if mir_index is not None:
+                mir_type = node.to_mir_type(self._mir_cache)
+                assert mir_type is not None
+                layers.append((mir_type, mir_index))
+            node = node.get_type_children()[index]
+        assert isinstance(node, sval.PointerType)
+        mir_type = node.to_mir_type(self._mir_cache)
+        assert isinstance(mir_type, mir.PointerType)
+        result: mir.Value = mir.NullValue(mir_type)
+        for outer_mir_type, mir_index in reversed(layers):
+            result = self._emit(mir.InsertValue(mir.UndefValue(outer_mir_type), result, mir_index))
+        return result
 
     def _convert(
         self, value: mir.Value, from_type: sval.Type, to_type: sval.Type
@@ -3565,6 +3917,10 @@ class HirRunner:
                 # a compile-time aggregate: its fields (or elements) are their
                 # own places (see ``init_inline_aggregate``)
                 val.committed = self._inline_aggregate_of(val, type)
+            elif isinstance(type, sval.OptionType):
+                # a compile-time option: the tag is a value and the payload a
+                # place of its own (see ``ComptimeOptionPtr``)
+                val.committed = self.init_comptime_option(type)
             else:
                 # a single value in a compile-time box
                 val.committed = ComptimeBox(type, ComptimeVal(sval.Undefined(type)))
@@ -3730,7 +4086,7 @@ class HirRunner:
             # the delivery goes into the payload of the option - and, when the
             # option's child is an option itself, through each of its layers
             # (a ``T`` converts to ``Option[T]``, and so on outward)
-            inner = self._option_payload_ptr(ptr, from_type)
+            inner = self._option_payload_ptr(ptr)
             return self._convert_result_ptr(inner, to_type)
         raise CompileError(
             f'cannot deliver a {to_type} into a location of type {from_type}'
@@ -3745,26 +4101,41 @@ class HirRunner:
             and not container_type.child.is_zst()
         )
 
-    def _option_payload_ptr(self, ptr: InterpVal, option: sval.OptionType) -> InterpVal:
+    def _option_payload_ptr(self, ptr: InterpVal, write_tag: bool = True) -> InterpVal:
         """The place the value of a present ``Option[T]`` lives in - what a
         delivery of a ``T`` into the option writes through.  The delivery also
         marks the option present: for a child that still has a free pointer the
         option *is* the value (that pointer is the tag, and the value itself
         sets it), and otherwise the tag of the struct representation is set
-        here."""
+        here.
+
+        ``write_tag`` says whether taking the address also marks the option
+        present: a construction delivering a ``T`` does, while the ``:=``
+        unwrap does not - the option may still be absent when the address is
+        taken, and its tag must not be overwritten before it is tested."""
+        type = _type_of(ptr)
+        assert isinstance(type, sval.PointerType)
+        option = type.elem
+        assert isinstance(option, sval.OptionType)
         child = option.child
         if child.is_zst():
             # a zero-sized child has no storage to address: its value is the
             # type's unit value, which the place of an undefined pointer names
             # (a store into it is a no-op, see ``store``)
-            return ComptimeVal(sval.Undefined(sval.PointerType(child, is_const=False)))
+            return ComptimeVal(sval.Undefined(sval.PointerType(child, type.is_const)))
+        ptr = _shallow_normalize(ptr)
+        if isinstance(ptr, ComptimeOptionPtr):
+            if write_tag:
+                ptr.is_null = ComptimeVal(False)
+            return ptr.payload_ptr
         src = self._to_runtime(ptr)
         if sval.find_first_pointer_type_pos(child) is not None:
-            return RuntimeVal(src, sval.PointerType(child, is_const=False))
+            return RuntimeVal(src, sval.PointerType(child, type.is_const))
         tag = self._emit(mir.Gep(src, 0))
-        self._emit(mir.Store(tag, mir.BoolValue(True)))
+        if write_tag:
+            self._emit(mir.Store(tag, mir.BoolValue(True)))
         payload = self._emit(mir.Gep(src, 1))
-        return RuntimeVal(payload, sval.PointerType(child, is_const=False))
+        return RuntimeVal(payload, sval.PointerType(child, type.is_const))
 
     def _is_null(self, ev: InterpVal) -> InterpVal:
         """Whether ``ev`` is the *absent* value of an option, as a bool value.
@@ -3780,6 +4151,9 @@ class HirRunner:
         and any other child tags a ``(bool, T)`` struct whose first field is the
         tag."""
         ev = _shallow_normalize(ev)
+        if isinstance(ev, ComptimeOption):
+            # a compile-time option carries its own tag (see ``ComptimeOption``)
+            return ev.is_null
         if isinstance(ev, ComptimeVal):
             return ComptimeVal(isinstance(ev.obj, (sval.Null, sval.TypedNull)))
         type = _type_of(ev)
@@ -3804,7 +4178,7 @@ class HirRunner:
             tag, tag_type = self._option_tag_value(RuntimeVal(ev.value, child), child)
             tag_mir_type = tag_type.to_mir_type(self._mir_cache)
             assert isinstance(tag_mir_type, mir.PointerType)
-            cmp = mir.Cmp('==', False, 'int', self._to_runtime(tag), mir.NullValue(tag_mir_type))
+            cmp = mir.Cmp('==', False, 'ptr', self._to_runtime(tag), mir.NullValue(tag_mir_type))
         return RuntimeVal(self._emit(cmp), sval.BoolType())
 
     def _option_tag_value(self, value: InterpVal, child: sval.Type) -> tuple[InterpVal, sval.PointerType]:
@@ -3846,6 +4220,8 @@ class HirRunner:
         ev = _shallow_normalize(ev)
         child = option.child
         if isinstance(ev, ComptimeOption):
+            if _to_comptime(ev.is_null) is True:
+                raise CompileError(f'a present value is required here: {option} is absent')
             return ev.value
         if isinstance(ev, RuntimeVal) and _type_of(ev) == option:
             if child.is_zst():
@@ -4028,14 +4404,14 @@ class HirRunner:
         option holding it coerced to ``usize`` otherwise."""
         if _comptime_bool(self._is_null(ev), what):
             return ComptimeVal(sval.TypedNull(usize))
-        return ComptimeOption(self._coerce(ev, usize))
+        return ComptimeOption(ComptimeVal(False), self._coerce(ev, usize))
 
     def _slice_bound_value(self, ev: InterpVal, what: str) -> InterpVal | None:
         """The value of a bound of the ``std.slice`` object a slice subscript
         built, or None when it is absent (see ``slice_object``)."""
         ev = _shallow_normalize(ev)
         if isinstance(ev, ComptimeOption):
-            return ev.value
+            return None if _comptime_bool(ev.is_null, what) else ev.value
         if _comptime_bool(self._is_null(ev), what):
             return None
         return ev
@@ -4155,15 +4531,32 @@ class HirRunner:
         ``ComptimeAggregatePtr`` and ``ComptimeAggregate``)."""
         places: list[InterpVal] = []
         for place_type in _aggregate_place_types(type):
-            if _is_aggregate(place_type):
-                places.append(self.init_inline_aggregate(place_type))
-                continue
             unit = place_type.get_unit_value()
-            if unit is not None:
-                places.append(ComptimeBox(place_type, ComptimeVal(unit)))
-            else:
-                places.append(ComptimeBox(place_type, ComptimeVal(sval.Undefined(place_type))))
+            initial = ComptimeVal(unit) if unit is not None else ComptimeVal(sval.Undefined(place_type))
+            places.append(self._fresh_place(place_type, initial))
         return ComptimeAggregatePtr(type, tuple(places))
+
+    def _fresh_place(self, type: sval.Type, initial: InterpVal) -> InterpVal:
+        """A fresh compile-time place for a value of ``type``, used as the
+        field/element/payload of a compile-time aggregate or option: a nested
+        aggregate or option gets a pointer form of its own, anything else a
+        box.  ``initial`` is the value the place holds before it is written
+        (the type's unit value for a zero-sized one, undefined otherwise)."""
+        if _is_aggregate(type):
+            return self.init_inline_aggregate(type)
+        if isinstance(type, sval.OptionType):
+            return self.init_comptime_option(type)
+        return ComptimeBox(type, initial)
+
+    def init_comptime_option(self, option: sval.OptionType) -> ComptimeOptionPtr:
+        """Fresh compile-time storage for an option: the payload gets a place of
+        its own and the tag starts absent (see ``ComptimeOptionPtr``)."""
+        child = option.child
+        if child.is_zst():
+            payload: InterpVal = ComptimeVal(sval.Undefined(sval.PointerType(child, is_const=False)))
+        else:
+            payload = self._fresh_place(child, ComptimeVal(sval.Undefined(child)))
+        return ComptimeOptionPtr(ComptimeVal(True), payload)
 
     def finish_struct(
         self,

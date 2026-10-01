@@ -304,6 +304,8 @@ class _Lowerer:
             ptr_type = self._to_llvm(value.type)
             assert isinstance(ptr_type, sllvm.PointerType)
             return sllvm.NullValue(ptr_type)
+        if isinstance(value, mir.UndefValue):
+            return sllvm.Undef(self._to_llvm(value.type))
         if isinstance(value, mir.GlobalValue):
             return self.lower_global(value)
         raise CompileError(f'cannot lower value {value!r}')
@@ -368,6 +370,18 @@ class _Lowerer:
                     result = block.get_element_ptr(ptr, index_value)
             case mir.ExtractValue():
                 result = block.extract_value(self._value(inst.value, arg_values), inst.index)
+            case mir.InsertValue():
+                result = block.insert_value(
+                    self._value(inst.value, arg_values),
+                    self._value(inst.elem, arg_values),
+                    inst.index,
+                )
+            case mir.Select():
+                result = block.select(
+                    self._value(inst.cond, arg_values),
+                    self._value(inst.if_true, arg_values),
+                    self._value(inst.if_false, arg_values),
+                )
             case mir.Arith():
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)
@@ -423,6 +437,9 @@ class _Lowerer:
                 op = _ICMP_OPS[inst.op]
                 if inst.kind == 'int':
                     result = block.icmp(op, inst.signed, lhs, rhs)
+                elif inst.kind == 'ptr':
+                    # only equality is defined on pointers (``icmp eq/ne``)
+                    result = block.icmp(op, False, lhs, rhs)
                 else:
                     result = block.fcmp(op, lhs, rhs)
             case mir.Phi():

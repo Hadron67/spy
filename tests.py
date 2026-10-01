@@ -4827,6 +4827,563 @@ class SpyOptionNestingTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# ``and``/``or``: a chain is lowered into a ``hir.Block`` whose operands
+# short-circuit with ``hir.BreakIf``s.  An ``if``/``while`` whose condition is
+# an ``and`` chain puts its branch body inside the block, so an unwrapped
+# option's payload dominates it (see ``astgen``).
+# ---------------------------------------------------------------------------
+
+
+@func()
+def record(p: Ptr[i32], v: i32) -> spy_bool:
+    # a side effect, to observe whether an operand was evaluated
+    p[...] = v
+    return True
+
+
+@func()
+def boolop_and(a: i32, b: i32) -> i32:
+    if a > 0 and b > 0:
+        return 1
+    return 0
+
+
+@func()
+def boolop_and_else(a: i32, b: i32) -> i32:
+    if a > 0 and b > 0:
+        return 1
+    else:
+        return 2
+
+
+@func()
+def boolop_and_return(a: i32, b: i32) -> i32:
+    if a > 0 and b > 0 and a + b > 5:
+        return a + b
+    return -1
+
+
+@func()
+def boolop_or(a: i32, b: i32) -> i32:
+    if a > 0 or b > 0:
+        return 1
+    return 0
+
+
+@func()
+def boolop_or_else(a: i32, b: i32) -> i32:
+    if a > 0 or b > 0:
+        return 1
+    else:
+        return 2
+
+
+@func()
+def boolop_nested(a: i32, b: i32, c: spy_bool) -> i32:
+    # an ``or`` chain is an operand of an ``and`` chain
+    if (a > 0 or b > 0) and c:
+        return 1
+    return 0
+
+
+@func()
+def boolop_comptime(a: i32) -> i32:
+    # a compile-time operand short-circuits the chain
+    flag: Comptime = False
+    if a > 0 and flag:
+        return 1
+    return 0
+
+
+@func()
+def boolop_and_value(a: i32, b: i32) -> spy_bool:
+    return a > 0 and b > 0
+
+
+@func()
+def boolop_or_value(a: i32, b: i32) -> spy_bool:
+    return a > 0 or b > 0
+
+
+@func()
+def boolop_and_short_circuit(a: i32) -> i32:
+    # the ``record`` operand runs only when the first one is true
+    x = a
+    if a > 0 and record(ref(x), 7):
+        pass
+    return x
+
+
+@func()
+def boolop_or_short_circuit(a: i32) -> i32:
+    # ... and only when the first one is false, for ``or``
+    x = a
+    if a > 0 or record(ref(x), 7):
+        pass
+    return x
+
+
+@func()
+def boolop_while(n: i32) -> i32:
+    i: i32 = 0
+    total: i32 = 0
+    while i < n and i < 3:
+        total = total + i
+        i = i + 1
+    return total
+
+
+@func()
+def boolop_while_break(n: i32) -> i32:
+    i: i32 = 0
+    total: i32 = 0
+    while i < n and i < 5:
+        if i == 2:
+            break
+        total = total + i
+        i = i + 1
+    else:
+        total = total + 100
+    return total
+
+
+@func()
+def boolop_while_continue(n: i32) -> i32:
+    i: i32 = 0
+    total: i32 = 0
+    while i < n and i < 4:
+        i = i + 1
+        if i == 2:
+            continue
+        total = total + i
+    return total
+
+
+class SpyBoolOpTest(TestCase):
+    def test_and(self) -> None:
+        self.assertEqual(boolop_and(1, 1), 1)
+        self.assertEqual(boolop_and(0, 1), 0)
+        self.assertEqual(boolop_and(1, 0), 0)
+
+    def test_and_with_an_else(self) -> None:
+        self.assertEqual(boolop_and_else(1, 1), 1)
+        self.assertEqual(boolop_and_else(1, 0), 2)
+
+    def test_a_body_that_returns(self) -> None:
+        self.assertEqual(boolop_and_return(3, 4), 7)
+        self.assertEqual(boolop_and_return(1, 1), -1)
+        self.assertEqual(boolop_and_return(0, 4), -1)
+
+    def test_or(self) -> None:
+        self.assertEqual(boolop_or(1, 0), 1)
+        self.assertEqual(boolop_or(0, 1), 1)
+        self.assertEqual(boolop_or(0, 0), 0)
+
+    def test_or_with_an_else(self) -> None:
+        self.assertEqual(boolop_or_else(0, 1), 1)
+        self.assertEqual(boolop_or_else(0, 0), 2)
+
+    def test_a_nested_chain(self) -> None:
+        self.assertEqual(boolop_nested(1, 0, True), 1)
+        self.assertEqual(boolop_nested(0, 0, True), 0)
+        self.assertEqual(boolop_nested(1, 1, False), 0)
+
+    def test_a_compile_time_operand(self) -> None:
+        self.assertEqual(boolop_comptime(1), 0)
+
+    def test_a_chain_as_a_value(self) -> None:
+        self.assertTrue(boolop_and_value(1, 1))
+        self.assertFalse(boolop_and_value(1, 0))
+        self.assertFalse(boolop_and_value(0, 1))
+        self.assertTrue(boolop_or_value(1, 0))
+        self.assertTrue(boolop_or_value(0, 1))
+        self.assertFalse(boolop_or_value(0, 0))
+
+    def test_short_circuiting(self) -> None:
+        self.assertEqual(boolop_and_short_circuit(0), 0)
+        self.assertEqual(boolop_and_short_circuit(1), 7)
+        self.assertEqual(boolop_or_short_circuit(1), 1)
+        self.assertEqual(boolop_or_short_circuit(-1), 7)
+
+    def test_a_while_condition(self) -> None:
+        self.assertEqual(boolop_while(5), 3)
+        self.assertEqual(boolop_while(2), 1)
+
+    def test_break_and_the_else_of_a_while(self) -> None:
+        self.assertEqual(boolop_while_break(9), 1)
+        self.assertEqual(boolop_while_break(2), 101)
+
+    def test_continue_of_a_while(self) -> None:
+        self.assertEqual(boolop_while_continue(5), 8)
+
+
+# ---------------------------------------------------------------------------
+# unwrapping an option: ``expr is None`` / ``expr is not None`` test whether an
+# option is absent, and the walrus form ``(name := expr) is not None`` binds
+# ``name`` to the option's *payload* - a place, so writing through it writes the
+# payload - while the general ``(name := expr)`` binds the option itself.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def unwrap_opt(x: i32, c: spy_bool) -> i32:
+    # ``o`` is the payload of the option: reading it reads the payload
+    if (o := maybe_add(x, 1, c)) is not None:
+        return o
+    return -1
+
+
+@func()
+def unwrap_opt_written(x: i32, c: spy_bool) -> i32:
+    # writing ``o`` writes the payload of the option
+    if (o := maybe_add(x, 1, c)) is not None:
+        o = o + 10
+        return o
+    return -1
+
+
+@func()
+def unwrap_opt_augmented(x: i32, c: spy_bool) -> i32:
+    if (o := maybe_add(x, 1, c)) is not None:
+        o += 100
+        return o
+    return -1
+
+
+@func()
+def opt_is_none(x: i32, c: spy_bool) -> spy_bool:
+    o = maybe_add(x, 1, c)
+    return o is None
+
+
+@func()
+def walrus_is_none(x: i32, c: spy_bool) -> spy_bool:
+    # the general ``:=`` binds the target to the option itself, which ``is
+    # None`` then tests
+    return (_ := maybe_add(x, 1, c)) is None
+
+
+@func()
+def unwrap_opt_chain(x: i32, c: spy_bool) -> i32:
+    # both names are visible in the branch the ``and`` chain guards
+    if (a := maybe_add(x, 1, c)) is not None and (b := maybe_add(x, 100, c)) is not None:
+        return a + b
+    return -1
+
+
+@func()
+def unwrap_ptr_opt(x: i32, c: spy_bool) -> i32:
+    # the option shares the representation of its pointer child: the payload is
+    # the pointer itself
+    y = x
+    if (p := maybe_ptr(ref(y), c)) is not None:
+        return p[...]
+    return -1
+
+
+@func()
+def unwrap_large_opt(x: i64, c: spy_bool) -> i64:
+    if (l := maybe_large(x, c)) is not None:
+        return l.a
+    return -1
+
+
+@func()
+def unwrap_deep_opt(x: i32, c: spy_bool) -> i32:
+    # the outer option carries a ``bool`` tag (the inner one claimed the only
+    # pointer): both layers are unwrapped
+    if (p := maybe_deep(x, c)) is not None:
+        if (q := p) is not None:
+            return q[...]
+        return -2
+    return -1
+
+
+@func()
+def unwrap_comptime_field(x: i32, c: spy_bool) -> i32:
+    # an option field of a compile-time aggregate: its payload pointer is taken
+    # out of the compile-time storage (a ``ComptimeOptionPtr``)
+    h = OptHolder(x if c else None, 1)
+    ch: Comptime = h
+    if (o := ch.o) is not None:
+        return o + 100
+    return -1
+
+
+@func()
+def maybe_u0(c: spy_bool) -> Option[u0]:
+    if c:
+        return 0  # pyright: ignore[reportReturnType]
+    return None
+
+
+@func()
+def unwrap_u0(c: spy_bool) -> i32:
+    # a zero-sized child: the payload has no storage, only its presence matters
+    if (_ := maybe_u0(c)) is not None:
+        return 7
+    return -1
+
+
+@func()
+def unwrap_declared() -> i32:
+    # a declared ``Comptime[Option[T]]`` variable is compile-time option storage
+    ch: Comptime[Option[i32]] = 5
+    if (o := ch) is not None:
+        return o
+    return -1
+
+
+@func()
+def bad_is_none(x: i32) -> spy_bool:
+    # ``is None`` needs an option
+    return x is None  # pyright: ignore[reportUnnecessaryComparison]
+
+
+@func()
+def unwrap_scope_leak(x: i32, c: spy_bool) -> i32:
+    # ``o`` is declared in the ``if`` condition's scope: it is not visible after
+    # the ``if``, so reading it here is rejected
+    if (o := maybe_add(x, 1, c)) is not None:
+        pass
+    return 0 if o is None else o
+
+
+@func()
+def walrus_duplicate(x: i32, c: spy_bool) -> i32:
+    # a ``:=`` target introduces a new variable: a duplicate is rejected
+    if (_ := maybe_add(x, 1, c)) is not None and (_ := maybe_add(x, 2, c)) is not None:
+        return 1
+    return -1
+
+
+# an option field of a compile-time aggregate whose child is a *pointer* struct:
+# the option shares the child's representation, so an absent value nulls the
+# pointer the child's first pointer field names (``mir.InsertValue``)
+@struct()
+class PtrMixedHolder:
+    o: Option[PtrMixed]
+    n: i32
+
+
+@func()
+def pass_declared_ptr_mixed(x: i32, c: spy_bool) -> i32:
+    y = x
+    pm = maybe_ptr_mixed(ref(y), 1, c)
+    ch: Comptime[Option[PtrMixed]] = pm
+    return take_ptr_mixed(ch)
+
+
+@func()
+def comptime_option_ref_in_memory() -> i32:
+    # a plain local has no compile-time storage for the pointer: the option is
+    # materialized and the local points at that copy (the ``_to_runtime`` of a
+    # ``ComptimeOptionPtr``), so writing through it does not touch ``ch``
+    ch: Comptime[Option[i32]] = 5
+    p = ref(ch)
+    p[...] = 7
+    if (v := p[...]) is not None and (w := ch) is not None:
+        return v * 10 + w
+    return -1
+
+
+@func()
+def unwrap_opt_else(x: i32, c: spy_bool) -> i32:
+    # an ``if`` whose ``and`` chain guards an unwrap, with an else branch
+    if (o := maybe_add(x, 1, c)) is not None and (p := maybe_add(o, 1, c)) is not None:
+        return o + p
+    else:
+        return -1
+
+
+@func()
+def unwrap_opt_while(n: i32) -> i32:
+    # an unwrapped option as a ``while`` condition: the body sees the payload
+    total: i32 = 0
+    i = n
+    while (v := maybe_add(i, 1, i > 0)) is not None and v > 1:
+        total = total + v
+        i = i - 1
+    return total
+
+
+@func()
+def unwrap_opt_while_break(n: i32) -> i32:
+    # a ``break`` in the body skips the else clause, a natural exit runs it
+    total: i32 = 0
+    i = n
+    while (v := maybe_add(i, 1, i > 0)) is not None and v > 0:
+        if v > 3:
+            break
+        total = total + v
+        i = i - 1
+    else:
+        total = total + 100
+    return total
+
+
+@func()
+def unwrap_opt_or_condition(x: i32, c: spy_bool) -> i32:
+    # an ``or`` condition is a value: the branch is a plain ``hir.If``
+    if maybe_add(x, 1, c) is not None or maybe_add(x, 2, c) is not None:
+        return 1
+    return -1
+
+
+@func()
+def unwrap_opt_else_scope(x: i32, c: spy_bool) -> i32:
+    # the else branch does not see the unwrap's target
+    if (o := maybe_add(x, 1, c)) is not None:
+        return o
+    else:
+        return 0 if o is None else o  # pyright: ignore[reportPossiblyUnboundVariable]
+
+
+@func()
+def opt_through_ptr(p: Ptr[Option[i32]]) -> i32:
+    # read an option through a pointer to it
+    if (v := p[...]) is not None:
+        return v
+    return -1
+
+
+@func()
+def ptr_opt_through_ptr(p: Ptr[Option[Ptr[i32]]]) -> i32:
+    # ... and a pointer-tag option (it shares the pointer's representation)
+    if (v := p[...]) is not None:
+        return v[...]
+    return -1
+
+
+@func()
+def comptime_option_ptr_present() -> i32:
+    # ``ref`` of compile-time option storage: the option is materialized and
+    # the pointer to that copy is what is passed (``_to_runtime`` of a
+    # ``ComptimeOptionPtr``)
+    ch: Comptime[Option[i32]] = 5
+    return opt_through_ptr(ref(ch))
+
+
+@func()
+def comptime_option_ptr_absent() -> i32:
+    ch: Comptime[Option[i32]] = None
+    return opt_through_ptr(ref(ch))
+
+
+@func()
+def comptime_option_ptr_runtime(x: i32, c: spy_bool) -> i32:
+    # the tag comes from a runtime option value
+    o = maybe_add(x, 1, c)
+    ch: Comptime[Option[i32]] = o
+    return opt_through_ptr(ref(ch))
+
+
+@func()
+def comptime_option_ptr_of_ptr(x: i32, c: spy_bool) -> i32:
+    y = x
+    o = maybe_ptr(ref(y), c)
+    ch: Comptime[Option[Ptr[i32]]] = o
+    return ptr_opt_through_ptr(ref(ch))
+
+
+class SpyOptionUnwrapTest(TestCase):
+    def test_reading_the_payload(self) -> None:
+        self.assertEqual(unwrap_opt(10, True), 11)
+        self.assertEqual(unwrap_opt(10, False), -1)
+
+    def test_writing_through_the_payload(self) -> None:
+        self.assertEqual(unwrap_opt_written(10, True), 21)
+        self.assertEqual(unwrap_opt_written(10, False), -1)
+        self.assertEqual(unwrap_opt_augmented(10, True), 111)
+
+    def test_is_none(self) -> None:
+        self.assertFalse(opt_is_none(10, True))
+        self.assertTrue(opt_is_none(10, False))
+        self.assertFalse(walrus_is_none(10, True))
+        self.assertTrue(walrus_is_none(10, False))
+
+    def test_a_chain_of_unwraps(self) -> None:
+        self.assertEqual(unwrap_opt_chain(10, True), 121)
+        self.assertEqual(unwrap_opt_chain(10, False), -1)
+
+    def test_a_pointer_option(self) -> None:
+        self.assertEqual(unwrap_ptr_opt(10, True), 10)
+        self.assertEqual(unwrap_ptr_opt(10, False), -1)
+
+    def test_a_large_option(self) -> None:
+        self.assertEqual(unwrap_large_opt(10, True), 10)
+        self.assertEqual(unwrap_large_opt(10, False), -1)
+
+    def test_a_nested_option(self) -> None:
+        self.assertEqual(unwrap_deep_opt(10, True), 10)
+        self.assertEqual(unwrap_deep_opt(10, False), -1)
+
+    def test_a_compile_time_option_field(self) -> None:
+        self.assertEqual(unwrap_comptime_field(10, True), 110)
+        self.assertEqual(unwrap_comptime_field(10, False), -1)
+
+    def test_a_zero_sized_child(self) -> None:
+        self.assertEqual(unwrap_u0(True), 7)
+        self.assertEqual(unwrap_u0(False), -1)
+
+    def test_a_declared_comptime_option(self) -> None:
+        self.assertEqual(unwrap_declared(), 5)
+
+    def test_an_absent_pointer_option_in_compile_time_storage(self) -> None:
+        self.assertEqual(pass_declared_ptr_mixed(10, True), 4)
+        self.assertEqual(pass_declared_ptr_mixed(10, False), 4)
+
+    def test_a_pointer_to_compile_time_option_storage(self) -> None:
+        # a ``Comptime[Option[T]]`` addressed by ``ref`` is materialized: what
+        # is passed is a pointer to a fresh copy of the option
+        self.assertEqual(comptime_option_ptr_present(), 5)
+        self.assertEqual(comptime_option_ptr_absent(), -1)
+        self.assertEqual(comptime_option_ptr_runtime(10, True), 11)
+        self.assertEqual(comptime_option_ptr_runtime(10, False), -1)
+
+    def test_a_pointer_to_compile_time_pointer_option_storage(self) -> None:
+        self.assertEqual(comptime_option_ptr_of_ptr(7, True), 7)
+        self.assertEqual(comptime_option_ptr_of_ptr(7, False), -1)
+
+    def test_a_pointer_to_a_compile_time_option(self) -> None:
+        # ``ref`` of a compile-time option: the option is materialized and the
+        # pointer points at that copy
+        self.assertEqual(comptime_option_ref_in_memory(), 75)
+
+    def test_an_if_else_guarded_by_a_chain(self) -> None:
+        self.assertEqual(unwrap_opt_else(10, True), 23)
+        self.assertEqual(unwrap_opt_else(10, False), -1)
+
+    def test_a_while_guarded_by_a_chain(self) -> None:
+        self.assertEqual(unwrap_opt_while(3), 9)
+        self.assertEqual(unwrap_opt_while(0), 0)
+
+    def test_break_and_the_else_of_a_while(self) -> None:
+        self.assertEqual(unwrap_opt_while_break(5), 0)
+        self.assertEqual(unwrap_opt_while_break(1), 102)
+
+    def test_an_or_condition(self) -> None:
+        self.assertEqual(unwrap_opt_or_condition(10, True), 1)
+        self.assertEqual(unwrap_opt_or_condition(10, False), -1)
+
+    def test_the_else_does_not_see_the_target(self) -> None:
+        with self.assertRaises(CompileError):
+            unwrap_opt_else_scope(1, True)
+
+    def test_is_none_needs_an_option(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_is_none(1)
+
+    def test_an_unwrap_target_is_scoped_to_the_branch(self) -> None:
+        with self.assertRaises(CompileError):
+            unwrap_scope_leak(1, True)
+
+    def test_a_duplicate_unwrap_target_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            walrus_duplicate(1, True)
+
+
+# ---------------------------------------------------------------------------
 # multiple return values: a function annotated ``-> tuple[T1, T2, ...]``
 # returns one value per element of the tuple.  The lowered function returns
 # one of them by value and delivers every other one through a hidden result
@@ -6505,8 +7062,10 @@ all_tests = [
     SpyTupleTest,
     SpyZeroSizedResultTest,
     SpyCompileLogTest,
+    SpyBoolOpTest,
     SpyOptionTest,
     SpyOptionNestingTest,
+    SpyOptionUnwrapTest,
     SpyMultiReturnTest,
     SpyErrorUnionPrimitiveTest,
     SpyErrorUnionTest,

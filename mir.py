@@ -308,6 +308,23 @@ class NullValue(Value):
         return (self.type,)
 
 
+@dataclass(frozen=True)
+class UndefValue(Value):
+    """The undefined value of the aggregate type ``type``: the base an
+    ``InsertValue`` chain starts from (LLVM's ``undef``).  It carries no
+    information a consumer may rely on - it only exists to give the chain a
+    value to insert into."""
+
+    type: Type
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
+
+
 class GlobalValue(Value):
     def __hash__(self) -> int:
         return object.__hash__(self)
@@ -547,6 +564,84 @@ class ExtractValue(Inst):
 
 
 @dataclass(eq=False)
+class InsertValue(Inst):
+    """The aggregate value ``value`` with its field ``index`` (or element
+    ``index`` of an array) replaced by ``elem``: ``ExtractValue``'s counterpart
+    in the value domain, which builds an aggregate value from its fields
+    instead of reading one out of it.  ``index`` is the position in the
+    *mirror* of the struct (the declaration index mapped by
+    ``sval.StructType.get_field_mir_indices``), or an array element position.
+    The result has the type of ``value``."""
+
+    value: Value
+    elem: Value
+    index: int
+
+    def __init__(self, value: Value, elem: Value, index: int) -> None:
+        self.value = value
+        self.elem = elem
+        self.index = index
+        vtype = value.get_type()
+        if isinstance(vtype, StructType):
+            if index < 0 or index >= len(vtype.fields):
+                raise CompileError(f'field index {index} is out of bounds for {vtype}')
+            self.type: Type = vtype
+            return
+        if isinstance(vtype, ArrayType):
+            if not 0 <= index < vtype.length:
+                raise CompileError(f'element index {index} is out of bounds for {vtype}')
+            self.type = vtype
+            return
+        raise CompileError(f'cannot insert a field of a {vtype} value')
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.value.get_type()
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value, self.elem)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        elem = f(self.elem)
+        if value is self.value and elem is self.elem:
+            return self
+        return replace(self, value=value, elem=elem)
+
+
+@dataclass(eq=False)
+class Select(Inst):
+    """The value ``if_true`` or ``if_false``, chosen by the boolean ``cond``
+    (LLVM's ``select``): a value-level conditional that branches nowhere, so
+    both operands are always computed.  The two values have to agree on their
+    type, which is also the type of the result."""
+
+    cond: Value
+    if_true: Value
+    if_false: Value
+
+    def __init__(self, cond: Value, if_true: Value, if_false: Value) -> None:
+        self.cond = cond
+        self.if_true = if_true
+        self.if_false = if_false
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.if_true.get_type()
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.cond, self.if_true, self.if_false)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        cond = f(self.cond)
+        if_true = f(self.if_true)
+        if_false = f(self.if_false)
+        if cond is self.cond and if_true is self.if_true and if_false is self.if_false:
+            return self
+        return replace(self, cond=cond, if_true=if_true, if_false=if_false)
+
+
+@dataclass(eq=False)
 class Arith(Inst):
     """Integer/float arithmetic.
 
@@ -624,11 +719,13 @@ class BitCast(Inst):
 @dataclass(eq=False)
 class Cmp(Inst):
     """A comparison producing a bool; ``op`` is one of '==', '!=', '<',
-    '<=', '>', '>='."""
+    '<=', '>', '>='.  ``kind`` is the domain the operands live in: 'int' and
+    'float' compare numbers, and 'ptr' compares pointers against each other
+    (only equality is defined on them)."""
 
     op: CompareOp
     signed: bool
-    kind: str  # 'int' or 'float'
+    kind: str  # 'int', 'float' or 'ptr'
     lhs: Value
     rhs: Value
 
