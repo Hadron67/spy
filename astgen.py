@@ -129,30 +129,19 @@ def _is_struct_class(obj: Any) -> bool:
 
 class _Scope:
     """One lexical block of a spy function: the variable bindings of the
-    block (name -> the Alloca of its slot), chained to the enclosing
-    block.  A read and an assignment both resolve through the chain: an
-    assignment stores into the slot the name is already bound to - the
-    nearest enclosing binding, so an assignment inside a branch writes
-    the variable it sees - and only a name that is bound *nowhere* is
-    declared: it gets a fresh block-local slot, which is not visible
-    outside its block."""
+    block (name -> the Alloca of its slot).  A read and an assignment
+    both resolve through the enclosing blocks: an assignment stores into
+    the slot the name is already bound to - the nearest enclosing
+    binding, so an assignment inside a branch writes the variable it
+    sees - and only a name that is bound *nowhere* is declared: it gets a
+    fresh block-local slot, which is not visible outside its block.  The
+    chain of enclosing blocks is the scope stack of the :class:`_Builder`
+    translating the function (see ``_Builder._lookup``)."""
 
-    __slots__ = ('bindings', 'parent')
+    __slots__ = ('vars',)
 
-    def __init__(self, parent: _Scope | None) -> None:
-        self.parent = parent
-        self.bindings: dict[str, hir.Value] = {}
-
-    def lookup(self, name: str) -> hir.Value | None:
-        """The Alloca of the nearest binding of ``name``, or None when
-        the name is not bound in this or any enclosing block."""
-        scope = self
-        while scope is not None:
-            slot = scope.bindings.get(name)
-            if slot is not None:
-                return slot
-            scope = scope.parent
-        return None
+    def __init__(self) -> None:
+        self.vars: dict[str, hir.Value] = {}
 
 class _Pragma:
     pass
@@ -172,18 +161,22 @@ class _Builder:
     """Translates the AST of one function body into one linear
     instruction list of the untyped HIR.
 
-    Each builder translates one *block* - the function body, or the
-    body of one ``if`` branch - and carries the lexical scope of that
-    block: a child of the enclosing block's scope whose bindings (the
-    parameters, for the function body; local declarations, in every
-    block) are added as the block is translated.  Expression builders
-    of nested blocks look up names through the chain.
+    One builder translates the whole function; the lexical blocks it
+    enters (the function body, an ``if`` branch, a loop body, an
+    ``except`` clause) are a stack of :class:`_Scope` bindings, whose top
+    is the block being translated.  The bindings (the parameters, for the
+    function body; local declarations, in every block) are added as each
+    block is translated.  An expression of a nested block looks up names
+    through the stack.
     """
 
-    def __init__(self, fn: Any, fn_ir: FunctionIR, scope: _Scope, type_vars: dict[TypeVar, Value]) -> None:
+    def __init__(self, fn: Any, fn_ir: FunctionIR, type_vars: dict[TypeVar, Value]) -> None:
         self.fn = fn
         self._fn_ir = fn_ir
-        self._scope = scope
+        # the open lexical blocks, innermost last: names resolve through
+        # this stack (see ``_lookup``) and a declaration goes into its top
+        # (see ``_declare``)
+        self._scopes: list[_Scope] = [_Scope()]
         # the type parameters of the function (and of the struct a method
         # belongs to), keyed by the Python type parameter object their
         # annotations evaluate to: the names are the compile-time type values
@@ -194,6 +187,19 @@ class _Builder:
         self._generic_names: dict[str, Value] = {tp.__name__: v for tp, v in type_vars.items()}
         self._pragmas: set[_Pragma] = set()
         self.insts: list[hir.Inst] = []
+
+    def _lookup(self, name: str) -> hir.Value | None:
+        """The Alloca of the nearest binding of ``name``, or None when
+        the name is not bound in any open block."""
+        for scope in reversed(self._scopes):
+            slot = scope.vars.get(name)
+            if slot is not None:
+                return slot
+        return None
+
+    def _declare(self, name: str, slot: hir.Value) -> None:
+        """Bind ``name`` to ``slot`` in the innermost open block."""
+        self._scopes[-1].vars[name] = slot
 
     def add(self, inst: hir.Inst) -> hir.Inst:
         self.insts.append(inst)
@@ -284,10 +290,10 @@ class _Builder:
                 # delimited by the ``Else``/``End`` markers (WASM-style)
                 cond = self._gen_expr(node.test)[0]
                 self.add(hir.If(self.add(hir.AsBool(cond))))
-                self._gen_branch(node.body)
+                self._gen_block(node.body)
                 if len(node.orelse) > 0:
                     self.add(hir.Else())
-                    self._gen_branch(node.orelse)
+                    self._gen_block(node.orelse)
                 self.add(hir.End())
             case ast.Break():
                 self.add(hir.Break())
@@ -300,16 +306,17 @@ class _Builder:
                     f"unsupported statement {type(node).__name__} in spy function {fn_name}"
                 )
 
-    def _gen_branch(self, stmts: list[ast.stmt]) -> None:
-        """Translate one branch body of an ``if``, appending its
-        instructions to this builder's list (between the ``If``/``Else``
-        and ``End`` markers).  A branch is a lexical scope of its own - a
-        child of the enclosing scope - so a name it *declares* is not
-        visible after the block (an assignment to a name it sees writes
-        that variable, see ``_gen_assign``)."""
-        sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
-        sub._gen_body(stmts)
-        self.insts.extend(sub.insts)
+    def _gen_block(self, stmts: list[ast.stmt]) -> None:
+        """Translate one lexical block - a branch body, a loop body, the
+        ``else`` clause of a loop - appending its instructions to this
+        builder's list.  The block is a lexical scope of its own, a child of
+        the scope enclosing it: its declarations go into a fresh scope that
+        is dropped when the block ends, so a name it *declares* is not
+        visible after the block (an assignment to a name it sees writes that
+        variable, see ``_gen_assign``)."""
+        self._scopes.append(_Scope())
+        self._gen_body(stmts)
+        self._scopes.pop()
 
     def _gen_while(self, node: ast.While, is_inline: bool) -> None:
         """Translate one ``while``/``else`` statement into a dead ``loop``:
@@ -346,12 +353,10 @@ class _Builder:
         # condition is compile-time or not
         cond = self.add(hir.AsBool(self._gen_expr(node.test)[0]))
         self.add(hir.If(self.add(hir.Not(cond))))
-        else_clause = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
-        else_clause._gen_body(node.orelse)
-        self.insts.extend(else_clause.insts)
+        self._gen_block(node.orelse)
         self.add(hir.Break())
         self.add(hir.Else())
-        self._gen_branch(node.body)
+        self._gen_block(node.body)
         self.add(hir.End())
         self.add(hir.End())
 
@@ -406,25 +411,26 @@ class _Builder:
         self.add(hir.CallMethodInplace(base, '__iter__', RawArgList((), frozendict()), it))
         self.add(hir.CommitSlot(it))
         # the loop body, in a block of its own: the loop variable(s) are
-        # declared there and are not visible after the loop
-        sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
-        sub.add(hir.Loop(is_inline=is_inline))
-        sub.add(hir.Try((None,), (hir.Const(StopIteration),)))
+        # declared there and are not visible after the loop.  Its scope also
+        # encloses the ``else`` clause, which reads the loop variable.
+        self._scopes.append(_Scope())
+        self.add(hir.Loop(is_inline=is_inline))
+        self.add(hir.Try((None,), (hir.Const(StopIteration),)))
         new_slots: list[hir.Value] = []
-        place = sub._gen_lhs(
+        place = self._gen_lhs(
             node.target, new_slots,
             hir.InlineMode.FULL if is_inline else hir.InlineMode.NONE,
         )
-        sub.add(hir.CallMethodInplace(it, '__next__', RawArgList((), frozendict()), place))
+        self.add(hir.CallMethodInplace(it, '__next__', RawArgList((), frozendict()), place))
         for slot in new_slots:
-            sub.add(hir.CommitSlot(slot))
-        sub._gen_body(node.body)
-        sub.add(hir.Except(0))
-        sub._gen_body(node.orelse)
-        sub.add(hir.Break())
-        sub.add(hir.End())
-        sub.add(hir.End())
-        self.insts.extend(sub.insts)
+            self.add(hir.CommitSlot(slot))
+        self._gen_body(node.body)
+        self.add(hir.Except(0))
+        self._gen_body(node.orelse)
+        self.add(hir.Break())
+        self.add(hir.End())
+        self.add(hir.End())
+        self._scopes.pop()
 
     def _gen_try(self, node: ast.Try) -> None:
         """Translate one ``try``/``except`` statement: the try body, then one
@@ -468,12 +474,12 @@ class _Builder:
                 # the bind reads the clause's payload pointer: it is the first
                 # instruction of the clause body
                 self.add(bind)
-            sub = _Builder(self.fn, self._fn_ir, _Scope(self._scope), self._type_vars)
+            self._scopes.append(_Scope())
             if handler.name is not None:
                 assert bind is not None
-                sub._scope.bindings[handler.name] = bind
-            sub._gen_body(handler.body)
-            self.insts.extend(sub.insts)
+                self._declare(handler.name, bind)
+            self._gen_body(handler.body)
+            self._scopes.pop()
         self.add(hir.End())
 
     # -- variables ------------------------------------------------------------
@@ -494,10 +500,10 @@ class _Builder:
             # the right-hand side is generated straight into them (result-
             # location semantics), so no intermediate tuple value is built
             return self._gen_target_tuple(target, new_slots, inline_mode)
-        if isinstance(target, ast.Name) and self._scope.lookup(target.id) is None:
+        if isinstance(target, ast.Name) and self._lookup(target.id) is None:
             # the name is bound nowhere: declare it here, in the current block
             slot = self.add(hir.Alloca(inline_mode))
-            self._scope.bindings[target.id] = slot
+            self._declare(target.id, slot)
             new_slots.append(slot)
             return slot
         lhs = self._gen_expr(target, False)[0]
@@ -545,7 +551,7 @@ class _Builder:
         mirrors)."""
         match target:
             case ast.Name():
-                return self._scope.lookup(target.id) is None
+                return self._lookup(target.id) is None
             case ast.Tuple():
                 return all(self._declares_a_fresh_name(elt) for elt in target.elts)
             case _:
@@ -572,7 +578,7 @@ class _Builder:
                 f"only a name can be annotated in spy function {fn_name}, "
                 f"got {ast.unparse(target)!r}"
             )
-        if self._scope.lookup(target.id) is not None:
+        if self._lookup(target.id) is not None:
             raise CompileError(
                 f"'{target.id}' is already bound in spy function {fn_name}; "
                 f"an annotated declaration introduces a new variable"
@@ -588,7 +594,7 @@ class _Builder:
         slot = self.add(hir.Alloca(
             hir.InlineMode.FULL if is_comptime else hir.InlineMode.NONE, declared
         ))
-        self._scope.bindings[target.id] = slot
+        self._declare(target.id, slot)
         if node.value is not None:
             self._gen_result_loc(node.value, slot)
         self.add(hir.CommitSlot(slot))
@@ -620,9 +626,9 @@ class _Builder:
             if isinstance(elt, ast.Tuple):
                 elems.append(ArgEntry(self._gen_target_tuple(elt, new_slots, inline_mode), False))
                 continue
-            if isinstance(elt, ast.Name) and self._scope.lookup(elt.id) is None:
+            if isinstance(elt, ast.Name) and self._lookup(elt.id) is None:
                 slot = self.add(hir.Alloca(inline_mode))
-                self._scope.bindings[elt.id] = slot
+                self._declare(elt.id, slot)
                 new_slots.append(slot)
             ref = self._gen_expr(elt, False)[0]
             if not ref.is_ref:
@@ -724,7 +730,7 @@ class _Builder:
         name bound to a global, or an attribute of one (``syntax.ref``)."""
         match node:
             case ast.Name():
-                if self._scope.lookup(node.id) is not None or node.id in self._generic_names:
+                if self._lookup(node.id) is not None or node.id in self._generic_names:
                     return None
                 return self._resolve_global(node.id)
             case ast.Attribute():
@@ -1133,7 +1139,7 @@ class _Builder:
 
     def _gen_name(self, name: str) -> hir.Value:
         """Always returns a reference to the name ``name``."""
-        slot = self._scope.lookup(name)
+        slot = self._lookup(name)
         if slot is not None:
             # reading a variable (parameter or local): load its slot
             return slot
@@ -1342,16 +1348,15 @@ def parse_function(
 
     ir = FunctionIR(node.name, signature, tuple(arg_is_ref), ())
 
-    # At HIR level, parameters are passed by ref (pointer)
-    scope = _Scope(None)
-    for i, name in enumerate(positional.keys):
-        scope.bindings[name] = hir.Arg(i)
-
     # a name that denotes a type parameter (the function's own, or one of the
     # struct a method belongs to) refers to the compile-time value the call
     # solved it to; the function's own parameters are added last, so they
     # shadow a struct's parameter of the same name, like Python scoping
-    builder = _Builder(fn, ir, scope, type_vars)
+    builder = _Builder(fn, ir, type_vars)
+    # At HIR level, parameters are passed by ref (pointer); they are the
+    # function body's block, the bottom scope of the builder's stack
+    for i, name in enumerate(positional.keys):
+        builder._declare(name, hir.Arg(i))
     builder._gen_body(node.body)
     builder.add(hir.StoreVoidRetloc())
     ir.body = tuple(builder.insts)
