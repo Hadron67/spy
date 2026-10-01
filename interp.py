@@ -398,7 +398,12 @@ class ComptimeTaggedUnionValue(InterpVal):
     the variant it is (``tag``, the position of the variant in the union) and
     that variant's value (``value``, which may itself be a runtime value or a
     nested aggregate).  It is the tagged-union counterpart of
-    :class:`ComptimeAggregate`."""
+    :class:`ComptimeAggregate`.
+
+    The tag may be only known at runtime (a value read out of a runtime union);
+    then ``value`` is not the variant but the (untagged) payload union storage
+    of the type (``type.payload_type()``), and the tag picks the variant it
+    holds - see ``_tagged_union_parts_to_runtime``."""
 
     type: sval.TaggedUnionType
     tag: InterpVal
@@ -414,7 +419,12 @@ class ComptimeTaggedUnionPtr(InterpVal):
     :class:`ComptimeAggregatePtr`: ``HirRunner.load`` reads the union out of it,
     ``HirRunner.store`` splits a value into the tag and the payload, and
     ``HirRunner._tagged_union_payload_ptr`` hands the payload place over.  When
-    the variant changes the payload place is rebuilt."""
+    the variant changes the payload place is rebuilt.
+
+    When the tag is only known at runtime, ``payload_ptr`` points at the
+    (untagged) payload union storage of the type rather than at a variant's own
+    place, and a variant is read/written through it by reinterpreting its
+    address (see ``HirRunner._store_comptime_tagged_union``)."""
 
     type: sval.TaggedUnionType
     tag: InterpVal
@@ -2763,78 +2773,85 @@ class HirRunner:
             # a union value carries no storage - it says nothing but which union
             # it belongs to - so a storage destination has nothing to write
             return
-        if isinstance(elem, sval.OptionType):
-            # an option (and the ``T``/``Null`` a store delivers) is written
-            # through the representation of ``elem`` (see ``_write_option``)
-            match ptr:
-                case ComptimeOptionPtr():
-                    is_null = self._is_null(value)
-                    ptr.is_null = is_null
-                    if _to_comptime(is_null) is not True:
-                        # present: write the payload value into its place
-                        self.store(ptr.payload_ptr, self._option_payload_for_write(value, elem))
-                case ComptimeBox():
-                    obj = _to_comptime(value)
-                    if obj is None:
-                        ptr.value = self._coerce_option_value(value, elem)
-                    elif isinstance(obj, sval.Value):
-                        # an already spy-typed value (the null value, or a value
-                        # of the child type) carries its own type
-                        ptr.value = ComptimeVal(obj)
-                    else:
-                        ptr.value = ComptimeVal(sval.coerce_const(obj, elem))
-                case RuntimeVal():
-                    self._write_option(ptr.value, value, elem)
-                case _:
-                    raise CompileError('cannot store through a compile-time pointer')
-            return
-        if isinstance(elem, sval.TaggedUnionType):
-            # a tagged union (and the variant value a store delivers) is written
-            # through its representation (see ``_write_comptime_tagged_union``
-            # and ``_write_tagged_union_runtime``)
-            match ptr:
-                case ComptimeTaggedUnionPtr():
-                    self._write_comptime_tagged_union(ptr, value, elem)
-                case ComptimeBox():
-                    ptr.value = self._coerce_tagged_union_value(value, elem)
-                case RuntimeVal():
-                    self._write_tagged_union_runtime(ptr, value, elem)
-                case _:
-                    raise CompileError('cannot store through a compile-time pointer')
-            return
-        aggregate = _as_aggregate(value)
-        if aggregate is not None and _is_aggregate(elem):
-            # a whole aggregate *value* is written place by place, into the place
-            # of each field (or element) - memory storage or a compile-time
-            # aggregate - which is how a copy into an existing storage works (see
-            # ``ComptimeAggregate``).  This comes before any question about the
-            # type's runtime representation: an aggregate's places exist whether
-            # or not the aggregate has a mirror of its own.
-            #
-            # An aggregate value is only ever its own type, exactly like a
-            # runtime one (see ``_convert_inst``): an aggregate of another type
-            # of the same shape is not a copy of it.  A zero-sized destination
-            # has no storage at all, so whatever is delivered is a no-op
-            if aggregate.type != elem and not elem.is_zst():
-                raise CompileError(f'cannot convert a {aggregate.type} value to {elem}')
-            for index, place_value in enumerate(aggregate.values):
-                self.store(self.field_index_addr(ptr, _index_value(index)), place_value)
-            return
-        if isinstance(ptr, ComptimeAggregatePtr) and _is_aggregate(elem) and isinstance(value, RuntimeVal):
-            # a *runtime* aggregate value into a compile-time aggregate that
-            # exists already (a declared ``Comptime[T]``, or one assigned
-            # before): every field already is a place, which the field values are
-            # written into
-            for index, field_value in enumerate(self._runtime_aggregate_field_values(value)):
-                self.store(self.field_index_addr(ptr, _index_value(index)), field_value)
-            return
-        if isinstance(ptr, ComptimeVal) and isinstance(ptr.obj, sval.Undefined):
+        if isinstance(ptr, ComptimeVal) and isinstance(ptr.obj, sval.Undefined) and ptr_type.elem.is_zst():
             # a compile-time pointer with no storage at all: the address of a
             # zero-sized field or element (see ``field_index_addr``), or of a
             # zero-sized exception's variant (see ``_union_variant_ptr``).
             # Every value of the type it points at is the type's unit value, so
             # a store into it records nothing
             return
+
+        if _is_aggregate(elem):
+            # an aggregate is held by its fields (or elements), never by a box: a
+            # whole value is written place by place into a compile-time aggregate
+            # and as a whole into memory (see ``ComptimeAggregatePtr``)
+            match ptr:
+                case ComptimeAggregatePtr():
+                    aggregate = _as_aggregate(value)
+                    if aggregate is None:
+                        # a *runtime* aggregate value: its fields are read out of
+                        # the value itself (see ``as_comptime_aggregate``)
+                        aggregate = self.as_comptime_aggregate(value)
+                    # an aggregate value is only ever its own type, exactly like a
+                    # runtime one (see ``_convert_inst``): an aggregate of another
+                    # type of the same shape is not a copy of it.  A zero-sized
+                    # destination has no storage at all, so whatever is delivered
+                    # is a no-op
+                    if aggregate.type != elem and not elem.is_zst():
+                        raise CompileError(f'cannot convert a {aggregate.type} value to {elem}')
+                    for index, field_value in enumerate(aggregate.values):
+                        self.store(self.field_index_addr(ptr, _index_value(index)), field_value)
+                case RuntimeVal():
+                    if elem.is_zst():
+                        # a zero-sized aggregate has no storage to write into
+                        return
+                    if isinstance(value, RuntimeVal):
+                        # a runtime aggregate value is written as a whole
+                        self._emit(mir.Store(ptr.value, self._to_runtime(self._coerce(value, elem))))
+                    else:
+                        aggregate = _as_aggregate(value)
+                        if aggregate is None or (aggregate.type != elem and not elem.is_zst()):
+                            raise CompileError(f'cannot store {value!r} into {elem}')
+                        self._emit(mir.Store(ptr.value, self._aggregate_to_runtime(aggregate)))
+                case _:
+                    raise CompileError(f'a compile-time box cannot hold the aggregate {elem}')
+            return
+
+        if isinstance(elem, sval.OptionType):
+            # an option (and the ``T``/``Null`` a store delivers) is coerced to
+            # its value form first, then written through the storage of ``elem``
+            # (see ``ComptimeOption``)
+            coerced = self._coerce(value, elem)
+            match ptr:
+                case ComptimeOptionPtr():
+                    option = self._as_comptime_option(coerced, elem)
+                    ptr.is_null = option.is_null
+                    if _to_comptime(option.is_null) is not True:
+                        # present (or unknown): write the payload value into its place
+                        self.store(ptr.payload_ptr, option.value)
+                case RuntimeVal():
+                    self._emit(mir.Store(ptr.value, self._to_runtime(coerced)))
+                case _:
+                    raise CompileError(f'a compile-time box cannot hold the option {elem}')
+            return
+
+        if isinstance(elem, sval.TaggedUnionType):
+            # a tagged union (and the variant value a store delivers) is coerced
+            # to its value form first, then written through the storage of
+            # ``elem`` (see ``ComptimeTaggedUnionValue``)
+            coerced = self._coerce(value, elem)
+            match ptr:
+                case ComptimeTaggedUnionPtr():
+                    if not isinstance(coerced, ComptimeTaggedUnionValue):
+                        assert isinstance(coerced, RuntimeVal)
+                        coerced = self._runtime_union_to_value_form(coerced, elem)
+                    self._store_comptime_tagged_union(ptr, elem, coerced)
+                case RuntimeVal():
+                    self._emit(mir.Store(ptr.value, self._to_runtime(coerced)))
+                case _:
+                    raise CompileError(f'a compile-time box cannot hold the tagged union {elem}')
+            return
+
         unit = elem.get_unit_value()
         match ptr:
             case ComptimeBox():
@@ -2842,10 +2859,6 @@ class HirRunner:
                     raise CompileError(
                         f'cannot store through the const pointer {ptr.type}'
                     )
-                if _is_aggregate(ptr.type):
-                    # an aggregate is held by its own places, never by a box (see
-                    # ``ComptimeAggregatePtr``)
-                    raise CompileError(f'a compile-time box cannot hold the aggregate {ptr.type}')
                 if unit is not None:
                     # a zero-sized type has one value - its unit value - which
                     # is what a place of it holds whatever is stored into it (no
@@ -2949,82 +2962,6 @@ class HirRunner:
 
     # -- options ---------------------------------------------------------------
 
-    def _write_option(self, dst: mir.Value, value: InterpVal, option: sval.OptionType) -> None:
-        """Write the ``Option[T]`` value ``value`` into the memory ``dst`` - a
-        MIR pointer to the option's representation (see
-        ``sval.OptionType.to_mir_type``).  A present value is the child's own
-        representation (coerced to the child), and the absent one the null
-        representation: a ``bool`` for a zero-sized child, the tagging pointer
-        nulled (``_write_option_null``) for a child that has one, and the tag
-        ``false`` for the rest.
-
-        A tag that is only known at runtime (a value read out of a runtime
-        option) makes the representation written from the tag *value* instead
-        (see ``_write_option_runtime_tag``)."""
-        child = option.child
-        if isinstance(value, RuntimeVal) and _type_of(value) == option:
-            # the value already is an option of this type (a parameter of one,
-            # a load of one): its representation is written as a whole
-            self._emit(mir.Store(dst, self._to_runtime(value)))
-            return
-        is_null = self._is_null(value)
-        null_const = _to_comptime(is_null)
-        if null_const is None:
-            self._write_option_runtime_tag(dst, option, is_null, self._option_payload_for_write(value, option))
-            return
-        null = bool(null_const)
-        if child.is_zst():
-            # a zero-sized child carries no value: only whether there is one
-            self._emit(mir.Store(dst, mir.BoolValue(not null)))
-            return
-        tag_path = sval.find_first_pointer_type_pos(child)
-        if tag_path is not None:
-            if null:
-                tag_ptr, tag_type = self._option_tag_addr(dst, child, tag_path)
-                mir_type = tag_type.to_mir_type(self._mir_cache)
-                assert isinstance(mir_type, mir.PointerType)
-                self._emit(mir.Store(tag_ptr, mir.NullValue(mir_type)))
-            else:
-                self._emit(mir.Store(dst, self._to_runtime(self._coerce(self._option_payload_for_write(value, option), child))))
-            return
-        # a struct of the tag and the value: the tag says whether there is one
-        tag = self._emit(mir.Gep(dst, 0))
-        self._emit(mir.Store(tag, mir.BoolValue(not null)))
-        if not null:
-            payload = self._emit(mir.Gep(dst, 1))
-            self._emit(mir.Store(payload, self._to_runtime(self._coerce(self._option_payload_for_write(value, option), child))))
-
-    def _write_option_runtime_tag(
-        self, dst: mir.Value, option: sval.OptionType, is_null: InterpVal, payload: InterpVal
-    ) -> None:
-        """Write an option whose tag ``is_null`` is only known at runtime into
-        the memory ``dst``: the tag value (a runtime ``bool``) is stored where
-        the representation keeps it, and the payload - read out of the option
-        the value already is - is written as well.  A representation that tags
-        on a pointer nulls it with a ``mir.Select`` when the option is absent."""
-        child = option.child
-        if child.is_zst():
-            # the option *is* the "is there a value" bool
-            self._emit(mir.Store(dst, self._not_bool(is_null)))
-            return
-        tag_path = sval.find_first_pointer_type_pos(child)
-        if tag_path is None:
-            # the (bool, T) representation: the tag is the first field
-            tag = self._emit(mir.Gep(dst, 0))
-            self._emit(mir.Store(tag, self._not_bool(is_null)))
-            payload_ptr = self._emit(mir.Gep(dst, 1))
-            self._emit(mir.Store(payload_ptr, self._to_runtime(self._coerce(payload, child))))
-            return
-        # the option shares the child's representation: write the present value
-        # and null the pointer that tags it when the option is absent
-        self._emit(mir.Store(dst, self._to_runtime(self._coerce(payload, child))))
-        tag_ptr, tag_type = self._option_tag_addr(dst, option.child, tag_path)
-        mir_type = tag_type.to_mir_type(self._mir_cache)
-        assert isinstance(mir_type, mir.PointerType)
-        current = self._emit(mir.Load(tag_ptr))
-        selected = self._emit(mir.Select(self._to_runtime(is_null), mir.NullValue(mir_type), current))
-        self._emit(mir.Store(tag_ptr, selected))
-
     def _not_bool(self, value: InterpVal) -> mir.Value:
         """The negation of a boolean value as a MIR ``bool``: a compile-time one
         folds, a runtime one becomes a comparison against ``false``."""
@@ -3033,85 +2970,35 @@ class HirRunner:
             return mir.BoolValue(not obj)
         return self._emit(mir.Cmp('==', False, 'int', self._to_runtime(value), mir.BoolValue(False)))
 
-    def _option_payload_for_write(self, value: InterpVal, option: sval.OptionType) -> InterpVal:
-        """The child value a store of ``value`` into an ``option`` writes: the
-        payload a compile-time option or a runtime one of the option's own type
-        carries, and the value itself when it already is a child value."""
-        if isinstance(value, ComptimeOption):
-            return value.value
-        if isinstance(value, RuntimeVal) and _type_of(value) == option:
-            return self._option_payload(value, option)
-        return value
-
-
-    def _option_tag_addr(
-        self, ptr: mir.Value, opt_child_type: sval.Type, tag_path: tuple[int, ...]
-    ) -> tuple[mir.Value, sval.PointerType]:
-        """The address of the pointer that tags ``option``, and its type - the
-        pointer whose nullness makes the option absent - or ``None`` when the
-        option's representation carries a ``bool`` tag instead (see
-        ``sval.find_first_pointer_type_pos``).
-
-        The position is the one the spy type names, mapped onto the mirror: the
-        field positions of a struct are its *mirror* positions (a struct of one
-        stored field *is* that field, see ``mirror_is_a_field``), an array
-        element is its own position, and stepping into an option costs no
-        position (an option that still has a free pointer shares the
-        representation of its child)."""
-        node: sval.Type = opt_child_type
-        cur = ptr
-        for index in tag_path:
-            if isinstance(node, sval.OptionType):
-                node = node.child
-                continue
-            if isinstance(node, sval.StructType):
-                if not node.mirror_is_a_field(self._mir_cache):
-                    mir_index = node.get_field_mir_indices(self._mir_cache)[index]
-                    assert mir_index is not None, 'a field holding a pointer has a mirror position'
-                    cur = self._emit(mir.Gep(cur, mir_index))
-                node = node.fields().get_by_id(index).type
-            elif isinstance(node, sval.ArrayType):
-                cur = self._emit(mir.Gep(cur, index))
-                node = node.elem
-            else:
-                raise CompileError(f'cannot take the tag address of Option[{opt_child_type}]')
-        if not isinstance(node, sval.PointerType):
-            raise CompileError(f'cannot take the tag address of Option[{opt_child_type}]')
-        return cur, node
+    def _as_comptime_option(self, ev: InterpVal, option: sval.OptionType) -> ComptimeOption:
+        """The value form of a value that already is of the option type
+        ``option``: a compile-time option as it is, a runtime one read into the
+        tag and the payload it holds (see ``_is_null``/``_option_payload``)."""
+        if isinstance(ev, ComptimeOption):
+            return ev
+        assert isinstance(ev, RuntimeVal) and _type_of(ev) == option
+        return ComptimeOption(self._is_null(ev), self._option_payload(ev, option))
 
     def _coerce_option_value(self, ev: InterpVal, option: sval.OptionType) -> InterpVal:
-        """Materialize ``ev`` as a value of the option type ``option``: a value
-        that already is one passes through, the null value becomes the absent
-        one and anything else a present value of the child type.
+        """Materialize ``ev`` as a value form of the option type ``option``: a
+        value that already is one passes through, the null value becomes the
+        absent one and anything else a present value of the child type.
 
-        The result is a value of the option: for a child that has a free pointer
-        (whose representation the option shares) the coerced child itself, a
-        ``bool`` or a null pointer for the scalar representations, and the
-        constructed ``(bool, T)`` representation otherwise (see
-        ``_option_parts_to_runtime``)."""
+        The result is a :class:`ComptimeOption` whenever ``ev`` had to change -
+        its tag a bool value and its payload the child value - so that no runtime
+        representation is built here (see ``_option_parts_to_runtime``); a value
+        that already is an option of the type is returned as it is."""
         ev = _shallow_normalize(ev)
-        if isinstance(ev, RuntimeVal) and _type_of(ev) == option:
+        if _type_of(ev) == option:
             return ev
         child = option.child
         is_null = self._is_null(ev)
-        value = self._option_payload_for_write(ev, option)
-        null_const = _to_comptime(is_null)
-        if null_const is not None:
-            null = bool(null_const)
-            if child.is_zst():
-                return RuntimeVal(mir.BoolValue(not null), option)
-            if sval.find_first_pointer_type_pos(child) is not None:
-                if not null:
-                    return self._coerce(value, child)
-                mir_type = option.to_mir_type(self._mir_cache)
-                assert mir_type is not None and not option.is_zst()
-                if isinstance(mir_type, mir.PointerType):
-                    # the option itself is the tagging pointer: a null pointer is
-                    # the absent value
-                    return RuntimeVal(mir.NullValue(mir_type), option)
-        # the (bool, T) representation: the tag and the value are joined (a tag
-        # that is a runtime value needs the payload written as well)
-        return RuntimeVal(self._option_parts_to_runtime(option, is_null, value), option)
+        if _to_comptime(is_null) is True:
+            # absent: the payload is discarded, and the child type is only named
+            # by the placeholder value the form carries
+            return ComptimeOption(is_null, ComptimeVal(sval.Undefined(child)))
+        payload = ev.value if isinstance(ev, ComptimeOption) else ev
+        return ComptimeOption(is_null, self._coerce(payload, child))
 
     # -- tagged unions -------------------------------------------------------
 
@@ -3205,6 +3092,11 @@ class HirRunner:
         if variant_type.get_unit_value() is not None:
             return ComptimeVal(sval.Undefined(sval.PointerType(variant_type, is_const=ptr_type.is_const)))
         if isinstance(place, ComptimeTaggedUnionPtr):
+            if _to_comptime(place.tag) is None:
+                # a tag only known at runtime: the payload place points at the
+                # payload union storage, whose variant is read/written through
+                # by reinterpreting its address (see ``_materialize_union``)
+                return self._union_variant_ptr(place.payload_ptr, variant_type)
             payload_type = _type_of(place.payload_ptr)
             if isinstance(payload_type, sval.PointerType) and payload_type.elem == variant_type:
                 return place.payload_ptr
@@ -3241,20 +3133,24 @@ class HirRunner:
         self._emit(mir.Store(tag_ptr, mir.Int(index, tag_mir)))
         return place
 
-    def _write_comptime_tagged_union(self, ptr: ComptimeTaggedUnionPtr, value: InterpVal, type: sval.TaggedUnionType) -> None:
-        """Write ``value`` into the compile-time tagged union storage ``ptr``:
-        the tag becomes the variant ``value`` belongs to and the payload place
-        holds the coerced variant value (a fresh place when the variant
-        changes)."""
-        ev = _shallow_normalize(value)
-        index: int
-        payload: InterpVal
-        if isinstance(ev, ComptimeTaggedUnionValue):
-            index = self._tagged_union_index(type, ev.type.types[self._tagged_union_int(ev.tag)])
-            payload = ev.value
-        else:
-            index = self._tagged_union_variant_index(ev, type)
-            payload = ev
+    def _store_comptime_tagged_union(self, ptr: ComptimeTaggedUnionPtr, type: sval.TaggedUnionType, value: ComptimeTaggedUnionValue) -> None:
+        """Write the tagged union ``value`` into the compile-time storage ``ptr``:
+        the tag becomes the value's tag and the payload place holds the payload -
+        the variant's own place, rebuilt when the variant changes, or the payload
+        union storage in memory when the tag is only known at runtime."""
+        tag = value.tag
+        if _to_comptime(tag) is None:
+            # a tag only known at runtime: the payload is the payload union
+            # storage, which a variant is read/written through by reinterpreting
+            # its address (see ``_tagged_union_payload_ptr``)
+            ptr.tag = tag
+            if type.payload_type().get_unit_value() is not None:
+                # the payload holds no storage (every variant is zero-sized)
+                ptr.payload_ptr = ComptimeVal(sval.Undefined(sval.PointerType(type.payload_type())))
+            else:
+                ptr.payload_ptr = self._materialize_union(value.value, type.payload_type())
+            return
+        index = self._tagged_union_int(tag)
         variant = type.types[index]
         ptr.tag = ComptimeVal(sval.Int(index, type.tag_type()))
         if variant.get_unit_value() is not None:
@@ -3263,56 +3159,73 @@ class HirRunner:
         payload_type = _type_of(ptr.payload_ptr)
         if not (isinstance(payload_type, sval.PointerType) and payload_type.elem == variant):
             ptr.payload_ptr = self._fresh_place(variant, ComptimeVal(sval.Undefined(variant)))
-        self.store(ptr.payload_ptr, self._coerce(payload, variant))
+        self.store(ptr.payload_ptr, value.value)
 
-    def _write_tagged_union_runtime(self, dst: RuntimeVal, value: InterpVal, type: sval.TaggedUnionType) -> None:
-        """Write the tagged union value ``value`` into the runtime storage the
-        pointer ``dst`` points at: the tag and the payload variant (the value
-        form is ``_tagged_union_parts_to_runtime``)."""
-        ev = _shallow_normalize(value)
-        if isinstance(ev, RuntimeVal) and isinstance(_type_of(ev), sval.TaggedUnionType):
-            # the value already is a tagged union: it is converted to the target
-            # one when it differs and its representation stored as a whole
-            ev = self._convert_tagged_union(ev, type)
-            self._emit(mir.Store(dst.value, self._to_runtime(ev)))
-            return
+    def _materialize_union(self, value: InterpVal, union_type: sval.UnionType) -> InterpVal:
+        """The runtime pointer of fresh memory the union storage ``value`` is
+        written into: a union has no compile-time place an address could be taken
+        of, so a value of it whose variant has to be addressed is materialized
+        into memory (see ``_tagged_union_payload_ptr``)."""
+        slot = self.alloca(InlineMode.NONE)
+        self._commit_pending_slot(slot, union_type)
+        ptr = _shallow_normalize(slot)
+        if isinstance(value, ComptimeVal) and isinstance(value.obj, sval.Undefined):
+            mir_type = union_type.to_mir_type(self._mir_cache)
+            assert mir_type is not None and isinstance(ptr, RuntimeVal)
+            self._emit(mir.Store(ptr.value, mir.UndefValue(mir_type)))
+        else:
+            self.store(ptr, value)
+        return ptr
+
+    def _runtime_union_to_value_form(self, ev: RuntimeVal, type: sval.TaggedUnionType) -> ComptimeTaggedUnionValue:
+        """The value form of the runtime tagged union ``ev`` (of the type
+        ``type``): its tag and its payload - the variant value for a
+        single-variant union, the payload union storage otherwise (see
+        ``ComptimeTaggedUnionValue``)."""
         shape = self._tagged_union_shape(type)
         if shape == 'single':
-            self._emit(mir.Store(dst.value, self._to_runtime(self._coerce(ev, type.types[0]))))
-            return
-        index = self._tagged_union_variant_index(ev, type)
-        variant = type.types[index]
-        tag_mir = type.tag_type().to_mir_type(self._mir_cache)
-        assert isinstance(tag_mir, mir.IntType)
+            return ComptimeTaggedUnionValue(
+                type, ComptimeVal(sval.Int(0, type.tag_type())),
+                RuntimeVal(ev.value, type.types[0]),
+            )
+        tag = self._tagged_union_tag(ev)
         if shape == 'tag_only':
-            self._emit(mir.Store(dst.value, mir.Int(index, tag_mir)))
-            return
-        tag_ptr = self._emit(mir.Gep(dst.value, 0))
-        self._emit(mir.Store(tag_ptr, mir.Int(index, tag_mir)))
-        payload_ptr = self._union_variant_ptr(self._tagged_union_field_ptr(dst), variant)
-        self._emit(mir.Store(self._to_runtime(payload_ptr), self._to_runtime(self._coerce(ev, variant))))
+            unit = type.payload_type().get_unit_value()
+            assert unit is not None
+            return ComptimeTaggedUnionValue(type, tag, ComptimeVal(unit))
+        return ComptimeTaggedUnionValue(
+            type, tag, RuntimeVal(self._emit(mir.ExtractValue(ev.value, 1)), type.payload_type()),
+        )
 
-    def _tagged_union_parts_to_runtime(self, type: sval.TaggedUnionType, index: int, value: InterpVal) -> mir.Value:
-        """Build the runtime value of a tagged union from the variant ``index``
-        and its payload ``value``: the tag and the payload union (an ``AsUnion``
-        of the variant) inserted into an ``undef`` struct, or just the tag when
-        the payload holds no storage."""
-        variant = type.types[index]
+    def _tagged_union_parts_to_runtime(self, type: sval.TaggedUnionType, tag: InterpVal, value: InterpVal) -> mir.Value:
+        """Build the runtime value of a tagged union from its tag ``tag`` (which
+        may be a runtime value) and its payload ``value``: a compile-time tag
+        makes the payload a variant value, joined into the payload union with an
+        ``AsUnion``, while a runtime tag means the payload already *is* the
+        payload union storage (see ``ComptimeTaggedUnionValue``).  A zero-sized
+        payload keeps the tag alone, and a single-variant union is the variant
+        itself."""
         shape = self._tagged_union_shape(type)
         if shape == 'single':
-            return self._to_runtime(self._coerce(value, variant))
-        tag_mir = type.tag_type().to_mir_type(self._mir_cache)
-        assert isinstance(tag_mir, mir.IntType)
-        tag: mir.Value = mir.Int(index, tag_mir)
+            return self._to_runtime(self._coerce(value, type.types[0]))
         if shape == 'tag_only':
-            return tag
-        union_mir = type.payload_type().to_mir_type(self._mir_cache)
+            return self._to_runtime(tag)
         struct_mir = type.to_mir_type(self._mir_cache)
-        assert union_mir is not None and struct_mir is not None
-        variant_value = self._to_runtime(self._coerce(value, variant))
-        union_value = self._emit(mir.AsUnion(variant_value, union_mir))
-        result = self._emit(mir.InsertValue(mir.UndefValue(struct_mir), tag, 0))
-        return self._emit(mir.InsertValue(result, union_value, 1))
+        union_mir = type.payload_type().to_mir_type(self._mir_cache)
+        assert struct_mir is not None and union_mir is not None
+        union_value: mir.Value
+        index = _comptime_int(tag)
+        if index is None:
+            # a tag only known at runtime: the payload already is the union storage
+            if isinstance(value, ComptimeVal) and isinstance(value.obj, sval.Undefined):
+                union_value = mir.UndefValue(union_mir)
+            else:
+                union_value = self._to_runtime(value)
+        else:
+            variant_value = self._to_runtime(self._coerce(value, type.types[index]))
+            union_value = self._emit(mir.AsUnion(variant_value, union_mir))
+        with_tag = self._emit(mir.InsertValue(mir.UndefValue(struct_mir), self._to_runtime(tag), 0))
+        return self._emit(mir.InsertValue(with_tag, union_value, 1))
 
     def _tagged_union_reindex(self, tag: InterpVal, from_type: sval.TaggedUnionType, to_type: sval.TaggedUnionType) -> InterpVal:
         """The tag ``tag`` of ``from_type`` remapped to ``to_type``'s variant
@@ -3335,54 +3248,89 @@ class HirRunner:
             acc = self._emit(mir.Select(cond, mir.Int(to_index, to_tag_mir), acc))
         return RuntimeVal(acc, to_type.tag_type())
 
-    def _convert_tagged_union(self, ev: RuntimeVal, to_type: sval.TaggedUnionType) -> RuntimeVal:
-        """The runtime tagged union value ``ev`` converted to the compatible
-        union ``to_type``: the payload reinterpreted with ``mir.UnionCast`` and
-        the tag remapped (see ``_tagged_union_reindex``)."""
-        from_type = _type_of(ev)
-        assert isinstance(from_type, sval.TaggedUnionType)
-        if from_type == to_type:
-            return ev
+    def _runtime_union_value_form(self, ev: RuntimeVal, from_type: sval.TaggedUnionType, to_type: sval.TaggedUnionType) -> ComptimeTaggedUnionValue:
+        """The value form of the runtime tagged union ``ev`` (of the compatible
+        union ``from_type``) converted to ``to_type``: the tag remapped, and the
+        payload the variant value when the tag is compile-time (a single-variant
+        union on either side) and the payload union storage otherwise (see
+        ``ComptimeTaggedUnionValue``)."""
+        shape = self._tagged_union_shape(to_type)
         from_shape = self._tagged_union_shape(from_type)
-        to_shape = self._tagged_union_shape(to_type)
-        if to_shape == 'single':
+        if shape == 'single':
             # a subset of a single-variant union is that variant
-            return RuntimeVal(ev.value, to_type)
+            return ComptimeTaggedUnionValue(
+                to_type, ComptimeVal(sval.Int(0, to_type.tag_type())),
+                RuntimeVal(ev.value, to_type.types[0]),
+            )
         if from_shape == 'single':
             variant = from_type.types[0]
             index = self._tagged_union_index(to_type, variant)
-            return RuntimeVal(
-                self._tagged_union_parts_to_runtime(to_type, index, RuntimeVal(ev.value, variant)),
-                to_type,
+            return ComptimeTaggedUnionValue(
+                to_type, ComptimeVal(sval.Int(index, to_type.tag_type())),
+                RuntimeVal(ev.value, variant),
             )
         tag = self._tagged_union_reindex(self._tagged_union_tag(ev), from_type, to_type)
-        if to_shape == 'tag_only':
-            return RuntimeVal(self._to_runtime(tag), to_type)
-        to_union_mir = to_type.payload_type().to_mir_type(self._mir_cache)
-        to_mir = to_type.to_mir_type(self._mir_cache)
-        assert to_union_mir is not None and to_mir is not None
+        if shape == 'tag_only':
+            # the payload holds no storage: its value is the union's unit
+            unit = to_type.payload_type().get_unit_value()
+            assert unit is not None
+            return ComptimeTaggedUnionValue(to_type, tag, ComptimeVal(unit))
         if from_shape == 'tag_payload':
-            from_union = self._emit(mir.ExtractValue(ev.value, 1))
-            payload: mir.Value = self._emit(mir.UnionCast(from_union, to_union_mir))
-        else:
-            # the source variants are all zero-sized: the active payload has no
-            # storage, so nothing is read out of it
-            payload = mir.UndefValue(to_union_mir)
-        result = self._emit(mir.InsertValue(mir.UndefValue(to_mir), self._to_runtime(tag), 0))
-        return RuntimeVal(self._emit(mir.InsertValue(result, payload, 1)), to_type)
+            # the payload union storage reinterpreted as the target's
+            payload = self._convert_union_storage(
+                RuntimeVal(self._emit(mir.ExtractValue(ev.value, 1)), from_type.payload_type()),
+                to_type.payload_type(),
+            )
+            return ComptimeTaggedUnionValue(to_type, tag, payload)
+        # the source variants are all zero-sized: the active payload has no
+        # storage, so the target's payload storage is undefined
+        return ComptimeTaggedUnionValue(to_type, tag, ComptimeVal(sval.Undefined(to_type.payload_type())))
+
+    def _convert_union_storage(self, value: InterpVal, to_union: sval.UnionType) -> InterpVal:
+        """The union storage value ``value`` as a value of the union
+        ``to_union``: the two share their storage (every variant lives at offset
+        0), so the value is reinterpreted - a union without storage is the
+        target's unit value, an undefined (or storage-less) one stays undefined,
+        and any other runtime value is cast with ``mir.UnionCast``."""
+        unit = to_union.get_unit_value()
+        if unit is not None:
+            return ComptimeVal(unit)
+        if isinstance(value, ComptimeVal) and isinstance(value.obj, (sval.Undefined, sval.UnionValue)):
+            return ComptimeVal(sval.Undefined(to_union))
+        assert isinstance(value, RuntimeVal)
+        if value.type == to_union:
+            return value
+        to_mir = to_union.to_mir_type(self._mir_cache)
+        assert to_mir is not None
+        return RuntimeVal(self._emit(mir.UnionCast(value.value, to_mir)), to_union)
 
     def _coerce_tagged_union_value(self, ev: InterpVal, type: sval.TaggedUnionType) -> InterpVal:
-        """Materialize ``ev`` as a value of the tagged union ``type``: a value of
-        a compatible union is converted, anything else is the variant it belongs
-        to, tagged."""
+        """Materialize ``ev`` as a value form of the tagged union ``type``: a
+        value of a compatible union is converted, anything else is the variant it
+        belongs to, tagged.
+
+        The result is a :class:`ComptimeTaggedUnionValue` whenever ``ev`` had to
+        change - its tag the variant position (a compile-time value) and its
+        value the variant, or - for a tag only known at runtime - the payload
+        union storage (see ``ComptimeTaggedUnionValue``); a value that already is
+        a union of the type is returned as it is."""
         ev = _shallow_normalize(ev)
+        if _type_of(ev) == type:
+            return ev
         if isinstance(ev, ComptimeTaggedUnionValue):
-            if ev.type == type:
-                return ev
+            if _to_comptime(ev.tag) is None:
+                # a tag only known at runtime: the value already is the payload
+                # union storage
+                return ComptimeTaggedUnionValue(
+                    type,
+                    self._tagged_union_reindex(ev.tag, ev.type, type),
+                    self._convert_union_storage(ev.value, type.payload_type()),
+                )
             index = self._tagged_union_index(type, ev.type.types[self._tagged_union_int(ev.tag)])
             return ComptimeTaggedUnionValue(type, ComptimeVal(sval.Int(index, type.tag_type())), ev.value)
-        if isinstance(ev, RuntimeVal) and isinstance(_type_of(ev), sval.TaggedUnionType):
-            return self._convert_tagged_union(ev, type)
+        ev_type = _type_of(ev)
+        if isinstance(ev, RuntimeVal) and isinstance(ev_type, sval.TaggedUnionType):
+            return self._runtime_union_value_form(ev, ev_type, type)
         index = self._tagged_union_variant_index(ev, type)
         variant_value = self._coerce(ev, type.types[index])
         return ComptimeTaggedUnionValue(type, ComptimeVal(sval.Int(index, type.tag_type())), variant_value)
@@ -3702,38 +3650,16 @@ class HirRunner:
                 return ComptimeVal(sval.coerce_const(obj, target))
             case RuntimeVal(value, type):
                 return RuntimeVal(self._convert(value, type, target), target)
-            case ComptimeAggregatePtr():
+            case ComptimeAggregatePtr() | ComptimeOptionPtr() | ComptimeBox():
                 # a compile-time aggregate as a value of a pointer type: it *is*
                 # a pointer already (see ``_type_of``) - its fields are their own
                 # places - so nothing is converted here.  Becoming an address of
                 # real memory happens only where a MIR value is actually needed
                 # (see ``_to_runtime``)
+                # TODO: type check?
                 if not isinstance(target, sval.PointerType):
                     raise CoerceError(
                         f'cannot materialize a {target} from a compile-time aggregate'
-                    )
-                return ev
-            case ComptimeOptionPtr():
-                # the compile-time place of an option is a pointer already (see
-                # ``_type_of``): like a compile-time aggregate, nothing is
-                # converted until a MIR value is actually needed (``_to_runtime``)
-                if not isinstance(target, sval.PointerType):
-                    raise CoerceError(
-                        f'cannot materialize a {target} from a compile-time option'
-                    )
-                return ev
-            case ComptimeBox():
-                # a compile-time box already is a value of a pointer type (see
-                # ``_type_of``), and a pointer needs no conversion, just like a
-                # runtime one (see ``_convert``) - but a const box is not a
-                # non-const pointer
-                if not isinstance(target, sval.PointerType):
-                    raise CoerceError(
-                        f'cannot materialize a {target} from a compile-time box'
-                    )
-                if ev.is_const and target.is_const is not True:
-                    raise CoerceError(
-                        f'cannot materialize a {target} from the const pointer {ev.type}'
                     )
                 return ev
             case ComptimeAggregate():
@@ -3806,13 +3732,13 @@ class HirRunner:
                 mir_type = option.to_mir_type(self._mir_cache)
                 assert mir_type is not None
                 alloca = self._emit(mir.Alloca(mir_type))
-                self._write_option(alloca, self.load(ev), option)
+                self._emit(mir.Store(alloca, self._to_runtime(self.load(ev))))
                 return alloca
             case ComptimeTaggedUnionValue(type, tag, value):
                 # the tagged union value form: the tag and the payload union are
                 # joined into the struct representation (see
                 # ``_tagged_union_parts_to_runtime``)
-                return self._tagged_union_parts_to_runtime(type, self._tagged_union_int(tag), value)
+                return self._tagged_union_parts_to_runtime(type, tag, value)
             case ComptimeTaggedUnionPtr(type):
                 # the compile-time *storage* of a tagged union: what a value of
                 # its pointer type delivers is the address of fresh memory the
@@ -3820,9 +3746,7 @@ class HirRunner:
                 mir_type = type.to_mir_type(self._mir_cache)
                 assert mir_type is not None
                 alloca = self._emit(mir.Alloca(mir_type))
-                self._write_tagged_union_runtime(
-                    RuntimeVal(alloca, sval.PointerType(type, is_const=False)), self.load(ev), type,
-                )
+                self._emit(mir.Store(alloca, self._to_runtime(self.load(ev))))
                 return alloca
             case ComptimeBox():
                 raise CompileError('cannot use a compile-time box as a runtime value')
@@ -4581,8 +4505,8 @@ class HirRunner:
     def _option_tag_value(self, value: InterpVal, child: sval.Type) -> tuple[InterpVal, sval.PointerType]:
         """The pointer *value* that tags the option whose child is ``child``,
         read out of the option value ``value`` (which is typed as ``child``,
-        the two sharing their representation) - the value counterpart of
-        ``_option_tag_addr``: the first pointer of ``child`` (see
+        the two sharing their representation) - the value counterpart of taking
+        the tag address: the first pointer of ``child`` (see
         ``find_first_pointer_type_pos``), read field by field with
         ``_extract_aggregate_value`` (an option layer costs no field, since it
         shares its child's representation)."""
