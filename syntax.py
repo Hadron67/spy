@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import EllipsisType
 from typing import Any, Self, overload
 
@@ -91,3 +92,15 @@ class USize:
 
 class ISize:
     pass
+
+@contextmanager
+def defer():
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+@contextmanager
+def okdefer():
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+@contextmanager
+def errdefer():
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")

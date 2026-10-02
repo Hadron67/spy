@@ -111,6 +111,14 @@ _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
     ast.GtE: '>=',
 }
 
+# the ``syntax.*`` markers that start a deferred region when they are the
+# context manager of a ``with`` statement (see ``_Builder._gen_defer``)
+_DEFER_CALLS: dict[Any, hir.DeferKind] = {
+    syntax.defer: hir.DeferKind.DEFER,
+    syntax.okdefer: hir.DeferKind.OKDEFER,
+    syntax.errdefer: hir.DeferKind.ERRDEFER,
+}
+
 # the ``syntax.*`` markers that are *calls* in the source and are recognized by
 # identity (unlike ``syntax.array`` and ``syntax.Comptime``, which are resolved
 # through ``_gen_call``/``_split_comptime``)
@@ -302,6 +310,8 @@ class _Builder:
                 self.add(hir.Continue())
             case ast.Try():
                 self._gen_try(node)
+            case ast.With():
+                self._gen_defer(node)
             case ast.Match():
                 self._gen_match(node)
             case _:
@@ -567,6 +577,43 @@ class _Builder:
                 self._declare(handler.name, bind)
             self._gen_body(handler.body)
             self._scopes.pop()
+        self.add(hir.End())
+
+    def _gen_defer(self, node: ast.With) -> None:
+        """Translate one ``with syntax.defer(): body`` (or ``okdefer``/``errdefer``)
+        into a deferred region: a :class:`hir.Defer` marker carrying the kind the
+        context manager names, the body in a lexical block of its own, and the
+        matching ``hir.End``.  The body is not run where it is written - it is
+        deferred to the exit of the enclosing region (see ``interp``) - and it
+        may not jump out of itself (``return``/``break``/``continue``/``raise``
+        that would leave it are rejected by the interpreter).
+
+        Only a single, unbound context manager is accepted, and it has to be one
+        of the three ``syntax`` markers."""
+        fn_name = self._fn_ir.name
+        if len(node.items) != 1:
+            raise CompileError(
+                f'a defer statement takes exactly one context manager in spy '
+                f'function {fn_name}'
+            )
+        item = node.items[0]
+        if item.optional_vars is not None:
+            raise CompileError(
+                f'a defer statement binds no name in spy function {fn_name}'
+            )
+        call = item.context_expr
+        kind = (
+            _DEFER_CALLS.get(self._try_resolve_object(call.func))
+            if isinstance(call, ast.Call) and len(call.args) == 0 and len(call.keywords) == 0
+            else None
+        )
+        if kind is None:
+            raise CompileError(
+                f'expected syntax.defer()/syntax.okdefer()/syntax.errdefer() '
+                f'in spy function {fn_name}'
+            )
+        self.add(hir.Defer(kind))
+        self._gen_block(node.body)
         self.add(hir.End())
 
     # -- variables ------------------------------------------------------------

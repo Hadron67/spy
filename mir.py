@@ -1,5 +1,6 @@
 from abc import abstractmethod
 from collections.abc import Callable
+from copy import copy
 from dataclasses import dataclass, field, replace
 from typing import Any, Self, override
 
@@ -946,6 +947,13 @@ class Terminator(Inst):
         """The blocks this terminator transfers control to."""
         ...
 
+    def get_defer_blocks(self) -> tuple[BasicBlock, ...]:
+        """The deferred bodies this transfer triggers on its way out, in the
+        order they run (empty for a transfer that leaves no ``defer`` region, or
+        one whose regions have already been instantiated - see
+        ``instantiate_defers``)."""
+        return ()
+
 
 def ends_block(inst: Inst) -> bool:
     """Whether ``inst`` ends its basic block: a terminator, or a call of a
@@ -958,13 +966,19 @@ def ends_block(inst: Inst) -> bool:
 
 @dataclass(eq=False)
 class Jmp(Terminator):
-    """An unconditional jump to ``target``."""
+    """An unconditional jump to ``target``.  ``defer_blocks`` are the deferred
+    bodies the jump runs first, in order (see ``Terminator.get_defer_blocks``)."""
 
     target: BasicBlock
+    defer_blocks: tuple[BasicBlock, ...] = ()
 
     @override
     def get_targets(self) -> tuple[BasicBlock, ...]:
         return (self.target,)
+
+    @override
+    def get_defer_blocks(self) -> tuple[BasicBlock, ...]:
+        return self.defer_blocks
 
     def map_values(self, f: Callable[[Value], Value]) -> Self:
         return self
@@ -973,15 +987,25 @@ class Jmp(Terminator):
 @dataclass(eq=False)
 class Br(Terminator):
     """A two-way conditional branch: control goes to ``if_true`` when
-    ``cond`` holds and to ``if_false`` otherwise."""
+    ``cond`` holds and to ``if_false`` otherwise.  Each edge has its own
+    deferred bodies to run first (``if_true_defer_blocks``/:
+    ``if_false_defer_blocks``), because the two edges can leave different
+    regions (a conditional ``break`` leaves on the true edge only, a plain
+    runtime ``if`` leaves none)."""
 
     cond: Value
     if_true: BasicBlock
     if_false: BasicBlock
+    if_true_defer_blocks: tuple[BasicBlock, ...] = ()
+    if_false_defer_blocks: tuple[BasicBlock, ...] = ()
 
     @override
     def get_targets(self) -> tuple[BasicBlock, ...]:
         return (self.if_true, self.if_false)
+
+    @override
+    def get_defer_blocks(self) -> tuple[BasicBlock, ...]:
+        return (*self.if_true_defer_blocks, *self.if_false_defer_blocks)
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.cond,)
@@ -1016,13 +1040,19 @@ class Switch(Terminator):
 @dataclass(eq=False)
 class Ret(Terminator):
     """Return from the enclosing function; ends the path of its block.
-    ``value`` is None for a void return (a ``ret void``)."""
+    ``value`` is None for a void return (a ``ret void``).  ``defer_blocks`` are
+    the deferred bodies the return runs first, in order."""
 
     value: Value | None
+    defer_blocks: tuple[BasicBlock, ...] = ()
 
     @override
     def get_targets(self) -> tuple[BasicBlock, ...]:
         return ()
+
+    @override
+    def get_defer_blocks(self) -> tuple[BasicBlock, ...]:
+        return self.defer_blocks
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.value,) if self.value is not None else ()
@@ -1032,6 +1062,35 @@ class Ret(Terminator):
             return self
         value = f(self.value)
         return self if value is self.value else replace(self, value=value)
+
+
+@dataclass(eq=False, slots=True)
+class EndDefer(Terminator):
+    """The end of a deferred body (see ``hir.Defer``): the terminator of the
+    shared block tree the interpreter emitted a ``with syntax.defer():`` body
+    into.  ``defer_blocks`` are the deferred bodies the *normal* completion of
+    the body triggers - the ``defer``/``okdefer`` blocks declared inside it, in
+    reverse declaration order.
+
+    The tree is shared: every transfer that triggers the defer refers to its
+    entry, so a block's single terminator cannot name one continuation.
+    ``instantiate_defers`` therefore expands one fresh copy of the tree per use
+    and replaces every ``EndDefer`` with the ``Jmp`` that continues the copy
+    (running the nested triggers first).  After instantiation no ``EndDefer`` is
+    reachable any more."""
+
+    defer_blocks: tuple[BasicBlock, ...] = ()
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return ()
+
+    @override
+    def get_defer_blocks(self) -> tuple[BasicBlock, ...]:
+        return self.defer_blocks
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
 
 
 @dataclass(eq=False)
@@ -1079,11 +1138,38 @@ def _flatten(insts: list[Inst]) -> list[Inst]:
     return out
 
 
+def _reachable_with_defers(entry: BasicBlock) -> list[BasicBlock]:
+    """Every block reachable from ``entry``, following both the targets and the
+    deferred bodies of its terminators.  The deferred bodies of a transfer are
+    only reachable through ``get_defer_blocks`` (they are templates, not real
+    CFG edges), so :meth:`BasicBlock.collect_blocks` misses them; 
+    :func:`normalize` needs them all the same - their instructions hold
+    insertions to flatten."""
+    ret: list[BasicBlock] = []
+    seen: set[BasicBlock] = set()
+    todo: list[BasicBlock] = [entry]
+    while len(todo) > 0:
+        block = todo.pop()
+        if block in seen:
+            continue
+        seen.add(block)
+        ret.append(block)
+        children: list[BasicBlock] = []
+        if len(block.insts) > 0:
+            last = block.insts[-1]
+            if isinstance(last, Terminator):
+                children.extend(last.get_targets())
+                children.extend(last.get_defer_blocks())
+        children.reverse()
+        todo.extend(children)
+    return ret
+
+
 def normalize(fn: Function) -> None:
     """Eliminate the :class:`Insertion` placeholders of every block of
     ``fn`` by flattening them and substituting their values, then check
     that every block ends with a terminator."""
-    blocks = fn.entry.collect_blocks()
+    blocks = _reachable_with_defers(fn.entry)
 
     # every insertion that stands for a value maps to that value, so that
     # the operands referring to the insertion are rewritten to it
@@ -1197,3 +1283,216 @@ def collect_symbols(entry: list[GlobalValue]) -> set[GlobalValue | StructType]:
             symbols.add(value)
         todo.extend(reversed([a for a in value.get_children() if not isinstance(a, Inst)]))
     return symbols
+
+
+# ---------------------------------------------------------------------------
+# deferred bodies
+# ---------------------------------------------------------------------------
+
+
+def _repoint_phi_incoming(target: BasicBlock, old: BasicBlock, new: BasicBlock) -> None:
+    """Replace the predecessor ``old`` of every ``Phi`` of ``target`` by
+    ``new``: a transfer that runs deferred bodies first reaches the target from
+    the tail of the instantiated chain, not from the block that emitted it."""
+    for inst in target.insts:
+        if isinstance(inst, Phi):
+            for index, (value, pred) in enumerate(inst.incomings):
+                if pred is old:
+                    inst.incomings[index] = (value, new)
+
+
+def _instantiate_chain(entries: tuple[BasicBlock, ...], cont: BasicBlock) -> tuple[BasicBlock, BasicBlock]:
+    """The entry and the tail of an explicit chain running the deferred bodies
+    ``entries`` (in order) and then continuing in ``cont``: a fresh copy of every
+    entry is made, each wired to the next (see :func:`_clone_template`), and the
+    returned tail is the block that transfers to ``cont`` (the last copy's own
+    tail).  With no entries the chain is empty and both are ``cont``.  The
+    recursion follows the source nesting of the defers - one level per body
+    declared inside another - so it is shallow."""
+    if len(entries) == 0:
+        return cont, cont
+    entry = cont
+    tail = cont
+    first = True
+    for deferred in reversed(entries):
+        entry, copied_tail = _clone_template(deferred, entry)
+        if first:
+            # the first copy made is the innermost body: its tail is the one
+            # that reaches ``cont``
+            tail = copied_tail
+            first = False
+    return entry, tail
+
+
+def _clone_template(root: BasicBlock, cont: BasicBlock) -> tuple[BasicBlock, BasicBlock]:
+    """A fresh copy of the deferred body tree rooted at ``root``, continuing in
+    ``cont`` when the body has finished: every block and instruction of the copy
+    is new (the values the body reads from enclosing scopes are shared), the
+    operands and the blocks the terminators refer to are remapped onto the copy,
+    the transfers inside the body with deferred bodies of their own are
+    instantiated in turn, and the copy's :class:`EndDefer` is replaced by the
+    ``Jmp`` that runs the body's own triggers and continues in ``cont``.  Returns
+    the entry and the tail of the copy (the block that transfers to ``cont``)."""
+    # the blocks of the tree, following the real targets only: an ``EndDefer``
+    # is a leaf, and a body declared inside another is reached through a
+    # transfer's deferred blocks (expanded below), not through a real edge
+    tblocks: list[BasicBlock] = []
+    seen: set[BasicBlock] = set()
+    todo: list[BasicBlock] = [root]
+    while len(todo) > 0:
+        block = todo.pop()
+        if block in seen:
+            continue
+        seen.add(block)
+        tblocks.append(block)
+        if len(block.insts) > 0:
+            last = block.insts[-1]
+            if isinstance(last, Terminator):
+                todo.extend(last.get_targets())
+
+    # clone every instruction; the map original -> copy also drives the operand
+    # substitution (a value from an enclosing scope is not in the map, so it is
+    # shared by the copy)
+    repl: dict[Value, Value] = {}
+    for block in tblocks:
+        for inst in block.insts:
+            repl[inst] = copy(inst)
+
+    def resolve(value: Value) -> Value:
+        seen: set[Value] = set()
+        while value in repl:
+            if value in seen:
+                raise CompileError('cycle in a deferred body copy')
+            seen.add(value)
+            value = repl[value]
+        return value
+
+    def resolve_inst(inst: Inst) -> Inst:
+        resolved = resolve(inst)
+        assert isinstance(resolved, Inst)
+        return resolved
+
+    changed = True
+    while changed:
+        changed = False
+        for block in tblocks:
+            for inst in block.insts:
+                clone = resolve_inst(inst)
+                mapped = clone.map_values(resolve)
+                if mapped is not clone:
+                    repl[clone] = mapped
+                    changed = True
+
+    bmap: dict[BasicBlock, BasicBlock] = {block: BasicBlock() for block in tblocks}
+    for block in tblocks:
+        new = bmap[block]
+        new.insts = [resolve_inst(inst) for inst in block.insts]
+    # first remap every block reference onto the copies
+    for block in tblocks:
+        new = bmap[block]
+        for index, inst in enumerate(new.insts):
+            new.insts[index] = _remap_targets(inst, bmap)
+    # then expand the deferred bodies the transfers of the copy have of their own
+    # and give the copy's ``EndDefer`` its continuation
+    tail: BasicBlock | None = None
+    for block in tblocks:
+        new = bmap[block]
+        term = new.insts[-1]
+        if isinstance(term, Jmp) and len(term.defer_blocks) > 0:
+            entry, chain_tail = _instantiate_chain(term.defer_blocks, term.target)
+            _repoint_phi_incoming(term.target, new, chain_tail)
+            term.target = entry
+            term.defer_blocks = ()
+        elif isinstance(term, Br) and (
+            len(term.if_true_defer_blocks) > 0 or len(term.if_false_defer_blocks) > 0
+        ):
+            if len(term.if_true_defer_blocks) > 0:
+                entry, chain_tail = _instantiate_chain(term.if_true_defer_blocks, term.if_true)
+                _repoint_phi_incoming(term.if_true, new, chain_tail)
+                term.if_true = entry
+                term.if_true_defer_blocks = ()
+            if len(term.if_false_defer_blocks) > 0:
+                entry, chain_tail = _instantiate_chain(term.if_false_defer_blocks, term.if_false)
+                _repoint_phi_incoming(term.if_false, new, chain_tail)
+                term.if_false = entry
+                term.if_false_defer_blocks = ()
+        elif isinstance(term, EndDefer):
+            if len(term.defer_blocks) > 0:
+                entry, chain_tail = _instantiate_chain(term.defer_blocks, cont)
+                new.insts[-1] = Jmp(entry)
+                tail = chain_tail
+            else:
+                new.insts[-1] = Jmp(cont)
+                tail = new
+    assert tail is not None, 'a deferred body copy has an EndDefer'
+    return bmap[root], tail
+
+
+def _remap_targets(inst: Inst, bmap: dict[BasicBlock, BasicBlock]) -> Inst:
+    """Rewrite the block references of one cloned instruction ``inst`` onto the
+    copied blocks ``bmap``.  The deferred bodies a transfer has of its own are
+    expanded separately, once every block reference has been remapped."""
+    match inst:
+        case Jmp():
+            inst.target = bmap[inst.target]
+            return inst
+        case Br():
+            inst.if_true = bmap[inst.if_true]
+            inst.if_false = bmap[inst.if_false]
+            return inst
+        case Switch():
+            inst.default = bmap[inst.default]
+            inst.cases = tuple((value, bmap[block]) for value, block in inst.cases)
+            return inst
+        case Phi():
+            inst.incomings = [(value, bmap[pred]) for value, pred in inst.incomings]
+            return inst
+        case _:
+            return inst
+
+
+def instantiate_defers(fn: Function) -> None:
+    """Expand the shared deferred bodies of ``fn`` into explicit copies, one per
+    transfer that triggers them (rewrites the blocks of ``fn`` in place).  Every
+    transfer is replaced by a transfer of the same kind that runs its deferred
+    bodies first, so that afterwards no reachable transfer carries deferred
+    blocks and no reachable :class:`EndDefer` is left; the shared templates
+    become unreachable and are never lowered.  The expansion is driven by the
+    deferred blocks the interpreter collected on every transfer, so it is this
+    pass - not the lowering - that decides where a shared body continues."""
+    for block in fn.entry.collect_blocks():
+        if len(block.insts) == 0:
+            continue
+        last = block.insts[-1]
+        if isinstance(last, Jmp) and len(last.defer_blocks) > 0:
+            entry, chain_tail = _instantiate_chain(last.defer_blocks, last.target)
+            _repoint_phi_incoming(last.target, block, chain_tail)
+            last.target = entry
+            last.defer_blocks = ()
+        elif isinstance(last, Br) and (
+            len(last.if_true_defer_blocks) > 0 or len(last.if_false_defer_blocks) > 0
+        ):
+            if len(last.if_true_defer_blocks) > 0:
+                entry, chain_tail = _instantiate_chain(last.if_true_defer_blocks, last.if_true)
+                _repoint_phi_incoming(last.if_true, block, chain_tail)
+                last.if_true = entry
+                last.if_true_defer_blocks = ()
+            if len(last.if_false_defer_blocks) > 0:
+                entry, chain_tail = _instantiate_chain(last.if_false_defer_blocks, last.if_false)
+                _repoint_phi_incoming(last.if_false, block, chain_tail)
+                last.if_false = entry
+                last.if_false_defer_blocks = ()
+        elif isinstance(last, Ret) and len(last.defer_blocks) > 0:
+            # a return has no target to send the chain to: it ends in a fresh
+            # copy of the return itself
+            tail = BasicBlock()
+            tail.emit(Ret(last.value))
+            entry, _chain_tail = _instantiate_chain(last.defer_blocks, tail)
+            block.insts[-1] = Jmp(entry)
+    # the invariant of this pass: nothing deferred is left on the reachable CFG
+    for block in fn.entry.collect_blocks():
+        for inst in block.insts:
+            if isinstance(inst, EndDefer):
+                raise CompileError('a deferred body was not instantiated')
+            if isinstance(inst, (Jmp, Br, Ret)) and len(inst.get_defer_blocks()) > 0:
+                raise CompileError('a deferred body was not instantiated')

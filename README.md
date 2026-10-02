@@ -101,6 +101,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 - **异常**：`raise E(...)` 把异常值构造成一个 slot 并发出 `hir.Raise`。函数的返回约定是一个 `sval.ResultType`（正常返回值 + 按错误码排序的异常集），`make_ret_spec` 把它摊成叶子：值、错误码、payload union（结果位置因此是 `ComptimeResult`：value/code/payload 三个位置）。异常不往每个 try 自己的 error space 拷贝，而是在**抛出/调用点**用一个 `switch` 直接分派到最内层能捕获它的 except 子句：每个子句的入口块惰性创建，payload 指针由 `mir.Phi` 汇合送来，`except E as e` 的 `e` 直接绑定到那个指针（`hir.ExceptBind`），不拷贝。被调函数的 error 部分由调用方决定写到哪：若没有外层 try 能捕获、且（当前函数异常集为 infer 或已含被调函数的全部异常），就**直接写进当前函数的返回 payload**（零拷贝；payload 按值返回时也一样——写之前先把目标指针重解释成“到来的那个 union”，因为 union 值之间不能转换，只能重解释存储）；否则写进临时 slot 再按需拷入函数返回位置。没有被任何子句命中的 except 是死代码，其 HIR 不编译不分析；子句按顺序匹配，裸 `except` 的 union 随分派增长、延迟定型（`mir.UnionType`：子集 union 的指针可 bitcast 到超集），目前只把 code/payload 传进去、尚不读取。
 - **错误码的编码**：`ResultType.tag_bits` 取函数用到的 tag 所需的最小宽度：有正常返回值时 tag 是 `0..n`（`0` = 无错误），需要 `n.bit_length()` 位；**值部分是空类型**（`sval.EmptyType`：函数体从不交付值，因此不存在 `return` 路径）时没有“无错误”码，第 i 个异常的 tag 就是 `i`，于是单个异常时错误码是 `u0`（零大小）——调用点无从 `switch`，直接静态分派到那唯一的异常。写错误码（异常离开函数，或经 result location 抛出）依赖这个编码，而函数体跑的时候返回值类型可能还没定型，所以写入推迟成 `_PendingErrorCodeWrite`（`mir.Insertion` 占位），在 `finish_function` 里按最终的 `ResultType` 填上；`return` 路径清的 `0` 不用推迟（能 `return` 就不可能是空类型）。
 - **noreturn**：值部分是空类型且**不抛异常**的函数永远回不来：它的 MIR 返回值是 `mir.NoReturn`，LLVM 定义上标 `noreturn`，调用它是 `mir.Call(..., mir.NoReturn)`——这个调用**结束所在基本块**（lower 在它后面补一条 `unreachable`），`interp` 在它之后直接 cut，所以调用点之后的代码是死代码（它也不会让调用方的返回值类型被推断成那些死代码的类型）。值部分是空类型但会抛异常的函数照常“返回”（靠错误码），只是调用点没有 `code == 0` 分支。
+- **defer 块**：`with syntax.defer(): body` 把 `body` 登记到它所在区域（函数体、`if`/`while` 的分支体、`try` 的 body/子句、`hir.Block`、以及 defer 体自身），在**离开该区域**时运行：`defer` 对任何离开都运行，`okdefer` 只在正常离开（`return`/`break`/`continue`/自然落穿）时运行，`errdefer` 只在错误离开（`raise`、被传播出去的错误）时运行；同一区域内的多个 defer 按声明**反序**运行，内层区域先于外层。astgen 把 `with` 翻成一个 `hir.Defer`（带 variant）＋ body ＋匹配的 `hir.End`；`interp` 把 body 发射到一个**独立于当前块**的块树（模板），并把入口登记进当前区域的 defer 列表——body 在源位置并不执行，只有离开区域的转移指令才通过 `defer_blocks`（`mir.Jmp`/`mir.Br` 的两个边各一份/`mir.Ret`/`mir.EndDefer`）携带它。因此离开区域的每条路径（自然落穿、`return`、`break`/`continue`、条件 `break` 的 taken 边、错误分派、错误逃出函数）都会先跑相应的 defer 再继续；载入错误的转移会跨 inlined frame 收集，defer 体内声明的 defer 由该 body 的 `mir.EndDefer` 触发。这些模板是共享的，`mir.instantiate_defers`（在 `normalize` 之后）为每个使用点克隆一份并接好续接，实例化后 CFG 上不再有 `mir.EndDefer`、所有 `defer_blocks` 均为空——defer 因此完全不依赖 LLVM 的异常处理（将来 panic/recover 才会把模板另行 lower 成 cleanup 块）。`body` 不得跳出 defer 块（`return`/`break`/`continue`/`raise` 越出即报错，跨越 defer 体的 `break` 同理），目前也不允许声明在编译期（`syntax.unroll()`）循环里。
 
 ### 函数与调用
 
@@ -310,6 +311,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 - 多返回值：不能嵌套元组返回值（`-> tuple[i32, tuple[i32, i32]]`），且按值返回的聚合结果还不能从 Python 侧调用。
 - Option：还没有模式匹配（`match`，解包目前用 `is None` / 海牙语法 `(name := expr) is not None`）；以 `T` 的某个指针当标签的表示下，`T` 自身令该指针为空值（或内层选项为缺席）时会被误读为外层缺席（与 Zig/Rust 的 niche 优化同样的局限）。
 - 普通 Python 函数的内联不支持运行期递归（递归驱动参数是运行期值时会在内联嵌套上限处报错，而非编译期展开）；运行期的函数值调用（把函数存进变量/字段后再调用）也尚未实现。
+- `defer` 块：`body` 不能跳出（`return`/`break`/`continue`/`raise` 越出 defer 块即报错），也不能声明在编译期（`syntax.unroll()`）循环里（展开循环的相邻迭代间没有转移指令可挂）。panic/recover 尚未实现（defer 目前只覆盖 `return`/`break`/`continue`/自然落穿与语言自身的错误）。
 
 ## 运行测试
 

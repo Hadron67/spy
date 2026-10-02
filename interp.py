@@ -556,6 +556,34 @@ def _as_aggregate(ev: InterpVal) -> ComptimeAggregate | None:
 class BlockFrameData:
     pass
 
+
+@dataclass(frozen=True, slots=True)
+class _DeferEntry:
+    """One ``with syntax.defer():`` region declared in an open region: its kind
+    and the entry block of the deferred body the interpreter emitted (the
+    template every transfer that triggers it refers to, see
+    ``mir.EndDefer``/``Terminator.get_defer_blocks``)."""
+
+    kind: hir.DeferKind
+    entry: mir.BasicBlock
+
+
+@dataclass
+class DeferBlockData(BlockFrameData):
+    """The state of the defer body currently being walked (a
+    ``with syntax.defer():`` region).  ``variant`` is the kind of the defer,
+    ``entry`` the entry block of the body (appended to the enclosing region's
+    defer list), ``body_defers`` the defers declared inside the body itself -
+    they are what its ``mir.EndDefer`` triggers - and ``saved_block`` the block
+    the walk continues in after the body, which is emitted detached from the
+    current one (see ``HirRunner._exec_defer``)."""
+
+    variant: hir.DeferKind
+    entry: mir.BasicBlock
+    body_defers: list[_DeferEntry]
+    saved_block: mir.BasicBlock
+
+
 @dataclass
 class IfBlockData(BlockFrameData):
     """The state of one open ``if`` of the HIR.
@@ -575,6 +603,12 @@ class IfBlockData(BlockFrameData):
     then_block: mir.BasicBlock | None = None
     else_block: mir.BasicBlock | None = None
     exit_block: mir.BasicBlock | None = None
+    # which branch is being walked: 0 the then-region, 1 the else-region (see
+    # ``HirRunner._region_defers`` and the region-exit collection)
+    region: int = 0
+    # the deferred bodies declared directly in each region (see ``hir.Defer``)
+    then_defers: list[_DeferEntry] = field(default_factory=list)
+    else_defers: list[_DeferEntry] = field(default_factory=list)
 
 @dataclass
 class LoopBlockData(BlockFrameData):
@@ -600,6 +634,8 @@ class LoopBlockData(BlockFrameData):
     header_block: mir.BasicBlock | None = None
     exit_block: mir.BasicBlock | None = None
     inline_next: mir.BasicBlock | None = None
+    # the deferred bodies declared directly in the loop body (see ``hir.Defer``)
+    body_defers: list[_DeferEntry] = field(default_factory=list)
 
 @dataclass
 class PlainBlockData(BlockFrameData):
@@ -614,6 +650,8 @@ class PlainBlockData(BlockFrameData):
 
     p_end: int
     exit_block: mir.BasicBlock | None = None
+    # the deferred bodies declared directly in the block body (see ``hir.Defer``)
+    body_defers: list[_DeferEntry] = field(default_factory=list)
 
 @dataclass
 class TryExceptBlockData(BlockFrameData):
@@ -647,6 +685,9 @@ class TryExceptBlockData(BlockFrameData):
     # ``_begin_except_clause``)
     bare_pending: list[tuple[int, mir.BasicBlock, InterpVal, sval.Type]] = field(default_factory=list)
     region: int = 0
+    # the deferred bodies declared directly in each region (the try body and
+    # every except clause), indexed like ``region`` (see ``hir.Defer``)
+    region_defers: list[list[_DeferEntry]] = field(default_factory=list)
     # the try body has been walked: errors at the current position no longer
     # belong to this try
     body_done: bool = False
@@ -679,6 +720,10 @@ class InlineFrame:
         self.pc: int = 0
         self.block_stack: list[BlockFrame] = []
         self.regs: dict[hir.Inst, InterpVal] = {}
+        # the deferred bodies declared directly in the body's top-level region
+        # (the function body, or the body an inlined plain function; see
+        # ``hir.Defer`` and ``HirRunner._region_defers``)
+        self.body_defers: list[_DeferEntry] = []
         # the block the caller of the inlined body continues in: created by
         # ``continuation`` the first time a path of the body reaches it, so that
         # a body whose every path ends elsewhere (a ``raise`` leaving it) has
@@ -700,6 +745,29 @@ class InlineFrame:
 # operators and operator error messages) - none of them uses instance state,
 # so none of them is a method of :class:`HirRunner`
 # ---------------------------------------------------------------------------
+
+
+def _append_defers(out: list[mir.BasicBlock], defers: list[_DeferEntry], is_error: bool) -> None:
+    """Append the entries of ``defers`` a transfer that exits with ``is_error``
+    triggers, in the order they run - reverse declaration order (see
+    ``hir.DeferKind``): ``defer`` always, ``okdefer`` only on a normal exit and
+    ``errdefer`` only on an error one."""
+    for entry in reversed(defers):
+        if entry.kind is hir.DeferKind.DEFER:
+            out.append(entry.entry)
+        elif entry.kind is hir.DeferKind.OKDEFER:
+            if not is_error:
+                out.append(entry.entry)
+        elif is_error:
+            out.append(entry.entry)
+
+
+def _normal_defers(defers: list[_DeferEntry]) -> tuple[mir.BasicBlock, ...]:
+    """The entries of ``defers`` a *normal* exit of the region they were
+    declared in triggers (``defer`` and ``okdefer``), in the order they run."""
+    out: list[mir.BasicBlock] = []
+    _append_defers(out, defers, False)
+    return tuple(out)
 
 
 def _sval_to_runtime(value: sval.AnyValue) -> mir.Value:
@@ -1205,8 +1273,9 @@ class HirRunner:
         # the ``hir.Ret`` positions of the function proper whose return
         # convention is not fixed yet (an unannotated return type); their
         # ``mir.Ret`` is filled in by ``_finish_function`` once the result
-        # location has been materialized
-        self._deferred_returns: list[mir.Insertion] = []
+        # location has been materialized, together with the deferred bodies the
+        # return runs first
+        self._deferred_returns: list[tuple[mir.Insertion, tuple[mir.BasicBlock, ...]]] = []
         # the exception set of the function proper's own error location, in
         # first-delivery order (its error codes follow from this order, see
         # ``sval.ResultType``); it grows with every delivery while the set is
@@ -1537,40 +1606,43 @@ class HirRunner:
                         return data, index
         return None
 
-    def _defer_return(self) -> None:
+    def _defer_return(self, defer_blocks: tuple[mir.BasicBlock, ...] = ()) -> None:
         """End a path whose return convention is not fixed yet: a placeholder
         that ``_finish_function`` fills with the ``mir.Ret`` once the effective
         spec is known (see ``hir.Ret``/``hir.Raise``).  The placeholder is not
         a terminator, so ``emit`` cannot end the block on its own - the path
-        ends here all the same."""
+        ends here all the same.  ``defer_blocks`` are the deferred bodies the
+        return runs first."""
         insertion = mir.Insertion([], None)
         self._emit(insertion)
         self._cur_block.is_finished = True
-        self._deferred_returns.append(insertion)
+        self._deferred_returns.append((insertion, defer_blocks))
 
-    def _emit_function_return(self) -> None:
+    def _emit_function_return(self, defer_blocks: tuple[mir.BasicBlock, ...] = ()) -> None:
         """Emit the ``mir.Ret`` that ends one path of the *function proper*
         (whatever inline frame the path sits in): its by-value result is
         loaded out of the function's result location, or none is returned when
-        every result goes through a result pointer."""
+        every result goes through a result pointer.  ``defer_blocks`` are the
+        deferred bodies the return runs first."""
         sig = self.ret_sig
         assert sig is not None
         spec = sig.ret_spec(self._mir_cache)
         places = _result_places(self._frames[0].ret_loc)
         index = ret_by_value_index(spec)
         if index is None:
-            self._cur_block.emit(mir.Ret(None))
+            self._cur_block.emit(mir.Ret(None, defer_blocks))
         else:
-            self._cur_block.emit(mir.Ret(self._to_runtime(self.load(places[index]))))
+            self._cur_block.emit(mir.Ret(self._to_runtime(self.load(places[index])), defer_blocks))
 
 
-    def _end_error_path(self) -> None:
+    def _end_error_path(self, defer_blocks: tuple[mir.BasicBlock, ...] = ()) -> None:
         """End a path at the function boundary (an error escaping the function):
-        a typed return, or a deferred one when the convention is not fixed yet."""
+        a typed return, or a deferred one when the convention is not fixed yet.
+        ``defer_blocks`` are the deferred bodies the error exit runs first."""
         if self.ret_sig is None:
-            self._defer_return()
+            self._defer_return(defer_blocks)
         else:
-            self._emit_function_return()
+            self._emit_function_return(defer_blocks)
 
     def _raise(self, slot: InterpVal) -> PollResult:
         """End one path with ``hir.Raise``: the exception has been built into
@@ -1584,14 +1656,28 @@ class HirRunner:
         target = self._find_catching_clause(exception)
         if target is not None:
             data, index = target
+            defer_blocks = self._collect_exit_defers(
+                True, data, inclusive=True, current_frame_only=False,
+            )
             if exception.is_zst():
                 incoming = ComptimeVal(sval.Undefined(sval.PointerType(exception, is_const=False)))
             else:
                 self._commit_pending_slot(slot, exception)
                 incoming = _shallow_normalize(slot)
-            self._route_to_clause(data, index, incoming, exception)
+            self._route_to_clause(data, index, incoming, exception, defer_blocks)
         else:
-            self._deliver_uncaught_raise(slot, exception)
+            defer_blocks = self._collect_exit_defers(
+                True, None, inclusive=False, current_frame_only=False,
+            )
+            self._add_function_exception(exception)
+            self._defer_error_code_write(exception)
+            if exception.is_zst():
+                self._commit_pending_slot(slot, exception)
+            else:
+                dest = self._payload_variant_ptr(exception)
+                assert isinstance(dest, RuntimeVal)
+                self._commit_pending_slot(slot, exception, ptr=dest.value)
+            self._end_error_path(defer_blocks)
         return self._cut()
 
     # -- error locations ---------------------------------------------------
@@ -1683,26 +1769,27 @@ class HirRunner:
             return True
         return all(exception in self._error_types.values for exception in callee_exceptions)
 
-    def _route_to_clause(self, data: TryExceptBlockData, index: int, incoming: InterpVal, exception: sval.StructType) -> None:
+    def _route_to_clause(self, data: TryExceptBlockData, index: int, incoming: InterpVal, exception: sval.StructType, defer_blocks: tuple[mir.BasicBlock, ...] = ()) -> None:
         """Route one caught error to clause ``index``: create the clause's entry
         block - and its error-payload ``Phi`` - on the first dispatch that
         reaches it, then have the current block jump to it with ``incoming`` (the
         address of the caught exception) as its payload pointer.  A bare clause's
         union - and so its phi types - is only fixed once the whole try body has
-        been walked, so its dispatch is deferred through a case block."""
+        been walked, so its dispatch is deferred through a case block.
+        ``defer_blocks`` are the deferred bodies the error exit runs first."""
         block = data.clause_blocks[index]
         if block is None:
             block = mir.BasicBlock()
             data.clause_blocks[index] = block
         if self._except_struct_type(data.except_types[index]) is None:
             case_block = mir.BasicBlock()
-            self._cur_block.emit(mir.Jmp(case_block))
+            self._cur_block.emit(mir.Jmp(case_block, defer_blocks))
             data.bare_pending.append((index, case_block, incoming, exception))
             return
         if exception.is_zst():
             # a zero-sized exception has no payload: the clause is entered
             # without a payload pointer (its bind is the unit value)
-            self._cur_block.emit(mir.Jmp(block))
+            self._cur_block.emit(mir.Jmp(block, defer_blocks))
             return
         value = self._to_runtime(incoming)
         phi = data.payload_phi[index]
@@ -1712,37 +1799,8 @@ class HirRunner:
             block.emit(phi)
         else:
             phi.add_incoming(value, self._cur_block)
-        self._cur_block.emit(mir.Jmp(block))
+        self._cur_block.emit(mir.Jmp(block, defer_blocks))
 
-
-    def _deliver_uncaught_call(self, exception: sval.StructType, payload_place: InterpVal, use_ret_payload: bool) -> None:
-        """Deliver a call's error no clause catches into the function's error
-        location and end the path: the callee's tag remapped (written once the
-        tags are known, see ``_defer_error_code_write``), the payload already in
-        place when the callee wrote straight into the location (no copy) or
-        copied from the call's payload slot otherwise."""
-        self._add_function_exception(exception)
-        self._defer_error_code_write(exception)
-        if not use_ret_payload and not exception.is_zst():
-            value = self.load(self._union_variant_ptr(payload_place, exception))
-            self.store(self._payload_variant_ptr(exception), value)
-        self._end_error_path()
-
-    def _deliver_uncaught_raise(self, slot: InterpVal, exception: sval.StructType) -> None:
-        """Deliver a ``raise`` no clause catches into the function's error
-        location and end the path: the exception's own slot is bound to the
-        location's payload variant, so the already built value is written there
-        directly (no copy), and the code tagged (once the tags are known, see
-        ``_defer_error_code_write``)."""
-        self._add_function_exception(exception)
-        self._defer_error_code_write(exception)
-        if exception.is_zst():
-            self._commit_pending_slot(slot, exception)
-        else:
-            dest = self._payload_variant_ptr(exception)
-            assert isinstance(dest, RuntimeVal)
-            self._commit_pending_slot(slot, exception, ptr=dest.value)
-        self._end_error_path()
 
     def _in_function_proper(self) -> bool:
         """Whether the instructions currently being executed are those
@@ -1782,8 +1840,9 @@ class HirRunner:
         blocks when it is not, as it does for a dead path."""
         frame = self._frames.pop()
         if not self._cur_block.is_finished:
-            # the path fell off the end of the body: it joins the caller
-            self._cur_block.emit(mir.Jmp(frame.continuation()))
+            # the path fell off the end of the body: it joins the caller, after
+            # running the defers of the body's top-level region
+            self._cur_block.emit(mir.Jmp(frame.continuation(), _normal_defers(frame.body_defers)))
         exit_block = frame.exit_block
         if exit_block is None:
             return False
@@ -1816,6 +1875,103 @@ class HirRunner:
     def _scan_block(self, entry: int) -> tuple[int | None, int]:
         return hir.scan_block(self._frames[-1].insts, entry)
 
+    # -- deferred bodies -----------------------------------------------------
+
+    def _region_defers(self, data: BlockFrameData) -> list[_DeferEntry]:
+        """The deferred bodies declared directly in the region whose state is
+        ``data`` - the region currently being walked (an ``if`` walks one branch
+        at a time, a ``try`` one clause, ...)."""
+        if isinstance(data, DeferBlockData):
+            return data.body_defers
+        if isinstance(data, IfBlockData):
+            return data.then_defers if data.region == 0 else data.else_defers
+        if isinstance(data, (LoopBlockData, PlainBlockData)):
+            return data.body_defers
+        assert isinstance(data, TryExceptBlockData)
+        return data.region_defers[data.region]
+
+    def _current_defers(self) -> list[_DeferEntry]:
+        """The list a ``with syntax.defer():`` region being opened appends its
+        entry to: the defer list of the region currently being walked."""
+        frame = self._frames[-1]
+        if len(frame.block_stack) == 0:
+            return frame.body_defers
+        return self._region_defers(frame.block_stack[-1].data)
+
+    def _collect_exit_defers(
+        self,
+        is_error: bool,
+        stop_data: BlockFrameData | None,
+        inclusive: bool,
+        current_frame_only: bool,
+    ) -> tuple[mir.BasicBlock, ...]:
+        """The deferred bodies a transfer out of the currently walked regions
+        triggers, in the order they run: from the innermost region outwards,
+        every region's ``defer``/``okdefer`` (on a normal exit) or
+        ``defer``/``errdefer`` (on an error exit), each in reverse declaration
+        order.  The walk stops at the region of ``stop_data`` - included or not
+        per ``inclusive`` - and, when ``current_frame_only`` is set, at the
+        current inline frame's own body (an inlined ``return``); otherwise it
+        continues into the caller's frames, so that an error escaping an inlined
+        body runs the defers of the caller's regions too.  A transfer that would
+        leave a defer body is rejected."""
+        ret: list[mir.BasicBlock] = []
+        for frame in reversed(self._frames):
+            for bf in reversed(frame.block_stack):
+                if bf.data is stop_data:
+                    if inclusive:
+                        _append_defers(ret, self._region_defers(bf.data), is_error)
+                    return tuple(ret)
+                if isinstance(bf.data, DeferBlockData):
+                    raise CompileError('cannot jump out of a defer block')
+                _append_defers(ret, self._region_defers(bf.data), is_error)
+            _append_defers(ret, frame.body_defers, is_error)
+            if current_frame_only:
+                return tuple(ret)
+        if stop_data is not None:
+            raise CompileError('the target of a transfer is not an open region')
+        return tuple(ret)
+
+    def _run_defers_on_fallthrough(self, defers: list[_DeferEntry], is_error: bool) -> None:
+        """A region ended by falling off its end into a continuation that has no
+        transfer instruction of its own (a compile-time ``if`` whose chosen
+        branch fell through): when its deferred bodies have to run, split the
+        block - jump through them to a fresh block and continue there."""
+        out: list[mir.BasicBlock] = []
+        _append_defers(out, defers, is_error)
+        if len(out) == 0:
+            return
+        cont = mir.BasicBlock()
+        self._cur_block.emit(mir.Jmp(cont, tuple(out)))
+        self._cur_block = cont
+
+    def _exec_defer(self, inst: hir.Defer) -> None:
+        """Open a ``with syntax.defer():`` region (``hir.Defer``): the body
+        follows in the flat instruction list, closed by the matching ``hir.End``.
+        The body is *not* executed here - it is emitted into a block tree of its
+        own, detached from the current block, and its entry is recorded in the
+        enclosing region's defer list (see ``_current_defers``), so that only the
+        transfers leaving that region run it.  The walk continues in the
+        detached block until the body's ``End`` emits ``mir.EndDefer`` and
+        restores the block the region was opened in (see ``_exec_end``).
+
+        A compile-time (``syntax.unroll``) loop has no transfer between its
+        unrolled iterations, so a defer declared inside one has no exit to be
+        deferred to; it is rejected for now."""
+        frame = self._frames[-1]
+        for bf in reversed(frame.block_stack):
+            if isinstance(bf.data, LoopBlockData) and bf.data.is_inline:
+                raise CompileError('a defer block inside a compile-time loop is not supported yet')
+        entry = frame.pc - 1
+        p_else, _p_end = self._scan_block(entry)
+        assert p_else is None, 'a defer body has no else marker'
+        template = mir.BasicBlock()
+        self._current_defers().append(_DeferEntry(inst.variant, template))
+        frame.block_stack.append(
+            BlockFrame(entry, DeferBlockData(inst.variant, template, [], self._cur_block))
+        )
+        self._cur_block = template
+
     def _exec_inst(self, inst: hir.Inst) -> PollResult:
         """Execute one instruction of the executing frame.  A control
         instruction changes the execution state: an ``If`` splits the
@@ -1842,18 +1998,29 @@ class HirRunner:
                 if not self._in_function_proper():
                     # an inlined ``return`` delivers its value (already
                     # stored into the result location) and leaves the
-                    # inlined body; the caller continues in the exit block
+                    # inlined body; the caller continues in the exit block.  It
+                    # runs the defers of the body's own regions first
                     if not self._cur_block.is_finished:
-                        self._cur_block.emit(mir.Jmp(frame.continuation()))
+                        self._cur_block.emit(mir.Jmp(
+                            frame.continuation(),
+                            self._collect_exit_defers(
+                                False, None, inclusive=False, current_frame_only=True,
+                            ),
+                        ))
                     return self._cut()
+                # a ``return`` of the function proper runs the defers of every
+                # region it leaves, up to the function body
+                defer_blocks = self._collect_exit_defers(
+                    False, None, inclusive=False, current_frame_only=False,
+                )
                 self.store(self._function_result().code, ComptimeVal(sval.Int(0, sval.IntType(0, False))))
                 if self.ret_sig is None:
                     # the return convention is not fixed yet (an unannotated
                     # return type, or an inferred exception set): the ``mir.Ret``
                     # is filled in by ``_finish_function`` once it is known
-                    self._defer_return()
+                    self._defer_return(defer_blocks)
                     return self._cut()
-                self._emit_function_return()
+                self._emit_function_return(defer_blocks)
                 return self._cut()
             case hir.Raise():
                 # the exception was built into the slot the instruction names;
@@ -1919,6 +2086,8 @@ class HirRunner:
                 return self.binary_assign(inst.op, self.operand(inst.lhs), self.operand_arg(inst.rhs))
             case hir.If():
                 self._exec_if(inst)
+            case hir.Defer():
+                self._exec_defer(inst)
             case hir.Loop():
                 self._exec_loop()
             case hir.Try():
@@ -2034,7 +2203,7 @@ class HirRunner:
                 frame.pc = p_end + 1
                 return
             frame.block_stack.append(
-                BlockFrame(entry, IfBlockData(False, p_else=p_else, p_end=p_end))
+                BlockFrame(entry, IfBlockData(False, p_else=p_else, p_end=p_end, region=1))
             )
             frame.pc = p_else + 1
             return
@@ -2080,6 +2249,8 @@ class HirRunner:
             data = bf.data
             if isinstance(data, LoopBlockData):
                 return data
+            if isinstance(data, DeferBlockData):
+                raise CompileError('break/continue cannot leave a defer block')
         raise CompileError('break/continue outside of a loop')
 
     def _unroll_inline_loop(self, frame: InlineFrame, bf: BlockFrame, data: LoopBlockData) -> None:
@@ -2121,7 +2292,10 @@ class HirRunner:
         if exit_block is None:
             exit_block = data.exit_block = mir.BasicBlock()
         if not self._cur_block.is_finished:
-            self._cur_block.emit(mir.Jmp(exit_block))
+            self._cur_block.emit(mir.Jmp(
+                exit_block,
+                self._collect_exit_defers(False, data, inclusive=True, current_frame_only=False),
+            ))
         return self._cut()
 
     def _exec_continue(self) -> PollResult:
@@ -2140,7 +2314,10 @@ class HirRunner:
             assert data.header_block is not None
             nxt = data.header_block
         if not self._cur_block.is_finished:
-            self._cur_block.emit(mir.Jmp(nxt))
+            self._cur_block.emit(mir.Jmp(
+                nxt,
+                self._collect_exit_defers(False, data, inclusive=True, current_frame_only=False),
+            ))
         return self._cut()
 
     def _exec_block(self) -> None:
@@ -2170,6 +2347,8 @@ class HirRunner:
         blocks a condition of it opened (see ``_find_loop``)."""
         count = 0
         for bf in reversed(self._frames[-1].block_stack):
+            if isinstance(bf.data, DeferBlockData):
+                raise CompileError('break cannot leave a defer block')
             if isinstance(bf.data, PlainBlockData):
                 count += 1
                 if count == levels:
@@ -2185,26 +2364,26 @@ class HirRunner:
         splits the block being typed instead: the taken edge jumps to the exit
         and the walk continues in a fresh block for the rest of the body."""
         target_bf = self._find_block(inst.levels)
+        target = target_bf.data
+        assert isinstance(target, PlainBlockData)
+        exit_block = self._block_exit(target)
+        defer_blocks = self._collect_exit_defers(
+            False, target, inclusive=True, current_frame_only=False,
+        )
         if inst.cond is not None:
             cond = self.operand(inst.cond)
             if isinstance(cond, ComptimeVal):
                 if not cond.obj:
                     return PollResult.AGAIN
             else:
-                target = target_bf.data
-                assert isinstance(target, PlainBlockData)
-                exit_block = self._block_exit(target)
                 cont_block = mir.BasicBlock()
                 self._cur_block.emit(
-                    mir.Br(self._to_runtime(cond), exit_block, cont_block)
+                    mir.Br(self._to_runtime(cond), exit_block, cont_block, if_true_defer_blocks=defer_blocks)
                 )
                 self._cur_block = cont_block
                 return PollResult.AGAIN
-        target = target_bf.data
-        assert isinstance(target, PlainBlockData)
-        exit_block = self._block_exit(target)
         if not self._cur_block.is_finished:
-            self._cur_block.emit(mir.Jmp(exit_block))
+            self._cur_block.emit(mir.Jmp(exit_block, defer_blocks))
         return self._cut()
 
     def _exec_else(self) -> None:
@@ -2216,19 +2395,21 @@ class HirRunner:
         assert isinstance(data, IfBlockData)
         if data.chosen is None:
             # a runtime ``if``: its then-region fell off its end (it does
-            # not return); the then block joins the continuation and the
-            # else-region is typed next
+            # not return); the then block joins the continuation (after running
+            # the then-region's defers) and the else-region is typed next
             data.then_returns = False
             exit_block = data.exit_block
             assert exit_block is not None and data.else_block is not None
             if not self._cur_block.is_finished:
-                self._cur_block.emit(mir.Jmp(exit_block))
+                self._cur_block.emit(mir.Jmp(exit_block, _normal_defers(data.then_defers)))
             self._cur_block = data.else_block
+            data.region = 1
             return
         # a compile-time ``if`` whose chosen branch is the then branch,
-        # which fell off its end: the (unchosen) else branch is dead -
-        # skip it and close the block
+        # which fell off its end: the (unchosen) else branch is dead - the
+        # then-region's defers still run before the code after the ``if``
         assert data.chosen
+        self._run_defers_on_fallthrough(self._region_defers(data), False)
         frame.block_stack.pop()
         frame.pc = data.p_end + 1
 
@@ -2250,6 +2431,7 @@ class HirRunner:
             clause_blocks=[None] * len(p_excepts),
             payload_phi=[None] * len(p_excepts),
             code_phi=[None] * len(p_excepts),
+            region_defers=[[] for _ in range(len(p_excepts) + 1)],
         )
         frame.block_stack.append(BlockFrame(entry, data))
 
@@ -2261,7 +2443,7 @@ class HirRunner:
         data = frame.block_stack[-1].data
         assert isinstance(data, TryExceptBlockData)
         if not self._cur_block.is_finished:
-            self._cur_block.emit(mir.Jmp(data.join))
+            self._cur_block.emit(mir.Jmp(data.join, _normal_defers(self._region_defers(data))))
         data.fell = True
         data.body_done = True
         index = self._next_live_clause(data, inst.index)
@@ -2368,6 +2550,15 @@ class HirRunner:
         (see ``_unroll_inline_loop``)."""
         frame = self._frames[-1]
         data = frame.block_stack[-1].data
+        if isinstance(data, DeferBlockData):
+            # the defer body fell off its end: it ends in ``mir.EndDefer``, which
+            # triggers the defers declared inside the body (they run when the
+            # body completes, a normal exit), and the walk continues in the
+            # block the body was detached from
+            self._cur_block.emit(mir.EndDefer(_normal_defers(data.body_defers)))
+            frame.block_stack.pop()
+            self._cur_block = data.saved_block
+            return PollResult.AGAIN
         if isinstance(data, LoopBlockData):
             if data.is_inline:
                 # the body fell off its end: unroll the next iteration, routing
@@ -2375,40 +2566,43 @@ class HirRunner:
                 # there was one)
                 self._unroll_inline_loop(frame, frame.block_stack[-1], data)
                 return PollResult.AGAIN
-            # the loop body fell off its end: jump back to the header.  Whether
-            # the code after the loop is live is decided by ``_cut`` from the
-            # loop's exit block (created only by a ``break``)
+            # the loop body fell off its end: jump back to the header, running
+            # the body's defers on the way.  Whether the code after the loop is
+            # live is decided by ``_cut`` from the loop's exit block (created
+            # only by a ``break``)
             assert data.header_block is not None
             if not self._cur_block.is_finished:
-                self._cur_block.emit(mir.Jmp(data.header_block))
+                self._cur_block.emit(mir.Jmp(data.header_block, _normal_defers(data.body_defers)))
             return self._cut()
         if isinstance(data, TryExceptBlockData):
             # the last except clause fell off its end: the try is complete
             assert data.join is not None
             if not self._cur_block.is_finished:
-                self._cur_block.emit(mir.Jmp(data.join))
+                self._cur_block.emit(mir.Jmp(data.join, _normal_defers(self._region_defers(data))))
             self._cur_block = data.join
             frame.block_stack.pop()
             return PollResult.AGAIN
         if isinstance(data, PlainBlockData):
             # a ``hir.Block`` body fell off its end: it joins the code after the
             # block - the block the breaks of the body jump to (see
-            # ``PlainBlockData``)
+            # ``PlainBlockData``) - after running the body's defers
             exit_block = self._block_exit(data)
             if not self._cur_block.is_finished:
-                self._cur_block.emit(mir.Jmp(exit_block))
+                self._cur_block.emit(mir.Jmp(exit_block, _normal_defers(data.body_defers)))
             self._cur_block = exit_block
             frame.block_stack.pop()
             return PollResult.AGAIN
         assert isinstance(data, IfBlockData)
         if data.chosen is not None:
-            # a compile-time ``if``: the chosen branch fell off its end
+            # a compile-time ``if``: the chosen branch fell off its end, a
+            # normal exit of its region
+            self._run_defers_on_fallthrough(self._region_defers(data), False)
             frame.block_stack.pop()
             return PollResult.AGAIN
         exit_block = data.exit_block
         assert exit_block is not None
         if not self._cur_block.is_finished:
-            self._cur_block.emit(mir.Jmp(exit_block))
+            self._cur_block.emit(mir.Jmp(exit_block, _normal_defers(self._region_defers(data))))
         self._cur_block = exit_block
         frame.block_stack.pop()
         return PollResult.AGAIN
@@ -2474,6 +2668,11 @@ class HirRunner:
                 continue
             bf = frame.block_stack[-1]
             data = bf.data
+            if isinstance(data, DeferBlockData):
+                # the current path ended inside a defer body and every path of the
+                # body ended elsewhere: the body never completes, so the defer
+                # would never run
+                raise CompileError('the body of a defer must complete')
             if isinstance(data, TryExceptBlockData):
                 # the region that ended (the try body, or a clause) returned or
                 # raised: a later clause some error reached is typed next;
@@ -2539,6 +2738,7 @@ class HirRunner:
                 # next, or - without one - continue after the ``if``
                 data.then_returns = True
                 if data.else_block is not None:
+                    data.region = 1
                     self._cur_block = data.else_block
                     assert data.p_else is not None
                     frame.pc = data.p_else + 1
@@ -5468,10 +5668,21 @@ class HirRunner:
         if target is not None:
             data, clause = target
             assert not use_ret_payload
+            defer_blocks = self._collect_exit_defers(
+                True, data, inclusive=True, current_frame_only=False,
+            )
             incoming = self._union_variant_ptr(payload_place, exception)
-            self._route_to_clause(data, clause, incoming, exception)
+            self._route_to_clause(data, clause, incoming, exception, defer_blocks)
         else:
-            self._deliver_uncaught_call(exception, payload_place, use_ret_payload)
+            defer_blocks = self._collect_exit_defers(
+                True, None, inclusive=False, current_frame_only=False,
+            )
+            self._add_function_exception(exception)
+            self._defer_error_code_write(exception)
+            if not use_ret_payload and not exception.is_zst():
+                value = self.load(self._union_variant_ptr(payload_place, exception))
+                self.store(self._payload_variant_ptr(exception), value)
+            self._end_error_path(defer_blocks)
 
     def _deliver_result(
         self,
@@ -5691,13 +5902,20 @@ class HirRunner:
     def finish(self) -> None:
         """Called when the body of the function proper has been fully
         typed: end the last block (a body that fell off its end returns
-        void), fix an inferred return convention and flatten the deferred
-        insertion blocks away."""
+        void), fix an inferred return convention, flatten the deferred
+        insertion blocks away and expand the deferred bodies into explicit
+        copies (see ``mir.instantiate_defers``)."""
         if not self._cur_block.is_finished:
-            self._cur_block.emit(mir.Ret(None))
+            # the body fell off its end (the last block is not closed): it
+            # returns void, after running the defers of its top-level region
+            self._cur_block.emit(mir.Ret(None, _normal_defers(self._frames[0].body_defers)))
         self._finish_function()
         mir_fn = self._fn_instance.mir
         mir.normalize(mir_fn)
+        # the deferred bodies were emitted as shared templates every triggering
+        # transfer refers to; give each transfer its own explicit copy now that
+        # the CFG is complete (and the insertion placeholders are gone)
+        mir.instantiate_defers(mir_fn)
 
     def _finish_function(self) -> None:
         """Fix the return convention of the function proper - the return type
@@ -5727,18 +5945,18 @@ class HirRunner:
         spec = sig.ret_spec(self._mir_cache)
         places = _result_places(self._current_result_loc())
         index = ret_by_value_index(spec)
-        for block in self._deferred_returns:
+        for block, defer_blocks in self._deferred_returns:
             if index is None:
-                block.insts.append(mir.Ret(None))
+                block.insts.append(mir.Ret(None, defer_blocks))
             else:
                 slot = _shallow_normalize(places[index])
                 if isinstance(slot, RuntimeVal):
                     load = mir.Load(slot.value)
                     block.insts.append(load)
-                    block.insts.append(mir.Ret(load))
+                    block.insts.append(mir.Ret(load, defer_blocks))
                 elif isinstance(slot, ComptimeBox):
                     assert slot.value is not None
-                    block.insts.append(mir.Ret(self._to_runtime(slot.value)))
+                    block.insts.append(mir.Ret(self._to_runtime(slot.value), defer_blocks))
                 else:
                     raise CompileError('cannot deliver the return value')
 

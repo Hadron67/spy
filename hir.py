@@ -108,6 +108,15 @@ class InlineMode(IntEnum):
     FULL = auto()
 
 
+class DeferKind(IntEnum):
+    """Which exits of the enclosing region trigger a ``with syntax.defer():``
+    block (see :class:`Defer`)."""
+
+    DEFER = auto()
+    OKDEFER = auto()
+    ERRDEFER = auto()
+
+
 @dataclass(frozen=True)
 class Const(Value):
     """A leaf holding a Python object: a literal, or the *value* of an
@@ -588,6 +597,23 @@ class BreakIf(Inst):
 
 
 @dataclass(eq=False)
+class Defer(Inst):
+    """The start of a ``with syntax.defer():`` region (WASM-style, like
+    :class:`If`/`Loop`/`Block`/`Try`): the instructions of the defer body follow
+    it in the same list, closed by the matching :class:`End`.  The body is not
+    executed where it is written - it is *deferred* to the exit of the enclosing
+    region - so the interpreter emits it into a detached block tree and the
+    transfers that leave the region carry its entry (see ``interp``/``mir``).
+
+    ``variant`` says which exits trigger the body: ``DEFER`` runs on any exit of
+    the enclosing region, ``OKDEFER`` only on a normal one (a ``return``, a
+    ``break``/``continue``, or falling off the region's end) and ``ERRDEFER``
+    only when an error leaves it."""
+
+    variant: DeferKind
+
+
+@dataclass(eq=False)
 class Try(Inst):
     """Open a ``try`` block: the instructions of the try body follow, then one
     :class:`Except` marker per ``except`` clause (each followed by its clause
@@ -656,7 +682,7 @@ def scan_block(insts: tuple[Inst, ...], entry: int) -> tuple[int | None, int]:
     p_else: int | None = None
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, (If, Loop, Block, Try)):
+        if isinstance(inst, (If, Loop, Block, Try, Defer)):
             depth += 1
         elif isinstance(inst, End):
             if depth == 0:
@@ -676,7 +702,7 @@ def scan_try(insts: tuple[Inst, ...], entry: int) -> tuple[list[int], int]:
     excepts: list[int] = []
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, (If, Loop, Block, Try)):
+        if isinstance(inst, (If, Loop, Block, Try, Defer)):
             depth += 1
         elif isinstance(inst, End):
             if depth == 0:
