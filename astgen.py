@@ -1464,7 +1464,9 @@ def parse_function(
     self_type: Type | None = None,
     self_by_value: bool = False,
     context_type_vars: dict[TypeVar, Value] | None = None,
-    exceptions: set[Any] | Literal["infer"] | None = None,
+    exceptions: tuple[Any, ...] | Literal["infer"] | None = None,
+    callconv: str = 'default',
+    may_panic: bool = False,
 ) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
@@ -1480,8 +1482,14 @@ def parse_function(
 
     ``exceptions`` is the ``@func(exceptions=...)`` declaration: ``None`` (the
     default) declares that the function raises nothing, ``"infer"`` that the
-    exceptions are inferred from the body, and a set of spy struct classes the
-    exceptions it may raise (in error-code order).
+    exceptions are inferred from the body, and a tuple of spy struct classes the
+    exceptions it may raise (in error-code order; the decorator normalizes a
+    single type to a one-element tuple, see ``dsl._normalize_exceptions``).
+
+    ``callconv`` is the ``@func(callconv=...)`` calling convention:
+    ``'default'`` is the spy one; any other value names a C one, in which
+    every argument is passed by value, the result is returned by value, and
+    the function may not raise.  ``may_panic`` is carried through only.
 
     ``resolver`` is the host the annotations (and the declared exceptions) are
     resolved in: a struct class or function handle the annotation names is
@@ -1649,6 +1657,7 @@ def parse_function(
     # already support them for the calls the parser will allow later.
     signature = Signature(
         tuple(generic_args), positional, None, None, annotation_of(ret_annotation), exception_set(),
+        callconv, may_panic,
     )
 
     ir = FunctionIR(node.name, signature, tuple(arg_is_ref), ())

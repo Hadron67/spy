@@ -27,7 +27,7 @@ from enum import IntEnum, auto
 from types import NoneType
 from typing import Any, Literal, override
 
-from spy.util import IdentityObj, IndexedMap, TriState, frozendict
+from spy.util import FrozenArraySet, IdentityObj, IndexedMap, TriState, frozendict
 
 from . import mir, syntax
 from .errors import CompileError
@@ -339,7 +339,7 @@ class UnionType(Type):
     tag - so a variant value is written and read through a reinterpretation of
     the payload's address (see ``mir.UnionType``)."""
 
-    types: tuple[Type, ...]
+    types: frozenset[Type]
 
     @override
     def get_type(self) -> Type:
@@ -352,7 +352,7 @@ class UnionType(Type):
 
     @override
     def get_type_children(self) -> tuple[Type, ...]:
-        return self.types
+        return tuple(self.types)
 
     @override
     def is_subtype_of(self, other: Type) -> bool:
@@ -455,7 +455,7 @@ class TaggedUnionType(Type):
     its own, its representation is the variant's, and it is zero-sized when the
     variant is."""
 
-    types: tuple[Type, ...]
+    types: FrozenArraySet[Type]
 
     @property
     def tag_bits(self) -> int:
@@ -467,7 +467,7 @@ class TaggedUnionType(Type):
         return IntType(self.tag_bits, False)
 
     def payload_type(self) -> UnionType:
-        return UnionType(self.types)
+        return UnionType(frozenset(self.types))
 
     def has_tag(self) -> bool:
         return len(self.types) > 1
@@ -498,7 +498,7 @@ class TaggedUnionType(Type):
 
     @override
     def get_type_children(self) -> tuple[Type, ...]:
-        return self.types
+        return tuple(self.types)
 
     @override
     def get_unit_value(self) -> AnyValue | None:
@@ -573,7 +573,7 @@ def tagged_union_of(types: tuple[Type, ...]) -> TaggedUnionType:
         if not any(type == variant for variant in variants):
             variants.append(type)
     assert len(variants) > 0, 'a tagged union has at least one variant'
-    return TaggedUnionType(tuple(variants))
+    return TaggedUnionType(FrozenArraySet(variants))
 
 
 @dataclass(frozen=True, slots=True)
@@ -652,7 +652,7 @@ class ResultType(Type):
     error."""
 
     return_type: Type
-    types: tuple[Type, ...]
+    types: FrozenArraySet[Type]
 
     @property
     def tag_base(self) -> int:
@@ -683,7 +683,7 @@ class ResultType(Type):
     def union(self) -> UnionType:
         """The payload union: the storage of the exception value the error
         code tags."""
-        return UnionType(self.types)
+        return UnionType(frozenset(self.types))
 
     def code_of(self, exception: Type) -> int:
         """The error code of ``exception`` in this result type: the position it
@@ -717,7 +717,7 @@ class ResultType(Type):
         for type in other.types:
             if type not in types:
                 types.append(type)
-        return ResultType(self.return_type, tuple(types))
+        return ResultType(self.return_type, FrozenArraySet(types))
 
     @override
     def get_unit_value(self) -> AnyValue | None:
@@ -748,7 +748,7 @@ class Success(Value):
 
     @override
     def get_type(self) -> Type:
-        return ResultType(VoidType(), ())
+        return ResultType(VoidType(), FrozenArraySet())
 
     def __str__(self) -> str:
         return 'success'
@@ -1523,6 +1523,11 @@ class FormalArg:
     default_value: AnyValue | None
 
 
+# the shared, immutable default of ``FunctionType.exceptions``: a function that
+# raises nothing (see ``FrozenArraySet``)
+_NO_EXCEPTIONS: FrozenArraySet[Type] = FrozenArraySet()
+
+
 @dataclass(frozen=True)
 class FunctionType(Type):
     args: tuple[FormalArg, ...]
@@ -1530,12 +1535,29 @@ class FunctionType(Type):
     # result, or a ``tuple[...]`` when it returns several (see
     # :func:`make_ret_spec`)
     return_type: Type
+    # the exceptions the function may raise, in error-code order (an empty
+    # set for a function that raises nothing).  A function that does not use
+    # the default calling convention may not raise at all (see ``callconv``)
+    exceptions: FrozenArraySet[Type] = _NO_EXCEPTIONS
+    # the calling convention: ``'default'`` is the spy convention (a result
+    # outgrowing the by-value limit goes through a hidden result pointer, an
+    # aggregate argument may be passed by reference, and the function may
+    # raise); any other value names a C convention, in which every argument is
+    # passed by value, the result is returned by value, and the function may
+    # not raise
+    callconv: str = 'default'
+    # whether the function may panic; passed through only (no logic yet)
+    may_panic: bool = False
 
     def ret_spec(self, cache: MirLowerCache) -> RetSpec:
         """How a call of a function of this signature delivers its result
         (see :func:`make_ret_spec`); ``cache`` is the MIR-mirror cache of the
         host the call is compiled for."""
-        return make_ret_spec(self.return_type, cache)
+        if len(self.exceptions) == 0:
+            base: Type = self.return_type
+        else:
+            base = ResultType(self.return_type, self.exceptions)
+        return make_ret_spec(base, cache, force_by_value=self.callconv != 'default')
 
     @override
     def get_type(self) -> Type:
@@ -1548,6 +1570,10 @@ class FunctionType(Type):
             child = leaf_type.get_type()
             assert isinstance(child, TypeType)
             level = max(level, child.level)
+        for exception in self.exceptions:
+            child = exception.get_type()
+            assert isinstance(child, TypeType)
+            level = max(level, child.level)
         return TypeType(level)
 
     @override
@@ -1558,6 +1584,7 @@ class FunctionType(Type):
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        is_c = self.callconv != 'default'
         args: list[mir.Type] = []
         for arg in self.args:
             if arg.type.is_zst():
@@ -1565,7 +1592,11 @@ class FunctionType(Type):
             mir_type = arg.type.to_mir_type(cache)
             if mir_type is None:
                 return None
-            args.append(mir_type)
+            if not is_c and pass_by_ref(arg.type, cache) is TriState.TRUE:
+                # an argument the default convention passes as a const pointer
+                args.append(mir.PointerType(mir_type, False))
+            else:
+                args.append(mir_type)
         ret_type: mir.MayBeVoidType = mir.VOID
         for leaf in iter_ret_leaves(self.ret_spec(cache)):
             if leaf.type.is_zst():
@@ -1579,7 +1610,7 @@ class FunctionType(Type):
                 args.append(mir.PointerType(mir_type, False))
             else:
                 ret_type = mir_type
-        return mir.FunctionType(tuple(args), ret_type)
+        return mir.FunctionType(tuple(args), ret_type, self.callconv, self.may_panic)
 
     def __str__(self) -> str:
         return f"fn({', '.join(str(arg.type) for arg in self.args)}) -> {self.return_type}"
@@ -2140,7 +2171,7 @@ def result_leaves(type: Type) -> list[Type]:
     return leaves
 
 
-def make_ret_spec(type: Type, cache: MirLowerCache) -> RetSpec:
+def make_ret_spec(type: Type, cache: MirLowerCache, force_by_value: bool = False) -> RetSpec:
     """The return convention of a function whose return annotation is the spy
     type ``type`` (a ``tuple[...]`` for several values, nested at whatever
     depth it is written): the annotation as one :class:`RetSpec` tree.  A
@@ -2155,7 +2186,10 @@ def make_ret_spec(type: Type, cache: MirLowerCache) -> RetSpec:
     qualifies the function returns void.  A zero-sized leaf has no value to
     return: it is delivered as its unit value and never takes the by-value
     slot (a value-less function's payload union can take the slot of the code
-    its exception set needs no longer)."""
+    its exception set needs no longer).  ``force_by_value`` overrides the
+    by-value policy: the first non-zero-sized leaf is returned by value even
+    when it outgrows the limit (the C convention, see
+    ``FunctionType.callconv``)."""
     # the leaf types, in declaration order (depth first)
     leaves = result_leaves(type)
     chosen: int | None = None
@@ -2164,7 +2198,7 @@ def make_ret_spec(type: Type, cache: MirLowerCache) -> RetSpec:
             # a zero-sized value is delivered as its unit value, not
             # through the by-value slot
             continue
-        if not returns_via_result_ptr(leaf_type, cache):
+        if force_by_value or not returns_via_result_ptr(leaf_type, cache):
             chosen = index
             break
     via = tuple(
@@ -2691,13 +2725,13 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
                 value.has_ellipsis,
             )
         case UnionType():
-            return UnionType(tuple(replace_type_vars_type(t, reps) for t in value.types))
+            return UnionType(frozenset(replace_type_vars_type(t, reps) for t in value.types))
         case TaggedUnionType():
             return tagged_union_of(tuple(replace_type_vars_type(t, reps) for t in value.types))
         case ResultType():
             return ResultType(
                 replace_type_vars_type(value.return_type, reps),
-                tuple(replace_type_vars_type(t, reps) for t in value.types),
+                FrozenArraySet(replace_type_vars_type(t, reps) for t in value.types),
             )
         case StructType():
             # a struct type carries its type arguments: substituting into it

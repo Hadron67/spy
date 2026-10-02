@@ -19,10 +19,10 @@ function no earlier test has compiled.
 import ctypes
 import io
 from contextlib import redirect_stdout
-from typing import TYPE_CHECKING, Any, Literal, Never, cast
+from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, cast
 from unittest import TestCase
 
-from spy.dsl import _GLOBAL_CONTEXT, _Context, func, struct
+from spy.dsl import _GLOBAL_CONTEXT, _Context, func, func_type, struct
 
 from . import (
     CompileError,
@@ -60,7 +60,7 @@ from .syntax import (
     okdefer,
     ref,
 )
-from .util import StrBiMap, TriState
+from .util import FrozenArraySet, StrBiMap, TriState
 
 # ---------------------------------------------------------------------------
 # functions under test
@@ -5753,7 +5753,7 @@ class SpyErrorUnionPrimitiveTest(TestCase):
     written through a ``BitCast``."""
 
     def test_empty_error_union_is_the_unit_type(self) -> None:
-        empty = sval.ResultType(sval.VoidType(), ())
+        empty = sval.ResultType(sval.VoidType(), sval.FrozenArraySet())
         self.assertEqual(empty.tag_bits, 0)
         self.assertEqual(empty.code_type, sval.IntType(0, False))
         self.assertIsNotNone(empty.get_unit_value())
@@ -5762,35 +5762,47 @@ class SpyErrorUnionPrimitiveTest(TestCase):
     def test_error_code_width_is_the_smallest(self) -> None:
         small = struct_type(Small)
         large = struct_type(Large)
+        # a third, distinct exception (its size does not matter here)
+        third = struct_type(ExternMixed)
         void = sval.VoidType()
-        self.assertEqual(sval.ResultType(void, (small,)).tag_bits, 1)
-        self.assertEqual(sval.ResultType(void, (small, large)).tag_bits, 2)
-        self.assertEqual(sval.ResultType(void, (small, large, small)).tag_bits, 2)
-        self.assertEqual(sval.ResultType(void, (small, large, small, large)).tag_bits, 3)
+        self.assertEqual(sval.ResultType(void, sval.FrozenArraySet((small,))).tag_bits, 1)
+        self.assertEqual(sval.ResultType(void, sval.FrozenArraySet((small, large))).tag_bits, 2)
+        # ``types`` is a set: a duplicate is dropped
+        self.assertEqual(
+            sval.ResultType(void, sval.FrozenArraySet((small, large, small))).tag_bits, 2
+        )
+        self.assertEqual(
+            sval.ResultType(void, sval.FrozenArraySet((small, large, third))).tag_bits, 2
+        )
         # a function that returns no value has no "no error" code: its i-th
         # exception is tagged ``i``, so a single one needs no code at all
         empty = sval.EmptyType()
-        self.assertEqual(sval.ResultType(empty, ()).tag_bits, 0)
-        self.assertEqual(sval.ResultType(empty, (small,)).tag_bits, 0)
-        self.assertEqual(sval.ResultType(empty, (small, large)).tag_bits, 1)
-        self.assertEqual(sval.ResultType(empty, (small, large, small)).tag_bits, 2)
-        self.assertEqual(sval.ResultType(empty, (small,)).code_of(small), 0)
-        self.assertEqual(sval.ResultType(void, (small,)).code_of(small), 1)
+        self.assertEqual(sval.ResultType(empty, sval.FrozenArraySet()).tag_bits, 0)
+        self.assertEqual(sval.ResultType(empty, sval.FrozenArraySet((small,))).tag_bits, 0)
+        self.assertEqual(sval.ResultType(empty, sval.FrozenArraySet((small, large))).tag_bits, 1)
+        self.assertEqual(
+            sval.ResultType(empty, sval.FrozenArraySet((small, large, third))).tag_bits, 2
+        )
+        self.assertEqual(sval.ResultType(empty, sval.FrozenArraySet((small,))).code_of(small), 0)
+        self.assertEqual(sval.ResultType(void, sval.FrozenArraySet((small,))).code_of(small), 1)
 
     def test_payload_union_uses_the_largest_variant_and_is_interned(self) -> None:
         small = struct_type(Small)
         large = struct_type(Large)
-        one = sval.UnionType((small, large))
-        two = sval.UnionType((small, large))
+        one = sval.UnionType(frozenset((small, large)))
+        two = sval.UnionType(frozenset((small, large)))
         self.assertIs(one.storage_variant(MIR_CACHE), large)
         self.assertIs(one.to_mir_type(MIR_CACHE), two.to_mir_type(MIR_CACHE))
-        self.assertIsNone(sval.UnionType(()).to_mir_type(MIR_CACHE))
-        self.assertEqual(sval.UnionType(()).get_unit_value(), sval.UnionValue(sval.UnionType(())))
+        self.assertIsNone(sval.UnionType(frozenset()).to_mir_type(MIR_CACHE))
+        self.assertEqual(
+            sval.UnionType(frozenset()).get_unit_value(),
+            sval.UnionValue(sval.UnionType(frozenset())),
+        )
 
     def test_make_ret_spec_spreads_the_error_union(self) -> None:
         small = struct_type(Small)
         i32_type = sval.IntType(32, True)
-        type = sval.ResultType(i32_type, (small,))
+        type = sval.ResultType(i32_type, sval.FrozenArraySet((small,)))
         spec = sval.make_ret_spec(type, MIR_CACHE)
         assert isinstance(spec, sval.RetTuple)
         self.assertIs(spec.type, type)
@@ -5811,7 +5823,7 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         small = struct_type(Small)
         # no value to return, one exception: the code is ``u0`` (zero-sized) and
         # the payload union takes the by-value slot
-        type = sval.ResultType(sval.EmptyType(), (small,))
+        type = sval.ResultType(sval.EmptyType(), sval.FrozenArraySet((small,)))
         spec = sval.make_ret_spec(type, MIR_CACHE)
         assert isinstance(spec, sval.RetTuple)
         _value, code, payload = spec.values
@@ -5826,31 +5838,31 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         small = struct_type(Small)
         large = struct_type(Large)
         void = sval.VoidType()
-        empty = sval.ResultType(void, ())
-        one = sval.ResultType(void, (small,))
-        both = sval.ResultType(void, (small, large))
+        empty = sval.ResultType(void, sval.FrozenArraySet())
+        one = sval.ResultType(void, sval.FrozenArraySet((small,)))
+        both = sval.ResultType(void, sval.FrozenArraySet((small, large)))
         self.assertTrue(empty.is_subtype_of(one))
         self.assertTrue(one.is_subtype_of(both))
         self.assertFalse(both.is_subtype_of(one))
-        self.assertFalse(one.is_subtype_of(sval.ResultType(void, (large,))))
+        self.assertFalse(one.is_subtype_of(sval.ResultType(void, sval.FrozenArraySet((large,)))))
 
     def test_error_union_peer_is_the_union_in_delivery_order(self) -> None:
         small = struct_type(Small)
         large = struct_type(Large)
         void = sval.VoidType()
-        peer = sval.ResultType(void, (small,)).resolve_peer_type(
-            sval.ResultType(void, (large, small)),
+        peer = sval.ResultType(void, sval.FrozenArraySet((small,))).resolve_peer_type(
+            sval.ResultType(void, sval.FrozenArraySet((large, small))),
         )
-        self.assertEqual(peer, sval.ResultType(void, (small, large)))
+        self.assertEqual(peer, sval.ResultType(void, sval.FrozenArraySet((small, large))))
         self.assertEqual(
-            sval.ResultType(void, ()).resolve_peer_type(
-                sval.ResultType(void, (small,)),
+            sval.ResultType(void, sval.FrozenArraySet()).resolve_peer_type(
+                sval.ResultType(void, sval.FrozenArraySet((small,))),
             ),
-            sval.ResultType(void, (small,)),
+            sval.ResultType(void, sval.FrozenArraySet((small,))),
         )
 
     def test_success_is_the_value_of_the_empty_error_union(self) -> None:
-        empty = sval.ResultType(sval.VoidType(), ())
+        empty = sval.ResultType(sval.VoidType(), sval.FrozenArraySet())
         success = empty.get_unit_value()
         assert success is not None
         self.assertIsInstance(success, sval.Success)
@@ -5889,26 +5901,26 @@ class ErrorB(Exception):
     n: i32
 
 
-@func(exceptions={ErrorA})
+@func(exceptions=ErrorA)
 def raise_a(n: i32) -> i32:
     if n < 0:
         raise ErrorA(7)
     return n + 1
 
 
-@func(exceptions={ErrorB})
+@func(exceptions=ErrorB)
 def raise_b(n: i32) -> i32:
     if n < 0:
         raise ErrorB(9)
     return n + 2
 
 
-@func(exceptions={ErrorA, ErrorB})
+@func(exceptions=(ErrorA, ErrorB))
 def forward_raise(n: i32) -> i32:
     return raise_a(n) + 10
 
 
-@func(exceptions={ErrorA})
+@func(exceptions=(ErrorA,))
 def catch_bound(n: i32) -> i32:
     try:
         return raise_a(n)
@@ -5916,7 +5928,7 @@ def catch_bound(n: i32) -> i32:
         return e.code + 100
 
 
-@func(exceptions={ErrorA, ErrorB})
+@func(exceptions=(ErrorA, ErrorB))
 def catch_multi(n: i32) -> i32:
     try:
         return raise_a(n)
@@ -5928,7 +5940,7 @@ def catch_multi(n: i32) -> i32:
         return -1
 
 
-@func(exceptions={ErrorA, ErrorB})
+@func(exceptions=(ErrorA, ErrorB))
 def escape_through(n: i32) -> i32:
     try:
         return raise_a(n)
@@ -6061,7 +6073,7 @@ def catch_inline_in_branch(n: i32) -> i32:
         return e.code + 100
 
 
-@func(exceptions={ErrorA, ErrorB})
+@func(exceptions=(ErrorA, ErrorB))
 def raise_in_clause(n: i32) -> i32:
     # a raise inside a clause body belongs to the try *enclosing* the clause,
     # never to the clause's own try again
@@ -6076,13 +6088,13 @@ def raise_in_clause(n: i32) -> i32:
     return 3
 
 
-@func(exceptions={ErrorA})
+@func(exceptions=(ErrorA,))
 def forward_no_return(n: i32) -> i32:
     # the ``+ 10`` after the call is dead: the inlined body never returns
     return inline_no_return(n) + 10
 
 
-@func(exceptions={ErrorA})
+@func(exceptions=(ErrorA,))
 def nested_forward_no_return(n: i32) -> i32:
     return inline_forward_no_return(n) + 10
 
@@ -6522,7 +6534,7 @@ def call_loop_forever(n: i32) -> i32:
     return n + 1
 
 
-@func(exceptions={ErrorA})
+@func(exceptions=(ErrorA,))
 def always_raises(n: i32):
     # no value to return and one exception: the error code is zero-sized
     # (``u0``) and the payload union takes the by-value result
@@ -6569,7 +6581,7 @@ def call_forward_never(n: i32) -> i32:
     return n + 1
 
 
-@func(exceptions={ErrorA})
+@func(exceptions=(ErrorA,))
 def raises_never(n: i32) -> Never:
     # the declared empty value behaves like the inferred one of ``always_raises``
     raise ErrorA(n)
@@ -6927,7 +6939,7 @@ class SpyTypeClassifyTest(TestCase):
     def test_compile_time_only_types(self) -> None:
         for type in (sval.TypeType(0), sval.TypeVar('C'), sval.AnyIntType(),
                      sval.TupleType((sval.IntType(32, True),), False),
-                     sval.ResultType(sval.VoidType(), ()), sval.AnyFunction()):
+                     sval.ResultType(sval.VoidType(), sval.FrozenArraySet()), sval.AnyFunction()):
             self.assertEqual(type.classify(), sval.SpecialTypeKind.COMPTIME)
             self.assertFalse(type.is_zst())
 
@@ -6980,14 +6992,14 @@ class SpyTypeClassifyTest(TestCase):
 
     def test_union_kinds(self) -> None:
         i32_type = sval.IntType(32, True)
-        self.assertTrue(sval.UnionType(()).is_zst())
-        self.assertTrue(sval.UnionType((sval.VoidType(),)).is_zst())
-        self.assertEqual(sval.UnionType((i32_type,)).classify(), sval.SpecialTypeKind.NONE)
+        self.assertTrue(sval.UnionType(frozenset()).is_zst())
+        self.assertTrue(sval.UnionType(frozenset((sval.VoidType(),))).is_zst())
+        self.assertEqual(sval.UnionType(frozenset((i32_type,))).classify(), sval.SpecialTypeKind.NONE)
         self.assertEqual(
-            sval.UnionType((_fn_type(),)).classify(), sval.SpecialTypeKind.DST
+            sval.UnionType(frozenset((_fn_type(),))).classify(), sval.SpecialTypeKind.DST
         )
         self.assertEqual(
-            sval.UnionType((sval.TypeType(0),)).classify(), sval.SpecialTypeKind.COMPTIME
+            sval.UnionType(frozenset((sval.TypeType(0),))).classify(), sval.SpecialTypeKind.COMPTIME
         )
 
     def test_struct_kinds(self) -> None:
@@ -7018,7 +7030,7 @@ class SpyTypeClassifyTest(TestCase):
         # the interning table belongs to a host context, so two contexts do not
         # share the MIR types they intern
         self.assertIsNot(_GLOBAL_CONTEXT.mir_lower_cache, _CROSS_CONTEXT.mir_lower_cache)
-        union = sval.UnionType((sval.IntType(32, True),))
+        union = sval.UnionType(frozenset((sval.IntType(32, True),)))
         global_mir = union.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache)
         # ... while one context reuses the one it made
         self.assertIs(union.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache), global_mir)
@@ -7546,7 +7558,7 @@ def call_defer_ok_only(x: i32) -> i32:
     return v * 100 + r
 
 
-@func(exceptions={ErrorA})
+@func(exceptions=(ErrorA,))
 def defer_err(p: Ptr[i32], n: i32) -> i32:
     # ``okdefer`` runs on the normal return, ``errdefer`` on the raise
     with okdefer():
@@ -7802,6 +7814,269 @@ class SpyDeferTest(TestCase):
             defer_bad_break_outer()
 
 
+# ---------------------------------------------------------------------------
+# function types: ``@func_type`` declares a spy function type from a Protocol's
+# ``__call__``, and a value of a pointer to one is called through the pointer
+# (the only callable form: a function type itself is dynamically sized)
+# ---------------------------------------------------------------------------
+
+
+@struct()
+class FnError(Exception):
+    code: i32
+
+
+@func_type(exceptions=(FnError,))
+class Fallible(Protocol):
+    # a spy-convention function pointer that may raise ``FnError``: the pointed-
+    # to function carries the error code and payload like a compiled spy
+    # function (the default calling convention)
+    def __call__(self, n: i32) -> i32: ...
+
+
+@func_type(callconv='c')
+class CBinary(Protocol):
+    # a C function pointer: every argument by value, the result by value, no
+    # exceptions
+    def __call__(self, a: i32, b: i32) -> i32: ...
+
+
+@func_type(callconv='c')
+class CWithDefault(Protocol):
+    def __call__(self, a: i32, b: i32 = 10) -> i32: ...
+
+
+@struct(extern_c=True)
+class Wide:
+    a: i64
+    b: i64
+    c: i64
+
+
+@func_type(callconv='c')
+class CGetWide(Protocol):
+    def __call__(self) -> Wide: ...
+
+
+@func_type(callconv='c', exceptions=(FnError,))
+class CBad(Protocol):
+    def __call__(self, n: i32) -> i32: ...
+
+
+@func_type(exceptions=FnError)
+class FallibleSingle(Protocol):
+    # the single-type spelling of ``exceptions`` (see ``_normalize_exceptions``)
+    def __call__(self, n: i32) -> i32: ...
+
+
+@func(exceptions=FnError)
+def raise_fn_error(n: i32) -> i32:
+    if n < 0:
+        raise FnError(1)
+    return n + 1
+
+
+@func()
+def call_fallible(f: Fallible, n: i32) -> i32:
+    # a DST parameter is passed by reference; the call carries the pointer's
+    # error code and payload, routed to the try here
+    try:
+        return f(n)
+    except FnError as e:
+        return e.code + 1000
+
+
+@func()
+def call_c_binary(p: ConstPtr[CBinary], a: i32, b: i32) -> i32:
+    # a pointer to a function type is an ordinary value
+    return p[...](a, b)
+
+
+@func()
+def call_c_default(p: ConstPtr[CWithDefault], a: i32) -> i32:
+    # the argument the call leaves out takes the pointer type's default
+    return p[...](a)
+
+
+@func(callconv='c', exceptions='infer')
+def c_inferred_raise(n: i32) -> i32:
+    # a C function may not raise; the inferred exception set is rejected once
+    # the body is typed
+    if n < 0:
+        raise FnError(1)
+    return n
+
+
+@func(callconv='c')
+def c_multi(n: i32) -> tuple[i32, i32]:
+    # a C function may return only one value
+    return n, n + 1
+
+
+class SpyFuncTypeTest(TestCase):
+    """``@func_type``: the annotations of a Protocol's ``__call__`` (its
+    receiver dropped) become a ``sval.FunctionType``, resolved in the context
+    that names the declaration."""
+
+    def test_a_function_type_resolves_from_the_call_signature(self) -> None:
+        t = _GLOBAL_CONTEXT.resolve_global(Fallible)
+        assert isinstance(t, sval.FunctionType)
+        self.assertEqual([a.name for a in t.args], ['n'])
+        self.assertEqual(t.args[0].type, sval.IntType(32, True))
+        self.assertEqual(t.return_type, sval.IntType(32, True))
+        self.assertEqual(tuple(t.exceptions), (struct_type(FnError),))
+        self.assertEqual(t.callconv, 'default')
+
+    def test_a_default_of_a_function_type_parameter_is_carried(self) -> None:
+        t = _GLOBAL_CONTEXT.resolve_global(CWithDefault)
+        assert isinstance(t, sval.FunctionType)
+        self.assertEqual(t.args[1].default_value, 10)
+
+    def test_a_pointer_to_a_function_type_is_a_pointer(self) -> None:
+        t = sval.as_value(ConstPtr[CBinary], _GLOBAL_CONTEXT)
+        assert isinstance(t, sval.PointerType)
+        self.assertIsInstance(t.elem, sval.FunctionType)
+        self.assertIs(t.is_const, True)
+
+    def test_a_c_function_type_forces_every_argument_by_value(self) -> None:
+        t = _GLOBAL_CONTEXT.resolve_global(CBinary)
+        assert isinstance(t, sval.FunctionType)
+        i32_mir = mir.IntType(32, True)
+        # no by-ref argument and no result pointer: ``fn(i32, i32) -> i32``
+        self.assertEqual(
+            t.to_mir_type(MIR_CACHE), mir.FunctionType((i32_mir, i32_mir), i32_mir, 'c', False),
+        )
+
+    def test_a_c_function_type_returns_an_aggregate_by_value(self) -> None:
+        t = _GLOBAL_CONTEXT.resolve_global(CGetWide)
+        assert isinstance(t, sval.FunctionType)
+        mirror = t.to_mir_type(MIR_CACHE)
+        assert isinstance(mirror, mir.FunctionType)
+        # a wide aggregate would go through a result pointer under the default
+        # convention; the C one returns it by value (no hidden pointer argument)
+        self.assertEqual(mirror.args, ())
+        self.assertIsInstance(mirror.return_type, mir.StructType)
+
+    def test_a_c_function_type_may_not_declare_exceptions(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            _GLOBAL_CONTEXT.resolve_global(CBad)
+        self.assertIn('may not declare exceptions', str(ctx.exception))
+
+
+class SpyFnPtrCallTest(TestCase):
+    """A runtime function pointer is called through the address its value
+    carries; the call is emitted like a call of a compiled function."""
+
+    def test_calling_a_c_function_pointer(self) -> None:
+        ptr_type = sval.as_value(ConstPtr[CBinary], _GLOBAL_CONTEXT)
+        proto = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32, ctypes.c_int32)
+        callback = proto(lambda a, b: a + b)
+        pointer = ctypes.cast(callback, ctypes.c_void_p)
+        self.assertEqual(call_c_binary(spy_as(pointer, ptr_type), 2, 3), 5)  # pyright: ignore
+
+    def test_the_default_of_a_function_pointer_is_filled_in(self) -> None:
+        ptr_type = sval.as_value(ConstPtr[CWithDefault], _GLOBAL_CONTEXT)
+        proto = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32, ctypes.c_int32)
+        callback = proto(lambda a, b: a + b)
+        pointer = ctypes.cast(callback, ctypes.c_void_p)
+        self.assertEqual(call_c_default(spy_as(pointer, ptr_type), 5), 15)  # pyright: ignore
+
+    def test_calling_a_spy_function_pointer(self) -> None:
+        # the default convention: the callee carries the error code and payload
+        # through trailing pointers
+        ptr_type = _GLOBAL_CONTEXT.resolve_global(Fallible)
+        proto = ctypes.CFUNCTYPE(
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p,
+        )
+
+        def success(n: int, code_ptr: int, payload_ptr: int) -> int:
+            ctypes.cast(code_ptr, ctypes.POINTER(ctypes.c_uint8))[0] = 0
+            return n + 1
+
+        callback = proto(success)
+        pointer = ctypes.cast(callback, ctypes.c_void_p)
+        self.assertEqual(call_fallible(spy_as(pointer, ptr_type), 5), 6)  # pyright: ignore
+
+    def test_the_error_of_a_spy_function_pointer_is_routed(self) -> None:
+        ptr_type = _GLOBAL_CONTEXT.resolve_global(Fallible)
+        proto = ctypes.CFUNCTYPE(
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p,
+        )
+
+        def fail(n: int, code_ptr: int, payload_ptr: int) -> int:
+            ctypes.cast(code_ptr, ctypes.POINTER(ctypes.c_uint8))[0] = 1
+            ctypes.cast(payload_ptr, ctypes.POINTER(ctypes.c_int32))[0] = 7
+            return 0
+
+        callback = proto(fail)
+        pointer = ctypes.cast(callback, ctypes.c_void_p)
+        self.assertEqual(call_fallible(spy_as(pointer, ptr_type), 5), 1007)  # pyright: ignore
+
+
+class SpyCallconvTest(TestCase):
+    """A non-default calling convention forces every argument by value, the
+    result by value, and forbids raising and multiple results."""
+
+    def test_a_c_function_may_not_infer_exceptions(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            c_inferred_raise(1)
+        self.assertIn('may not raise', str(ctx.exception))
+
+    def test_a_c_function_may_not_return_several_values(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            c_multi(1)
+        self.assertIn('only one value', str(ctx.exception))
+
+
+class SpyFrozenArraySetTest(TestCase):
+    """``util.FrozenArraySet``: an immutable, ordered, deduplicated collection
+    whose equality and hashing are by value (it may be a field of a frozen
+    dataclass)."""
+
+    def test_it_keeps_the_insertion_order_and_drops_duplicates(self) -> None:
+        s = FrozenArraySet((1, 2, 1, 3, 2))
+        self.assertEqual(s.values, (1, 2, 3))
+        self.assertEqual(list(s), [1, 2, 3])
+        self.assertEqual(len(s), 3)
+
+    def test_membership_and_indexing(self) -> None:
+        s: FrozenArraySet[str] = FrozenArraySet(('a', 'b', 'c'))
+        self.assertIn('b', s)
+        self.assertNotIn('z', s)
+        self.assertEqual(s[0], 'a')
+        self.assertEqual(s.index('c'), 2)
+        self.assertIsNone(s.index_of('z'))
+        with self.assertRaises(ValueError):
+            s.index('z')
+
+    def test_equality_and_hashing_are_by_value(self) -> None:
+        # the order is part of the value (an error-code or tag order is)
+        self.assertEqual(FrozenArraySet((1, 2)), FrozenArraySet((1, 2)))
+        self.assertNotEqual(FrozenArraySet((1, 2)), FrozenArraySet((2, 1)))
+        self.assertEqual(hash(FrozenArraySet((1, 2))), hash(FrozenArraySet((1, 2))))
+        self.assertEqual(len({FrozenArraySet((1, 2)), FrozenArraySet((1, 2))}), 1)
+
+
+class SpyExceptionsArgumentTest(TestCase):
+    """``@func``/``@func_type`` take the exception set as a tuple or as a single
+    exception type (``exceptions=ErrorA`` means ``exceptions=(ErrorA,)``)."""
+
+    def test_a_func_type_accepts_a_single_exception(self) -> None:
+        t = _GLOBAL_CONTEXT.resolve_global(FallibleSingle)
+        assert isinstance(t, sval.FunctionType)
+        self.assertEqual(tuple(t.exceptions), (struct_type(FnError),))
+
+    def test_a_func_accepts_a_single_exception(self) -> None:
+        # a call from Python compiles the function before the boundary rejects it
+        with self.assertRaises(SpyError):
+            raise_fn_error(1)
+        entry = raise_fn_error.get_entry()  # pyright: ignore
+        assert entry.hir.signature.exceptions is not None
+        self.assertEqual(
+            list(entry.hir.signature.exceptions.values), [struct_type(FnError)],
+        )
+
+
 all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
@@ -7842,4 +8117,9 @@ all_tests = [
     SpyTypeClassifyTest,
     SpyDstTest,
     SpyDeferTest,
+    SpyFuncTypeTest,
+    SpyFnPtrCallTest,
+    SpyCallconvTest,
+    SpyFrozenArraySetTest,
+    SpyExceptionsArgumentTest,
 ]

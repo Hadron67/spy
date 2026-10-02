@@ -109,6 +109,61 @@ class ArraySet[T]:
     def __iter__(self):
         return iter(self.values)
 
+class FrozenArraySet[T]:
+    """The immutable, ordered counterpart of :class:`ArraySet`: a deduplicated
+    collection whose values keep the order they were first inserted in (which
+    is meaningful for an error-code or tag order).  Equality and hashing are by
+    value, and an instance is hashable, so it may be the field of a frozen
+    dataclass."""
+
+    values: tuple[T, ...]
+    _ids: dict[T, int]
+
+    def __init__(self, values: Iterable[T] = ()) -> None:
+        unique: list[T] = []
+        ids: dict[T, int] = {}
+        for value in values:
+            if value in ids:
+                continue
+            ids[value] = len(unique)
+            unique.append(value)
+        self.values = tuple(unique)
+        self._ids = ids
+
+    def index(self, value: T) -> int:
+        """The position of ``value``, like ``tuple.index``; raises
+        :class:`ValueError` when it is not held."""
+        index = self._ids.get(value)
+        if index is None:
+            raise ValueError(f'{value!r} is not in the FrozenArraySet')
+        return index
+
+    def index_of(self, value: T) -> int | None:
+        return self._ids.get(value)
+
+    def __contains__(self, value: T) -> bool:
+        return value in self._ids
+
+    def __getitem__(self, index: int) -> T:
+        return self.values[index]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, FrozenArraySet):
+            return self.values == other.values
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.values)
+
+    def __repr__(self) -> str:
+        return f'FrozenArraySet({self.values!r})'
+
 class PtrObject:
     @override
     def __eq__(self, value: object, /) -> bool:

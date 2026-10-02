@@ -172,6 +172,11 @@ class FunctionType(Type):
 
     args: tuple[Type, ...]
     return_type: ReturnType
+    # the calling convention: ``'default'`` is the spy one; any other value
+    # names a C one (see ``sval.FunctionType.callconv``)
+    callconv: str = 'default'
+    # whether the function may panic; carried through only (no logic yet)
+    may_panic: bool = False
 
     def get_children(self) -> tuple[Any, ...]:
         return (*self.args, self.return_type)

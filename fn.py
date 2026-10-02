@@ -27,7 +27,15 @@ from .sval import (
     ret_spec_value_is_empty,
     type_of,
 )
-from .util import ArraySet, IndexedMap, StrBiMap, TriState, frozendict, sanitize_name
+from .util import (
+    ArraySet,
+    FrozenArraySet,
+    IndexedMap,
+    StrBiMap,
+    TriState,
+    frozendict,
+    sanitize_name,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +134,10 @@ class PartialReturnSignature:
 
     ret_type_spec: RetSpec | None
     exceptions: ArraySet[Type] | None
+    # the calling convention the function is declared with (see
+    # ``Signature.callconv``): a non-default one forces the result by value
+    # and forbids raising
+    callconv: str = 'default'
 
     def is_complete(self) -> bool:
         """Whether both parts are declared - the convention can then be fixed
@@ -140,7 +152,7 @@ class PartialReturnSignature:
         assert ret_type_spec is not None and exceptions is not None, (
             'the return signature is not complete yet'
         )
-        return ReturnSignature(ret_type_spec, exceptions)
+        return ReturnSignature(ret_type_spec, exceptions, self.callconv)
 
 @dataclass(frozen=True, slots=True)
 class ReturnSignature:
@@ -158,6 +170,9 @@ class ReturnSignature:
 
     ret_type_spec: RetSpec
     exceptions: ArraySet[Type]
+    # the calling convention the function is declared with (see
+    # ``Signature.callconv``): a non-default one forces the result by value
+    callconv: str = 'default'
 
     def ret_spec(self, cache: MirLowerCache) -> RetSpec:
         """The effective return spec: the declared return spec with the value's
@@ -167,13 +182,17 @@ class ReturnSignature:
         zero-sized and so never reach the MIR.  ``cache`` is the MIR-mirror
         cache of the host the function is compiled for: which leaf is returned
         by value is decided by its layout (see ``sval.make_ret_spec``)."""
-        return make_ret_spec(self.result_type(), cache)
+        return make_ret_spec(
+            self.result_type(),
+            cache,
+            force_by_value=self.callconv != 'default',
+        )
 
     def result_type(self) -> ResultType:
         """The result type of this function: the value it returns normally and
         the exceptions it may raise, which is what decides how its error codes
         are encoded (see :class:`sval.ResultType`)."""
-        return ResultType(self.ret_type_spec.type, tuple(self.exceptions.values))
+        return ResultType(self.ret_type_spec.type, FrozenArraySet(self.exceptions.values))
 
     def value_is_empty(self) -> bool:
         """Whether the function has no value to return at all: its only value
@@ -251,6 +270,13 @@ class Signature:
     # corresponds to the i-th one); an empty set for a function that raises
     # nothing, and None when the set is inferred from the body
     exceptions: ArraySet[Type] | None
+    # the calling convention: ``'default'`` is the spy one; any other value
+    # names a C one, in which every argument is passed by value, the result is
+    # returned by value, and the function may not raise (see
+    # ``sval.FunctionType``)
+    callconv: str = 'default'
+    # whether the function may panic; passed through only (no logic yet)
+    may_panic: bool = False
 
     def bind_arg_pos[T](
         self,
@@ -389,7 +415,13 @@ class Signature:
         for name, arg in self.positional.items():
             assert arg.type is not None
             formal.append(FormalArg(name, arg.type, arg.default_value))
-        return FunctionType(tuple(formal), self.ret_type)
+        exceptions: FrozenArraySet[Type] = (
+            FrozenArraySet() if self.exceptions is None
+            else FrozenArraySet(self.exceptions.values)
+        )
+        return FunctionType(
+            tuple(formal), self.ret_type, exceptions, self.callconv, self.may_panic,
+        )
 
     def substitute_type_vars(self, reps: dict[TypeVar, AnyValue]) -> Signature:
         """A copy of this signature with every type parameter of ``reps``
@@ -428,7 +460,9 @@ class Signature:
         type is still a type parameter) and what ``sval.pass_by_ref`` says of
         the substituted type, combined (see :meth:`util.TriState.or_`).  A
         zero-sized parameter is dropped from the runtime signature - it
-        carries its unit value as a compile-time argument.
+        carries its unit value as a compile-time argument.  A signature that
+        does not use the default calling convention (``callconv``) forces
+        every argument by value instead.
 
         Returns the specialized call signature - also the cache key of
         the specialization - and the return convention as far as the
@@ -437,6 +471,7 @@ class Signature:
         ``PartialReturnSignature``).  ``cache`` is the MIR-mirror cache of
         the host the call is compiled for: the return convention needs the
         layout a mirror carries (see ``sval.make_ret_spec``)."""
+        is_c = self.callconv != 'default'
         type_var_values = self.solve_param_types(provided)
         reps: dict[TypeVar, AnyValue] = dict(zip(self.generic_args, type_var_values))
 
@@ -468,8 +503,12 @@ class Signature:
                 )
             # the convention the formal declares (unknown while its type was a
             # type parameter) and the one the substituted type asks for: by
-            # reference unless one of them says otherwise
-            by_ref = TriState.or_(param.by_ref, pass_by_ref(resolved, cache))
+            # reference unless one of them says otherwise - and never for a C
+            # convention, which passes every argument by value
+            if is_c:
+                by_ref = TriState.FALSE
+            else:
+                by_ref = TriState.or_(param.by_ref, pass_by_ref(resolved, cache))
             return SpecializedRuntimeArg(resolved, by_ref is not TriState.FALSE)
 
         positional = tuple(
@@ -498,9 +537,23 @@ class Signature:
 
         # the parts the definition declares; the interpreter infers the ones it
         # leaves out from the body
-        ret_type_spec = None if self.ret_type is None else make_ret_spec(substitute(self.ret_type), cache)
-        exceptions = None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute)
-        return call_sig, PartialReturnSignature(ret_type_spec, exceptions)
+        if is_c:
+            # a C function may not raise: a declared exception set has to be
+            # empty, one left to be inferred is checked once the body is typed
+            # (see ``HirRunner._materialize_ret_sig``)
+            if self.exceptions is not None and len(self.exceptions) > 0:
+                raise CompileError(
+                    'a non-default-callconv function may not declare exceptions'
+                )
+            ret_type_spec = (
+                None if self.ret_type is None
+                else make_ret_spec(substitute(self.ret_type), cache, force_by_value=True)
+            )
+            exceptions = self.exceptions
+        else:
+            ret_type_spec = None if self.ret_type is None else make_ret_spec(substitute(self.ret_type), cache)
+            exceptions = None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute)
+        return call_sig, PartialReturnSignature(ret_type_spec, exceptions, self.callconv)
 
 
 def _substitute_exceptions(exceptions: ArraySet[Type], substitute: Callable[[Type], Type]) -> ArraySet[Type]:
@@ -510,6 +563,28 @@ def _substitute_exceptions(exceptions: ArraySet[Type], substitute: Callable[[Typ
     for exception in exceptions.values:
         ret.add(substitute(exception))
     return ret
+
+
+def signature_of_fn_type(fn_type: FunctionType) -> Signature:
+    """The :class:`Signature` a function-pointer type denotes: its formal
+    parameters (by name, with their defaults) and its return convention.  A
+    function type is always concrete, so the signature has no generic type
+    parameters and no ``*args``/``**kwargs``; ``callconv`` and ``may_panic``
+    are carried over.  The call logic rebuilds the :class:`CallSignature` and
+    :class:`ReturnSignature` of one call through it (see ``interp``)."""
+    positional: IndexedMap[str, SignatureFormalArg] = IndexedMap()
+    for arg in fn_type.args:
+        positional.add(
+            arg.name,
+            SignatureFormalArg(arg.type, False, arg.default_value, TriState.UNKNOWN),
+        )
+    exceptions: ArraySet[Type] = ArraySet()
+    for exception in fn_type.exceptions:
+        exceptions.add(exception)
+    return Signature(
+        (), positional, None, None, fn_type.return_type, exceptions,
+        fn_type.callconv, fn_type.may_panic,
+    )
 
 
 @dataclass

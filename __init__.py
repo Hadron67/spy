@@ -23,7 +23,7 @@ from types import NoneType
 from typing import TYPE_CHECKING
 
 from . import builtins as _builtins
-from .dsl import func, struct
+from .dsl import func, func_type, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
 from .syntax import ISize, USize
@@ -78,6 +78,7 @@ __all__ = [
     'f32',
     'f64',
     'func',
+    'func_type',
     'i8',
     'i16',
     'i32',

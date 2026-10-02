@@ -103,6 +103,7 @@ from .fn import (
     SpecializedComptimeArg,
     SpecializedFormalArg,
     SpecializedRuntimeArg,
+    signature_of_fn_type,
 )
 from .hir import InlineMode
 from .sval import (
@@ -1465,6 +1466,16 @@ class HirRunner:
         The convention is a property of the result types
         (``sval.make_ret_spec``) unless the signature declares it.
         """
+        if sig.callconv != 'default':
+            # a C function may return only one value and may not raise (the
+            # declared parts were checked when the signature was specialized;
+            # an inferred one is checked here, once its type is known)
+            if isinstance(sig.ret_type_spec.type, sval.TupleType):
+                raise CompileError(
+                    'a non-default-callconv function may return only one value'
+                )
+            if len(sig.exceptions) > 0:
+                raise CompileError('a non-default-callconv function may not raise')
         spec = sig.ret_spec(self._mir_cache)
         if self.ret_sig is not None:
             if self.ret_sig != sig:
@@ -1711,7 +1722,7 @@ class HirRunner:
             if not self._function_error_inferred():
                 raise CompileError(
                     f'{exception} is not an exception of this function: it '
-                    f'cannot raise it (declare it with @func(exceptions={{...}}) '
+                    f'cannot raise it (declare it with @func(exceptions=(...)) '
                     f'or @func(exceptions="infer"))'
                 )
             self._error_types.add(exception)
@@ -2486,7 +2497,7 @@ class HirRunner:
             return
         block = data.clause_blocks[index]
         assert block is not None
-        union = sval.UnionType(tuple(exception for _, _, _, exception in records))
+        union = sval.UnionType(frozenset(exception for _, _, _, exception in records))
         assert not union.is_zst(), 'a bare clause has a payload pointer'
         union_mir = union.to_mir_type(self._mir_cache)
         assert isinstance(union_mir, mir.UnionType)
@@ -4334,6 +4345,7 @@ class HirRunner:
         just started and must be typed first: the call is then completed
         by ``resume`` when that runner ends (see
         ``_call_function_entry``)."""
+        callee = self._auto_deref(callee)
         target = _callee_object(callee)
         if target is not None:
             if isinstance(target, FunctionValue):
@@ -4350,6 +4362,12 @@ class HirRunner:
                 if res == PollResult.AGAIN and on_return is not None:
                     on_return()
                 return res
+        # a runtime function pointer: a value of a pointer-to-function type,
+        # called through the pointer the value carries (a function type alone
+        # is dynamically sized, so only a pointer to one is a value)
+        callee_type = _type_of(callee)
+        if isinstance(callee_type, sval.PointerType) and isinstance(callee_type.elem, sval.FunctionType):
+            return self._call_fn_ptr(callee, callee_type.elem, args, ret, on_return)
         raise CompileError(
             f"cannot compile a call to {callee!r}; only spy functions, plain Python "
             "functions and the spy builtins can be called"
@@ -4386,6 +4404,31 @@ class HirRunner:
             self.store(ret, ComptimeVal(sval.Void()))
             return PollResult.AGAIN
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
+
+    def _call_fn_ptr(
+        self,
+        callee: InterpVal,
+        fn_type: sval.FunctionType,
+        args: RawArgList[ArgEntry[InterpVal]],
+        ret: InterpVal,
+        on_return: Callable[[], None] | None,
+    ) -> PollResult:
+        """A call through a runtime function pointer: the callee value is an
+        address of the function type's signature, so the call is emitted like a
+        call of a compiled function, reusing ``_make_runtime_call``.  The call
+        signature and the return convention are rebuilt from the function type
+        (see ``signature_of_fn_type``)."""
+        sig = signature_of_fn_type(fn_type)
+        binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
+        _check_comptime_args(sig, binded_args)
+        call_sig, partial_ret_sig = sig.specialize(binded_args.map(_arg_type_of), self._mir_cache)
+        ret_sig = partial_ret_sig.complete()
+        res = self._make_runtime_call(
+            self._to_runtime(callee), binded_args, ret, call_sig, ret_sig,
+        )
+        if on_return is not None and not ret_sig.value_is_empty():
+            on_return()
+        return res
 
     def _record_pending_action(self, slot: PendingSlot, data: _PendingActionData) -> None:
         """Record one action on a still uncommitted slot, reserving the
@@ -5933,11 +5976,12 @@ class HirRunner:
             # all (see ``sval.EmptyType``)
             value_spec = sval.make_ret_spec(location.committed_type(), self._mir_cache)
         exceptions = partial.exceptions if partial is not None else None
+        callconv = partial.callconv if partial is not None else 'default'
         if exceptions is None:
             exceptions = ArraySet()
             for exception in self._error_types.values:
                 exceptions.add(exception)
-        self._materialize_ret_sig(ReturnSignature(value_spec, exceptions))
+        self._materialize_ret_sig(ReturnSignature(value_spec, exceptions, callconv))
         sig = self.ret_sig
         assert sig is not None
         result_type = sig.result_type()
