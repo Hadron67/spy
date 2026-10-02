@@ -1063,21 +1063,26 @@ class _Builder:
 
     def _gen_match(self, node: ast.Match) -> None:
         """``match (e := union): case T1(): ... case T2(): ...`` over a tagged
-        union: each ``case Ti()`` is the tag test ``isinstance(e, Ti)`` and binds
-        its body's ``e`` to the payload of ``Ti``; ``case _:`` is the fallback,
-        which has to come last.  The name is only visible in the case that binds
-        it - it is not declared outside the cases."""
+        union: each ``case Ti()`` is the tag test ``isinstance(e, Ti)`` and - in
+        the ``(e := union)`` form - binds its body's ``e`` to the payload of
+        ``Ti``; ``case _:`` is the fallback, which has to come last.  A plain
+        name subject (``match union:``) tests the tags only and binds nothing,
+        so the name keeps naming the union inside the cases.  The bound name is
+        only visible in the case that binds it - it is not declared outside the
+        cases."""
         fn_name = self._fn_ir.name
         subject = node.subject
-        name: str
+        bind_name: str | None
         value_node: ast.expr
         if isinstance(subject, ast.NamedExpr):
             if not isinstance(subject.target, ast.Name):
                 raise CompileError('the target of ``:=`` has to be a name')
-            name = subject.target.id
+            bind_name = subject.target.id
             value_node = subject.value
         elif isinstance(subject, ast.Name):
-            name = subject.id
+            # a plain name: the tag is tested, but no payload is bound (the name
+            # is not redeclared, so it still names the union inside the cases)
+            bind_name = None
             value_node = subject
         else:
             raise CompileError(
@@ -1104,8 +1109,9 @@ class _Builder:
             test = self.add(hir.IsInstance(ArgEntry(place, True), type_value))
             self.add(hir.If(self.add(hir.AsBool(ArgEntry(test, False)))))
             self._scopes.append(_Scope())
-            payload = self.add(hir.TaggedUnionPayloadPtr(place, type_value))
-            self._declare(name, payload)
+            if bind_name is not None:
+                payload = self.add(hir.TaggedUnionPayloadPtr(place, type_value))
+                self._declare(bind_name, payload)
             self._gen_block(case.body)
             self._scopes.pop()
             self.add(hir.Else())

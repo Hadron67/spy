@@ -7039,7 +7039,8 @@ class SpyDstTest(TestCase):
 
 # ---------------------------------------------------------------------------
 # tagged unions: ``A | B``, the tag test ``isinstance(u, A)`` / the unwrap
-# ``isinstance(e := u, A)`` and the ``match (e := u): case A(): ...`` unwrap
+# ``isinstance(e := u, A)``, and ``match (e := u): case A(): ...`` (which binds
+# the payload) / ``match u: case A(): ...`` (which tests only)
 # ---------------------------------------------------------------------------
 
 
@@ -7164,6 +7165,40 @@ def tu_match_wildcard(u: TU_A | TU_B) -> i32:
 @func()
 def tu_match_wildcard_make(sel: i32) -> i32:
     return tu_match_wildcard(tu_make(sel))
+
+
+@func()
+def tu_match_tag(u: TU_A | TU_B) -> i32:
+    # a plain-name subject: the tag is tested, no payload is bound
+    match u:
+        case TU_A():
+            return 1
+        case TU_B():
+            return 2
+    return -1
+
+
+@func()
+def tu_match_tag_make(sel: i32) -> i32:
+    return tu_match_tag(tu_make(sel))
+
+
+@func()
+def tu_match_no_shadow(u: TU_A | TU_B) -> i32:
+    # no payload is bound, so the subject name still names the union in the
+    # case body, where it can be unwrapped
+    match u:
+        case TU_A():
+            if isinstance(a := u, TU_A):
+                return a.x
+            return -1
+        case _:
+            return -2
+
+
+@func()
+def tu_match_no_shadow_make(sel: i32) -> i32:
+    return tu_match_no_shadow(tu_make(sel))
 
 
 @func()
@@ -7331,6 +7366,16 @@ class SpyTaggedUnionTest(TestCase):
     def test_match_wildcard(self) -> None:
         self.assertEqual(tu_match_wildcard_make(0), 1)
         self.assertEqual(tu_match_wildcard_make(1), 2)
+
+    def test_match_without_binding(self) -> None:
+        # ``match u:`` (a plain-name subject) tests the tag only
+        self.assertEqual(tu_match_tag_make(0), 1)
+        self.assertEqual(tu_match_tag_make(1), 2)
+
+    def test_match_subject_keeps_naming_the_union(self) -> None:
+        # nothing is bound, so the subject name is still the union in the body
+        self.assertEqual(tu_match_no_shadow_make(0), 3)
+        self.assertEqual(tu_match_no_shadow_make(1), -2)
 
     def test_scalar_variants(self) -> None:
         # an untyped integer literal takes the first variant it fits
