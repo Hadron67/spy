@@ -298,7 +298,9 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 | `compiler/binop.py` | 运算符的字面量类型 |
 | `compiler/builtins.py` | 函数体内使用的 `spy.*` builtin |
 | `compiler/util.py` | 共用工具 |
-| `std/__init__.py` | 标准库类型：`Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr` 及 `arr_slice`/`const_arr_slice` |
+| `std/__init__.py` | 标准库对外入口：把 `std.core` 的类型与 `compiler.syntax` 的标记一并再导出 |
+| `std/core.py` | 标准库核心类型：`Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr` 及 `arr_slice`/`const_arr_slice` |
+| `std/mem.py` | 内存相关工具（尚未实现） |
 | `tests.py` | 集成测试 |
 
 ## 尚未实现 / 已知限制

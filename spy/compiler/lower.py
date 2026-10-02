@@ -392,10 +392,10 @@ class _Lowerer:
                 if isinstance(pointee, (sllvm.StructType, sllvm.ArrayType)):
                     # a field/element of the value the pointer points at: LLVM
                     # addresses it with the leading zero index
-                    result = block.get_element_ptr(ptr, 0, index_value)
+                    result = block.get_element_ptr(ptr, 0, index_value, pointee=pointee)
                 else:
                     # an offset *by whole pointees* (a ``MultiPtr``, ``mptr + n``)
-                    result = block.get_element_ptr(ptr, index_value)
+                    result = block.get_element_ptr(ptr, index_value, pointee=pointee)
             case mir.ExtractValue():
                 result = block.extract_value(self._value(inst.value, arg_values), inst.index)
             case mir.InsertValue():

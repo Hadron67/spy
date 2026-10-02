@@ -910,8 +910,8 @@ class BasicBlock(LocalValue):
     def float_ext(self, value: Value, type: FloatType):
         return self.emit(FloatExt(value, type))
 
-    def get_element_ptr(self, array: Value, *indices: Value | int) -> Value:
-        return self.emit(GetElementPtr(array, indices))
+    def get_element_ptr(self, array: Value, *indices: Value | int, pointee: Type | None = None) -> Value:
+        return self.emit(GetElementPtr(array, indices, pointee))
 
     def ptrtoint(self, value: Value, type: IntType):
         return self.emit(PtrToInt(value, type))
@@ -1416,13 +1416,19 @@ class GetElementPtr(Inst):
     ptr_type: Type
     type: PointerType
 
-    def __init__(self, ptr: Value, indices: tuple[Value | int, ...]):
+    def __init__(self, ptr: Value, indices: tuple[Value | int, ...], pointee: Type | None = None):
         self.ptr = ptr
         indices0: list[Value] = []
 
         ptr_type = self.ptr.get_type()
         assert isinstance(ptr_type, PointerType), "expected pointer type"
-        type = ptr_type.child
+        # the pointee the indices address.  The value's own type names it, except
+        # when a pointer was reinterpreted by a no-op ``bitcast`` (the MIR
+        # pointer types are re-tagged without an instruction, so the value keeps
+        # the type it came from): the caller then passes the MIR pointee, which
+        # is what the strides are computed from (see ``lower._Lowerer``)
+        type = ptr_type.child if pointee is None else pointee
+        self.ptr_type = type
         i0 = indices[0]
         if isinstance(i0, int):
             i0 = IntValue(i0, I64)
@@ -1448,7 +1454,6 @@ class GetElementPtr(Inst):
                 case _:
                     raise TypeError(f"cannot get element of type {type}")
         self.indices = tuple(indices0)
-        self.ptr_type = ptr_type.child
         self.type = PointerType(type)
 
     @override

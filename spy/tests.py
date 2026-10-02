@@ -4061,6 +4061,12 @@ class SpyMultiPointerTest(TestCase):
             single_ptr_is_not_multi(1)
         self.assertIn('cannot convert', str(ctx.exception))
 
+    def test_a_pointer_reinterpreted_by_ptr_cast_indexes_by_its_new_pointee(self) -> None:
+        # ``ptr_cast`` re-tags the pointer without an instruction (the LLVM
+        # pointers are untyped): the index still strides by the *new* pointee
+        # (the element), not by the array the address came from
+        self.assertEqual(ptr_cast_index(10), 12)
+
 
 class SpySliceIteratorTest(TestCase):
     """Iterating a ``std.SlicePtr``/``std.ConstSlicePtr``: ``__iter__`` yields
@@ -6919,17 +6925,13 @@ def opaque_roundtrip(x: i32) -> i32:
 
 
 @func()
-def unsized_array_index(p: Ptr[Array[i32, None]]) -> i32:  # pyright: ignore
+def unsized_ptr_index(x: i32) -> i32:
     # a pointer to an unsized array converts to the multi pointer of its
     # elements: ``*[?]T`` and ``*T`` carry the same address
+    a = array(x, x + 1, x + 2, x + 3)
+    p = ptr_cast(ref(a), Ptr[Array[i32, None]])  # pyright: ignore
     m: MultiPtr[i32] = p  # pyright: ignore
     return m[2]
-
-
-@func()
-def unsized_ptr_index(x: i32) -> i32:
-    a = array(x, x + 1, x + 2, x + 3)
-    return unsized_array_index(ptr_cast(ref(a), Ptr[Array[i32, None]]))  # pyright: ignore
 
 
 @struct()
@@ -6959,6 +6961,15 @@ def fam_read_by_value(x: i32) -> i32:
     a = array(x, x + 1)
     w = ptr_cast(ref(a), Ptr[FamCarrier])
     return w.data  # pyright: ignore
+
+
+@func()
+def ptr_cast_index(x: i32) -> i32:
+    # a pointer reinterpreted by ``ptr_cast`` indexes by its *new* pointee:
+    # the stride is the element type, not the array the address came from
+    a = array(x, x + 1, x + 2, x + 3)
+    m = ptr_cast(ref(a), MultiPtr[i32])
+    return m[2]
 
 
 def _make_struct(*fields: tuple[str, sval.Type]) -> sval.StructType:
