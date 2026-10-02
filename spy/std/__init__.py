@@ -1,10 +1,8 @@
 from typing import Protocol, Self, cast
 
-from spy import syntax
-
-from . import usize
-from .dsl import struct
-from .syntax import (
+from ..compiler import syntax, usize
+from ..compiler.dsl import struct
+from ..compiler.syntax import (
     Array,
     ConstMultiPtr,
     ConstPtr,

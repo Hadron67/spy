@@ -22,9 +22,7 @@ from contextlib import redirect_stdout
 from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, cast
 from unittest import TestCase
 
-from spy.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
-
-from . import (
+from .compiler import (
     CompileError,
     SpyError,
     TypeMismatchError,
@@ -41,12 +39,12 @@ from . import (
     u64,
     void,
 )
-from . import as_ as spy_as
-from . import bool as spy_bool
-from . import typeof as spy_typeof
-from .lower import LLVMBackend
-from .std import ConstSlicePtr, Numeric, SlicePtr, arr_slice, const_arr_slice
-from .syntax import (
+from .compiler import as_ as spy_as
+from .compiler import bool as spy_bool
+from .compiler import typeof as spy_typeof
+from .compiler.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
+from .compiler.lower import LLVMBackend
+from .compiler.syntax import (
     Array,
     Comptime,
     ConstMultiPtr,
@@ -61,7 +59,8 @@ from .syntax import (
     okdefer,
     ref,
 )
-from .util import FrozenArraySet, StrBiMap, TriState
+from .compiler.util import FrozenArraySet, StrBiMap, TriState
+from .std import ConstSlicePtr, Numeric, SlicePtr, arr_slice, const_arr_slice
 
 # ---------------------------------------------------------------------------
 # functions under test

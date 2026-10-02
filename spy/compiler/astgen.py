@@ -490,7 +490,7 @@ class _Builder:
         loop are *compile-time values*, so both are built into inline slots -
         a compile-time iterable is an aggregate with no runtime representation
         of its own, which an ordinary expression temporary may not hold."""
-        from .std import StopIteration
+        from ..std import StopIteration
 
         # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
         # iteration would restart the iteration)
@@ -839,7 +839,7 @@ class _Builder:
             return globals[name]
         builtin = getattr(builtins, name, None)
         if builtin is range or builtin is StopIteration:
-            from . import std
+            from .. import std
             return std.range if builtin is range else std.StopIteration
         if builtin is isinstance:
             # ``isinstance(value, T)`` against a tagged union: the parser lowers

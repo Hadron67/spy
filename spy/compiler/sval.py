@@ -27,11 +27,10 @@ from enum import IntEnum, auto
 from types import NoneType
 from typing import Any, Literal, override
 
-from spy.util import FrozenArraySet, IdentityObj, IndexedMap, TriState, frozendict
-
 from . import mir, syntax
 from .errors import CompileError
 from .target import TargetInfo
+from .util import FrozenArraySet, IdentityObj, IndexedMap, TriState, frozendict
 
 INT_DEFAULT_BITS = 32
 """The signedness/width of the default spy integer type: the type a

@@ -720,7 +720,7 @@ class _Context(CompileContext):
     @override
     def special_types(self) -> sval.SpecialTypes:
         if self._special_types is None:
-            from . import std
+            from .. import std
             self._special_types = sval.SpecialTypes(
                 self._struct_head(std.slice),
                 self._struct_head(std.SlicePtr),

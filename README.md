@@ -282,22 +282,23 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 
 | 文件 | 作用 |
 |---|---|
-| `__init__.py` | 公开接口：`func`、`struct`、`typeof`、`compile_log`、`as_`，以及各类型常量（`spy.i32` 等） |
-| `dsl.py` | `func`/`struct` 装饰器、注册与全局 context（`_Context`）、Python 侧调用入口（实参绑定、特化、原生调用） |
-| `astgen.py` | 源码 → 无类型 HIR；把函数签名（注解/默认值/泛型参数）转成 spy 域的 `fn.Signature` |
-| `hir.py` | 无类型 HIR 指令定义 |
-| `interp.py` | 编译期运行 HIR → 有类型 MIR（comptime 语义所在）；结构体的字段寻址、方法分发与就地构造 |
-| `mir.py` | MIR 类型、指令与基本块定义 |
-| `opt.py` | MIR 清理：把单次存取的 slot 折回寄存器（按基本块支配关系判定）、删除无用 slot |
-| `llvm.py` | LLVM IR 的文本构造器 |
-| `lower.py` | MIR → LLVM IR → 机器码（llvmlite MCJIT） |
-| `fn.py` | 函数签名（`Signature`：形参绑定、类型参数求解、返回类型推导）、函数值与编译产物、链接名表（`SymbolTable`）与函数入口 thunk |
-| `sval.py` | spy 类型系统（含结构体类型）、编译期值、Python 值 → spy 域的映射（`as_value`）与类型参数约束求解（`TypeVarSolver`） |
-| `syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`/`ConstPtr`/`MultiPtr`/`ConstMultiPtr`、取地址 `ref`、指针强转 `ptr_cast`、数组类型 `Array` 与构造 `array`、`Option`、编译期变量标注 `Comptime` |
-| `errors.py` | `SpyError`、`CompileError`、`CoerceError`、`TypeMismatchError`（同时是 `TypeError` 子类） |
-| `binop.py` | 运算符的字面量类型 |
-| `builtins.py` | 函数体内使用的 `spy.*` builtin |
-| `util.py` | 共用工具 |
+| `compiler/__init__.py` | 公开接口：`func`、`struct`、`typeof`、`compile_log`、`as_`，以及各类型常量（`spy.i32` 等） |
+| `compiler/dsl.py` | `func`/`struct` 装饰器、注册与全局 context（`_Context`）、Python 侧调用入口（实参绑定、特化、原生调用） |
+| `compiler/astgen.py` | 源码 → 无类型 HIR；把函数签名（注解/默认值/泛型参数）转成 spy 域的 `fn.Signature` |
+| `compiler/hir.py` | 无类型 HIR 指令定义 |
+| `compiler/interp.py` | 编译期运行 HIR → 有类型 MIR（comptime 语义所在）；结构体的字段寻址、方法分发与就地构造 |
+| `compiler/mir.py` | MIR 类型、指令与基本块定义 |
+| `compiler/opt.py` | MIR 清理：把单次存取的 slot 折回寄存器（按基本块支配关系判定）、删除无用 slot |
+| `compiler/llvm.py` | LLVM IR 的文本构造器 |
+| `compiler/lower.py` | MIR → LLVM IR → 机器码（llvmlite MCJIT） |
+| `compiler/fn.py` | 函数签名（`Signature`：形参绑定、类型参数求解、返回类型推导）、函数值与编译产物、链接名表（`SymbolTable`）与函数入口 thunk |
+| `compiler/sval.py` | spy 类型系统（含结构体类型）、编译期值、Python 值 → spy 域的映射（`as_value`）与类型参数约束求解（`TypeVarSolver`） |
+| `compiler/syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`/`ConstPtr`/`MultiPtr`/`ConstMultiPtr`、取地址 `ref`、指针强转 `ptr_cast`、数组类型 `Array` 与构造 `array`、`Option`、编译期变量标注 `Comptime` |
+| `compiler/errors.py` | `SpyError`、`CompileError`、`CoerceError`、`TypeMismatchError`（同时是 `TypeError` 子类） |
+| `compiler/binop.py` | 运算符的字面量类型 |
+| `compiler/builtins.py` | 函数体内使用的 `spy.*` builtin |
+| `compiler/util.py` | 共用工具 |
+| `std/__init__.py` | 标准库类型：`Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr` 及 `arr_slice`/`const_arr_slice` |
 | `tests.py` | 集成测试 |
 
 ## 尚未实现 / 已知限制
