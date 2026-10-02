@@ -350,6 +350,15 @@ class PtrCast(Inst):
     type: Value
 
 @dataclass(eq=False)
+class AsFuncPtr(Inst):
+    """``syntax.as_func_ptr(T, f)``: the runtime pointer to the spy function
+    ``f`` of the function type ``T`` (both value operands).  The result is a
+    ``ConstPtr[T]`` value (see ``interp``)."""
+
+    type: Value
+    obj: Value
+
+@dataclass(eq=False)
 class InitTuple(Inst):
     tuple_ptr: Value
     length: int

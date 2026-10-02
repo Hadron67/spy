@@ -104,3 +104,6 @@ def okdefer():
 @contextmanager
 def errdefer():
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+def as_func_ptr[T](type: type[T], obj: T) -> ConstPtr[T]:
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")

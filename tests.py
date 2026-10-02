@@ -22,7 +22,7 @@ from contextlib import redirect_stdout
 from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, cast
 from unittest import TestCase
 
-from spy.dsl import _GLOBAL_CONTEXT, _Context, func, func_type, struct
+from spy.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
 
 from . import (
     CompileError,
@@ -55,6 +55,7 @@ from .syntax import (
     Option,
     Ptr,
     array,
+    as_func_ptr,
     defer,
     errdefer,
     okdefer,
@@ -7913,6 +7914,53 @@ def c_multi(n: i32) -> tuple[i32, i32]:
     return n, n + 1
 
 
+@decl_func("abs")
+def c_abs(x: i32) -> i32:
+    # an external function declared by its C link name (the default callconv)
+    ...
+
+
+@decl_func("bad", exceptions=FnError)
+def c_bad_decl(x: i32) -> i32:
+    # a C function may not declare exceptions: resolving this is rejected
+    ...
+
+
+@func()
+def call_c_abs(x: i32) -> i32:
+    # the declared name is a function pointer value: the call goes through it
+    return c_abs(x)
+
+
+@func()
+def ptr_target_incr(n: i32) -> i32:
+    return n + 1
+
+
+@func()
+def call_spy_func_ptr(n: i32) -> i32:
+    # ``as_func_ptr`` materializes the address of a spy function
+    p = as_func_ptr(spy_typeof(ptr_target_incr), ptr_target_incr)  # pyright: ignore
+    return p[...](n)
+
+
+@func_type()
+class IntUnary(Protocol):
+    def __call__(self, n: i32) -> i32: ...
+
+
+@func()
+def apply_int_unary(p: ConstPtr[IntUnary], n: i32) -> i32:
+    return p[...](n)
+
+
+@func()
+def call_spy_func_ptr_typed(n: i32) -> i32:
+    # the pointer of a spy function converts to a declared function-pointer type
+    p = as_func_ptr(spy_typeof(ptr_target_incr), ptr_target_incr)  # pyright: ignore
+    return apply_int_unary(p, n)
+
+
 class SpyFuncTypeTest(TestCase):
     """``@func_type``: the annotations of a Protocol's ``__call__`` (its
     receiver dropped) become a ``sval.FunctionType``, resolved in the context
@@ -8077,6 +8125,46 @@ class SpyExceptionsArgumentTest(TestCase):
         )
 
 
+class SpyDeclFuncTest(TestCase):
+    """``@decl_func`` declares an external function by its link name: the
+    decorated name resolves to a function pointer (``sval.DeclareFunction``)."""
+
+    def test_a_declared_function_is_a_c_function_pointer(self) -> None:
+        decl = _GLOBAL_CONTEXT.resolve_global(c_abs)
+        assert isinstance(decl, sval.DeclareFunction)
+        self.assertEqual(decl.linkname, 'abs')
+        self.assertEqual(decl.type.callconv, 'c')
+        self.assertEqual(decl.type.exceptions, sval.FrozenArraySet())
+        self.assertEqual(decl.get_type(), sval.PointerType(decl.type, is_const=True))
+
+    def test_calling_a_declared_c_function(self) -> None:
+        self.assertEqual(call_c_abs(-5), 5)
+        self.assertEqual(call_c_abs(7), 7)
+
+    def test_it_lowers_to_an_extern_symbol(self) -> None:
+        self.assertEqual(call_c_abs(-1), 1)
+        entry = call_c_abs.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        assert instance.native_fn is not None
+        self.assertIn('abs', '\n'.join(instance.native_fn.print_all()))
+
+    def test_a_c_declaration_may_not_declare_exceptions(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            _GLOBAL_CONTEXT.resolve_global(c_bad_decl)
+        self.assertIn('may not declare exceptions', str(ctx.exception))
+
+
+class SpyAsFuncPtrTest(TestCase):
+    """``syntax.as_func_ptr`` materializes the address of a spy function as a
+    ``ConstPtr`` of its function type."""
+
+    def test_the_pointer_of_a_spy_function_can_be_called(self) -> None:
+        self.assertEqual(call_spy_func_ptr(5), 6)
+
+    def test_the_pointer_converts_to_a_declared_function_pointer_type(self) -> None:
+        self.assertEqual(call_spy_func_ptr_typed(10), 11)
+
+
 all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
@@ -8122,4 +8210,6 @@ all_tests = [
     SpyCallconvTest,
     SpyFrozenArraySetTest,
     SpyExceptionsArgumentTest,
+    SpyDeclFuncTest,
+    SpyAsFuncPtrTest,
 ]

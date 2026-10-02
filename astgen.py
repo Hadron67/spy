@@ -122,7 +122,7 @@ _DEFER_CALLS: dict[Any, hir.DeferKind] = {
 # the ``syntax.*`` markers that are *calls* in the source and are recognized by
 # identity (unlike ``syntax.array`` and ``syntax.Comptime``, which are resolved
 # through ``_gen_call``/``_split_comptime``)
-_SYNTAX_CALLS = (syntax.ref, syntax.unroll, syntax.comptime, syntax.ptr_cast)
+_SYNTAX_CALLS = (syntax.ref, syntax.unroll, syntax.comptime, syntax.ptr_cast, syntax.as_func_ptr)
 
 # the ``syntax.*`` classes that name a pointer type, by the (is_const, is_multi)
 # of the pointer each one is; ``Array``/``Option`` are handled alongside them in
@@ -1192,6 +1192,15 @@ class _Builder:
             value = self._as_value(self._gen_expr(args[0])[0])
             target = self._as_value(self._gen_expr(args[1])[0])
             return ArgEntry(self.add(hir.PtrCast(value, target)), False), False
+
+        if callee is syntax.as_func_ptr:
+            # ``as_func_ptr(T, f)``: the runtime pointer to the spy function ``f``
+            # of the function type ``T`` (see ``hir.AsFuncPtr`` and ``interp``)
+            if len(args) != 2:
+                raise CompileError('as_func_ptr takes exactly two arguments')
+            type = self._as_value(self._gen_expr(args[0])[0])
+            obj = self._as_value(self._gen_expr(args[1])[0])
+            return ArgEntry(self.add(hir.AsFuncPtr(type, obj)), False), False
 
         if callee is syntax.unroll:
             # it is a *statement* marker placed before a loop (see

@@ -771,7 +771,7 @@ def _normal_defers(defers: list[_DeferEntry]) -> tuple[mir.BasicBlock, ...]:
     return tuple(out)
 
 
-def _sval_to_runtime(value: sval.AnyValue) -> mir.Value:
+def _sval_to_runtime(value: sval.AnyValue, cache: sval.MirLowerCache) -> mir.Value:
     match value:
         case bool():
             return mir.BoolValue(value)
@@ -779,6 +779,12 @@ def _sval_to_runtime(value: sval.AnyValue) -> mir.Value:
             return mir.Int(value.value, mir.IntType(value.type.bits, value.type.signed))
         case sval.Float():
             return mir.Float(value.value, mir.FloatType(value.type.bits))
+        case sval.DeclareFunction():
+            # an external function is a global symbol: a function pointer is a
+            # reference to it (see ``mir.ExternSymbol`` and ``lower``)
+            mir_type = value.get_type().to_mir_type(cache)
+            assert isinstance(mir_type, mir.PointerType)
+            return mir.ExternSymbol(value.linkname, mir_type)
         case _:
             raise CompileError(f"cannot return the compile-time value {value!r}")
 
@@ -2182,6 +2188,8 @@ class HirRunner:
                 ))
             case hir.PtrCast():
                 regs[inst] = self.exec_ptr_cast(self.operand(inst.value), self.operand(inst.type))
+            case hir.AsFuncPtr():
+                return self.exec_as_func_ptr(inst)
             case _:
                 raise CompileError(f"unsupported instruction {inst}")
         return PollResult.AGAIN
@@ -3916,7 +3924,7 @@ class HirRunner:
             case RuntimeVal():
                 return ev.value
             case ComptimeVal():
-                return _sval_to_runtime(ev.obj)
+                return _sval_to_runtime(ev.obj, self._mir_cache)
             case ComptimeAggregatePtr(aggregate_type, _):
                 aggregate = self.load(ev)
                 if not isinstance(aggregate, ComptimeAggregate):
@@ -4141,6 +4149,50 @@ class HirRunner:
         if coerced is not None:
             return coerced
         return ComptimeCastedPtr(ev, target_obj)
+
+    def exec_as_func_ptr(self, inst: hir.AsFuncPtr) -> PollResult:
+        """``syntax.as_func_ptr(T, f)``: the runtime function pointer to the spy
+        function ``f``, typed as ``ConstPtr[T]``.  The pointer is the address of
+        the specialization of ``f`` for the function type ``T``, so the callee
+        is compiled (if it is not already) and the instruction resumes with its
+        ``mir`` value - exactly like a call, except that no call is emitted (see
+        ``_request_function``).  A declared external function is already a
+        pointer and is taken as it is."""
+        fn_type = self.type_operand(inst.type, 'the type of a function pointer')
+        if not isinstance(fn_type, sval.FunctionType):
+            raise CompileError(f'as_func_ptr needs a function type, got {fn_type!r}')
+        obj = self._operand_comptime_value(inst.obj)
+        regs = self._frames[-1].regs
+        if isinstance(obj, sval.DeclareFunction):
+            # a declared external function already is a function pointer
+            if obj.type != fn_type:
+                raise CompileError(
+                    f'as_func_ptr: {obj.linkname!r} has type {obj.type}, not {fn_type}'
+                )
+            regs[inst] = ComptimeVal(obj)
+            return PollResult.AGAIN
+        if not isinstance(obj, FunctionValue):
+            raise CompileError(f'as_func_ptr expects a spy function, got {obj!r}')
+        if obj.force_inline:
+            raise CompileError(
+                'cannot take the function pointer of an inlined Python function'
+            )
+        declared = obj.get_type()
+        if declared != fn_type:
+            raise CompileError(
+                f'as_func_ptr: function {obj.hir.name} has type {declared}, not {fn_type}'
+            )
+        sig = obj.hir.signature
+        provided = ArgList(
+            tuple(arg.type for arg in sig.positional.by_id), (), frozendict(),
+        )
+        call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
+
+        def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
+            regs[inst] = RuntimeVal(fn_mir, sval.PointerType(fn_type, is_const=True))
+            return PollResult.AGAIN
+
+        return self._request_function(obj, call_sig, partial_ret_sig, _resumer)
 
     # -- operators ------------------------------------------------------------
 
@@ -5557,11 +5609,27 @@ class HirRunner:
                 on_return()
             return res
 
-        self._fn_req_resumer = _resumer
-        res = self._analyser._request_function(fn, spec_sig[0], spec_sig[1], generic_var_values)
+        return self._request_function(fn, spec_sig[0], spec_sig[1], _resumer, generic_var_values)
+
+    def _request_function(
+        self,
+        fn: FunctionValue,
+        call_sig: CallSignature,
+        ret_sig: PartialReturnSignature,
+        resumer: Callable[[Self, mir.Value, ReturnSignature], PollResult],
+        generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
+    ) -> PollResult:
+        """Request the compilation of the specialization ``call_sig`` of
+        ``fn`` and resume this runner through ``resumer`` when it is typed: the
+        resumer runs right away when the specialization is already compiled (or
+        is the very function being typed, i.e. recursion), and otherwise is
+        stored and runs when the callee's runner ends (``resume``, see
+        ``Analyser._run``).  Returns ``AGAIN`` or ``SUSPEND``."""
+        self._fn_req_resumer = resumer
+        res = self._analyser._request_function(fn, call_sig, ret_sig, generic_var_values)
         if res is not None:
-            fn_mir, ret_sig = res
-            return self.resume(fn_mir, ret_sig)
+            fn_mir, actual_ret_sig = res
+            return self.resume(fn_mir, actual_ret_sig)
         return PollResult.SUSPEND
 
     def resume(self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:

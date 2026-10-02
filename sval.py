@@ -1617,6 +1617,24 @@ class FunctionType(Type):
 
 
 @dataclass(frozen=True)
+class DeclareFunction(Value):
+    """An external function declared by ``@decl_func(linkname)``: its signature
+    (a :class:`FunctionType`) and the link name it resolves to.  Its own type is
+    a const pointer to the signature - a function pointer - and the interpreter
+    lowers it to a ``mir.ExternSymbol`` (see ``interp``)."""
+
+    type: FunctionType
+    linkname: str
+
+    @override
+    def get_type(self) -> Type:
+        return PointerType(self.type, is_const=True)
+
+    def __str__(self) -> str:
+        return f'decl_func({self.linkname!r}: {self.type})'
+
+
+@dataclass(frozen=True)
 class StructField:
     name: str
     type: Type

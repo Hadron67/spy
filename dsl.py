@@ -43,8 +43,17 @@ time.
 
 import ctypes
 import types as pytypes
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, NoDefault, TypeVar, cast, dataclass_transform, override
+from typing import (
+    Any,
+    Literal,
+    NoDefault,
+    TypeVar,
+    cast,
+    dataclass_transform,
+    override,
+)
 
 from . import astgen, mir, sval
 from .builtins import spy_as, spy_compile_log, spy_typeof
@@ -468,66 +477,15 @@ class _FuncTypeDecl:
         if self.entry is not None:
             return self.entry
         call = self.cls.__call__
-        code = getattr(call, '__code__', None)
-        if code is None:
+        if getattr(call, '__code__', None) is None:
             raise CompileError(
                 f'function type {self.cls.__name__} must declare a Python __call__'
             )
-        count = code.co_argcount
-        names = code.co_varnames[:count]
-        annotations = call.__annotations__
-        defaults = call.__defaults__ if call.__defaults__ is not None else ()
-        offset = count - len(defaults)
-        args: list[sval.FormalArg] = []
-        for i, name in enumerate(names):
-            if i == 0:
-                # the receiver of the protocol method is not a parameter of the
-                # function type
-                continue
-            if name not in annotations:
-                raise CompileError(
-                    f'every parameter of function type {self.cls.__name__} must be annotated'
-                )
-            arg_type = sval.as_value(annotations[name], self.context)
-            if not isinstance(arg_type, sval.Type):
-                raise CompileError(
-                    f'cannot use {annotations[name]!r} as the type of parameter '
-                    f'{name!r} of function type {self.cls.__name__}'
-                )
-            default: sval.AnyValue | None = None
-            if i >= offset:
-                default = sval.as_value(defaults[i - offset], self.context)
-            args.append(sval.FormalArg(name, arg_type, default))
-        if 'return' not in annotations or annotations['return'] is None:
-            ret: sval.AnyValue = sval.VoidType()
-        else:
-            ret = sval.as_value(annotations['return'], self.context)
-        if not isinstance(ret, sval.Type):
-            raise CompileError(
-                f'cannot use {annotations.get("return")!r} as the return type of '
-                f'function type {self.cls.__name__}'
-            )
-        if self.meta.exceptions == 'infer':
-            raise CompileError(
-                f'the exceptions of function type {self.cls.__name__} cannot be inferred'
-            )
-        exceptions: list[sval.Type] = []
-        if self.meta.exceptions is not None:
-            for exception in self.meta.exceptions:
-                value = sval.as_value(exception, self.context)
-                if not isinstance(value, sval.StructType):
-                    raise CompileError(
-                        f'cannot use {exception!r} as an exception of function type '
-                        f'{self.cls.__name__}: an exception must be a spy struct'
-                    )
-                exceptions.append(value)
-        if self.meta.callconv != 'default' and len(exceptions) > 0:
-            raise CompileError(
-                f'a non-default-callconv function type may not declare exceptions: '
-                f'{self.cls.__name__}'
-            )
-        self.entry = sval.FunctionType(
-            tuple(args), ret, FrozenArraySet(exceptions), self.meta.callconv, self.meta.may_panic,
+        self.entry = _build_fn_type(
+            call, self.context, drop_receiver=True,
+            callconv=self.meta.callconv, may_panic=self.meta.may_panic,
+            exceptions=self.meta.exceptions,
+            what=f'function type {self.cls.__name__}',
         )
         return self.entry
 
@@ -536,6 +494,120 @@ class _FuncTypeDecl:
 
     def __ror__(self, other: Any) -> sval.TaggedUnionApplication:
         return sval.union_application(other, self)
+
+
+def _build_fn_type(
+    fn: Callable[..., Any],
+    context: _Context,
+    drop_receiver: bool,
+    callconv: str,
+    may_panic: bool,
+    exceptions: tuple[type, ...] | Literal["infer"] | None,
+    what: str,
+) -> sval.FunctionType:
+    """The ``sval.FunctionType`` the annotations of ``fn`` describe: every
+    parameter (the receiver is dropped when ``drop_receiver``, for a protocol's
+    ``__call__``) and the return.  The annotations resolve in ``context``, so a
+    ``std`` struct they name is that context's copy.  ``exceptions`` is the
+    declared exception set (``"infer"`` is rejected: a declared function type
+    has no body to infer from); ``callconv``/``may_panic`` are carried over.
+    ``what`` names the declaration in the errors."""
+    code = getattr(fn, '__code__', None)
+    if code is None:
+        raise CompileError(f'{what} must declare a Python function')
+    count = code.co_argcount
+    names = code.co_varnames[:count]
+    annotations = fn.__annotations__
+    defaults = fn.__defaults__ if fn.__defaults__ is not None else ()
+    offset = count - len(defaults)
+    args: list[sval.FormalArg] = []
+    for i, name in enumerate(names):
+        if drop_receiver and i == 0:
+            # the receiver of a protocol method is not a parameter of the
+            # function type
+            continue
+        if name not in annotations:
+            raise CompileError(f'every parameter of {what} must be annotated')
+        arg_type = sval.as_value(annotations[name], context)
+        if not isinstance(arg_type, sval.Type):
+            raise CompileError(
+                f'cannot use {annotations[name]!r} as the type of parameter '
+                f'{name!r} of {what}'
+            )
+        default: sval.AnyValue | None = None
+        if i >= offset:
+            default = sval.as_value(defaults[i - offset], context)
+        args.append(sval.FormalArg(name, arg_type, default))
+    if 'return' not in annotations or annotations['return'] is None:
+        ret: sval.AnyValue = sval.VoidType()
+    else:
+        ret = sval.as_value(annotations['return'], context)
+    if not isinstance(ret, sval.Type):
+        raise CompileError(
+            f'cannot use {annotations.get("return")!r} as the return type of {what}'
+        )
+    if exceptions == 'infer':
+        raise CompileError(f'the exceptions of {what} cannot be inferred')
+    exception_types: list[sval.Type] = []
+    if exceptions is not None:
+        for exception in exceptions:
+            value = sval.as_value(exception, context)
+            if not isinstance(value, sval.StructType):
+                raise CompileError(
+                    f'cannot use {exception!r} as an exception of {what}: '
+                    f'an exception must be a spy struct'
+                )
+            exception_types.append(value)
+    if callconv != 'default' and len(exception_types) > 0:
+        raise CompileError(f'a non-default-callconv {what} may not declare exceptions')
+    return sval.FunctionType(
+        tuple(args), ret, FrozenArraySet(exception_types), callconv, may_panic,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DeclFuncMetadata:
+    """The ``@decl_func(...)`` declaration of an external function (see
+    ``_DeclFuncDecl``)."""
+
+    linkname: str
+    callconv: str
+    may_panic: bool
+    exceptions: tuple[type, ...] | Literal["infer"] | None
+
+
+class _DeclFuncDecl:
+    """One function decorated with ``@decl_func(linkname)``: the declaration of
+    an external function.
+
+    The decorated name is a handle the context it is resolved in turns into a
+    ``sval.DeclareFunction`` - the signature read off the annotations, the link
+    name the one declared - which lowers to a ``mir.ExternSymbol`` (see
+    ``interp``).  The declaration is resolved lazily because its annotations
+    name objects of the resolving context."""
+
+    def __init__(self, fn: Any, meta: DeclFuncMetadata, context: _Context) -> None:
+        self.fn = fn
+        self.meta = meta
+        self.context = context
+        self.entry: sval.DeclareFunction | None = None
+
+    def with_context(self, context: _Context) -> _DeclFuncDecl:
+        # this context's copy of the declaration (see ``_Context._local_decl_func``)
+        return _DeclFuncDecl(self.fn, self.meta, context)
+
+    def as_spy_value(self) -> sval.DeclareFunction:
+        """The declared function this handle names, built in its context."""
+        if self.entry is not None:
+            return self.entry
+        fn_type = _build_fn_type(
+            self.fn, self.context, drop_receiver=False,
+            callconv=self.meta.callconv, may_panic=self.meta.may_panic,
+            exceptions=self.meta.exceptions,
+            what=f'declared function {self.fn.__name__!r}',
+        )
+        self.entry = sval.DeclareFunction(fn_type, self.meta.linkname)
+        return self.entry
 
 
 class _Context(CompileContext):
@@ -548,6 +620,8 @@ class _Context(CompileContext):
         self._cls_annotation_cache: dict[type, _RegisteredClass] = {}
         # the ``@func_type()`` declarations, by the class that carries them
         self._func_type_cache: dict[type, _FuncTypeDecl] = {}
+        # the ``@decl_func()`` declarations, by the function that carries them
+        self._decl_func_cache: dict[Any, _DeclFuncDecl] = {}
         # the inline entries of the undecorated Python functions reached
         # from a spy body, by function object
         self._inline_cache: dict[Any, FunctionValue] = {}
@@ -590,6 +664,14 @@ class _Context(CompileContext):
             self._func_type_cache[handle.cls] = existing
         return existing
 
+    def _local_decl_func(self, handle: _DeclFuncDecl) -> _DeclFuncDecl:
+        # likewise for a declared function (see ``_DeclFuncDecl``)
+        existing = self._decl_func_cache.get(handle.fn)
+        if existing is None:
+            existing = handle.with_context(self)
+            self._decl_func_cache[handle.fn] = existing
+        return existing
+
     @override
     def resolve_global(self, value: Any) -> AnyValue | None:
         match value:
@@ -603,6 +685,9 @@ class _Context(CompileContext):
                 return handle.as_spy_value()
             case _FuncTypeDecl():
                 handle = value if value.context is self else self._local_func_type(value)
+                return handle.as_spy_value()
+            case _DeclFuncDecl():
+                handle = value if value.context is self else self._local_decl_func(value)
                 return handle.as_spy_value()
             case pytypes.FunctionType():
                 builtin = _BUILTINS.get(value)
@@ -688,6 +773,26 @@ class _Context(CompileContext):
             return cast(type[T], result)
         return wrapper
 
+    def decl_func(self, linkname: str, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'c', may_panic: bool = False):
+        """Declare an external function of the link name ``linkname``: the
+        decorated function names the signature through its annotations, and the
+        decorated name is the handle that resolves to a
+        ``sval.DeclareFunction`` (see ``_DeclFuncDecl``).  Its arguments are the
+        ones of ``@func_type``, with the link name first and ``callconv``
+        defaulting to the C one."""
+        meta = DeclFuncMetadata(
+            linkname=linkname, callconv=callconv, may_panic=may_panic,
+            exceptions=_normalize_exceptions(exceptions),
+        )
+
+        def wrapper[T](fn: T) -> T:
+            if fn in self._decl_func_cache:
+                return cast(T, self._decl_func_cache[fn])
+            result = _DeclFuncDecl(fn, meta, self)
+            self._decl_func_cache[fn] = result
+            return cast(T, result)
+        return wrapper
+
     @dataclass_transform()
     def struct(self, extern_c: bool = False):
         meta = StructMetadata(extern_c=extern_c)
@@ -705,3 +810,4 @@ _GLOBAL_CONTEXT = _Context(LLVMBackend())
 func = _GLOBAL_CONTEXT.func
 struct = _GLOBAL_CONTEXT.struct
 func_type = _GLOBAL_CONTEXT.func_type
+decl_func = _GLOBAL_CONTEXT.decl_func

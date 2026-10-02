@@ -23,7 +23,7 @@ from types import NoneType
 from typing import TYPE_CHECKING
 
 from . import builtins as _builtins
-from .dsl import func, func_type, struct
+from .dsl import decl_func, func, func_type, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
 from .syntax import ISize, USize
@@ -75,6 +75,7 @@ __all__ = [
     'as_',
     'bool',
     'compile_log',
+    'decl_func',
     'f32',
     'f64',
     'func',
