@@ -26,7 +26,7 @@ from . import builtins as _builtins
 from .dsl import decl_func, func, func_type, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
-from .syntax import ISize, USize
+from .syntax import ConstMultiPtr, ConstPtr, ISize, MultiPtr, Option, Ptr, USize
 
 typeof = _builtins.spy_typeof  # ``spy.typeof`` is evaluated at compile time
 compile_log = _builtins.spy_compile_log
@@ -70,6 +70,11 @@ else:
 
 __all__ = [
     'CompileError',
+    'ConstMultiPtr',
+    'ConstPtr',
+    'MultiPtr',
+    'Option',
+    'Ptr',
     'SpyError',
     'TypeMismatchError',
     'as_',
@@ -84,10 +89,12 @@ __all__ = [
     'i16',
     'i32',
     'i64',
+    'isize',
     'struct',
     'typeof',
     'u8',
     'u16',
     'u32',
     'u64',
+    'usize',
 ]

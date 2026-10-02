@@ -329,10 +329,12 @@ class PointerType(Inst):
 class ArrayType(Inst):
     """Build the spy array type ``syntax.Array[T, N]``: ``length`` values of
     the element type ``elem`` (both value operands; the length is a *value*,
-    which may be a type parameter the call solves)."""
+    which may be a type parameter the call solves).  A ``length`` of ``None``
+    builds an *unsized* array (``syntax.Array[T, None]``), a dynamically-sized
+    type (see ``sval.ArrayType``)."""
 
     elem: Value
-    length: Value
+    length: Value | None
 
 @dataclass(eq=False)
 class OptionType(Inst):

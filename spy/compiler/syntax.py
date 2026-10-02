@@ -93,6 +93,13 @@ class USize:
 class ISize:
     pass
 
+class Opaque:
+    """An opaque type: a dynamically-sized type of unknown layout.  It is
+    converted to ``sval.OpaqueType`` and, as a bare name, is only usable behind
+    a pointer - a ``Ptr[Opaque]``/``ConstPtr[Opaque]`` lowers to a void pointer.
+    As the last field of a ``@struct()`` it is an opaque tail, the flexible
+    member of a C struct."""
+
 @contextmanager
 def defer():
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")

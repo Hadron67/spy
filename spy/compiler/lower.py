@@ -97,9 +97,18 @@ class _ModuleTypes:
             case mir.StructType():
                 ret = self._structs.get(type)
                 if ret is None:
+                    fields = [self.to_llvm(f.type) for f in type.fields]
+                    if type.fam_type is not None:
+                        # the flexible member: a zero-length array of the element
+                        # type (an ``i8`` array for an opaque tail), which adds
+                        # no size but its element alignment to the struct
+                        if isinstance(type.fam_type, mir.VoidType):
+                            fields.append(sllvm.ArrayType(sllvm.IntType(8), 0))
+                        else:
+                            fields.append(sllvm.ArrayType(self.to_llvm(type.fam_type), 0))
                     ret = sllvm.StructType(
                         sanitize_name(type.name_base or 'anon'),
-                        *(self.to_llvm(f.type) for f in type.fields),
+                        *fields,
                     )
                     self._structs[type] = ret
                 return ret
@@ -155,6 +164,12 @@ def struct_ctype(struct: mir.StructType) -> type[ctypes.Structure]:
     the MIR type."""
     cls = struct.ctype
     if cls is None:
+        if struct.fam_type is not None:
+            # a struct with a flexible member has no value of its own: it cannot
+            # cross the Python boundary (only a pointer to it can)
+            raise CompileError(
+                f'{struct} has a flexible member and cannot be passed by value'
+            )
         fields: list[tuple[str, Any]] = []
         for i, field in enumerate(struct.fields):
             ctype = to_ctype(field.type)

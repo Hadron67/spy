@@ -107,19 +107,29 @@ class MirLowerCache:
             self._union_mirs[type] = ret
         return ret
 
-    def option_struct_mir(self, child: Type, child_mir: mir.Type) -> mir.StructType:
+    def option_struct_mir(self, child: Type, child_mir: mir.Type | None) -> mir.StructType:
         """The (interned) MIR mirror of the ``Option[T]`` whose ``T``
         (``child``) has no pointer to be tagged on: a struct of a ``bool`` tag
-        and the value."""
+        and the value.  A dynamically-sized child has no mirror of its own: it
+        is the option's flexible member, placed last (the option itself is then
+        dynamically sized)."""
         ret = self._option_struct_mirs.get(child)
         if ret is None:
-            ret = mir.StructType(
-                'option',
-                (
-                    mir.FormalArg('tag', mir.BoolType()),
-                    mir.FormalArg('value', child_mir),
-                ),
-            )
+            if child.classify() == SpecialTypeKind.DST:
+                ret = mir.StructType(
+                    'option',
+                    (mir.FormalArg('tag', mir.BoolType()),),
+                    child.fam_mir_type(self),
+                )
+            else:
+                assert child_mir is not None
+                ret = mir.StructType(
+                    'option',
+                    (
+                        mir.FormalArg('tag', mir.BoolType()),
+                        mir.FormalArg('value', child_mir),
+                    ),
+                )
             self._option_struct_mirs[child] = ret
         return ret
 
@@ -221,6 +231,14 @@ class Type(Value):
 
     def get_type_children(self) -> tuple[Type, ...]:
         return ()
+
+    def fam_mir_type(self, cache: MirLowerCache) -> mir.MayBeVoidType:
+        """The MIR mirror this *dynamically-sized* type contributes as the
+        flexible member (the FAM) of the aggregate that holds it - the element
+        type of an unsized array, ``VOID`` for an opaque type, the mirror of a
+        dynamically-sized struct.  Only a type whose ``classify`` is
+        :attr:`SpecialTypeKind.DST` has one."""
+        raise CompileError(f'{self} is not a dynamically-sized type')
 
     def contains(self, needle: Type):
         todo: list[Type] = [self]
@@ -407,6 +425,13 @@ class UnionType(Type):
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        if any(type.classify() == SpecialTypeKind.DST for type in self.types):
+            # the union is laid out as its largest variant: a dynamically-sized
+            # one has no size to hold, so such a union has no representation yet
+            raise CompileError(
+                f'a union with a dynamically-sized variant ({self}) '
+                f'is not supported yet'
+            )
         payload = self.storage_variant(cache)
         if payload is None:
             # every variant is zero-sized: the union holds no storage
@@ -549,6 +574,13 @@ class TaggedUnionType(Type):
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        if any(type.classify() == SpecialTypeKind.DST for type in self.types):
+            # the payload union holds one variant's storage: a dynamically-sized
+            # variant has none, so such a union has no representation yet
+            raise CompileError(
+                f'a tagged union with a dynamically-sized variant ({self}) '
+                f'is not supported yet'
+            )
         if len(self.types) == 1:
             # a single variant: the representation is the variant's own
             return self.types[0].to_mir_type(cache)
@@ -1010,6 +1042,10 @@ class OptionType(Type):
             return mir.BoolType()
         child_mir = child.to_mir_type(cache)
         if child_mir is None:
+            if child.classify() == SpecialTypeKind.DST:
+                # a dynamically-sized child has no mirror of its own: the option
+                # stores it as its flexible member (the tag alone has storage)
+                return cache.option_struct_mir(child, None)
             return None
         if find_first_pointer_type_pos(child) is not None:
             # the child holds a pointer, which is null exactly when the option
@@ -1347,6 +1383,16 @@ class PointerType(Type):
         if self.elem.is_zst():
             # the pointee has no value of its own: the pointer is a void pointer
             return mir.PointerType(mir.VOID, self.is_const)
+        if isinstance(self.elem, OpaqueType):
+            # a pointer to an opaque type is a void pointer
+            return mir.PointerType(mir.VOID, self.is_const)
+        if isinstance(self.elem, ArrayType) and self.elem.length is None:
+            # a pointer to an unsized array points at its first element: it is a
+            # plain pointer to that element type (``*[?]T -> *T``)
+            elem = self.elem.elem.to_mir_type(cache)
+            if elem is None:
+                return None
+            return mir.PointerType(elem, self.is_const)
         child = self.elem.to_mir_type(cache)
         if child is None:
             return None
@@ -1361,12 +1407,14 @@ class PointerType(Type):
 @dataclass(frozen=True, slots=True)
 class ArrayType(Type):
     """A spy array type: ``length`` values of the element type ``elem``, in a
-    row.  The length is a *value* (a Python ``int``, or an ``Int``): a signature
-    that takes or returns an array spells it out, since the Python type system
-    cannot infer it from the arguments of ``array(...)`` (see ``syntax``)."""
+    row.  The length is a *value* (a Python ``int``, or an ``Int``), or ``None``
+    for an *unsized* array - a dynamically-sized type whose length is not part
+    of the type (see ``classify``).  A signature that takes or returns a sized
+    array spells the length out, since the Python type system cannot infer it
+    from the arguments of ``array(...)`` (see ``syntax``)."""
 
     elem: Type
-    length: AnyValue # int
+    length: AnyValue | None # int; None = unknown length (a DST)
 
     @property
     def length_int(self) -> int | None:
@@ -1401,13 +1449,14 @@ class ArrayType(Type):
         so the element type is compared for equality rather than subtyped
         (widening the elements of an array is a conversion, not a subtype -
         the element types of one construction are unified one level down).
-        Note that the base rule would take any array for any array."""
-        return (
-            isinstance(other, ArrayType)
-            and self.length_int is not None
-            and self.length_int == other.length_int
-            and self.elem == other.elem
-        )
+        An *unsized* array (``length is None``) is a subtype of another unsized
+        array of the same element type.  Note that the base rule would take any
+        array for any array."""
+        if not isinstance(other, ArrayType) or self.elem != other.elem:
+            return False
+        if self.length is None or other.length is None:
+            return self.length is None and other.length is None
+        return self.length_int is not None and self.length_int == other.length_int
 
     @override
     def get_unit_value(self) -> AnyValue | None:
@@ -1431,6 +1480,10 @@ class ArrayType(Type):
 
     @override
     def classify(self) -> SpecialTypeKind:
+        if self.length is None:
+            # an array of unknown length holds no storage of its own: it is a
+            # dynamically-sized type (a C flexible array member)
+            return SpecialTypeKind.DST
         length = self.length_int
         if length is None:
             # the length is not known yet, so nothing is known about the layout
@@ -1449,7 +1502,23 @@ class ArrayType(Type):
                 return SpecialTypeKind.NONE
 
     @override
+    def fam_mir_type(self, cache: MirLowerCache) -> mir.MayBeVoidType:
+        assert self.length is None, 'only an unsized array is a flexible member'
+        elem = self.elem.to_mir_type(cache)
+        if elem is None or self.elem.is_zst() or self.elem.classify() == SpecialTypeKind.DST:
+            raise CompileError(
+                f'the elements of the unsized array {self} have no fixed runtime '
+                f'representation'
+            )
+        return elem
+
+    @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        if self.length is None:
+            # an unsized array has no mirror of its own: only a pointer to it is
+            # a value (and that pointer is a plain pointer to its elements, see
+            # ``PointerType.to_mir_type``)
+            return None
         length = self.length_int
         if length is None:
             return None
@@ -1465,7 +1534,40 @@ class ArrayType(Type):
         return mir.ArrayType(elem, length)
 
     def __str__(self) -> str:
-        return f"{self.elem}[{self.length}]"
+        length = '?' if self.length is None else str(self.length)
+        return f"{self.elem}[{length}]"
+
+@dataclass(frozen=True, slots=True)
+class OpaqueType(Type):
+    """An opaque type (``syntax.Opaque``): a dynamically-sized type of unknown
+    layout.  It has no value of its own - only a pointer to it is one, and that
+    pointer is a ``void*`` (see ``PointerType.to_mir_type``).  As the last field
+    of a struct it is an opaque tail (see ``sval.StructType._calculate_mir`` and
+    ``mir.StructType.fam_type``)."""
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        # an opaque type has no size of its own
+        return SpecialTypeKind.DST
+
+    @override
+    def fam_mir_type(self, cache: MirLowerCache) -> mir.MayBeVoidType:
+        # an opaque tail is lowered as a zero-length ``i8`` array (it has no
+        # type to name; the pointer to it is a void pointer)
+        return mir.VOID
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        # an opaque type cannot be lowered on its own: only a pointer to it is a
+        # value (see ``PointerType.to_mir_type``)
+        return None
+
+    def __str__(self) -> str:
+        return 'Opaque'
 
 @dataclass(frozen=True, slots=True)
 class Undefined(Value):
@@ -1588,13 +1690,24 @@ class FunctionType(Type):
         for arg in self.args:
             if arg.type.is_zst():
                 continue
-            mir_type = arg.type.to_mir_type(cache)
-            if mir_type is None:
-                return None
             if not is_c and pass_by_ref(arg.type, cache) is TriState.TRUE:
                 # an argument the default convention passes as a const pointer
-                args.append(mir.PointerType(mir_type, False))
+                # (a dynamically-sized one always is: its pointee type is what
+                # the pointer is built from)
+                arg_ptr = PointerType(arg.type, is_const=False).to_mir_type(cache)
+                if arg_ptr is None:
+                    return None
+                args.append(arg_ptr)
             else:
+                if arg.type.classify() == SpecialTypeKind.DST:
+                    # the C convention forces a dynamically-sized argument by
+                    # value, which has no size to pass
+                    raise CompileError(
+                        f'a C function may not take the dynamically-sized type {arg.type}'
+                    )
+                mir_type = arg.type.to_mir_type(cache)
+                if mir_type is None:
+                    return None
                 args.append(mir_type)
         ret_type: mir.MayBeVoidType = mir.VOID
         for leaf in iter_ret_leaves(self.ret_spec(cache)):
@@ -1602,12 +1715,23 @@ class FunctionType(Type):
                 # a zero-sized result is delivered as its unit value, not
                 # through the by-value slot
                 continue
-            mir_type = leaf.type.to_mir_type(cache)
-            if mir_type is None:
-                return None
             if leaf.via_result_ptr:
-                args.append(mir.PointerType(mir_type, False))
+                # delivered through a hidden result pointer (a dynamically-sized
+                # result always is)
+                ptr_mir = PointerType(leaf.type, is_const=False).to_mir_type(cache)
+                if ptr_mir is None:
+                    return None
+                args.append(ptr_mir)
             else:
+                if leaf.type.classify() == SpecialTypeKind.DST:
+                    # only a non-default convention could force a dynamically-
+                    # sized result by value, which has no size to return
+                    raise CompileError(
+                        f'a C function may not return the dynamically-sized type {leaf.type}'
+                    )
+                mir_type = leaf.type.to_mir_type(cache)
+                if mir_type is None:
+                    return None
                 ret_type = mir_type
         return mir.FunctionType(tuple(args), ret_type, self.callconv, self.may_panic)
 
@@ -1874,11 +1998,24 @@ class StructType(Type):
             return
 
         # the fields that occupy storage, each with the mirror of its type:
-        # a zero-sized field occupies none and has no mirror position
+        # a zero-sized field occupies none and has no mirror position.  A
+        # dynamically-sized field (an unsized array, an opaque type, a
+        # dynamically-sized struct) has no mirror of its own either: the first
+        # one becomes the struct's flexible member (the FAM, see
+        # ``mir.StructType.fam_type``), placed after every field with storage,
+        # and every further one occupies no position at all (see
+        # ``get_field_mir_indices``)
         fields = self.fields().values()
         mirrored: list[tuple[int, StructField, mir.Type]] = []
+        fam_type: mir.MayBeVoidType | None = None
+        fam_index: int | None = None
         for index, field in enumerate(fields):
             if field.type.is_zst():
+                continue
+            if field.type.classify() == SpecialTypeKind.DST:
+                if fam_index is None:
+                    fam_index = index
+                    fam_type = field.type.fam_mir_type(cache)
                 continue
             field_mir = field.type.to_mir_type(cache)
             if field_mir is None:
@@ -1907,11 +2044,15 @@ class StructType(Type):
         indices: list[int | None] = [None] * len(fields)
         for position, (index, _, _) in enumerate(mirrored):
             indices[index] = position
+        if fam_index is not None:
+            # the flexible member sits after every field with storage: that is
+            # the index ``mir.Gep`` - and the lowered LLVM struct - puts it at
+            indices[fam_index] = len(mirrored)
         self._field_mir_indices = tuple(indices)
 
-        if len(mirrored) == 0:
+        if len(mirrored) == 0 and fam_type is None:
             self._mir = None
-        elif len(mirrored) == 1 and not self.modifiers.extern_c:
+        elif len(mirrored) == 1 and not self.modifiers.extern_c and fam_type is None:
             self._mir = mirrored[0][2]
             self._mir_is_a_field = True
         else:
@@ -1921,7 +2062,18 @@ class StructType(Type):
                     mir.FormalArg(field.name, field_mir)
                     for _, field, field_mir in mirrored
                 ),
+                fam_type,
             )
+
+    @override
+    def fam_mir_type(self, cache: MirLowerCache) -> mir.MayBeVoidType:
+        # a dynamically-sized struct contributes its own mirror as the flexible
+        # member of the aggregate that holds it (the mirror already carries its
+        # own FAM, if any)
+        mir_type = self.get_mir_type(cache)
+        if mir_type is None:
+            raise CompileError(f'{self} is a dynamically-sized struct with no layout')
+        return mir_type
 
     def get_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         """The (cached) MIR mirror of the struct: the one ``mir`` type every
@@ -1930,7 +2082,10 @@ class StructType(Type):
         zero-sized (it has no storage and so no mirror of its own).  An
         ``extern_c`` struct mirrors to a ``mir.StructType`` of its declaration
         order; a spy struct orders the fields by alignment instead, and mirrors
-        to the type of its own field when it holds exactly one."""
+        to the type of its own field when it holds exactly one.  A struct with
+        a dynamically-sized field mirrors to a ``mir.StructType`` whose
+        ``fam_type`` is that field's flexible member (see
+        :meth:`_calculate_mir`)."""
         self._calculate_mir(cache)
         return self._mir
 
@@ -1938,9 +2093,11 @@ class StructType(Type):
         """The mirror position of every field, in declaration order: the
         i-th entry is the position of the i-th field in the mirror returned
         by :meth:`get_mir_type` - a zero-sized field occupies no position
-        and maps to ``None``.  A mirror that is the type of the struct's own
-        field (see :meth:`_calculate_mir`) has that field at position 0, and
-        the field sits at the address of the value itself."""
+        and maps to ``None``, and so does every dynamically-sized field
+        beyond the first (which is the struct's FAM, at the position past
+        every field with storage).  A mirror that is the type of the struct's
+        own field (see :meth:`_calculate_mir`) has that field at position 0,
+        and the field sits at the address of the value itself."""
         self._calculate_mir(cache)
         assert self._field_mir_indices is not None
         return self._field_mir_indices
@@ -2062,10 +2219,17 @@ def returns_via_result_ptr(type: Type, cache: MirLowerCache) -> bool:
     :data:`_AGGREGATE_VALUE_RETURN_LIMIT` bytes) and through a result
     pointer once it outgrows it, and a new aggregate kind (arrays) only
     needs to extend this function.  Scalars are always returned by
-    value.  The size is the one of the type's MIR mirror - the layout the
-    lowered code uses (see ``mir.estimated_size_of``) - for pointers of
-    the target the cache belongs to.  A signature may override the default
+    value, and a dynamically-sized type - which has no size at all - is
+    always delivered through a result pointer.  The size is the one of the
+    type's MIR mirror - the layout the lowered code uses (see
+    ``mir.estimated_size_of``) - for pointers of the target the cache
+    belongs to.  A signature may override the default
     (``fn.ReturnSignature.ret_spec``)."""
+    if type.classify() == SpecialTypeKind.DST:
+        # a dynamically-sized type has no size to return by value: it is always
+        # delivered through a hidden result pointer (see also
+        # ``HirRunner._ret_leaf_ptr``)
+        return True
     match type:
         case StructType() | ArrayType() | OptionType() | UnionType() | TaggedUnionType():
             if _mentions_type_var(type):
@@ -2392,6 +2556,10 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         return IntType(ctx.target_info().usize_bits, False)
     if value is syntax.ISize:
         return IntType(ctx.target_info().usize_bits, True)
+    if value is syntax.Opaque:
+        # an opaque type: a dynamically-sized type of unknown layout, of which
+        # only a pointer (a void pointer) is a value
+        return OpaqueType()
     if value is typing.Never or value is typing.NoReturn:
         # ``Never`` (and its deprecated alias ``NoReturn``): a function that
         # returns it never returns a value at all (see :class:`EmptyType`)
@@ -2488,6 +2656,10 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         elem = as_value(args[0], ctx, type_vars)
         if not isinstance(elem, Type):
             raise TypeError(f'{args[0]!r} is not a type')
+        if args[1] is None or args[1] is NoneType:
+            # ``Array[T, None]``: an array of unknown length (a DST; Python
+            # normalizes the ``None`` of a subscripted alias to ``NoneType``)
+            return ArrayType(elem, None)
         return ArrayType(elem, as_value(args[1], ctx, type_vars))
     if typing.get_origin(value) is syntax.Option:
         # ``Option[T]``: ``T`` or the ``Null`` value.  The alias
@@ -2689,9 +2861,11 @@ class TypeVarSolver:
                     todo.append((lhs.is_const, rhs.is_const, False))
             if isinstance(lhs, ArrayType) and isinstance(rhs, ArrayType):
                 # an array constrains its element type and its length (a length
-                # that is still a type parameter is solved to the value itself)
+                # that is still a type parameter is solved to the value itself);
+                # an unsized array (``length is None``) constrains nothing
                 todo.append((lhs.elem, rhs.elem, False))
-                todo.append((lhs.length, rhs.length, False))
+                if lhs.length is not None and rhs.length is not None:
+                    todo.append((lhs.length, rhs.length, False))
 
             self._add_unsatisfied(lhs, rhs, is_subtype)
 
@@ -2729,10 +2903,10 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
             )
         case ArrayType():
             # the length is substituted too: it may be a type parameter
-            # (``Array[T, N]``)
+            # (``Array[T, N]``); an unsized array keeps its ``None``
             return ArrayType(
                 replace_type_vars_type(value.elem, reps),
-                replace_type_var(value.length, reps),
+                None if value.length is None else replace_type_var(value.length, reps),
             )
         case OptionType():
             return OptionType(replace_type_vars_type(value.child, reps))
@@ -2897,6 +3071,11 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             if isinstance(value, (Void, Null)):
                 return Void()
             raise CompileError(f"cannot use {value!r} as a void constant")
+        case _ if type.classify() == SpecialTypeKind.DST:
+            # a dynamically-sized type has no value of its own to build one from
+            raise CompileError(
+                f"cannot create a constant of the dynamically-sized type {type}"
+            )
         case _:
             raise CompileError(
                 f"cannot create a constant of type {type} from {value}"

@@ -50,6 +50,7 @@ from .compiler.syntax import (
     ConstMultiPtr,
     ConstPtr,
     MultiPtr,
+    Opaque,
     Option,
     Ptr,
     array,
@@ -57,6 +58,7 @@ from .compiler.syntax import (
     defer,
     errdefer,
     okdefer,
+    ptr_cast,
     ref,
 )
 from .compiler.util import FrozenArraySet, StrBiMap, TriState
@@ -6907,6 +6909,58 @@ def dst_return():
     return dst_target_fn
 
 
+@func()
+def opaque_roundtrip(x: i32) -> i32:
+    # a pointer to an opaque type is a void pointer: it round-trips through
+    # ``ptr_cast`` without ever naming a value of the opaque type
+    p = ptr_cast(ref(x), Ptr[Opaque])
+    q = ptr_cast(p, Ptr[i32])
+    return q[...]
+
+
+@func()
+def unsized_array_index(p: Ptr[Array[i32, None]]) -> i32:  # pyright: ignore
+    # a pointer to an unsized array converts to the multi pointer of its
+    # elements: ``*[?]T`` and ``*T`` carry the same address
+    m: MultiPtr[i32] = p  # pyright: ignore
+    return m[2]
+
+
+@func()
+def unsized_ptr_index(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    return unsized_array_index(ptr_cast(ref(a), Ptr[Array[i32, None]]))  # pyright: ignore
+
+
+@struct()
+class FamCarrier:
+    # a struct with an unsized-array field: a C flexible array member
+    n: i32
+    data: Array[i32, None]  # pyright: ignore
+
+
+@func()
+def fam_ptr_index(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    w = ptr_cast(ref(a), Ptr[FamCarrier])
+    m: MultiPtr[i32] = ref(w.data)  # pyright: ignore
+    return m[1]
+
+
+@func()
+def fam_subscript_rejected(x: i32) -> i32:
+    a = array(x, x + 1)
+    w = ptr_cast(ref(a), Ptr[FamCarrier])
+    return w.data[0]  # pyright: ignore
+
+
+@func()
+def fam_read_by_value(x: i32) -> i32:
+    a = array(x, x + 1)
+    w = ptr_cast(ref(a), Ptr[FamCarrier])
+    return w.data  # pyright: ignore
+
+
 def _make_struct(*fields: tuple[str, sval.Type]) -> sval.StructType:
     head = sval.StructTypeHead('T')
     for name, type in fields:
@@ -7051,6 +7105,118 @@ class SpyDstTest(TestCase):
             dst_return()
         self.assertIn('dynamically-sized', str(ctx.exception))
 
+
+class SpyOpaqueAndUnsizedTest(TestCase):
+    """An opaque type (``syntax.Opaque``) and an unsized array
+    (``syntax.Array[T, None]``): dynamically-sized types that have no value of
+    their own.  A pointer to one is a value - a ``void*`` for an opaque type, a
+    plain pointer to the elements of an unsized array - and an unsized-array (or
+    opaque) field is a struct's flexible member (a C FAM), placed last."""
+
+    def test_an_opaque_type_is_dynamically_sized(self) -> None:
+        opaque = sval.OpaqueType()
+        self.assertIs(opaque.classify(), sval.SpecialTypeKind.DST)
+        self.assertIsNone(opaque.to_mir_type(MIR_CACHE))
+        # a pointer to it is a void pointer
+        self.assertEqual(
+            sval.PointerType(opaque).to_mir_type(MIR_CACHE), mir.PointerType(mir.VOID)
+        )
+
+    def test_an_unsized_array_is_dynamically_sized(self) -> None:
+        unsized = sval.ArrayType(sval.IntType(32, True), None)
+        self.assertIs(unsized.classify(), sval.SpecialTypeKind.DST)
+        self.assertIsNone(unsized.to_mir_type(MIR_CACHE))
+        self.assertEqual(str(unsized), 'i32[?]')
+        # a pointer to it is a plain pointer to its elements (``*[?]T -> *T``)
+        self.assertEqual(
+            sval.PointerType(unsized).to_mir_type(MIR_CACHE),
+            mir.PointerType(mir.IntType(32, True)),
+        )
+
+    def test_a_pointer_to_an_unsized_array_converts_to_a_multi_pointer(self) -> None:
+        i32_type = sval.IntType(32, True)
+        single = sval.PointerType(sval.ArrayType(i32_type, None))
+        multi = sval.PointerType(i32_type, variant=sval.PointerVariant.MULTI)
+        self.assertTrue(single.is_subtype_of(multi))
+        # ... but not the other way around
+        self.assertFalse(multi.is_subtype_of(single))
+
+    def test_the_opaque_pointer_round_trips(self) -> None:
+        self.assertEqual(opaque_roundtrip(41), 41)
+
+    def test_a_pointer_to_an_unsized_array_is_indexable(self) -> None:
+        self.assertEqual(unsized_ptr_index(10), 12)
+
+    def test_a_fam_field_is_placed_last(self) -> None:
+        carrier = struct_type(FamCarrier)
+        mirror = carrier.get_mir_type(MIR_CACHE)
+        assert isinstance(mirror, mir.StructType)
+        # ``n`` keeps its storage, ``data`` is the flexible member
+        self.assertEqual([f.name for f in mirror.fields], ['n'])
+        self.assertEqual(mirror.fam_type, mir.IntType(32, True))
+        # ``data`` sits past ``n``: position 1 of the mirror
+        self.assertEqual(carrier.get_field_mir_indices(MIR_CACHE), (0, 1))
+        # the FAM adds no size, but its element alignment
+        self.assertEqual(mir.estimated_size_of(mirror, 8), 4)
+        self.assertEqual(mir.estimated_alignment_of(mirror, 8), 4)
+
+    def test_the_fam_address_is_indexable(self) -> None:
+        # ``ref(w.data)`` is ``*[?]i32``: it converts to ``MultiPtr[i32]`` and
+        # names the elements that follow ``n``
+        self.assertEqual(fam_ptr_index(10), 12)
+
+    def test_an_unsized_array_is_not_subscripted(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            fam_subscript_rejected(1)
+        self.assertIn('dynamically-sized array', str(ctx.exception))
+
+    def test_a_fam_field_is_not_read_by_value(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            fam_read_by_value(1)
+        self.assertIn('dynamically-sized', str(ctx.exception))
+
+    def test_only_the_first_dst_field_is_reachable(self) -> None:
+        i32_type = sval.IntType(32, True)
+        s = _make_struct(
+            ('n', i32_type),
+            ('a', sval.ArrayType(i32_type, None)),
+            ('b', sval.OpaqueType()),
+        )
+        # the first DST field is the FAM, the second is left with no position
+        self.assertEqual(s.get_field_mir_indices(MIR_CACHE), (0, 1, None))
+        mirror = s.get_mir_type(MIR_CACHE)
+        assert isinstance(mirror, mir.StructType)
+        self.assertEqual([f.name for f in mirror.fields], ['n'])
+        self.assertEqual(mirror.fam_type, mir.IntType(32, True))
+
+    def test_a_nested_dst_struct_is_placed_last(self) -> None:
+        i32_type = sval.IntType(32, True)
+        inner = _make_struct(('n', i32_type), ('data', sval.ArrayType(i32_type, None)))
+        outer = _make_struct(('x', i32_type), ('inner', inner))
+        self.assertIs(outer.classify(), sval.SpecialTypeKind.DST)
+        mirror = outer.get_mir_type(MIR_CACHE)
+        assert isinstance(mirror, mir.StructType)
+        self.assertEqual([f.name for f in mirror.fields], ['x'])
+        self.assertIs(mirror.fam_type, inner.get_mir_type(MIR_CACHE))
+
+    def test_an_option_of_a_dst_puts_it_last(self) -> None:
+        option = sval.OptionType(sval.OpaqueType())
+        mirror = option.to_mir_type(MIR_CACHE)
+        assert isinstance(mirror, mir.StructType)
+        self.assertEqual([f.name for f in mirror.fields], ['tag'])
+        self.assertIs(mirror.fam_type, mir.VOID)
+
+    def test_a_dst_result_is_delivered_through_a_result_pointer(self) -> None:
+        # a non-default convention: ``() -> Opaque`` lowers to ``(*void) -> void``
+        fn = sval.FunctionType((), sval.OpaqueType())
+        self.assertEqual(
+            fn.to_mir_type(MIR_CACHE),
+            mir.FunctionType((mir.PointerType(mir.VOID),), mir.VOID),
+        )
+        # a C convention forces the result by value, which a DST has no size for
+        fn_c = sval.FunctionType((), sval.OpaqueType(), callconv='c')
+        with self.assertRaises(CompileError):
+            fn_c.to_mir_type(MIR_CACHE)
 
 # ---------------------------------------------------------------------------
 # tagged unions: ``A | B``, the tag test ``isinstance(u, A)`` / the unwrap

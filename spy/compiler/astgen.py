@@ -490,7 +490,7 @@ class _Builder:
         loop are *compile-time values*, so both are built into inline slots -
         a compile-time iterable is an aggregate with no runtime representation
         of its own, which an ordinary expression temporary may not hold."""
-        from ..std import StopIteration
+        from ..std.core import StopIteration
 
         # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
         # iteration would restart the iteration)
@@ -839,8 +839,8 @@ class _Builder:
             return globals[name]
         builtin = getattr(builtins, name, None)
         if builtin is range or builtin is StopIteration:
-            from .. import std
-            return std.range if builtin is range else std.StopIteration
+            from ..std import core
+            return core.range if builtin is range else core.StopIteration
         if builtin is isinstance:
             # ``isinstance(value, T)`` against a tagged union: the parser lowers
             # it to the tag test itself (see ``_gen_isinstance``)
@@ -1233,6 +1233,9 @@ class _Builder:
         if marker is syntax.Array:
             elem_node, length_node = self._type_args(slice_node, marker, 2)
             elem = self._as_value(self._gen_expr(elem_node)[0])
+            if isinstance(length_node, ast.Constant) and length_node.value is None:
+                # ``Array[T, None]``: an array of unknown length (a DST)
+                return self.add(hir.ArrayType(elem, None))
             length = self._as_value(self._gen_expr(length_node)[0])
             return self.add(hir.ArrayType(elem, length))
         if marker is syntax.Option:

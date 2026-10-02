@@ -96,17 +96,26 @@ class StructType(Type):
     fields, zero-sized spy fields excluded - they occupy no storage);
     it is materialized on demand by ``lower`` when a value of the type
     crosses the Python boundary, and cached here once built.
+
+    ``fam_type`` is the element type of the struct's *flexible array member*
+    (a C FAM), or ``VOID`` for an opaque tail: the struct's first
+    dynamically-sized field, which is not one of ``fields`` (it has no size of
+    its own) but is placed *after* them all (see ``lower._ModuleTypes``, which
+    appends a ``[0 x T]`` for it).  A struct with a FAM has no value of its
+    own - only a pointer to it is one.
     """
 
     def __init__(
         self,
         name_base: str | None,
         fields: tuple[FormalArg, ...] | None,
+        fam_type: MayBeVoidType | None = None,
     ) -> None:
         self.name_base = name_base
         self.fields: list[FormalArg] = []
         if fields is not None:
             self.fields.extend(fields)
+        self.fam_type = fam_type
         # the ctypes class mirroring the LLVM layout of this struct (what
         # a struct value crossing the Python boundary is viewed as);
         # materialized on demand and cached by ``lower``
@@ -119,7 +128,12 @@ class StructType(Type):
         return object.__hash__(self)
 
     def get_children(self) -> tuple[Any, ...]:
-        return tuple(f.type for f in self.fields)
+        children: list[Any] = [f.type for f in self.fields]
+        if isinstance(self.fam_type, Type):
+            # the FAM's own type is used by the lowered struct: it has to be
+            # collected like any other nested type (see ``collect_symbols``)
+            children.append(self.fam_type)
+        return tuple(children)
 
 
 @dataclass(frozen=True)
@@ -237,10 +251,15 @@ def estimated_alignment_of(type: Type, pointer_size: int) -> int:
         case ArrayType():
             return estimated_alignment_of(type.elem, pointer_size)
         case StructType():
-            return max(
+            align = max(
                 (estimated_alignment_of(field.type, pointer_size) for field in type.fields),
                 default=1,
             )
+            if type.fam_type is not None and not isinstance(type.fam_type, VoidType):
+                # the flexible member is a ``[0 x T]``: it adds no size but its
+                # element type's alignment
+                align = max(align, estimated_alignment_of(type.fam_type, pointer_size))
+            return align
         case UnionType():
             return estimated_alignment_of(type.payload, pointer_size)
         case _:
@@ -497,6 +516,12 @@ class Gep(Inst):
         if isinstance(elem, StructType):
             if not isinstance(index, int):
                 raise CompileError(f'a field of {elem} is taken by a constant index')
+            if elem.fam_type is not None and index == len(elem.fields):
+                # the struct's flexible member sits past every field of the
+                # mirror: its address is a pointer to its element type (or a
+                # void pointer for an opaque tail)
+                self.type = PointerType(elem.fam_type)
+                return
             if index < 0 or index >= len(elem.fields):
                 raise CompileError(f'field index {index} is out of bounds for {elem}')
             self.type: Type = PointerType(elem.fields[index].type)

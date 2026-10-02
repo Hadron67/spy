@@ -1139,6 +1139,10 @@ def _no_runtime_type(type: sval.Type) -> CompileError:
             f'{type} is a compile-time-only type: a runtime location cannot '
             f'hold it and must declare its type'
         )
+    if type.classify() == sval.SpecialTypeKind.DST:
+        return CompileError(
+            f'{type} is a dynamically-sized type: only a pointer to it is a value'
+        )
     return CompileError(f'cannot give a value of type {type} a runtime representation')
 
 # ---------------------------------------------------------------------------
@@ -1184,7 +1188,10 @@ def _convert_inst(
             f'union is written through a pointer to it'
         )
     mir_to_type = to_type.to_mir_type(cache)
-    assert mir_to_type is not None and not to_type.is_zst()
+    if mir_to_type is None or to_type.is_zst():
+        # a dynamically-sized or zero-sized target has no value to convert to
+        # (and a dynamically-sized one is not lowerable on its own)
+        raise CoerceError(f'cannot convert a {from_type} value to {to_type}')
     if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.IntType):
         if from_type.bits < to_type.bits:
             kind = 'sext' if from_type.signed else 'zext'
@@ -1387,16 +1394,22 @@ class HirRunner:
             case SpecializedComptimeArg():
                 return ComptimeVal(sval.ConstRef(node.value))
             case SpecializedRuntimeArg():
-                mir_type = node.type.to_mir_type(self._mir_cache)
-                if mir_type is None or node.type.is_zst():
-                    raise _no_runtime_type(node.type)
                 index = len(mir_args)
                 if node.is_ref:
                     # the signature passes the address of the value as a const
-                    # pointer
-                    arg_mir = mir.PointerType(mir_type, True)
+                    # pointer: the pointer's own mirror is always there, even
+                    # when the pointee is dynamically sized (an opaque type or
+                    # an unsized array has no mirror of its own)
                     arg_sval = sval.PointerType(node.type, True)
+                    arg_mir = arg_sval.to_mir_type(self._mir_cache)
+                    if arg_mir is None:
+                        raise _no_runtime_type(node.type)
                 else:
+                    mir_type = node.type.to_mir_type(self._mir_cache)
+                    # ZSTs are never present in SpecializedRuntimeArg
+                    assert not node.type.is_zst()
+                    if mir_type is None:
+                        raise _no_runtime_type(node.type)
                     arg_mir = mir_type
                     arg_sval = node.type
                 mir_args.append(arg_mir)
@@ -1538,24 +1551,30 @@ class HirRunner:
     def _ret_leaf_ptr(self, leaf: RetSpec) -> mir.Value | None:
         """The hidden result pointer a leaf is delivered through (appending the
         formal to the lowered signature), or None when the leaf is returned by
-        value (which fixes the MIR return type)."""
+        value (which fixes the MIR return type).  A dynamically-sized leaf has
+        no value of its own: it is always delivered through the result pointer,
+        the pointer to it (a ``void*`` for an opaque type, a plain pointer to
+        the elements of an unsized array)."""
         assert isinstance(leaf, RetValue)
-        if leaf.type.classify() == sval.SpecialTypeKind.DST:
-            # a dynamically-sized type has no runtime value a return could
-            # deliver: only a pointer to one can be returned
-            raise CompileError(
-                f'cannot return a value of the dynamically-sized type {leaf.type}'
-            )
         mir_fn = self._fn_instance.mir
         if leaf.via_result_ptr:
-            mir_type = leaf.type.to_mir_type(self._mir_cache)
-            if mir_type is None or leaf.type.is_zst():
+            if leaf.type.is_zst():
                 raise CompileError(f'cannot return {leaf.type} through a result pointer')
-            ptr_type = mir.PointerType(mir_type, False)
+            # the pointer to the value: for a dynamically-sized type that is the
+            # only form a value of it has (see ``sval.PointerType.to_mir_type``)
+            ptr_type = sval.PointerType(leaf.type, is_const=False).to_mir_type(self._mir_cache)
+            if ptr_type is None:
+                raise CompileError(f'cannot return {leaf.type} through a result pointer')
             index = len(mir_fn.args)
             mir_fn.args.append(ptr_type)
             mir_fn.arg_names.append('$result')
             return mir.Param(index, ptr_type)
+        if leaf.type.classify() == sval.SpecialTypeKind.DST:
+            # a dynamically-sized leaf is only ever delivered through the result
+            # pointer: reaching here means a convention forced it by value
+            raise CompileError(
+                f'cannot return a value of the dynamically-sized type {leaf.type} by value'
+            )
         if not leaf.type.is_zst():
             # a zero-sized result is delivered as its unit value; only a
             # result with storage fixes the MIR return type
@@ -2180,7 +2199,7 @@ class HirRunner:
             case hir.ArrayType():
                 regs[inst] = ComptimeVal(sval.ArrayType(
                     self.type_operand(inst.elem, 'the element type of an array'),
-                    self._operand_comptime_value(inst.length),
+                    None if inst.length is None else self._operand_comptime_value(inst.length),
                 ))
             case hir.OptionType():
                 regs[inst] = ComptimeVal(sval.OptionType(
@@ -3109,6 +3128,12 @@ class HirRunner:
         if not isinstance(type, (sval.StructType, sval.ArrayType)):
             raise CompileError(f'{value!r} is not an aggregate')
         field_type = _aggregate_place_types(type)[index]
+        if field_type.classify() == sval.SpecialTypeKind.DST:
+            # a dynamically-sized field has no value to read: only its address
+            # can be taken (see ``field_index_addr``)
+            raise CompileError(
+                f'cannot read the dynamically-sized field of {type} by value'
+            )
         unit = field_type.get_unit_value()
         if unit is not None:
             return ComptimeVal(unit)
@@ -3699,6 +3724,17 @@ class HirRunner:
             if field_type.is_zst():
                 # a zero-sized field occupies no storage and has no address
                 return ComptimeVal(sval.Undefined(field_ptr_type))
+            if (
+                field_type.classify() == sval.SpecialTypeKind.DST
+                and container_type.get_field_mir_indices(self._mir_cache)[index_int] is None
+            ):
+                # only the first dynamically-sized field (the struct's flexible
+                # member) has a mirror position; every further one is
+                # inaccessible (see ``sval.StructType.get_field_mir_indices``)
+                raise CompileError(
+                    f"only the first dynamically-sized field of {container_type} "
+                    f"can be accessed"
+                )
             match ptr:
                 case ComptimeAggregatePtr(_, ptrs):
                     # the fields of a compile-time aggregate are their own
@@ -4893,6 +4929,11 @@ class HirRunner:
         rather than a register (see ``_call_function_entry``)."""
         array_type = _array_elem_type_of(base)
         if array_type is not None:
+            if array_type.length is None:
+                raise CompileError(
+                    f'cannot subscript {array_type}: a dynamically-sized array has '
+                    f'no elements to index (use a ``MultiPtr`` to its elements)'
+                )
             index_value = self._coerce(self._arg_value(index), self._usize_type())
             element_index = _to_comptime(index_value)
             if isinstance(element_index, sval.Int):
