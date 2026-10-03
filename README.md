@@ -301,7 +301,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 | `std/__init__.py` | 标准库对外入口：把 `std.core` 的类型与 `compiler.syntax` 的标记一并再导出 |
 | `std/core.py` | 标准库核心类型：`Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr` 及 `arr_slice`/`const_arr_slice` |
 | `std/mem.py` | 内存相关工具：`layout_of` / `size_of` / `align_of`（布局反射）与分配器（更多尚未实现） |
-| `tests.py` | 集成测试 |
+| `tests/` | 集成测试（按特性拆分成多个模块） |
 
 ## 尚未实现 / 已知限制
 

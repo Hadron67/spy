@@ -813,19 +813,22 @@ class _Context(CompileContext):
             return cast(type[T], result)
         return wrapper
 
-    def decl_func(self, linkname: str, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'c', may_panic: bool = False):
+    def decl_func(self, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'c', may_panic: bool = False):
         """Declare an external function of the link name ``linkname``: the
         decorated function names the signature through its annotations, and the
         decorated name is the handle that resolves to a
         ``sval.DeclareFunction`` (see ``_DeclFuncDecl``).  Its arguments are the
         ones of ``@func_type``, with the link name first and ``callconv``
         defaulting to the C one."""
-        meta = DeclFuncMetadata(
-            linkname=linkname, callconv=callconv, may_panic=may_panic,
-            exceptions=_normalize_exceptions(exceptions),
-        )
 
-        def wrapper[T](fn: T) -> T:
+        def wrapper[T: pytypes.FunctionType](fn: T) -> T:
+            name = linkname
+            if name is None:
+                name = cast(str, fn.__name__)
+            meta = DeclFuncMetadata(
+                linkname=name, callconv=callconv, may_panic=may_panic,
+                exceptions=_normalize_exceptions(exceptions),
+            )
             if fn in self._decl_func_cache:
                 return cast(T, self._decl_func_cache[fn])
             result = _DeclFuncDecl(fn, meta, self)
