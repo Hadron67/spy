@@ -197,6 +197,10 @@ class Type(Value):
         return isinstance(other, self.__class__)
 
     def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, UndefinedType):
+            # the undefined type is the bottom: a value of it is a value of any
+            # type, so the other type wins
+            return self
         if isinstance(other, NullType):
             # a type and the null value peer to the option of the type
             return OptionType(self)
@@ -569,6 +573,8 @@ class TaggedUnionType(Type):
 
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, UndefinedType):
+            return self
         if isinstance(other, TaggedUnionType):
             # the union with the smaller variant set is the peer type: a value
             # of it is a value of the larger one as well (with a remapped tag)
@@ -751,6 +757,8 @@ class ResultType(Type):
         first-delivery order (this one's exceptions first), with this one's
         return type.  A result type is never the type of a runtime value, so
         this is only reached for the parts of a signature."""
+        if isinstance(other, UndefinedType):
+            return self
         if not isinstance(other, ResultType):
             return None
         types = list(self.types)
@@ -939,6 +947,8 @@ class NullType(Type):
         # Null is the absent value: it peers with the void type (it converts
         # to it), with an option (it is one of its values), and with any other
         # type by making it optional
+        if isinstance(other, UndefinedType):
+            return self
         match other:
             case NullType() | VoidType() | OptionType():
                 return other
@@ -1021,6 +1031,8 @@ class OptionType(Type):
 
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, UndefinedType):
+            return self
         match other:
             case NullType():
                 return self
@@ -1190,6 +1202,8 @@ class AnyIntType(Type):
         return 'int'
 
     def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, UndefinedType):
+            return self
         if isinstance(other, (IntType, AnyIntType)):
             return other
         if isinstance(other, NullType):
@@ -1238,6 +1252,8 @@ class IntType(Type):
         return min_int_type(lower, upper)
 
     def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, UndefinedType):
+            return self
         if isinstance(other, NullType):
             return OptionType(self)
         if isinstance(other, OptionType):
@@ -1369,6 +1385,8 @@ class PointerType(Type):
         types have to match, the result is const when either is, and it is a
         single pointer as soon as either is (a multi pointer converts to a
         single one, not the other way around)."""
+        if isinstance(other, UndefinedType):
+            return self
         if isinstance(other, NullType):
             return OptionType(self)
         if isinstance(other, OptionType):
@@ -1606,6 +1624,58 @@ class Undefined(Value):
 
     def __str__(self) -> str:
         return "undefined"
+
+class UntypedUndefined(Value):
+    """The unique value of :class:`UndefinedType`: what the ``std.core.undefined``
+    builtin evaluates to at compile time.  It is the *untyped* undefined - a
+    value of no fixed type - which converts to a value of any type: written into
+    a location of the type ``T`` it becomes the typed :class:`Undefined` of
+    ``T`` (see :func:`coerce_const`)."""
+
+    @override
+    def get_type(self) -> Type:
+        return UndefinedType()
+
+    def __str__(self) -> str:
+        return 'undefined'
+
+@dataclass(frozen=True, slots=True)
+class UndefinedType(Type):
+    """The type of :class:`UntypedUndefined` - the undefined value
+    ``std.core.undefined`` evaluates to.  It is a zero-sized type whose only
+    value is :class:`UntypedUndefined`, and it converts to any other type: a
+    value of it may be written where a value of any type is expected, leaving
+    the location undefined (see :func:`coerce_const` and ``interp``).  It is the
+    *bottom* of the peer rule as well: paired with any other type, the other type
+    wins."""
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def get_unit_value(self) -> Value | None:
+        return UntypedUndefined()
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        return True
+
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        # undefined takes the type of whatever it is paired with
+        return other
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.ZST
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
+
+    def __str__(self) -> str:
+        return 'undefined'
 
 @dataclass(frozen=True)
 class ValueType(Type):
@@ -3012,6 +3082,11 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     builds the MIR constant from it later."""
     if isinstance(value, AsValue):
         value = value.value
+    if isinstance(value, UntypedUndefined):
+        # the undefined literal is the value of any type: of a zero-sized type it
+        # is that type's unit value, of any other the typed undefined of it
+        unit = type.get_unit_value()
+        return unit if unit is not None else Undefined(type)
     if isinstance(value, Undefined):
         # an *undetermined* value - the value of a place that holds nothing yet,
         # or of one that holds no storage at all - is a value of any type, so

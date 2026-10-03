@@ -590,6 +590,14 @@ def _is_union_unit(val: InterpVal) -> bool:
         obj = obj.value
     return isinstance(obj, sval.UnionValue)
 
+def _is_undefined_val(val: InterpVal) -> bool:
+    """Whether the value is the undefined literal - the untyped
+    ``sval.UntypedUndefined`` ``std.core.undefined`` evaluates to, or the typed
+    ``sval.Undefined`` it becomes once it is coerced to a type: a store of one
+    leaves its destination undefined (see ``HirRunner.store``)."""
+    obj = _to_comptime(_shallow_normalize(val))
+    return isinstance(obj, (sval.UntypedUndefined, sval.Undefined))
+
 def _aggregate_place_types(type: sval.Type) -> tuple[sval.Type, ...]:
     """The type of every place of the aggregate ``type``, in place order: the
     fields of a struct in declaration order, the elements of an array."""
@@ -848,6 +856,13 @@ def _sval_to_runtime(value: sval.AnyValue, cache: sval.MirLowerCache) -> mir.Val
             mir_type = value.get_type().to_mir_type(cache)
             assert isinstance(mir_type, mir.PointerType)
             return mir.ExternSymbol(value.linkname, mir_type)
+        case sval.Undefined():
+            # an undefined value has no defined content: it materializes as
+            # LLVM's ``undef`` of its type
+            mir_type = value.type.to_mir_type(cache)
+            if mir_type is None:
+                raise _no_runtime_type(value.type)
+            return mir.UndefValue(mir_type)
         case _:
             raise CompileError(f"cannot return the compile-time value {value!r}")
 
@@ -3107,6 +3122,44 @@ class HirRunner:
             # a store into it records nothing
             return
 
+        if _is_undefined_val(value):
+            # an undefined value leaves its destination undefined: a zero-sized
+            # one has no storage, a runtime location is filled with ``undef``,
+            # and the compile-time storage forms record it in their own way
+            elem_unit = elem.get_unit_value()
+            match ptr:
+                case ComptimeBox():
+                    if ptr.is_const:
+                        raise CompileError(
+                            f'cannot store through the const pointer {ptr.type}'
+                        )
+                    ptr.value = ComptimeVal(
+                        elem_unit if elem_unit is not None else sval.Undefined(elem)
+                    )
+                case ComptimeAggregatePtr():
+                    # an aggregate is its fields' (or elements') own places: each
+                    # of them is left undefined in turn
+                    for index in range(len(_aggregate_place_types(elem))):
+                        self.store(self.field_index_addr(ptr, _index_value(index)), value)
+                case ComptimeOptionPtr():
+                    # the tag is what says whether the option is present; with no
+                    # value, it is left undefined (the payload is never read)
+                    ptr.is_null = ComptimeVal(sval.Undefined(sval.BoolType()))
+                case ComptimeTaggedUnionPtr():
+                    # likewise for a union: its variant tag is left undefined
+                    ptr.tag = ComptimeVal(sval.Undefined(ptr.type.tag_type()))
+                case RuntimeVal():
+                    if elem_unit is not None:
+                        # a zero-sized type has no storage to write
+                        return
+                    mir_type = elem.to_mir_type(self._mir_cache)
+                    if mir_type is None:
+                        raise _no_runtime_type(elem)
+                    self._emit(mir.Store(ptr.value, mir.UndefValue(mir_type)))
+                case _:
+                    raise CompileError(f'cannot leave a {elem} undefined')
+            return
+
         if _is_aggregate(elem):
             # an aggregate is held by its fields (or elements), never by a box: a
             # whole value is written place by place into a compile-time aggregate
@@ -4948,6 +5001,14 @@ class HirRunner:
             if not isinstance(obj, sval.Type):
                 raise CompileError(f'spy.type_info takes a type, got {obj!r}')
             self.store(ret, self._build_type_info(obj))
+            return PollResult.AGAIN
+        if fn.name == 'undefined':
+            # ``std.core.undefined``: the undefined literal, the value of any
+            # type (see ``sval.UndefinedType``); the store into the result
+            # location coerces it to that location's type
+            if len(args.positional) != 0 or len(args.kwargs) > 0:
+                raise CompileError('std.core.undefined takes no arguments')
+            self.store(ret, ComptimeVal(sval.UntypedUndefined()))
             return PollResult.AGAIN
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 

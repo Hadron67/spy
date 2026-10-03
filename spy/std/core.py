@@ -1,14 +1,15 @@
 # This file is imported by the compiler, make sure to avoid circular imports.
 
-from typing import TYPE_CHECKING, Protocol, Self, cast
+from typing import TYPE_CHECKING, Any, Never, Protocol, Self, cast
 
-from ..compiler import syntax, usize
+from ..compiler import builtin_func, i64, syntax, u64, usize
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
     Array,
     ConstMultiPtr,
     ConstPtr,
     MultiPtr,
+    Opaque,
     Option,
     Ptr,
     comptime,
@@ -210,3 +211,6 @@ def unwrap[T](val: Option[T]) -> T:
     if (ret := val) is not None:
         return ret
     raise NullException()
+
+@builtin_func
+def undefined() -> Any: ...

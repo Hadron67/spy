@@ -26,6 +26,7 @@ from .core import (
     const_arr_slice,
     range,
     slice,
+    undefined,
 )
 
 __all__ = [
@@ -47,5 +48,6 @@ __all__ = [
     'slice',
     'struct',
     'syntax',
+    'undefined',
     'usize',
 ]
