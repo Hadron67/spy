@@ -1,41 +1,17 @@
 from unittest import TestCase
+
+from ..compiler import bool as spy_bool
 from ..compiler import (
-    CompileError,
-    SpyError,
-    TypeMismatchError,
-    compile_log,
-    f32,
-    f64,
-    i8,
     i32,
     i64,
-    mir,
-    sval,
-    syntax,
-    u0,
-    u64,
-    usize,
-    void,
 )
-from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
+from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
     Array,
     Comptime,
-    ConstMultiPtr,
-    ConstPtr,
-    MultiPtr,
-    Opaque,
     Option,
     Ptr,
-    array,
-    as_func_ptr,
-    defer,
-    errdefer,
-    okdefer,
-    ptr_cast,
-    ref,
 )
 from ..std.reflect import (
     ArrayType,
@@ -46,7 +22,6 @@ from ..std.reflect import (
     TaggedUnionType,
     type_info,
 )
-
 
 # ---------------------------------------------------------------------------
 # compile-time reflection: ``std.reflect.type_info`` describes a compile-time

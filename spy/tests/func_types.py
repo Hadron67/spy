@@ -1,48 +1,24 @@
 import ctypes
-from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, cast
+from typing import Protocol
 from unittest import TestCase
+
 from ..compiler import (
     CompileError,
     SpyError,
-    TypeMismatchError,
-    compile_log,
-    f32,
-    f64,
-    i8,
     i32,
     i64,
     mir,
     sval,
-    syntax,
-    u0,
-    u64,
-    usize,
-    void,
 )
 from ..compiler import as_ as spy_as
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
+from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type, struct
 from ..compiler.syntax import (
-    Array,
-    Comptime,
-    ConstMultiPtr,
     ConstPtr,
-    MultiPtr,
-    Opaque,
-    Option,
-    Ptr,
-    array,
     as_func_ptr,
-    defer,
-    errdefer,
-    okdefer,
-    ptr_cast,
-    ref,
 )
-from ..compiler.util import FrozenArraySet, StrBiMap, TriState
-
+from ..compiler.util import FrozenArraySet
 from .structs import MIR_CACHE, struct_type
-
 
 # ---------------------------------------------------------------------------
 # function types: ``@func_type`` declares a spy function type from a Protocol's

@@ -1,28 +1,13 @@
 from unittest import TestCase
-from ..compiler import (
-    CompileError,
-    SpyError,
-    TypeMismatchError,
-    compile_log,
-    f32,
-    f64,
-    i8,
-    i32,
-    i64,
-    mir,
-    sval,
-    syntax,
-    u0,
-    u64,
-    usize,
-    void,
-)
-from ..compiler.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
-from ..compiler.lower import LLVMBackend
 
+from ..compiler import (
+    i32,
+    sval,
+)
+from ..compiler.dsl import _Context, func, struct
+from ..compiler.lower import LLVMBackend
 from .basics import smoke_test
 from .structs import struct_type
-
 
 # ---------------------------------------------------------------------------
 # cross-context calls: a spy function compiled in one host context may reach

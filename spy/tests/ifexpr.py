@@ -1,46 +1,18 @@
 from unittest import TestCase
+
 from ..compiler import (
     CompileError,
-    SpyError,
-    TypeMismatchError,
-    compile_log,
-    f32,
-    f64,
-    i8,
     i32,
     i64,
-    mir,
-    sval,
-    syntax,
-    u0,
-    u64,
-    usize,
-    void,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
+from ..compiler.dsl import func
 from ..compiler.syntax import (
-    Array,
-    Comptime,
-    ConstMultiPtr,
-    ConstPtr,
-    MultiPtr,
-    Opaque,
-    Option,
-    Ptr,
-    array,
-    as_func_ptr,
-    defer,
-    errdefer,
-    okdefer,
-    ptr_cast,
     ref,
 )
-
 from .basics import inc, le
 from .structs import Large, Small
-
 
 # ---------------------------------------------------------------------------
 # if-expressions: ``a if c else b`` writes the branch it takes into the

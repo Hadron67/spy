@@ -1,47 +1,24 @@
-from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, cast
+from typing import Any, cast
 from unittest import TestCase
+
 from ..compiler import (
     CompileError,
-    SpyError,
-    TypeMismatchError,
-    compile_log,
-    f32,
-    f64,
     i8,
     i32,
     i64,
     mir,
     sval,
-    syntax,
     u0,
-    u64,
-    usize,
     void,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
+from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
 from ..compiler.syntax import (
-    Array,
     Comptime,
-    ConstMultiPtr,
-    ConstPtr,
-    MultiPtr,
-    Opaque,
-    Option,
-    Ptr,
-    array,
-    as_func_ptr,
-    defer,
-    errdefer,
-    okdefer,
-    ptr_cast,
-    ref,
 )
-
 from .basics import nothing
 from .generics import OuterTwo, nested_struct_field
-
 
 # ---------------------------------------------------------------------------
 # struct values: a struct is declared by decorating a class with ``@struct()``

@@ -1,27 +1,12 @@
 from unittest import TestCase
+
 from ..compiler import (
     CompileError,
-    SpyError,
-    TypeMismatchError,
-    compile_log,
-    f32,
-    f64,
-    i8,
     i32,
-    i64,
-    mir,
-    sval,
-    syntax,
-    u0,
-    u64,
-    usize,
-    void,
 )
-from ..compiler.dsl import _GLOBAL_CONTEXT, _Context, decl_func, func, func_type, struct
-from ..std.mem import DynamicAllocator, align_of, layout_of, size_of
-
+from ..compiler.dsl import func, struct
+from ..std.mem import DynamicAllocator
 from .structs import struct_type
-
 
 # ---------------------------------------------------------------------------
 # calling a struct's function through the class name, and inherited methods
