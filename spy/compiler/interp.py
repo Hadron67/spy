@@ -6698,7 +6698,7 @@ class HirRunner:
         mir_fn = self._fn_instance.mir
         mir.normalize(mir_fn)
         # the deferred bodies were emitted as shared templates every triggering
-        # transfer refers to; give each transfer its own explicit copy now that
+        # transfer refers to; give the transfers their explicit copies now that
         # the CFG is complete (and the insertion placeholders are gone)
         mir.instantiate_defers(mir_fn)
 

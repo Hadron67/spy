@@ -7930,6 +7930,55 @@ def call_defer_err_in_try_body(x: i32, n: i32) -> i32:
 
 
 @func()
+def defer_shared_raise(p: Ptr[i32], n: i32) -> i32:
+    # two ``raise``s leave the same ``try`` body and reach the same typed clause:
+    # they share one copy of the defer, and the payload phi of the clause merges
+    # the two raises at the chain entry (each path still catches its own payload)
+    try:
+        with errdefer():
+            p[...] = p[...] + 100
+        if n < 0:
+            raise ErrorA(1)
+        raise ErrorA(2)
+    except ErrorA as e:
+        return e.code
+
+
+@func()
+def call_defer_shared_raise(x: i32, n: i32) -> i32:
+    v = x
+    r: i32 = defer_shared_raise(ref(v), n)
+    return v * 100 + r
+
+
+@func(exceptions=ErrorA)
+def raise_a_never(n: i32) -> Never:
+    # a call that always raises: it has no normal continuation
+    raise ErrorA(n)
+
+
+@func()
+def defer_shared_call(p: Ptr[i32], n: i32) -> i32:
+    # the same through the error dispatch of two calls: both share the chain and
+    # deliver their payload to the clause's merged phi
+    try:
+        with errdefer():
+            p[...] = p[...] + 100
+        if n < 0:
+            raise_a_never(1)
+        raise_a_never(2)
+    except ErrorA as e:
+        return e.code
+
+
+@func()
+def call_defer_shared_call(x: i32, n: i32) -> i32:
+    v = x
+    r: i32 = defer_shared_call(ref(v), n)
+    return v * 100 + r
+
+
+@func()
 def defer_err_caught_outside(p: Ptr[i32], n: i32) -> i32:
     # the raise is caught inside the same function, so the function body is not
     # left and its errdefer does not run
@@ -8064,6 +8113,14 @@ class SpyDeferTest(TestCase):
     def test_a_defer_in_a_try_body_runs_on_a_caught_raise(self) -> None:
         self.assertEqual(call_defer_err_in_try_body(0, 5), 1)
         self.assertEqual(call_defer_err_in_try_body(0, -1), 10002)
+
+    def test_two_raises_share_a_defer_and_keep_their_payloads(self) -> None:
+        self.assertEqual(call_defer_shared_raise(0, -1), 10001)
+        self.assertEqual(call_defer_shared_raise(0, 5), 10002)
+
+    def test_two_calls_share_a_defer_and_keep_their_payloads(self) -> None:
+        self.assertEqual(call_defer_shared_call(0, -1), 10001)
+        self.assertEqual(call_defer_shared_call(0, 5), 10002)
 
     def test_an_errdefer_is_not_run_when_the_error_is_caught_inside(self) -> None:
         self.assertEqual(call_defer_err_caught_outside(0, 5), 1)

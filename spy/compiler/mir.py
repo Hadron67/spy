@@ -1147,10 +1147,11 @@ class EndDefer(Terminator):
 
     The tree is shared: every transfer that triggers the defer refers to its
     entry, so a block's single terminator cannot name one continuation.
-    ``instantiate_defers`` therefore expands one fresh copy of the tree per use
-    and replaces every ``EndDefer`` with the ``Jmp`` that continues the copy
-    (running the nested triggers first).  After instantiation no ``EndDefer`` is
-    reachable any more."""
+    ``instantiate_defers`` therefore expands one fresh copy of the tree per
+    distinct use (transfers that run the same bodies and continue in the same
+    block share a copy) and replaces every ``EndDefer`` with the ``Jmp`` that
+    continues the copy (running the nested triggers first).  After instantiation
+    no ``EndDefer`` is reachable any more."""
 
     defer_blocks: tuple[BasicBlock, ...] = ()
 
@@ -1215,7 +1216,7 @@ def _reachable_with_defers(entry: BasicBlock) -> list[BasicBlock]:
     """Every block reachable from ``entry``, following both the targets and the
     deferred bodies of its terminators.  The deferred bodies of a transfer are
     only reachable through ``get_defer_blocks`` (they are templates, not real
-    CFG edges), so :meth:`BasicBlock.collect_blocks` misses them; 
+    CFG edges), so :meth:`BasicBlock.collect_blocks` misses them;
     :func:`normalize` needs them all the same - their instructions hold
     insertions to flatten."""
     ret: list[BasicBlock] = []
@@ -1524,44 +1525,142 @@ def _remap_targets(inst: Inst, bmap: dict[BasicBlock, BasicBlock]) -> Inst:
             return inst
 
 
+# defer instantiation ---
+
+@dataclass(eq=False, slots=True)
+class _ChainInstance:
+    """One instantiated defer chain, cached by the deferred bodies it runs and
+    the block it continues in (see ``instantiate_defers``).
+
+    ``entry`` is the block every trigger of the chain transfers to and ``tail``
+    the block that reaches the continuation (or, for a return chain, ends the
+    shared copy of the return).  The entry is the merge point of every trigger,
+    so the values the triggers deliver to the continuation cannot reach it along
+    their own edge any more: ``phis`` maps each ``Phi`` of a real continuation
+    to the ``Phi`` synthesized at the entry that merges this chain's triggers'
+    values for it, and ``ret_value`` is that merge for a return chain (which has
+    no continuation block to hold it).  ``triggers`` are the transfers that were
+    redirected to the chain."""
+
+    entry: BasicBlock
+    tail: BasicBlock
+    phis: dict[Phi, Phi]
+    ret_value: Phi | None
+    triggers: list[BasicBlock]
+
+
+def _phi_incoming(phi: Phi, pred: BasicBlock) -> Value | None:
+    """The value ``phi`` takes when control arrives from ``pred``, or None when
+    it has no incoming from it (a phi of a continuation a chain feeds always
+    does, for every trigger of the chain)."""
+    for value, block in phi.incomings:
+        if block is pred:
+            return value
+    return None
+
+
 def instantiate_defers(fn: Function) -> None:
-    """Expand the shared deferred bodies of ``fn`` into explicit copies, one per
-    transfer that triggers them (rewrites the blocks of ``fn`` in place).  Every
-    transfer is replaced by a transfer of the same kind that runs its deferred
-    bodies first, so that afterwards no reachable transfer carries deferred
-    blocks and no reachable :class:`EndDefer` is left; the shared templates
-    become unreachable and are never lowered.  The expansion is driven by the
-    deferred blocks the interpreter collected on every transfer, so it is this
-    pass - not the lowering - that decides where a shared body continues."""
+    """Expand the shared deferred bodies of ``fn`` into explicit copies,
+    rewriting the blocks of ``fn`` in place.  A copy is shared by every transfer
+    that runs the same deferred bodies and continues in the same block, so the
+    same path is instantiated only once; every transfer is replaced by a
+    transfer that runs its deferred bodies first, so that afterwards no reachable
+    transfer carries deferred blocks and no reachable :class:`EndDefer` is left,
+    and the shared templates become unreachable and are never lowered.  The
+    expansion is driven by the deferred blocks the interpreter collected on every
+    transfer, so it is this pass - not the lowering - that decides where a shared
+    body continues.
+
+    A shared copy has several predecessors, so the values a trigger delivers to
+    the continuation - the incomings of its ``Phi``s, or the value a return
+    returns - can no longer flow along its own edge.  The chain entry merges them
+    into a fresh ``Phi`` instead and the continuation reads that one value (see
+    :class:`_ChainInstance`).  The merges are recorded as the triggers are found
+    and folded in once the whole function has been walked."""
+    # every chain instantiated so far, keyed by the deferred bodies it runs and
+    # the block it continues in (None for a return, whose chain ends in a fresh
+    # copy of the return rather than a jump to a continuation block)
+    chains: dict[tuple[tuple[BasicBlock, ...], BasicBlock | None], _ChainInstance] = {}
+
+    def jump_chain(entries: tuple[BasicBlock, ...], cont: BasicBlock, trigger: BasicBlock) -> BasicBlock:
+        """The entry of the chain running ``entries`` and then continuing in
+        ``cont``, created on first use, with the values ``trigger`` delivers to
+        the phis of ``cont`` recorded into the entry's merge phis.  Returns the
+        block ``trigger`` is to transfer to."""
+        chain = chains.get((entries, cont))
+        if chain is None:
+            entry, tail = _instantiate_chain(entries, cont)
+            chain = _ChainInstance(entry, tail, {}, None, [])
+            chains[(entries, cont)] = chain
+        chain.triggers.append(trigger)
+        for cont_phi in cont.insts:
+            if not isinstance(cont_phi, Phi):
+                continue
+            value = _phi_incoming(cont_phi, trigger)
+            if value is None:
+                continue
+            entry_phi = chain.phis.get(cont_phi)
+            if entry_phi is None:
+                entry_phi = Phi([])
+                chain.phis[cont_phi] = entry_phi
+                chain.entry.insts.insert(0, entry_phi)
+            entry_phi.add_incoming(value, trigger)
+        return chain.entry
+
+    def return_chain(entries: tuple[BasicBlock, ...], value: Value | None, trigger: BasicBlock) -> BasicBlock:
+        """The entry of the chain running ``entries`` and then returning
+        ``value``, created on first use; the values the return sites return are
+        merged into a phi at the entry.  Returns the block ``trigger`` is to
+        transfer to."""
+        chain = chains.get((entries, None))
+        if chain is None:
+            tail = BasicBlock()
+            entry, _ = _instantiate_chain(entries, tail)
+            merged: Phi | None = None
+            if value is not None:
+                merged = Phi([])
+                entry.insts.insert(0, merged)
+            tail.emit(Ret(merged))
+            chain = _ChainInstance(entry, tail, {}, merged, [])
+            chains[(entries, None)] = chain
+        chain.triggers.append(trigger)
+        if value is None:
+            assert chain.ret_value is None, 'a return chain cannot mix a value and none'
+        else:
+            assert chain.ret_value is not None, 'a return chain cannot mix a value and none'
+            chain.ret_value.add_incoming(value, trigger)
+        return chain.entry
+
     for block in fn.entry.collect_blocks():
         if len(block.insts) == 0:
             continue
         last = block.insts[-1]
         if isinstance(last, Jmp) and len(last.defer_blocks) > 0:
-            entry, chain_tail = _instantiate_chain(last.defer_blocks, last.target)
-            _repoint_phi_incoming(last.target, block, chain_tail)
-            last.target = entry
+            last.target = jump_chain(last.defer_blocks, last.target, block)
             last.defer_blocks = ()
         elif isinstance(last, Br) and (
             len(last.if_true_defer_blocks) > 0 or len(last.if_false_defer_blocks) > 0
         ):
             if len(last.if_true_defer_blocks) > 0:
-                entry, chain_tail = _instantiate_chain(last.if_true_defer_blocks, last.if_true)
-                _repoint_phi_incoming(last.if_true, block, chain_tail)
-                last.if_true = entry
+                last.if_true = jump_chain(last.if_true_defer_blocks, last.if_true, block)
                 last.if_true_defer_blocks = ()
             if len(last.if_false_defer_blocks) > 0:
-                entry, chain_tail = _instantiate_chain(last.if_false_defer_blocks, last.if_false)
-                _repoint_phi_incoming(last.if_false, block, chain_tail)
-                last.if_false = entry
+                last.if_false = jump_chain(last.if_false_defer_blocks, last.if_false, block)
                 last.if_false_defer_blocks = ()
         elif isinstance(last, Ret) and len(last.defer_blocks) > 0:
             # a return has no target to send the chain to: it ends in a fresh
             # copy of the return itself
-            tail = BasicBlock()
-            tail.emit(Ret(last.value))
-            entry, _chain_tail = _instantiate_chain(last.defer_blocks, tail)
-            block.insts[-1] = Jmp(entry)
+            block.insts[-1] = Jmp(return_chain(last.defer_blocks, last.value, block))
+    # every trigger is known now: the continuations no longer receive their
+    # values from the triggers themselves (the shared tail reaches them instead),
+    # so replace those incoming edges by the one merged value the entry holds
+    for chain in chains.values():
+        triggers = set(chain.triggers)
+        for cont_phi, entry_phi in chain.phis.items():
+            cont_phi.incomings = [
+                (value, pred) for value, pred in cont_phi.incomings if pred not in triggers
+            ]
+            cont_phi.incomings.append((entry_phi, chain.tail))
     # the invariant of this pass: nothing deferred is left on the reachable CFG
     for block in fn.entry.collect_blocks():
         for inst in block.insts:
