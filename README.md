@@ -61,7 +61,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 
 **payload union**：异常的 payload 是一个**无标签并集** `sval.UnionType`（`mir.UnionType` 的存储就是最大变体，各变体都在偏移 0，因此读写都靠指针重解释 / `BitCast`）；**union 值之间不能转换**，只能重解释存储。不占存储的并集（没有变体，或变体全为 ZST）在编译期只有 `sval.UnionValue`，里面只保存“是哪个 union”——并集值不携带变体（变体由旁边的错误码指明）。
 
-**单位类型（ZST）**：`-> None` 的 void 类型 `VoidType` 是一个**零大小类型**（zero-sized type，ZST）；零位整数 `spy.u0`，字段全为 ZST、没有字段的结构体，以及元素为 ZST 或长度为 0 的数组同样是 ZST。ZST 没有运行时表示——`to_mir_type` 对 ZST 返回 `None`（返回类型是 ZST 的函数因此不返回值）——ZST 的 slot 不落内存、不产生 load/store，结构体里的 ZST 字段不占布局、不进入 MIR 结构体。**ZST 参数同样跳过**：不进入 MIR 签名、调用时不传参，函数体内读到的是该类型的单位值。**ZST 结果照常交付**：返回类型是 ZST 的调用同样不产生寄存器（callee 返回 void），但调用仍把结果的单位值写进它的 result location——因此 `y = f(x)`（`f` 返回 `None`）会把 `y` 绑定为单位值、类型为该 ZST，丢弃结果的表达式语句也不会留下无类型的临时 slot。估计大小与对齐（`sval.estimated_size_of`、`estimated_alignment_of`，用来决定结构体的返回与传参方式）对 ZST 分别取 0 与 1。在编译期，“无值”用其单位值 `sval.Void()` 表示。
+**单位类型（ZST）**：`-> None` 的 void 类型 `VoidType` 是一个**零大小类型**（zero-sized type，ZST）；零位整数 `spy.u0`，字段全为 ZST、没有字段的结构体，以及元素为 ZST 或长度为 0 的数组同样是 ZST。ZST 没有运行时表示——`to_mir_type` 对 ZST 返回 `None`（返回类型是 ZST 的函数因此不返回值）——ZST 的 slot 不落内存、不产生 load/store，结构体里的 ZST 字段不占布局、不进入 MIR 结构体。**ZST 参数同样跳过**：不进入 MIR 签名、调用时不传参，函数体内读到的是该类型的单位值。**ZST 结果照常交付**：返回类型是 ZST 的调用同样不产生寄存器（callee 返回 void），但调用仍把结果的单位值写进它的 result location——因此 `y = f(x)`（`f` 返回 `None`）会把 `y` 绑定为单位值、类型为该 ZST，丢弃结果的表达式语句也不会留下无类型的临时 slot。ZST 的大小是 0，对齐量则没有固定值，而是由 `sval.alignment_of` 按结构算出（数组取元素的对齐，即 `align_of(T[0]) == align_of([?]T) == align_of(T)`；结构体取所有成员对齐量的最大值，空结构体为 1；联合体取所有变体的最大值；单变体 tagged union 取该变体；其余叶子 ZST（void、`u0`、`Null`、`undefined`……）为 1）。`std.mem.layout_of`（以及基于它的 `size_of`/`align_of`）把这些暴露给代码：具体的字节数由 lower 阶段发射的 `mir.Sizeof`/`mir.Alignof` 确定，只有 ZST 和长度未定数组在编译期折叠。**已知不一致（待定）**：普通（有存储的）结构体的 MIR 镜像会丢掉 ZST 字段，因此「结构体取所有成员对齐量的最大值」这条规则只在 ZST 结构体上成立——有存储的结构体里，ZST 字段的对齐量不影响结果（与当前 MIR/LLVM 布局一致，但与「所有成员」的直觉不符，如何统一尚未决定）。在编译期，“无值”用其单位值 `sval.Void()` 表示。
 
 泛型：函数可以用 PEP 695 的 `[T]` 语法（需要 Python 3.13+）。`T` 由实参类型求解；形参注解为同一个 `T` 的实参类型会被统一成一个共同类型，实参再转换到它。**声明了返回注解时，它决定该特化的返回类型**（递归函数必须有，见下）。
 
@@ -142,7 +142,7 @@ assert use_point(2) == 12
 
 - **字段**按声明顺序排列，支持嵌套结构体（`p.inner.a`）；字段可读、可赋值、可 `+=`（`x.h = e`、`x.h += e`，可任意嵌套）。局部结构体变量是一个 alloca，`y = x` 拷贝结构体（改 `y` 不影响 `x`）。
 - **传参按值**：结构体实参是调用方结构体的一份拷贝，函数内对参数字段的修改不外溢（大于 16 字节的聚合在原生 ABI 上以指针传递，但语义仍是拷贝）。
-- **方法**：在类里定义并用 `@spy.func()` 装饰的是编译成原生调用的 spy 方法（未写返回注解时按函数体推断，什么都不返回就是 void 方法）；未装饰的方法在调用处被**内联**。方法的 `self` 默认是一个指向自身的指针（`self: Ptr[Self]`）：HIR 直接把 `self` 绑到调用方传进来的那个指针上（`FunctionIR.arg_is_ref`），因此读 `self` 会隐含解引用得到接收者本身、`ref(self)` 是 `Ptr[Self]`，可以就地写回；`@spy.func(sfv=True)` 让 `self` 按值传递（得到一份拷贝）。结构体还可以定义**魔术方法**参与运算符重载：算术与位运算的 `__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/`__or__`/`__and__`/`__xor__`/`__lshift__`/`__rshift__`（各自的反射版 `__r*__` 与原地版 `__i*__`）让 `a + b`、`a += b` 等落到方法上；比较 `__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__`（`<` 等对右操作数用相反的比较方法）；一元 `__neg__`/`__invert__`；以及作为 `if`/`not` 条件的 `__bool__`。左操作数没有对应方法时用右操作数的反射方法（交换操作数）。
+- **方法**：在类里定义并用 `@spy.func()` 装饰的是编译成原生调用的 spy 方法（未写返回注解时按函数体推断，什么都不返回就是 void 方法）；未装饰的方法在调用处被**内联**。方法的 `self` 默认是一个指向自身的指针（`self: Ptr[Self]`）：HIR 直接把 `self` 绑到调用方传进来的那个指针上（`FunctionIR.arg_is_ref`），因此读 `self` 会隐含解引用得到接收者本身、`ref(self)` 是 `Ptr[Self]`，可以就地写回；`@spy.func(sfv=True)` 让 `self` 按值传递（得到一份拷贝）。结构体还可以定义**魔术方法**参与运算符重载：算术与位运算的 `__add__`/`__sub__`/`__mul__`/`__truediv__`/`__floordiv__`/`__mod__`/`__pow__`/`__or__`/`__and__`/`__xor__`/`__lshift__`/`__rshift__`（各自的反射版 `__r*__` 与原地版 `__i*__`）让 `a + b`、`a += b` 等落到方法上；比较 `__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__`（`<` 等对右操作数用相反的比较方法）；一元 `__neg__`/`__invert__`；以及作为 `if`/`not` 条件的 `__bool__`。左操作数没有对应方法时用右操作数的反射方法（交换操作数）。**通过类名调用**：`Foo.m(...)`（已特化的 `Foo[i32].m(x)` 亦然）按名字解析出方法/函数并**不隐式传 `self`**——实参按序原样传入，`self` 由调用处显式给出（`Foo.m(x, ...)`）；`@staticmethod` 声明的方法不带接收者（`Foo.m()` 与值上的 `v.m()` 都不传 `self`）。`@struct()` 可省略：普通类可用 `Cls.fn(...)` 调用其函数（把类当作命名空间）。**方法可继承**：方法取自整个 MRO（普通类/`Protocol` 基类的函数也成为方法），子类覆盖优先，例如 `std.mem.DynamicAllocator` 继承了 `Allocator` 的 `new`/`deinit`/`new_array`/`resize_array`。
 - **构造**：`Point(a, b)` 是一个 result-location 构造调用——`p = Point(...)` 或 `return Point(...)` 直接向目标位置的 slot 写字段，嵌套构造（`Bar(Foo(...), ...)`）把内层结构体直接建在外层字段里，不产生拷贝。位置实参按字段声明顺序写入，关键字实参按名指定；**每个字段都要得到值**：没有默认值的字段必须写全（零大小（ZST）的字段也一样，`Blank(None)` 不能写 `Blank()`），类体里给了值的字段（`y: i32 = 7`）可以省略，省略时把自己的默认值写进去（按字段类型转换，ZST 字段则写不进任何东西——它的值就是单位值）。默认值**不参与泛型参数推断**，只由提供的字段值决定。类里**不能**定义 `__init__`（自定义构造函数尚未支持）。
 - **编译期聚合体**（结构体或数组）：只有落进 `Comptime`/`Comptime[T]` 变量（`hir.InlineMode.FULL`）时才不落内存，而是被表示成一个**编译期聚合**（`interp.ComptimeAggregatePtr`：每个字段/元素各有自己的 place，聚合本身是一个指针）：读写在编译期折叠（`s.a = s.a` 是编译期赋值），字段/元素值可以作为编译期 `if` 的条件或 `syntax.unroll()` 循环的条件，嵌套聚合（结构体字段、数组元素）按各自类型递归。**`FULL` 槽里的聚合一律是编译期聚合**，不管字段装的是什么（运行时值也行）——唯一的例外是某次交付需要它自己的单个地址（走 result pointer 的调用，见 `_defer_ptr_convertion`），那时只能落内存。字段的 place 各按自己的类型决定：装编译期值的落成 box（`ComptimeBox`），装运行时值的落成它自己的运行时 place（内存，因此**可以取地址**：`ref(s.a)` 能交给原生函数写透）。因此把一个**整个运行时结构体值**赋给编译期变量（`s = Small(x, 2); c: Comptime = s`）会把值拆成“每字段一次写入”（嵌套聚合递归拆分），而不是把整个结构体物化进内存。整个聚合按 place 拷贝（`b: Comptime = a` 不共享 place）。**表达式临时量**是 `InlineMode.NON_AGGREGATE`，不内联聚合：`f(Pair(x, 3))`、`Pair(x, 3).total()` 这类字面量直接写进运行时 alloca，没有多余的拷贝（运行时值写进 `NON_AGGREGATE` 槽或编译期聚合里装运行时值的字段时**必须**落内存：运行时 `if` 的两条路径只在内存里汇合，编译期 box 只会留下解释器走 body 时最后写的那个值）。`ComptimeBox` 只装非聚合值（标量、类型、元组……），聚合一律用 `ComptimeAggregatePtr`（零大小的聚合也是，它的值就是单位值）。传给**原生**调用的按值参数或方法接收者时先物化成内存再取地址（`interp._materialize_aggregate`）。注意编译期位置只持有一个值：**编译期值**写进同一批 place 时（运行时 `if` 的两个分支各构造一次，如 `s: Comptime = Small(1, 1) if c else Small(2, 2)`）最后写入的胜出（标量的 `x: Comptime = 1 if c else 2` 也是这个行为）；如果两边的值都是运行时值，则各分支写自己的值到同一批 place，运行时选择的语义得以保留。`ref(聚合)` 得到的是编译期指针：放进 `Comptime` 变量就指向聚合本身（写透会改到聚合），放进普通变量则会物化成一份拷贝的地址（聚合没有自己的地址）。
 - **返回结构体**：函数可以返回结构体（含方法）。返回方式由返回类型决定（`sval.returns_via_result_ptr`）：默认**小结构体（≤16 字节）按值返回**——spy 之间直接走 LLVM 聚合返回；**大结构体经 result 指针返回**——MIR 阶段就给函数追加一个 result 指针形参并返回 void，callee 直接写进调用方的结果位置。`return expr` 语句本身也走 RLS：表达式（含调用）直接写进函数的结果位置。
@@ -300,7 +300,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 | `compiler/util.py` | 共用工具 |
 | `std/__init__.py` | 标准库对外入口：把 `std.core` 的类型与 `compiler.syntax` 的标记一并再导出 |
 | `std/core.py` | 标准库核心类型：`Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr` 及 `arr_slice`/`const_arr_slice` |
-| `std/mem.py` | 内存相关工具（尚未实现） |
+| `std/mem.py` | 内存相关工具：`layout_of` / `size_of` / `align_of`（布局反射）与分配器（更多尚未实现） |
 | `tests.py` | 集成测试 |
 
 ## 尚未实现 / 已知限制
@@ -308,7 +308,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 - 赋值仅支持 `=`（含元组解包）与 `+=`（无链式赋值 `a = b = e`、其它增强赋值）。
 - `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、对**单指针**的下标 `p[i]`（单指针只有解引用 `p[...]` 可用；多指针的 `p[i]` 与数组的 `a[i]` 已实现）。
 - 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字符串的运算。
-- 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、通过类名访问方法（如 `Foo[i32].m(x)`）、结构体整体比较。
+- 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、结构体整体比较。
 - 数组：运行时长度的数组、数组之间的转换（如 `i32[2]` → `i64[2]`）、以及 Python 侧实例表示（带数组参数/返回值的函数还不能从 Python 侧直接调用）。切片已由 `std.arr_slice`/`std.const_arr_slice` 提供。
 - 类型标注：局部变量的标注按函数体内的表达式求值，支持能当值求出的类型（具体类型、类型参数、结构体及结构体特化）与 `Comptime` 标记；`Ptr[T]`/`ConstPtr[T]`/`MultiPtr[T]`/`ConstMultiPtr[T]`/`Array[T, N]`/`Option[T]` 这类 `syntax` 类型标记在函数体里也是可用作值的表达式（由 `hir.PointerType`/`hir.ArrayType`/`hir.OptionType` 在编译期构造），此外也能写在形参、返回值与结构体字段注解里。
 - 多返回值：不能嵌套元组返回值（`-> tuple[i32, tuple[i32, i32]]`），且按值返回的聚合结果还不能从 Python 侧调用。
@@ -326,3 +326,4 @@ python3 run_tests.py                  # 仓库根目录：跑全部测试
 ## 一些小TODO
 - [ ] sval中的内存估计改成用mir类型来计算
 - [ ] jit后端换成orcjit
+- [ ] 统一 ZST 字段的对齐：`std.mem.layout_of` 对 ZST 结构体按**所有**成员取最大对齐（`sval.alignment_of`），但有存储的结构体在 MIR 里丢掉了 ZST 字段，于是两者对「ZST 字段算不算对齐」不一致（详见「单位类型（ZST）」一节）。

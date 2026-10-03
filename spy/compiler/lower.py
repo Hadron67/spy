@@ -34,7 +34,7 @@ from . import llvm as sllvm
 from . import mir
 from .errors import CompileError
 from .fn import Backend, NativeFn
-from .target import HOST_POINTER_SIZE
+from .target import TargetInfo
 from .util import StrBiMap, sanitize_name
 
 llvm.initialize_native_target()
@@ -211,8 +211,10 @@ class _Lowerer:
         self,
         globals: StrBiMap[mir.GlobalValue],
         types: _ModuleTypes,
+        target: TargetInfo,
     ) -> None:
         self._types = types
+        self._target = target
         self._lowered: dict[object, sllvm.Value] = {}
         # the instructions already lowered (a terminator has no lowered value,
         # so ``_lowered`` alone cannot tell whether one was lowered)
@@ -395,6 +397,16 @@ class _Lowerer:
         match inst:
             case mir.Alloca():
                 result = block.alloca(self._to_llvm(inst.type))
+            case mir.Sizeof():
+                result = sllvm.IntValue(
+                    mir.estimated_size_of(inst.type, self._target.pointer_size),
+                    sllvm.IntType(inst.bits),
+                )
+            case mir.Alignof():
+                result = sllvm.IntValue(
+                    mir.estimated_alignment_of(inst.type, self._target.pointer_size),
+                    sllvm.IntType(inst.bits),
+                )
             case mir.Store():
                 block.store(
                     self._value(inst.ptr, arg_values), self._value(inst.value, arg_values)
@@ -507,8 +519,8 @@ class _Lowerer:
                 src = inst.value.get_type()
                 assert isinstance(src, mir.Type), 'a union conversion operand has a type'
                 dst = inst.type
-                src_size = mir.estimated_size_of(src, HOST_POINTER_SIZE)
-                dst_size = mir.estimated_size_of(dst, HOST_POINTER_SIZE)
+                src_size = mir.estimated_size_of(src, self._target.pointer_size)
+                dst_size = mir.estimated_size_of(dst, self._target.pointer_size)
                 wide = dst if dst_size > src_size else src
                 slot = block.alloca(self._to_llvm(wide))
                 block.store(slot, value)
@@ -632,12 +644,12 @@ class LLVMBackend(Backend):
         # each other's symbols by name
         self._engine = llvm.create_mcjit_compiler(backing_mod, tm)
 
-    def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue]) -> dict[mir.GlobalValue, NativeFn]:
+    def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue], target: TargetInfo) -> dict[mir.GlobalValue, NativeFn]:
         types = _ModuleTypes()
         for struct in structs:
             types.to_llvm(struct)
 
-        lowerer = _Lowerer(globals, types)
+        lowerer = _Lowerer(globals, types, target)
 
         fns: list[mir.Function] = sorted(
             (sym for sym in globals.values() if isinstance(sym, mir.Function)),

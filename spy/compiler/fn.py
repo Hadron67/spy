@@ -27,6 +27,7 @@ from .sval import (
     ret_spec_value_is_empty,
     type_of,
 )
+from .target import TargetInfo
 from .util import (
     ArraySet,
     FrozenArraySet,
@@ -784,7 +785,7 @@ class CompileBatch:
         entry.extend(extra)
         return mir.collect_symbols(entry)
 
-    def compile(self, symbol_table: SymbolTable, backend: Backend):
+    def compile(self, symbol_table: SymbolTable, backend: Backend, target: TargetInfo):
         thunks: dict[mir.Function, mir.Function] = {}
         for instance in self.newly_compiled:
             if _needs_thunk(instance.mir):
@@ -811,7 +812,7 @@ class CompileBatch:
             elif isinstance(sym, mir.GlobalValue):
                 globals.add(names[sym], sym)
 
-        native_fns = backend.compile(structs, globals) if self.newly_compiled else {}
+        native_fns = backend.compile(structs, globals, target) if self.newly_compiled else {}
         for instance in self.newly_compiled:
             native_fn = native_fns[instance.mir]
             instance.native_fn = native_fn
@@ -822,5 +823,5 @@ class CompileBatch:
 
 class Backend:
     @abstractmethod
-    def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue]) -> dict[mir.GlobalValue, NativeFn]:
+    def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue], target: TargetInfo) -> dict[mir.GlobalValue, NativeFn]:
         ...

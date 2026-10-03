@@ -237,8 +237,9 @@ def estimated_size_of(type: Type, pointer_size: int) -> int:
 
 def estimated_alignment_of(type: Type, pointer_size: int) -> int:
     """The estimated alignment of the MIR type ``type`` in bytes, for pointers
-    of ``pointer_size`` bytes (see :func:`estimated_size_of`).  A type that has
-    no layout at all (a function type) raises :class:`SpyError`."""
+    of ``pointer_size`` bytes (see :func:`estimated_size_of`).  An array aligns
+    to its element type, so ``estimated_alignment_of(T[0])`` is that of ``T``.
+    A type that has no layout at all (a function type) raises :class:`SpyError`."""
     match type:
         case BoolType():
             return 1
@@ -450,6 +451,46 @@ class Alloca(Inst):
     @override
     def get_type(self) -> MayBeVoidType:
         return PointerType(self.type)
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
+
+
+@dataclass(eq=False, slots=True)
+class Sizeof(Inst):
+    """The size, in bytes, of the MIR type ``type`` (``std.mem.layout_of``).
+    A type is not a value, so it is carried here as an operand and measured by
+    the lowerer against the target's layout - a spy type has no compile-time
+    size.  ``bits`` is the width of the integer result (the target ``usize``)."""
+
+    type: Type
+    bits: int
+
+    @override
+    def get_type(self) -> Type:
+        return IntType(self.bits, False)
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
+
+
+@dataclass(eq=False, slots=True)
+class Alignof(Inst):
+    """The alignment, in bytes, of the MIR type ``type`` (see :class:`Sizeof`
+    for the shared shape)."""
+
+    type: Type
+    bits: int
+
+    @override
+    def get_type(self) -> Type:
+        return IntType(self.bits, False)
 
     def get_children(self) -> tuple[Any, ...]:
         return (self.type,)

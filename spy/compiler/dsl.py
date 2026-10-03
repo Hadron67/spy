@@ -24,7 +24,11 @@ at its call sites).  The decorated name stands for that struct: a spy body
 annotates with it, constructs it (``Foo(a, b)`` - the arguments fill the
 fields in place, positional ones in declaration order and keyword ones by
 name; a custom ``__init__`` is not supported) and calls its methods on a
-value of it (``x.m()``, the object passed as the method's ``self``).  A class
+value of it (``x.m()``, the object passed as the method's ``self``) or
+through the class name (``Foo.m(x, ...)``, every argument passed explicitly,
+``self`` included; a ``@staticmethod`` takes none).  Its methods include the
+ones a plain class or ``Protocol`` base contributes (``std.mem.Allocator``),
+which a subclass such as ``DynamicAllocator`` therefore inherits.  A class
 with type parameters (``class Foo[T]``) declares a struct *template*:
 ``Foo[i32]`` names one specialization of it, a construction of the bare
 template (``Foo(...)``) takes the arguments of the specialization from the
@@ -280,7 +284,7 @@ class _RegisteredFn:
         analyser = Analyser(self.context, self.context.mir_lower_cache)
         analyser.analyse_function(entry, call_sig, ret_sig)
         sym = analyser.finish()
-        sym.compile(self.context._symbol_table, self.context.backend)
+        sym.compile(self.context._symbol_table, self.context.backend, self.context.target_info())
 
         instance = entry.specs[call_sig]
         # a function whose value form ctypes cannot call directly has a
@@ -400,26 +404,51 @@ class _RegisteredClass(StructDecl):
             # specialization the method was resolved on into it (see
             # ``interp``)
             template = head.specialize(tuple(generic_args))
-            for name, value in self.cls.__dict__.items():
-                if isinstance(value, _RegisteredFn):
-                    # a registered method: ``self`` is the struct it belongs
-                    # to (the method is parsed with that type, see astgen).  A
-                    # handle registered in another context is re-bound here,
-                    # so that the method is parsed and compiled with this
-                    # context's struct type and type parameters
-                    if value.context is not self.context:
-                        value = value.with_context(self.context)
-                    value.cls = template
-                    value.context_type_vars = self.class_type_vars
-                    head.methods[name] = value
-                elif isinstance(value, pytypes.FunctionType):
-                    # an undecorated method: inlined at its call sites like a
-                    # plain function.  It is wrapped like a registered one so
-                    # that it is parsed lazily with the struct as its ``self``
-                    # type and the struct's type parameters in scope
-                    method = _RegisteredFn(value, template, _INLINE_META, self.context)
-                    method.context_type_vars = self.class_type_vars
-                    head.methods[name] = method
+            # the methods, collected from the whole MRO (base classes first, so
+            # that an override wins): a plain class or ``Protocol`` base - such
+            # as ``std.mem.Allocator`` - contributes its functions as methods
+            # (``DynamicAllocator`` inherits its ``new``/``deinit``/... from
+            # ``Allocator``), while a ``@staticmethod`` takes no receiver.  The
+            # machinery of ``typing``/``object`` and their ``__init__`` are not
+            # methods and are skipped.
+            for base in reversed(self.cls.__mro__):
+                if base is object or base.__module__ in ('typing', 'builtins'):
+                    continue
+                for name, value in base.__dict__.items():
+                    if name == '__init__':
+                        continue
+                    is_static = isinstance(value, staticmethod)
+                    if is_static:
+                        value = value.__func__
+                    if isinstance(value, _RegisteredFn):
+                        # a registered method: ``self`` is the struct it
+                        # belongs to (the method is parsed with that type, see
+                        # astgen).  A handle registered in another context is
+                        # re-bound here, so that the method is parsed and
+                        # compiled with this context's struct type and type
+                        # parameters
+                        if value.context is not self.context:
+                            value = value.with_context(self.context)
+                        value.cls = None if is_static else template
+                        value.context_type_vars = self.class_type_vars
+                        head.methods[name] = value
+                    elif isinstance(value, pytypes.FunctionType):
+                        # an undecorated method: inlined at its call sites like
+                        # a plain function.  It is wrapped like a registered one
+                        # so that it is parsed lazily with the struct as its
+                        # ``self`` type and the struct's type parameters in
+                        # scope (a static one takes no ``self``)
+                        method = _RegisteredFn(
+                            value, None if is_static else template, _INLINE_META, self.context,
+                        )
+                        method.context_type_vars = self.class_type_vars
+                        head.methods[name] = method
+                    else:
+                        continue
+                    if is_static:
+                        head.static_methods.add(name)
+                    else:
+                        head.static_methods.discard(name)
         return self.entry
 
     def __getitem__(self, key: Any) -> sval.StructTypeApplication:
@@ -434,8 +463,8 @@ class _RegisteredClass(StructDecl):
         expression inside a body is the HIR's ``hir.Subscript`` instead,
         resolved by the interpreter.
 
-        A future *class-name method access* (``Foo[i32].m(x)``) resolves the
-        same specialization through this path (see ``interp``)."""
+        A *class-name method access* (``Foo[i32].m(x)``) resolves the same
+        specialization through this path (see ``interp``)."""
         args = key if isinstance(key, tuple) else (key,)
         return sval.StructTypeApplication(self, args)
 
@@ -749,7 +778,7 @@ class _Context(CompileContext):
         analyser = Analyser(self, self.mir_lower_cache)
         analyser.analyse_function(fn, call_sig, ret_sig)
         sym = analyser.finish()
-        sym.compile(self._symbol_table, self.backend)
+        sym.compile(self._symbol_table, self.backend, self.target_info())
 
     def func(self, sfv: bool = False, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = False):
         meta = FnMetadata(

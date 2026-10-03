@@ -5014,7 +5014,98 @@ class HirRunner:
                 raise CompileError('std.core.undefined takes no arguments')
             self.store(ret, ComptimeVal(sval.UntypedUndefined()))
             return PollResult.AGAIN
+        if fn.name == 'layout_of':
+            return self._layout_builtin(args, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
+
+    # -- ``std.mem.layout_of`` -----------------------------------------------
+
+    def _layout_builtin(
+        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.mem.layout_of``: evaluate the layout of the queried type and
+        hand it to the call's result location (see :meth:`_layout_of`)."""
+        if len(args.positional) != 1 or len(args.kwargs) > 0:
+            raise CompileError('std.mem.layout_of takes exactly one argument')
+        obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[0])))
+        if not isinstance(obj, sval.Type):
+            raise CompileError(f'std.mem.layout_of takes a type, got {obj!r}')
+        self.store(ret, self._layout_of(obj))
+        return PollResult.AGAIN
+
+    def _layout_of(self, type: sval.Type) -> InterpVal:
+        """The ``std.mem.Layout`` value of the spy type ``type``: a struct of
+        its ``size`` and its ``align``.  Both are measured by the lowerer (the
+        ``mir.Sizeof``/``mir.Alignof`` instructions), since a spy type has no
+        compile-time size; only a type with a trivially known layout - a
+        zero-sized type and an unsized array - is folded to a constant here."""
+        size = self._sizeof_value(type)
+        align = self._alignof_value(type)
+        layout = self._resolve_layout_type()
+        value = self._aggregate_to_runtime(ComptimeAggregate(layout, (size, align)))
+        return RuntimeVal(value, layout)
+
+    def _sizeof_value(self, type: sval.Type) -> InterpVal:
+        """The ``size`` field of ``layout_of(type)``: 0 for a zero-sized type
+        and for an unsized array (which has no size of its own), an emitted
+        ``mir.Sizeof`` otherwise.  A type with no fixed size (an opaque type or
+        a function type) and a compile-time-only type are rejected."""
+        kind = type.classify()
+        if kind == sval.SpecialTypeKind.COMPTIME:
+            raise CompileError(
+                f'cannot take the layout of {type}: it is a compile-time-only type'
+            )
+        if kind == sval.SpecialTypeKind.ZST:
+            return self._usize_const(0)
+        if isinstance(type, sval.ArrayType) and type.length is None:
+            return self._usize_const(0)
+        if kind == sval.SpecialTypeKind.DST and not isinstance(type, sval.StructType):
+            raise CompileError(f'cannot take the layout of {type}: it has no fixed size')
+        mir_type = type.to_mir_type(self._mir_cache)
+        if mir_type is None:
+            raise CompileError(f'cannot take the layout of {type}')
+        return RuntimeVal(
+            self._emit(mir.Sizeof(mir_type, self._usize_type().bits)), self._usize_type()
+        )
+
+    def _alignof_value(self, type: sval.Type) -> InterpVal:
+        """The ``align`` field of ``layout_of(type)``.  An unsized array aligns
+        to its element (``align_of([?]T) == align_of(T)``); a zero-sized type -
+        which has no MIR mirror to measure - is folded to the alignment its
+        structure gives it (see ``sval.alignment_of``), and every other type is
+        measured by an emitted ``mir.Alignof``."""
+        peeled = type
+        while isinstance(peeled, sval.ArrayType) and peeled.length is None:
+            peeled = peeled.elem
+        if peeled.is_zst():
+            align = sval.alignment_of(peeled, self._mir_cache)
+            return self._usize_const(align)
+        kind = peeled.classify()
+        if kind == sval.SpecialTypeKind.COMPTIME:
+            raise CompileError(
+                f'cannot take the layout of {peeled}: it is a compile-time-only type'
+            )
+        if kind == sval.SpecialTypeKind.DST and not isinstance(peeled, sval.StructType):
+            raise CompileError(f'cannot take the layout of {peeled}: it is dynamically sized')
+        mir_type = peeled.to_mir_type(self._mir_cache)
+        if mir_type is None:
+            raise CompileError(f'cannot take the layout of {peeled}')
+        return RuntimeVal(
+            self._emit(mir.Alignof(mir_type, self._usize_type().bits)), self._usize_type()
+        )
+
+    def _usize_const(self, value: int) -> InterpVal:
+        """A compile-time ``usize`` value (the folded layout part)."""
+        return ComptimeVal(sval.Int(value, self._usize_type()))
+
+    def _resolve_layout_type(self) -> sval.StructType:
+        """The ``std.mem.Layout`` struct type, resolved in the host context this
+        body is compiled for (so that every context reflects into its own copy
+        of the struct, like any other ``std`` type)."""
+        from ..std import mem
+        resolved = self._analyser._resolver.resolve_global(mem.Layout)
+        assert isinstance(resolved, sval.StructType), 'std.mem.Layout is not a struct'
+        return resolved
 
     # -- compile-time reflection (``std.reflect``) ---------------------------
 
@@ -6216,9 +6307,9 @@ class HirRunner:
         ``struct``: its function value - bound with the struct's type-
         argument values when the struct is generic (see
         :class:`sval.BoundMethod`).  This is the ``typeof(a).m`` a method
-        call ``a.m(...)`` resolves to.  A future class-name access
-        (``Foo[i32].m(x)``) resolves the same way, through the
-        specialization the class name denotes."""
+        call ``a.m(...)`` resolves to; a class-name access (``Foo[i32].m(x)``)
+        resolves the same way, through the specialization the class name
+        denotes (see ``_call_class_method``)."""
         method = struct.get_method(method_name)
         if method is None:
             return None
@@ -6237,26 +6328,88 @@ class HirRunner:
             case _:
                 return None
 
+    def _class_name_base(self, ptr: InterpVal) -> Any | None:
+        """The compile-time object a class-name method base denotes: a struct
+        type (``Foo``, ``Foo[i32]``), a struct template head (``Foo`` without
+        arguments, which a call has to specialize first), or a plain Python
+        class used as a namespace of functions.  None when the base is an
+        ordinary value, so the call is a method call on it (see
+        ``call_method``)."""
+        todo: list[InterpVal] = [_shallow_normalize(ptr)]
+        while len(todo) > 0:
+            ev = todo.pop()
+            match ev:
+                case PendingSlot() if ev.committed is not None:
+                    todo.append(_shallow_normalize(ev.committed))
+                case ComptimeBox():
+                    todo.append(ev.value)
+                case ComptimeVal(obj):
+                    if isinstance(obj, sval.ConstRef):
+                        obj = obj.value
+                    if isinstance(obj, (sval.Type, type)):
+                        return obj
+                    return None
+                case _:
+                    return None
+        return None
+
+    def _call_class_method(
+        self,
+        obj: Any,
+        method_name: str,
+        args: RawArgList[ArgEntry[InterpVal]],
+        ret: InterpVal,
+        on_return: Callable[[], None] | None,
+    ) -> PollResult:
+        """Call the function ``method_name`` of the compile-time object ``obj``
+        - a struct type, a struct template head, or a plain Python class used
+        as a namespace - with the given arguments and no implicit ``self``:
+        every argument is passed through, ``self`` included."""
+        if isinstance(obj, sval.StructType):
+            method = self._method_of(obj, method_name)
+            if method is None:
+                raise CompileError(f'{obj} has no method named {method_name}')
+            return self.call(ComptimeVal(sval.ConstRef(method)), args, ret, on_return)
+        if isinstance(obj, sval.StructTypeHead):
+            raise CompileError(
+                f'{obj} is a struct template: specialize it before calling its '
+                f'methods (``{obj.name_base}[...].{method_name}(...)``)'
+            )
+        if isinstance(obj, type):
+            # a plain Python class used as a namespace of functions: the
+            # attribute names a function, called like any other
+            fn = getattr(obj, method_name, None)
+            if fn is None or not callable(fn):
+                raise CompileError(f'{obj.__name__} has no function named {method_name}')
+            target = self._analyser._resolver.resolve_global(fn)
+            if target is None:
+                raise CompileError(f'cannot call {obj.__name__}.{method_name}')
+            return self.call(ComptimeVal(sval.ConstRef(target)), args, ret, on_return)
+        raise CompileError(f'cannot call a method on the type {obj}')
+
     def call_method(self, ptr: InterpVal, method_name: str, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None) -> PollResult:
         base = _shallow_normalize(ptr)
-        # ``Foo[i32].m(x)`` - a method accessed through the class name - is
-        # not supported yet.  Such a base is a compile-time struct *type*
-        # rather than a pointer to a value: the future path resolves the
-        # method through ``_method_of`` and calls it with no implicit
-        # ``self`` (the call passes every argument, ``self`` included).
-        if isinstance(base, ComptimeBox) and isinstance(base.value, ComptimeVal) and isinstance(base.value.obj, sval.StructType):
-            raise CompileError(
-                'calling a method through the class name is not supported yet; '
-                'call it on a value of the struct instead'
-            )
+        # ``Foo.m(...)`` / ``Foo[i32].m(x)`` - a method accessed through the
+        # class name (or a plain class used as a namespace) - resolves the
+        # function from the compile-time type and calls it with the given
+        # arguments and no implicit ``self`` (see ``_call_class_method``).
+        class_base = self._class_name_base(base)
+        if class_base is not None:
+            return self._call_class_method(class_base, method_name, args, ret, on_return)
         ptr = self._auto_deref(base)
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f'cannot call a method on a {type} value')
 
-        method = self._resolve_method(type.elem, method_name)
+        struct_type = type.elem
+        method = self._resolve_method(struct_type, method_name)
         if method is None:
-            raise CompileError(f'type {type.elem} has no method named {method_name}')
+            raise CompileError(f'type {struct_type} has no method named {method_name}')
+
+        # a ``@staticmethod`` takes no receiver: it is called with the given
+        # arguments alone
+        if isinstance(struct_type, sval.StructType) and struct_type.is_static_method(method_name):
+            return self.call(ComptimeVal(sval.ConstRef(method)), args, ret, on_return)
 
         # a method's first parameter is the struct itself: it is passed by
         # reference (the base's address) unless the method declares

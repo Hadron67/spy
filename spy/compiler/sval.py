@@ -1120,6 +1120,47 @@ def find_first_pointer_type_pos(type: Type, shift: int = 0) -> tuple[int, ...] |
     return None
 
 
+def alignment_of(type: Type, cache: MirLowerCache) -> int:
+    """The alignment in bytes of the spy type ``type`` for the target of
+    ``cache``.  A type that has a MIR mirror is measured through it
+    (``mir.estimated_alignment_of``); a zero-sized type has no mirror, so its
+    alignment is read off its *structure*: an array aligns to its element
+    (``T[0]``/``T[?]``/``T[N]`` alike), a struct to the maximum of its fields
+    (1 when it has none), a union to the maximum of its variants, a
+    single-variant tagged union to that variant, and every other leaf ZST
+    (void, ``u0``, ``Null``, ``undefined``, ...) to 1.  Iterative (an explicit
+    worklist), so a deeply nested type costs no Python stack.
+
+    Note that a struct's alignment takes the maximum over *every* declared
+    field here, which is what makes an all-ZST struct such as
+    ``struct { x: i64[0] }`` align to 8.  A struct that has storage drops its
+    zero-sized fields from its MIR mirror (see ``StructType._calculate_mir``),
+    so for one of those this structural alignment is *not* what the lowered
+    layout uses; reconciling the two is left for later (see the README)."""
+    pointer_size = cache.target.pointer_size
+    best = 1
+    todo: list[Type] = [type]
+    while len(todo) > 0:
+        current = todo.pop()
+        if not current.is_zst():
+            mir_type = current.to_mir_type(cache)
+            if mir_type is None:
+                raise CompileError(f'cannot take the alignment of {current}')
+            best = max(best, mir.estimated_alignment_of(mir_type, pointer_size))
+            continue
+        if isinstance(current, ArrayType):
+            todo.append(current.elem)
+        elif isinstance(current, StructType):
+            todo.extend(field.type for field in current.fields().values())
+        elif isinstance(current, UnionType):
+            todo.extend(current.types)
+        elif isinstance(current, TaggedUnionType):
+            # a tagged union is zero-sized only with a single variant
+            todo.append(current.types[0])
+        # any other leaf ZST contributes 1, which is the running maximum
+    return best
+
+
 def aggregate_type_length(type: Type) -> int:
     """The number of fields (or elements) of an aggregate type, in declaration
     (element) order.  An ``Option`` is *not* an aggregate (its representation
@@ -1886,7 +1927,15 @@ class StructTypeHead(Type, IdentityObj):
         self.modifiers = modifiers or StructModifiers()
         self.fields: IndexedMap[str, StructField] = IndexedMap()
         self.methods: dict[str, Any] = {}
+        # the methods of the body declared ``@staticmethod``: they take no
+        # receiver, so a call does not pass one (see ``interp.call_method``)
+        self.static_methods: set[str] = set()
         self._specs: dict[tuple[AnyValue, ...], StructType] = {}
+
+    def is_static_method(self, name: str) -> bool:
+        """Whether the method ``name`` of this struct declares
+        ``@staticmethod`` (it takes no ``self``)."""
+        return name in self.static_methods
 
     @override
     def get_type(self) -> Type:
@@ -1987,6 +2036,11 @@ class StructType(Type):
 
     def get_method(self, name: str) -> Any | None:
         return self.head.methods.get(name)
+
+    def is_static_method(self, name: str) -> bool:
+        """Whether the method ``name`` of this struct is a ``@staticmethod``
+        (see :meth:`StructTypeHead.is_static_method`)."""
+        return self.head.is_static_method(name)
 
     def fields(self) -> IndexedMap[str, StructField]:
         """The fields of this specialization, in declaration order: the
