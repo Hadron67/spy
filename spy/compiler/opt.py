@@ -121,6 +121,11 @@ def simplify(fn: mir.Function) -> None:
             case mir.Arith():
                 inst.lhs = resolve(inst.lhs)
                 inst.rhs = resolve(inst.rhs)
+            case mir.Floor():
+                inst.value = resolve(inst.value)
+            case mir.Pow():
+                inst.lhs = resolve(inst.lhs)
+                inst.rhs = resolve(inst.rhs)
             case mir.Convert():
                 inst.value = resolve(inst.value)
             case mir.BitCast():
@@ -225,6 +230,10 @@ def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
                 return ((inst.ptr, 'use'),)
             return ((inst.ptr, 'use'), (inst.index, 'use'))
         case mir.Arith():
+            return ((inst.lhs, 'use'), (inst.rhs, 'use'))
+        case mir.Floor():
+            return ((inst.value, 'use'),)
+        case mir.Pow():
             return ((inst.lhs, 'use'), (inst.rhs, 'use'))
         case mir.Convert():
             return ((inst.value, 'use'),)

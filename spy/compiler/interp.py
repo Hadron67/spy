@@ -77,6 +77,7 @@ typed it, see ``Analyser._request_function``).  The interpreter types an
 type information of its own.
 """
 
+import math
 import operator
 import types as pytypes
 from abc import abstractmethod
@@ -127,6 +128,11 @@ _PY_OPS: dict[str, Any] = {
     '//': operator.floordiv,
     '%': operator.mod,
     '**': operator.pow,
+    '|': operator.or_,
+    '&': operator.and_,
+    '^': operator.xor,
+    '<<': operator.lshift,
+    '>>': operator.rshift,
     '==': operator.eq,
     '!=': operator.ne,
     '<': operator.lt,
@@ -134,6 +140,58 @@ _PY_OPS: dict[str, Any] = {
     '>': operator.gt,
     '>=': operator.ge,
 }
+
+# the magic method of every binary operator: the method a struct's ``a op b``
+# resolves to, its reflected counterpart (``b``'s method, called with the
+# operands swapped, when ``a`` names none) and its in-place counterpart (what
+# an augmented assignment calls first, see ``HirRunner.binary_assign``)
+_BINARY_METHODS: dict[str, tuple[str, str, str]] = {
+    '+': ('__add__', '__radd__', '__iadd__'),
+    '-': ('__sub__', '__rsub__', '__isub__'),
+    '*': ('__mul__', '__rmul__', '__imul__'),
+    '/': ('__truediv__', '__rtruediv__', '__itruediv__'),
+    '//': ('__floordiv__', '__rfloordiv__', '__ifloordiv__'),
+    '%': ('__mod__', '__rmod__', '__imod__'),
+    '**': ('__pow__', '__rpow__', '__ipow__'),
+    '|': ('__or__', '__ror__', '__ior__'),
+    '&': ('__and__', '__rand__', '__iand__'),
+    '^': ('__xor__', '__rxor__', '__ixor__'),
+    '<<': ('__lshift__', '__rlshift__', '__ilshift__'),
+    '>>': ('__rshift__', '__rrshift__', '__irshift__'),
+}
+
+# the magic method of every comparison: the method the left operand's struct
+# answers with, and the one a struct *right* operand answers with when the
+# left one has none (the operands swapped: ``a < b`` becomes ``b > a``)
+_COMPARE_METHODS: dict[str, tuple[str, str]] = {
+    '==': ('__eq__', '__eq__'),
+    '!=': ('__ne__', '__ne__'),
+    '<': ('__lt__', '__gt__'),
+    '<=': ('__le__', '__ge__'),
+    '>': ('__gt__', '__lt__'),
+    '>=': ('__ge__', '__le__'),
+}
+
+# the magic method of every unary operator, and the one ``bool(x)`` uses
+_UNARY_METHODS: dict[str, str] = {'-': '__neg__', '~': '__invert__'}
+_BOOL_METHOD = '__bool__'
+
+
+@dataclass(slots=True)
+class CompileVars:
+    """The compile-time behaviours a frame can configure (see
+    ``InlineFrame.compile_vars_stack``).  Every field has the default the
+    compiler uses; a frame inherits the configuration of its caller."""
+
+    # the float type an integer ``/`` (and a division-like operation that
+    # promotes an integer) is computed in
+    int_div_type: sval.FloatType = field(default_factory=lambda: sval.FloatType(64))
+    # whether integer ``//`` truncates towards zero (True) or floors (False,
+    # the Python behaviour)
+    int_trunc_div: bool = False
+    # the largest magnitude of a compile-time integer exponent that is
+    # unfolded; a larger one becomes a runtime loop
+    max_exp_unroll: int = 4096
 
 class InterpVal:
     pass
@@ -702,9 +760,13 @@ class BlockFrame:
     data: BlockFrameData
 
 class InlineFrame:
-    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResult, insts: tuple[hir.Inst, ...], value_is_empty: bool = False, on_done: Callable[[], None] | None = None) -> None:
+    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResult, insts: tuple[hir.Inst, ...], value_is_empty: bool = False, on_done: Callable[[], None] | None = None, compile_vars: CompileVars | None = None) -> None:
         self.generic_var_values = generic_var_values
         self.arg_values = arg_values
+        # the compile-time configuration of this body, as a stack so a nested
+        # scope can push an override and pop it again; the bottom entry is
+        # inherited from the caller (a fresh default for the function proper)
+        self.compile_vars_stack: list[CompileVars] = [CompileVars() if compile_vars is None else compile_vars]
         # the frame's result location: the place its result is delivered into and
         # the function proper's error places (an inlined plain body raises into
         # the enclosing function's error location, so it shares them)
@@ -1171,6 +1233,12 @@ def _comptime_py_value(value: Any) -> Any:
     # compile-time object (a type, a null, ...) is used as it is
     return value.value if isinstance(value, (sval.Int, sval.Float)) else value
 
+def _truncate_div(a: int, b: int) -> int:
+    """Integer division truncated towards zero (C's ``/``), for the compile-time
+    fold of ``//`` when ``CompileVars.int_trunc_div`` is set."""
+    quotient = abs(a) // abs(b)
+    return -quotient if (a < 0) != (b < 0) else quotient
+
 def _convert_inst(
     value: mir.Value, from_type: sval.Type, to_type: sval.Type, cache: sval.MirLowerCache,
 ) -> mir.Inst | None:
@@ -1335,6 +1403,18 @@ class HirRunner:
         """``isize``: the signed integer of the target's pointer width - the
         type of a pointer offset, so that a negative one walks backwards."""
         return sval.IntType(self._analyser._resolver.target_info().usize_bits, True)
+
+    @property
+    def _compile_vars(self) -> CompileVars:
+        """The compile-time configuration of the innermost executing body (the
+        top of its ``compile_vars_stack``, see :class:`InlineFrame`)."""
+        return self._frames[-1].compile_vars_stack[-1]
+
+    def _inherit_compile_vars(self) -> CompileVars:
+        """A copy of the current configuration, for a body about to be inlined:
+        an inlined callee starts from its caller's configuration."""
+        vars = self._compile_vars
+        return CompileVars(vars.int_div_type, vars.int_trunc_div, vars.max_exp_unroll)
 
     # -- entry point ---------------------------------------------------------
 
@@ -2113,7 +2193,7 @@ class HirRunner:
                 else:
                     tag_mir = union_type.tag_type().to_mir_type(self._mir_cache)
                     assert isinstance(tag_mir, mir.IntType)
-                    cond = self._emit(mir.Cmp('==', False, 'int', self._to_runtime(tag), mir.Int(index, tag_mir)))
+                    cond = self._emit(mir.Cmp('==', self._to_runtime(tag), mir.Int(index, tag_mir)))
                     regs[inst] = RuntimeVal(cond, sval.BoolType())
             case hir.TaggedUnionPayloadPtr():
                 place = self.operand(inst.ptr)
@@ -2122,8 +2202,6 @@ class HirRunner:
                     raise CompileError(f'a payload address needs a tagged union, got {ptr_type}')
                 variant = self.type_operand(inst.type, 'the payload type')
                 regs[inst] = self._tagged_union_payload_ptr(place, variant)
-            case hir.BitOr():
-                regs[inst] = self._eval_bitor(inst.lhs, inst.rhs)
             case hir.BinaryAssign():
                 return self.binary_assign(inst.op, self.operand(inst.lhs), self.operand_arg(inst.rhs))
             case hir.If():
@@ -3222,7 +3300,7 @@ class HirRunner:
         obj = _to_comptime(value)
         if isinstance(obj, bool):
             return mir.BoolValue(not obj)
-        return self._emit(mir.Cmp('==', False, 'int', self._to_runtime(value), mir.BoolValue(False)))
+        return self._emit(mir.Cmp('==', self._to_runtime(value), mir.BoolValue(False)))
 
     def _as_comptime_option(self, ev: InterpVal, option: sval.OptionType) -> ComptimeOption:
         """The value form of a value that already is of the option type
@@ -3498,7 +3576,7 @@ class HirRunner:
         src = self._to_runtime(tag)
         acc: mir.Value = mir.Int(mapping[0][1], to_tag_mir)
         for index, to_index in mapping[1:]:
-            cond = self._emit(mir.Cmp('==', False, 'int', src, mir.Int(index, from_tag_mir)))
+            cond = self._emit(mir.Cmp('==', src, mir.Int(index, from_tag_mir)))
             acc = self._emit(mir.Select(cond, mir.Int(to_index, to_tag_mir), acc))
         return RuntimeVal(acc, to_type.tag_type())
 
@@ -3588,23 +3666,6 @@ class HirRunner:
         index = self._tagged_union_variant_index(ev, type)
         variant_value = self._coerce(ev, type.types[index])
         return ComptimeTaggedUnionValue(type, ComptimeVal(sval.Int(index, type.tag_type())), variant_value)
-
-    def _eval_bitor(self, lhs: hir.Value, rhs: hir.Value) -> InterpVal:
-        """``a | b``: a tagged-union type value when both operands are
-        compile-time type values (a tagged-union operand contributes its
-        variants), and - later - a bitwise or.  The syntax is shared, so the
-        decision is made here (see ``astgen``)."""
-        lv = _to_comptime(_shallow_normalize(self.operand(lhs)))
-        rv = _to_comptime(_shallow_normalize(self.operand(rhs)))
-        if isinstance(lv, sval.Type) and isinstance(rv, sval.Type):
-            variants: list[sval.Type] = []
-            for type in (lv, rv):
-                if isinstance(type, sval.TaggedUnionType):
-                    variants.extend(type.types)
-                else:
-                    variants.append(type)
-            return ComptimeVal(sval.tagged_union_of(tuple(variants)))
-        raise CompileError('``|`` on non-type values is not supported yet')
 
     def _arg_value(self, arg: ArgEntry[InterpVal]) -> InterpVal:
         """The value an argument denotes: a reference argument is loaded
@@ -4243,12 +4304,56 @@ class HirRunner:
     # -- operators ------------------------------------------------------------
 
     def _eval_binary(self, op: BinaryOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
-        # what the operation *is* follows from the types of the operands - a
-        # primitive arithmetic instruction, or (later) an overload method
-        # that takes the operands by reference (``a + b`` becomes
-        # ``a.__add__(b)``, see ``call_method``), so the operands are kept as
-        # the references they are and a value is only loaded where one is
-        # needed
+        # what the operation *is* follows from the types of the operands: a
+        # primitive instruction, a struct's magic method (``a + b`` becomes
+        # ``a.__add__(b)``, see ``call_method``) or the tagged-union type
+        # spelling of ``|``.  The operands are kept as the references they are
+        # and a value is only loaded where one is needed.
+        lhs_type = _arg_type_of(lhs)
+        rhs_type = _arg_type_of(rhs)
+
+        # ``a | b`` is also the tagged-union type spelling: two compile-time
+        # type values build the union (the interpreter is what decides which of
+        # the two meanings the shared syntax has)
+        if (
+            op == '|'
+            and isinstance(lhs_type, sval.TypeType)
+            and isinstance(rhs_type, sval.TypeType)
+        ):
+            lv = _to_comptime(_shallow_normalize(self._arg_value(lhs)))
+            rv = _to_comptime(_shallow_normalize(self._arg_value(rhs)))
+            assert isinstance(lv, sval.Type) and isinstance(rv, sval.Type)
+            variants: list[sval.Type] = []
+            for variant in (lv, rv):
+                if isinstance(variant, sval.TaggedUnionType):
+                    variants.extend(variant.types)
+                else:
+                    variants.append(variant)
+            self.store(ret, ComptimeVal(sval.tagged_union_of(tuple(variants))))
+            return PollResult.AGAIN
+
+        if isinstance(lhs_type, sval.StructType) or isinstance(rhs_type, sval.StructType):
+            return self._binary_overload(op, lhs, rhs, lhs_type, rhs_type, ret)
+
+        # the operators whose operands do not simply share one peer type are
+        # handled on their own: a division promotes to float, an exponent's
+        # type follows the base, and a shift's result is the left operand's
+        if op == '/':
+            return self._eval_divide(lhs, rhs, lhs_type, rhs_type, ret)
+        if op == '//':
+            return self._eval_floor_divide(lhs, rhs, lhs_type, rhs_type, ret)
+        if op == '**':
+            return self._eval_pow(lhs, rhs, lhs_type, rhs_type, ret)
+        if op in ('|', '&', '^', '<<', '>>'):
+            return self._eval_bitwise(op, lhs, rhs, lhs_type, rhs_type, ret)
+
+        if op == '%' and (
+            isinstance(lhs_type, sval.FloatType) or isinstance(rhs_type, sval.FloatType)
+        ):
+            # the float modulo is not implemented: reject it here too, so a
+            # compile-time pair does not fold where a runtime one errors
+            raise CompileError("unsupported operator '%' for floats")
+
         if _is_comptime_val(lhs.value) and _is_comptime_val(rhs.value):
             # every operand is compile-time: the operation is evaluated
             # eagerly in Python, whatever the runtime types are
@@ -4257,9 +4362,6 @@ class HirRunner:
             assert isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal)
             self.store(ret, ComptimeVal(_comptime_py_op(op, lv.obj, rv.obj)))
             return PollResult.AGAIN
-
-        lhs_type = _arg_type_of(lhs)
-        rhs_type = _arg_type_of(rhs)
 
         if lhs_type is None or rhs_type is None:
             raise CompileError(f"cannot apply '{op}' to untyped objects")
@@ -4272,38 +4374,322 @@ class HirRunner:
             if type is None:
                 raise CompileError(f"cannot apply '{op}' to {lhs_type} and {rhs_type}")
             if isinstance(type, sval.IntType):
-                if op == '/':
-                    raise CompileError(
-                        "integer division ('/') is not supported; divide float values instead"
-                    )
-                if op == '//':
-                    raise CompileError("integer floor division ('//') is not supported yet")
-                if op == '**':
-                    raise CompileError("integer exponentiation ('**') is not supported yet")
                 if op not in ('+', '-', '*', '%'):
                     raise CompileError(f"unsupported operator '{op}' for integers")
             else:
-                if op == '**':
-                    raise CompileError("float exponentiation ('**') is not supported yet")
-                if op == '//':
-                    raise CompileError("float floor division ('//') is not supported yet")
-                if op not in ('+', '-', '*', '/'):
+                if op not in ('+', '-', '*'):
                     raise CompileError(f"unsupported operator '{op}' for floats")
-            lc = self._coerce(lv, type)
-            rc = self._coerce(rv, type)
-            signed = isinstance(type, sval.IntType) and type.signed
-            mir_type = type.to_mir_type(self._mir_cache)
-            assert mir_type is not None and not type.is_zst()
-            value = self._emit(
-                mir.Arith(op, signed, self._to_runtime(lc), self._to_runtime(rc), mir_type)
-            )
-            self.store(ret, RuntimeVal(value, type))
+            self._fold_or_emit_arith(op, lv, rv, type, ret)
             return PollResult.AGAIN
-        elif isinstance(lhs_type, sval.StructType) or isinstance(rhs_type, sval.StructType):
-            # call `__xxx__` methods
-            raise NotImplementedError
+        raise CompileError(f"unsupported operator '{op}' for {lhs_type} and {rhs_type}")
+
+    def _as_float_type(self, a: sval.Type, b: sval.Type) -> sval.FloatType | None:
+        """The float type an operation on ``a`` and ``b`` is computed in when
+        either operand is a float: the wider of the two, with the integer side
+        converted.  ``None`` when neither is a float."""
+        if isinstance(a, sval.FloatType) and isinstance(b, sval.FloatType):
+            return sval.FloatType(max(a.bits, b.bits))
+        if isinstance(a, sval.FloatType):
+            return a
+        if isinstance(b, sval.FloatType):
+            return b
+        return None
+
+    def _one_constant(self, type: sval.Type) -> mir.Value:
+        """The multiplicative identity of the numeric type ``type``."""
+        mir_type = type.to_mir_type(self._mir_cache)
+        assert mir_type is not None and not type.is_zst()
+        if isinstance(mir_type, mir.FloatType):
+            return mir.Float(1.0, mir_type)
+        assert isinstance(mir_type, mir.IntType)
+        return mir.Int(1, mir_type)
+
+    def _fold_or_emit_arith(self, op: BinaryOp, lv: InterpVal, rv: InterpVal, target: sval.Type, ret: InterpVal) -> None:
+        """Compute ``lv op rv`` as ``target``: a compile-time pair folds in
+        Python (and the result is re-tagged as ``target``), a runtime one is a
+        ``mir.Arith`` over operands coerced to ``target``."""
+        if _is_comptime_val(lv) and _is_comptime_val(rv):
+            lobj = _to_comptime(lv)
+            robj = _to_comptime(rv)
+            assert lobj is not None and robj is not None
+            obj = _comptime_py_op(op, lobj, robj)
+            self.store(ret, ComptimeVal(sval.coerce_const(obj, target)))
+            return
+        lc = self._coerce(lv, target)
+        rc = self._coerce(rv, target)
+        mir_type = target.to_mir_type(self._mir_cache)
+        assert mir_type is not None and not target.is_zst()
+        value = self._emit(mir.Arith(op, self._to_runtime(lc), self._to_runtime(rc), mir_type))
+        self.store(ret, RuntimeVal(value, target))
+
+    def _eval_divide(self, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret: InterpVal) -> PollResult:
+        """``a / b``: true division.  A float operand picks the wider float
+        type; two integers are divided in ``CompileVars.int_div_type`` (f64 by
+        default), so ``a / b`` of two integers is a float, like Python's."""
+        target: sval.Type | None = None
+        if lhs_type is not None and rhs_type is not None:
+            target = self._as_float_type(lhs_type, rhs_type)
+            if target is None and sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type):
+                target = self._compile_vars.int_div_type
+        if target is None:
+            raise CompileError(f"cannot apply '/' to {lhs_type} and {rhs_type}")
+        self._fold_or_emit_arith('/', self._arg_value(lhs), self._arg_value(rhs), target, ret)
+        return PollResult.AGAIN
+
+    def _eval_floor_divide(self, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret: InterpVal) -> PollResult:
+        """``a // b``.  A float operand floors the float quotient; two integers
+        floor the integer quotient (or truncate it when
+        ``CompileVars.int_trunc_div`` says so)."""
+        ftype: sval.FloatType | None = None
+        if lhs_type is not None and rhs_type is not None:
+            ftype = self._as_float_type(lhs_type, rhs_type)
+        lv = self._arg_value(lhs)
+        rv = self._arg_value(rhs)
+        if ftype is not None:
+            if _is_comptime_val(lv) and _is_comptime_val(rv):
+                a = _comptime_py_value(_to_comptime(lv))
+                b = _comptime_py_value(_to_comptime(rv))
+                try:
+                    result = float(math.floor(a / b))
+                except Exception as e:
+                    raise CompileError(f"cannot apply '//' at compile time: {e}") from e
+                self.store(ret, ComptimeVal(sval.coerce_const(result, ftype)))
+                return PollResult.AGAIN
+            lc = self._coerce(lv, ftype)
+            rc = self._coerce(rv, ftype)
+            mir_type = ftype.to_mir_type(self._mir_cache)
+            assert isinstance(mir_type, mir.FloatType)
+            quotient = self._emit(mir.Arith('/', self._to_runtime(lc), self._to_runtime(rc), mir_type))
+            self.store(ret, RuntimeVal(self._emit(mir.Floor(quotient)), ftype))
+            return PollResult.AGAIN
+
+        if not (
+            lhs_type is not None and rhs_type is not None
+            and sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type)
+        ):
+            raise CompileError(f"cannot apply '//' to {lhs_type} and {rhs_type}")
+        target = lhs_type.resolve_peer_type(rhs_type)
+        if not isinstance(target, (sval.IntType, sval.AnyIntType)):
+            raise CompileError(f"cannot apply '//' to {lhs_type} and {rhs_type}")
+
+        if _is_comptime_val(lv) and _is_comptime_val(rv):
+            a = _comptime_py_value(_to_comptime(lv))
+            b = _comptime_py_value(_to_comptime(rv))
+            if not isinstance(a, int) or not isinstance(b, int) or isinstance(a, bool) or isinstance(b, bool):
+                raise CompileError(f"cannot apply '//' to {a!r} and {b!r} at compile time")
+            if b == 0:
+                raise CompileError("integer division by zero at compile time")
+            result = _truncate_div(a, b) if self._compile_vars.int_trunc_div else a // b
+            self.store(ret, ComptimeVal(sval.coerce_const(result, target)))
+            return PollResult.AGAIN
+
+        if self._compile_vars.int_trunc_div:
+            self._fold_or_emit_arith('/', lv, rv, target, ret)
+            return PollResult.AGAIN
+
+        # only two untyped compile-time literals could leave ``target`` as the
+        # compile-time-only ``AnyIntType``, and they folded above
+        assert isinstance(target, sval.IntType)
+        lc = self._coerce(lv, target)
+        rc = self._coerce(rv, target)
+        mir_type = target.to_mir_type(self._mir_cache)
+        assert isinstance(mir_type, mir.IntType)
+        lc_runtime = self._to_runtime(lc)
+        rc_runtime = self._to_runtime(rc)
+        quotient = self._emit(mir.Arith('/', lc_runtime, rc_runtime, mir_type))
+        if target.signed:
+            # floor division: correct the truncating quotient when the remainder
+            # is non-zero and its sign differs from the divisor's
+            remainder = self._emit(mir.Arith('%', lc_runtime, rc_runtime, mir_type))
+            zero = mir.Int(0, mir_type)
+            r_nonzero = self._emit(mir.Cmp('!=', remainder, zero))
+            r_negative = self._emit(mir.Cmp('<', remainder, zero))
+            d_negative = self._emit(mir.Cmp('<', rc_runtime, zero))
+            signs_differ = self._emit(mir.Cmp('!=', r_negative, d_negative))
+            adjust = self._emit(mir.Select(r_nonzero, signs_differ, mir.BoolValue(False)))
+            decremented = self._emit(mir.Arith('-', quotient, mir.Int(1, mir_type), mir_type))
+            quotient = self._emit(mir.Select(adjust, decremented, quotient))
+        self.store(ret, RuntimeVal(quotient, target))
+        return PollResult.AGAIN
+
+    def _eval_pow(self, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret: InterpVal) -> PollResult:
+        """``a ** b``.
+
+        A compile-time integer exponent is unfolded (exponentiation by
+        squaring) in the base's own type when non-negative, or in ``f64``
+        followed by a reciprocal when negative; one too large to unfold
+        (``CompileVars.max_exp_unroll``) becomes a runtime loop.  A runtime
+        integer exponent is a runtime loop in ``f64`` (its sign decides
+        whether a reciprocal follows).  A float exponent is a ``mir.Pow`` over
+        floats."""
+        if lhs_type is None or rhs_type is None:
+            raise CompileError("cannot apply '**' to untyped objects")
+        if not sval.is_numeric_type(lhs_type):
+            raise CompileError(f"cannot raise a {lhs_type} to a power")
+        if not sval.is_numeric_type(rhs_type):
+            raise CompileError(f"cannot use a {rhs_type} as an exponent")
+
+        lv = self._arg_value(lhs)
+        rv = self._arg_value(rhs)
+        exponent = _comptime_int(rv)
+
+        if _is_comptime_val(lv) and _is_comptime_val(rv):
+            # both compile-time: fold in Python (a negative exponent yields a
+            # float, exactly like the runtime rule)
+            lobj = _to_comptime(lv)
+            robj = _to_comptime(rv)
+            assert lobj is not None and robj is not None
+            result = _comptime_py_op('**', lobj, robj)
+            target: sval.Type = lhs_type if exponent is not None and exponent >= 0 else sval.FloatType(64)
+            self.store(ret, ComptimeVal(sval.coerce_const(result, target)))
+            return PollResult.AGAIN
+
+        if exponent is not None:
+            if abs(exponent) > self._compile_vars.max_exp_unroll:
+                # too large to unfold: a runtime loop with a constant count
+                count_type = rhs_type if isinstance(rhs_type, sval.IntType) else sval.IntType(64, exponent < 0)
+                self._pow_loop(lv, ComptimeVal(sval.coerce_const(exponent, count_type)), count_type, ret)
+                return PollResult.AGAIN
+            if exponent >= 0:
+                base_type: sval.Type = lhs_type
+                if isinstance(base_type, sval.AnyIntType):
+                    # an untyped literal has no runtime type of its own
+                    base_type = sval.FloatType(64)
+                self._pow_unrolled(lv, exponent, base_type, False, ret)
+            else:
+                self._pow_unrolled(lv, exponent, sval.FloatType(64), True, ret)
+            return PollResult.AGAIN
+
+        if isinstance(rhs_type, sval.IntType):
+            self._pow_loop(lv, rv, rhs_type, ret)
+            return PollResult.AGAIN
+
+        if isinstance(rhs_type, sval.FloatType):
+            target = self._as_float_type(lhs_type, rhs_type) or sval.FloatType(64)
+            lc = self._coerce(lv, target)
+            rc = self._coerce(rv, target)
+            mir_type = target.to_mir_type(self._mir_cache)
+            assert isinstance(mir_type, mir.FloatType)
+            value = self._emit(mir.Pow(self._to_runtime(lc), self._to_runtime(rc), mir_type))
+            self.store(ret, RuntimeVal(value, target))
+            return PollResult.AGAIN
+
+        raise CompileError(f"cannot use a {rhs_type} as an exponent")
+
+    def _pow_unrolled(self, base: InterpVal, exponent: int, type: sval.Type, negative: bool, ret: InterpVal) -> None:
+        """``base ** exponent`` with a compile-time exponent: exponentiation by
+        squaring in ``type`` (``f64`` for a negative exponent), followed by a
+        reciprocal when ``negative``."""
+        mir_type = type.to_mir_type(self._mir_cache)
+        assert mir_type is not None and not type.is_zst()
+        power = self._to_runtime(self._coerce(base, type))
+        result = self._one_constant(type)
+        remaining = abs(exponent)
+        while remaining > 0:
+            if remaining & 1:
+                result = self._emit(mir.Arith('*', result, power, mir_type))
+            remaining >>= 1
+            if remaining > 0:
+                power = self._emit(mir.Arith('*', power, power, mir_type))
+        if negative:
+            result = self._emit(mir.Arith('/', self._one_constant(sval.FloatType(64)), result, mir_type))
+        self.store(ret, RuntimeVal(result, type))
+
+    def _pow_loop(self, base: InterpVal, exponent: InterpVal, exponent_type: sval.IntType, ret: InterpVal) -> None:
+        """``base ** exponent`` with a runtime integer exponent: an ``f64`` loop
+        that squares the running power and multiplies the running result by it
+        whenever the current bit of the exponent is set.  A signed exponent is
+        made absolute first and the result is reciprocated at the end when it
+        was negative; an unsigned one loops directly.  The loop's carried
+        values are ``mir.Phi``s, so no alloca is needed."""
+        f64 = sval.FloatType(64)
+        mir_f64 = mir.FloatType(64)
+        base_runtime = self._to_runtime(self._coerce(base, f64))
+        count_mir = exponent_type.to_mir_type(self._mir_cache)
+        assert isinstance(count_mir, mir.IntType)
+        count = self._to_runtime(self._coerce(exponent, exponent_type))
+        zero = mir.Int(0, count_mir)
+        one_i = mir.Int(1, count_mir)
+        negative: mir.Value
+        if exponent_type.signed:
+            negative = self._emit(mir.Cmp('<', count, zero))
+            negative_count = self._emit(mir.Arith('-', zero, count, count_mir))
+            count = self._emit(mir.Select(negative, negative_count, count))
         else:
+            negative = mir.BoolValue(False)
+
+        preheader = self._cur_block
+        header = mir.BasicBlock()
+        body = mir.BasicBlock()
+        exit_block = mir.BasicBlock()
+        preheader.emit(mir.Jmp(header))
+
+        e_phi = mir.Phi([(count, preheader)])
+        acc_phi = mir.Phi([(mir.Float(1.0, mir_f64), preheader)])
+        base_phi = mir.Phi([(base_runtime, preheader)])
+        header.emit(e_phi)
+        header.emit(acc_phi)
+        header.emit(base_phi)
+        header.emit(mir.Br(header.emit(mir.Cmp('!=', e_phi, zero)), body, exit_block))
+
+        bit = body.emit(mir.Arith('&', e_phi, one_i, count_mir))
+        factor = body.emit(mir.Select(body.emit(mir.Cmp('!=', bit, zero)), base_phi, mir.Float(1.0, mir_f64)))
+        next_acc = body.emit(mir.Arith('*', acc_phi, factor, mir_f64))
+        next_base = body.emit(mir.Arith('*', base_phi, base_phi, mir_f64))
+        next_e = body.emit(mir.Arith('>>', e_phi, one_i, count_mir))
+        body.emit(mir.Jmp(header))
+        e_phi.add_incoming(next_e, body)
+        acc_phi.add_incoming(next_acc, body)
+        base_phi.add_incoming(next_base, body)
+
+        self._cur_block = exit_block
+        reciprocal = self._emit(mir.Arith('/', mir.Float(1.0, mir_f64), acc_phi, mir_f64))
+        self.store(ret, RuntimeVal(self._emit(mir.Select(negative, reciprocal, acc_phi)), f64))
+
+    def _eval_bitwise(self, op: BinaryOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret: InterpVal) -> PollResult:
+        """``a op b`` for the integer bitwise/shift operators.  A shift keeps
+        the left operand's type (the count is converted to it); the others use
+        the operands' peer type, like arithmetic."""
+        if lhs_type is None or rhs_type is None:
+            raise CompileError(f"cannot apply '{op}' to untyped objects")
+        if not (sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type)):
             raise CompileError(f"unsupported operator '{op}' for {lhs_type} and {rhs_type}")
+        target: sval.Type | None
+        if op in ('<<', '>>'):
+            if isinstance(lhs_type, sval.IntType):
+                target = lhs_type
+            elif isinstance(rhs_type, sval.IntType):
+                target = rhs_type
+            else:
+                target = lhs_type.resolve_peer_type(rhs_type)
+        else:
+            target = lhs_type.resolve_peer_type(rhs_type)
+        if not isinstance(target, (sval.IntType, sval.AnyIntType)):
+            raise CompileError(f"unsupported operator '{op}' for {lhs_type} and {rhs_type}")
+        self._fold_or_emit_arith(op, self._arg_value(lhs), self._arg_value(rhs), target, ret)
+        return PollResult.AGAIN
+
+    def _binary_overload(self, op: BinaryOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret: InterpVal) -> PollResult:
+        """A binary operator with a struct operand: the left operand's forward
+        magic method, or the right one's reflected method with the operands
+        swapped when the left names none."""
+        forward, reflected, _ = _BINARY_METHODS[op]
+        if isinstance(lhs_type, sval.StructType) and self._resolve_method(lhs_type, forward) is not None:
+            return self.call_method(self._operand_place(lhs), forward, RawArgList((rhs,), frozendict()), ret)
+        if isinstance(rhs_type, sval.StructType) and self._resolve_method(rhs_type, reflected) is not None:
+            return self.call_method(self._operand_place(rhs), reflected, RawArgList((lhs,), frozendict()), ret)
+        raise CompileError(f"unsupported operator '{op}' for {lhs_type} and {rhs_type}")
+
+    def _operand_place(self, arg: ArgEntry[InterpVal]) -> InterpVal:
+        """The place a struct operand is addressed by: a reference argument is
+        the address it already carries, any other value is written into a fresh
+        slot first (like ``astgen._as_ref``)."""
+        if arg.is_ref:
+            return arg.value
+        slot = self.alloca(InlineMode.NON_AGGREGATE)
+        self.store(slot, arg.value)
+        self._commit_pending_slot(slot)
+        return _shallow_normalize(slot)
 
     def _eval_pointer_arith(self, op: BinaryOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type, rhs_type: sval.Type, ret: InterpVal) -> PollResult:
         """One operation on a pointer: ``mptr + n``, the address of the n-th
@@ -4333,6 +4719,9 @@ class HirRunner:
         lhs_type = _arg_type_of(lhs)
         rhs_type = _arg_type_of(rhs)
 
+        if isinstance(lhs_type, sval.StructType) or isinstance(rhs_type, sval.StructType):
+            return self._cmp_overload(op, lhs, rhs, lhs_type, rhs_type, ret_reg)
+
         if _is_comptime_val(lhs.value) and _is_comptime_val(rhs.value):
             lv = self._arg_value(lhs)
             rv = self._arg_value(rhs)
@@ -4350,18 +4739,40 @@ class HirRunner:
                 raise CompileError(f'cannot compare {lhs_type} and {rhs_type}')
             lc = self._coerce(lv, type)
             rc = self._coerce(rv, type)
-            kind = 'int' if isinstance(type, sval.IntType) else 'float'
-            signed = isinstance(type, sval.IntType) and type.signed
             value = self._emit(
-                mir.Cmp(op, signed, kind, self._to_runtime(lc), self._to_runtime(rc))
+                mir.Cmp(op, self._to_runtime(lc), self._to_runtime(rc))
             )
             self._frames[-1].regs[ret_reg] = RuntimeVal(value, sval.BoolType())
             return PollResult.AGAIN
-        elif isinstance(lhs_type, sval.StructType) and isinstance(rhs_type, sval.StructType):
-            # call `__xxx__` methods
-            raise NotImplementedError
+        raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
+
+    def _cmp_overload(self, op: CompareOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret_reg: hir.Inst) -> PollResult:
+        """A comparison with a struct operand: the left operand's magic method,
+        or the right one's reflected method with the operands swapped when the
+        left names none (``a < b`` becomes ``b > a``).  The method's boolean
+        result is written into the comparison's register (``Compare`` produces
+        a register, not a result location, so the call delivers into a fresh
+        slot that is then loaded)."""
+        forward, reflected = _COMPARE_METHODS[op]
+        base: ArgEntry[InterpVal]
+        other: ArgEntry[InterpVal]
+        name: str
+        if isinstance(lhs_type, sval.StructType) and self._resolve_method(lhs_type, forward) is not None:
+            base, other, name = lhs, rhs, forward
+        elif isinstance(rhs_type, sval.StructType) and self._resolve_method(rhs_type, reflected) is not None:
+            base, other, name = rhs, lhs, reflected
         else:
             raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
+        slot = self.alloca(InlineMode.NON_AGGREGATE)
+        regs = self._frames[-1].regs
+
+        def on_return() -> None:
+            self._commit_pending_slot(slot)
+            regs[ret_reg] = self.load(slot)
+
+        return self.call_method(
+            self._operand_place(base), name, RawArgList((other,), frozendict()), slot, on_return,
+        )
 
     def _eval_not(self, operand: InterpVal, ret: hir.Inst) -> PollResult:
         """Boolean negation (``hir.Not``, value -> value): the negation of the
@@ -4377,12 +4788,18 @@ class HirRunner:
             raise CompileError(f"cannot apply 'not' to a {type} value")
         coerced = self._coerce(operand, type)
         value = self._emit(
-            mir.Cmp('==', False, 'int', self._to_runtime(coerced), mir.BoolValue(False))
+            mir.Cmp('==', self._to_runtime(coerced), mir.BoolValue(False))
         )
         self._frames[-1].regs[ret] = RuntimeVal(value, sval.BoolType())
         return PollResult.AGAIN
 
     def _eval_unary(self, op: UnaryOp, operand: ArgEntry[InterpVal], ret: InterpVal) -> PollResult:
+        type = _arg_type_of(operand)
+        if isinstance(type, sval.StructType):
+            name = _UNARY_METHODS.get(op)
+            if name is not None and self._resolve_method(type, name) is not None:
+                return self.call_method(self._operand_place(operand), name, RawArgList((), frozendict()), ret)
+
         if _is_comptime_val(operand.value):
             ev = self._arg_value(operand)
             assert isinstance(ev, ComptimeVal)
@@ -4393,9 +4810,17 @@ class HirRunner:
                     raise CompileError(f'cannot negate {obj!r} at compile time')
                 self.store(ret, ComptimeVal(negated))
                 return PollResult.AGAIN
+            if op == '~':
+                if isinstance(obj, sval.Int):
+                    complemented = ~obj.value if obj.type.signed else (~obj.value) & ((1 << obj.type.bits) - 1)
+                    self.store(ret, ComptimeVal(sval.Int(complemented, obj.type)))
+                elif isinstance(obj, int) and not isinstance(obj, bool):
+                    self.store(ret, ComptimeVal(~obj))
+                else:
+                    raise CompileError(f'cannot complement {obj!r} at compile time')
+                return PollResult.AGAIN
             raise CompileError(f"unsupported unary operator '{op}'")
 
-        type = _arg_type_of(operand)
         if type is None:
             raise CompileError(f"cannot apply unary '{op}' to a value that has no type yet")
         if op == '-':
@@ -4411,16 +4836,31 @@ class HirRunner:
                 raise CompileError(f'cannot negate a {type} value')
             coerced = self._coerce(self._arg_value(operand), type)
             value = self._emit(
-                mir.Arith('-', False, zero, self._to_runtime(coerced), mir_type)
+                mir.Arith('-', zero, self._to_runtime(coerced), mir_type)
+            )
+            self.store(ret, RuntimeVal(value, type))
+            return PollResult.AGAIN
+        if op == '~':
+            if not isinstance(type, sval.IntType):
+                raise CompileError(f'cannot complement a {type} value')
+            mir_type = type.to_mir_type(self._mir_cache)
+            assert isinstance(mir_type, mir.IntType)
+            coerced = self._coerce(self._arg_value(operand), type)
+            value = self._emit(
+                mir.Arith('^', self._to_runtime(coerced), mir.Int(-1, mir_type), mir_type)
             )
             self.store(ret, RuntimeVal(value, type))
             return PollResult.AGAIN
         raise CompileError(f"unsupported unary operator '{op}'")
 
     def binary_assign(self, op: BinaryOp, left: InterpVal, right: ArgEntry[InterpVal]) -> PollResult:
-        # ``x op= y`` is ``x = x op y``: the value the target currently
-        # holds and the right operand feed the operator, and its result is
-        # stored back into the target
+        # ``x op= y`` calls the target's in-place magic method when its struct
+        # declares one (``__iadd__``, ...); otherwise it is ``x = x op y``
+        left_type = _place_type(left)
+        if isinstance(left_type, sval.StructType):
+            _, _, inplace = _BINARY_METHODS[op]
+            if self._resolve_method(left_type, inplace) is not None:
+                return self.call_method(left, inplace, RawArgList((right,), frozendict()), left)
         return self._eval_binary(op, ArgEntry(left, True), right, left)
 
     # -- calls ----------------------------------------------------------------
@@ -4981,11 +5421,11 @@ class HirRunner:
         child = type.child
         if child.is_zst():
             # the option *is* the "is there a value" bool: absent when it is false
-            cmp = mir.Cmp('==', False, 'int', ev.value, mir.BoolValue(False))
+            cmp = mir.Cmp('==', ev.value, mir.BoolValue(False))
         elif sval.find_first_pointer_type_pos(child) is None:
             # the (bool, T) representation: the tag is its first field
             tag = self._emit(mir.ExtractValue(ev.value, 0))
-            cmp = mir.Cmp('==', False, 'int', tag, mir.BoolValue(False))
+            cmp = mir.Cmp('==', tag, mir.BoolValue(False))
         else:
             # the option *is* the child's value (they share the representation):
             # the tag is the child's first pointer, which is read out field by
@@ -4993,7 +5433,7 @@ class HirRunner:
             tag, tag_type = self._option_tag_value(RuntimeVal(ev.value, child), child)
             tag_mir_type = tag_type.to_mir_type(self._mir_cache)
             assert isinstance(tag_mir_type, mir.PointerType)
-            cmp = mir.Cmp('==', False, 'ptr', self._to_runtime(tag), mir.NullValue(tag_mir_type))
+            cmp = mir.Cmp('==', self._to_runtime(tag), mir.NullValue(tag_mir_type))
         return RuntimeVal(self._emit(cmp), sval.BoolType())
 
     def _option_tag_value(self, value: InterpVal, child: sval.Type) -> tuple[InterpVal, sval.PointerType]:
@@ -5055,12 +5495,24 @@ class HirRunner:
     def as_bool(self, value: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
         """Use the value as the condition of an ``if`` - a statement's or an
         if-expression's: a ``spy.bool`` value passes through, as the boolean
-        register the interpreter branches on.  Spy has no truthiness, so
-        nothing else is a condition."""
+        register the interpreter branches on, and a struct that declares
+        ``__bool__`` answers through it.  Spy has no truthiness, so nothing
+        else is a condition."""
         type = _arg_type_of(value)
         if isinstance(type, sval.BoolType):
             self._frames[-1].regs[ret] = self._arg_value(value)
             return PollResult.AGAIN
+        if isinstance(type, sval.StructType) and self._resolve_method(type, _BOOL_METHOD) is not None:
+            slot = self.alloca(InlineMode.NON_AGGREGATE)
+            regs = self._frames[-1].regs
+
+            def on_return() -> None:
+                self._commit_pending_slot(slot)
+                regs[ret] = self.load(slot)
+
+            return self.call_method(
+                self._operand_place(value), _BOOL_METHOD, RawArgList((), frozendict()), slot, on_return,
+            )
 
         raise CompileError(f'an if condition must be a bool value, got {type}')
 
@@ -5320,7 +5772,7 @@ class HirRunner:
         else:
             length = RuntimeVal(
                 self._emit(mir.Arith(
-                    '-', False,
+                    '-',
                     self._to_runtime(self._coerce(end_ev, usize)),
                     self._to_runtime(self._coerce(start_ev, usize)),
                     mir.IntType(usize.bits, usize.signed),
@@ -6225,6 +6677,7 @@ class HirRunner:
             frame_values, tuple(arg_values),
             ComptimeResult(ret, error.code, error.payload),
             body, value_is_empty=value_is_empty, on_done=on_done,
+            compile_vars=self._inherit_compile_vars(),
         )
         self._frames.append(frame)
         return PollResult.AGAIN

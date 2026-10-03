@@ -382,18 +382,11 @@ class Dict(Inst):
 
 
 @dataclass(eq=False)
-class BitOr(Inst):
-    """``a | b``: either a tagged-union type value (both operands are
-    compile-time type values) or, later, a bitwise or.  The decision is made by
-    the interpreter (see ``interp``), because the same syntax spells both; the
-    result is a value, so the instruction itself is the register holding it."""
-
-    lhs: Value
-    rhs: Value
-
-@dataclass(eq=False)
 class Binary(Inst):
-    """Arithmetic: '+', '-', '*', '/', '//', '%', '**'."""
+    """Binary operator: arithmetic ('+', '-', '*', '/', '//', '%', '**'),
+    bitwise/shift ('|', '&', '^', '<<', '>>') and '|' as a tagged-union type
+    value.  The interpreter decides which of the two meanings '|' has (see
+    ``interp``), because the same syntax spells both."""
 
     op: BinaryOp
     lhs: ArgEntry[Value]
@@ -429,7 +422,7 @@ class Not(Inst):
 
 @dataclass(eq=False)
 class Unary(Inst):
-    """Unary operator: '-'."""
+    """Unary operator: '-' (negation), '~' (bitwise not)."""
 
     op: UnaryOp
     operand: ArgEntry[Value]

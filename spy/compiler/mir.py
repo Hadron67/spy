@@ -674,15 +674,58 @@ class Select(Inst):
 
 @dataclass(eq=False)
 class Arith(Inst):
-    """Integer/float arithmetic.
+    """Integer/float arithmetic and integer bitwise/shift operations.
 
-    ``op`` is one of ``'+'``, ``'-'``, ``'*'`` (integer or float,
-    chosen by ``type``), ``'/'`` (float) and ``'%'`` (integer).  Integer
-    division/remainder honor ``signed``.
-    """
+    ``op`` is one of ``'+'``, ``'-'``, ``'*'`` (integer or float, chosen by
+    ``type``), ``'/'`` (truncating integer division, or float division),
+    ``'%'`` (integer remainder), the bitwise ``'|'``, ``'&'`` and ``'^'``, and
+    the shifts ``'<<'`` and ``'>>'``.  Division, remainder and the right shift
+    honor the signedness of the integer ``type`` (a float ``type`` ignores
+    it)."""
 
     op: BinaryOp
-    signed: bool
+    lhs: Value
+    rhs: Value
+    type: Type
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.lhs, self.rhs)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        lhs = f(self.lhs)
+        rhs = f(self.rhs)
+        if lhs is self.lhs and rhs is self.rhs:
+            return self
+        return replace(self, lhs=lhs, rhs=rhs)
+
+
+@dataclass(eq=False)
+class Floor(Inst):
+    """Round a float value toward negative infinity (LLVM's ``llvm.floor``)."""
+
+    value: Value
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.value.get_type()
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.value,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        value = f(self.value)
+        return self if value is self.value else replace(self, value=value)
+
+
+@dataclass(eq=False)
+class Pow(Inst):
+    """Raise the float value ``lhs`` to the float power ``rhs`` (LLVM's
+    ``llvm.pow``).  ``type`` is the (float) type of the result."""
+
     lhs: Value
     rhs: Value
     type: Type
@@ -813,13 +856,13 @@ class UnionCast(Inst):
 @dataclass(eq=False)
 class Cmp(Inst):
     """A comparison producing a bool; ``op`` is one of '==', '!=', '<',
-    '<=', '>', '>='.  ``kind`` is the domain the operands live in: 'int' and
-    'float' compare numbers, and 'ptr' compares pointers against each other
-    (only equality is defined on them)."""
+    '<=', '>', '>='.  The domain the operands live in - integers, floats or
+    pointers - is read off their type: numbers compare with ``icmp``/``fcmp``
+    (the signedness of an integer ``icmp`` follows the integer type), and
+    pointers compare against each other with ``icmp`` (only equality is
+    defined on them).  Both operands share one type."""
 
     op: CompareOp
-    signed: bool
-    kind: str  # 'int', 'float' or 'ptr'
     lhs: Value
     rhs: Value
 

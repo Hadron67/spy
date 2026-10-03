@@ -934,6 +934,18 @@ class BasicBlock(LocalValue):
     def xor(self, lhs: Value, rhs: Value):
         return self.emit(Binary(XorOp(), lhs, rhs))
 
+    def shl(self, lhs: Value, rhs: Value):
+        return self.emit(Binary(Shl(), lhs, rhs))
+
+    def lshr(self, lhs: Value, rhs: Value):
+        return self.emit(Binary(LShr(), lhs, rhs))
+
+    def ashr(self, lhs: Value, rhs: Value):
+        return self.emit(Binary(AShr(), lhs, rhs))
+
+    def floor(self, value: Value):
+        return self.float_func(value, FLOOR_F32, FLOOR_F64)
+
     def phi(self, *incomings: tuple[Value, BasicBlock]):
         ret = self.emit(Phi(*incomings))
         assert isinstance(ret, Phi)
@@ -1235,6 +1247,21 @@ class XorOp(BinaryOp):
             case IntValue(a, t), IntValue(b, _):
                 return IntValue(a ^ b, t)
         return None
+
+class Shl(BinaryOp):
+    @override
+    def head_name(self) -> str:
+        return 'shl'
+
+class LShr(BinaryOp):
+    @override
+    def head_name(self) -> str:
+        return 'lshr'
+
+class AShr(BinaryOp):
+    @override
+    def head_name(self) -> str:
+        return 'ashr'
 
 class UDiv(BinaryOp):
     @override
@@ -1867,6 +1894,8 @@ SQRT_F32 = DeclareFunction('llvm.sqrt.f32', FnType((F32,), F32))
 SQRT_F64 = DeclareFunction('llvm.sqrt.f64', FnType((F64,), F64))
 POW_F32 = DeclareFunction('llvm.pow.f32', FnType((F32, F32), F32))
 POW_F64 = DeclareFunction('llvm.pow.f64', FnType((F64, F64), F64))
+FLOOR_F32 = DeclareFunction('llvm.floor.f32', FnType((F32,), F32))
+FLOOR_F64 = DeclareFunction('llvm.floor.f64', FnType((F64,), F64))
 EXP_F32 = DeclareFunction('llvm.exp.f32', FnType((F32,), F32))
 EXP_F64 = DeclareFunction('llvm.exp.f64', FnType((F64,), F64))
 LN_F32 = DeclareFunction('llvm.log.f32', FnType((F32,), F32))

@@ -90,6 +90,11 @@ _BIN_OPS: dict[type[ast.AST], hir.BinaryOp] = {
     ast.FloorDiv: '//',
     ast.Mod: '%',
     ast.Pow: '**',
+    ast.BitOr: '|',
+    ast.BitAnd: '&',
+    ast.BitXor: '^',
+    ast.LShift: '<<',
+    ast.RShift: '>>',
 }
 
 _BOOL_OPS: dict[type[ast.AST], BoolOp] = {ast.And: 'and', ast.Or: 'or'}
@@ -100,7 +105,7 @@ def _is_none_literal(node: ast.expr) -> bool:
     ``expr is None`` tests against (see ``_Builder._gen_is_none``)."""
     return isinstance(node, ast.Constant) and node.value is None
 
-_UNARY_OPS: dict[type[ast.AST], hir.UnaryOp] = {ast.USub: '-'}
+_UNARY_OPS: dict[type[ast.AST], hir.UnaryOp] = {ast.USub: '-', ast.Invert: '~'}
 
 _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
     ast.Eq: '==',
@@ -778,14 +783,19 @@ class _Builder:
         address of a field of a runtime struct value (``self.h += e``);
         ``+=`` never declares: it requires the name to be declared."""
         fn_name = self._fn_ir.name
-        if not isinstance(node.op, ast.Add):
-            raise CompileError(f"only '+=' is supported yet in spy function {fn_name}")
-
+        # ``x op= y`` is ``x = x op y`` (or the in-place magic method, see
+        # ``interp``): every binary operator the source spells is accepted here
+        op = _BIN_OPS.get(type(node.op))
+        if op is None:
+            raise CompileError(
+                f"unsupported augmented assignment operator "
+                f"{type(node.op).__name__} in spy function {fn_name}"
+            )
         lhs = self._gen_expr(node.target, False)[0]
         if not lhs.is_ref:
             raise CompileError(f"target of augmented assignment must be a variable, got {node.target}")
         rhs = self._gen_expr(node.value)[0]
-        self.add(hir.BinaryAssign(_BIN_OPS[type(node.op)], lhs.value, rhs))
+        self.add(hir.BinaryAssign(op, lhs.value, rhs))
 
     # -- expressions ----------------------------------------------------------
 
@@ -928,8 +938,6 @@ class _Builder:
                 # ``not`` is value -> value (``hir.Not``), so it needs no result
                 # location: ``not expr`` is ``Not(AsBool(expr))``
                 return ArgEntry(self.add(hir.Not(self.add(hir.AsBool(self._gen_expr(node.operand)[0])))), False), False
-            case ast.BinOp(op=ast.BitOr()):
-                return ArgEntry(self._gen_bitor(node), False), False
             case ast.Compare():
                 if len(node.ops) != 1 or len(node.comparators) != 1:
                     raise CompileError(
@@ -1076,15 +1084,6 @@ class _Builder:
                 f"``:=`` introduces a new variable"
             )
         self._declare(name, value)
-
-    def _gen_bitor(self, node: ast.BinOp) -> hir.Inst:
-        """``a | b``: a tagged-union type value (both operands are compile-time
-        type values), or - later - a bitwise or.  Both operands are generated as
-        values; the interpreter decides which of the two the syntax spells (see
-        ``interp``)."""
-        lhs = self._as_value(self._gen_expr(node.left)[0])
-        rhs = self._as_value(self._gen_expr(node.right)[0])
-        return self.add(hir.BitOr(lhs, rhs))
 
     def _gen_isinstance(self, node: ast.Call, result_loc: hir.Value) -> None:
         """``isinstance(value, T)`` against a tagged union: the boolean the test
@@ -1268,8 +1267,6 @@ class _Builder:
                         f"unsupported unary operator {type(node.op).__name__} in spy function {fn_name}"
                     )
                 self.add(hir.Unary(op, self._gen_expr(node.operand)[0], result_loc))
-            case ast.BinOp() if isinstance(node.op, ast.BitOr):
-                self.add(hir.Store(result_loc, self._gen_bitor(node)))
             case ast.BinOp():
                 op = _BIN_OPS.get(type(node.op))
                 if op is None:

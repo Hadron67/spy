@@ -285,22 +285,42 @@ class _Lowerer:
                         self._lower_inst(llvm_fn.entry, inst, arg_values, block_map)
                         hoisted = True
         # lower every remaining instruction, iterating the blocks until no
-        # progress: an instruction is lowered once every value it uses is (a
-        # ``Phi``'s incomings are defined in its predecessors, so a phi is
-        # lowered once they are), and an instruction is never lowered before an
-        # earlier one of its block - so the definitions stay in order and a phi,
-        # its block's first instruction, is inserted at the front
+        # progress: an instruction is lowered once every value it uses is, and
+        # an instruction is never lowered before an earlier one of its block -
+        # so the definitions stay in order and a phi, its block's first
+        # instruction, is inserted at the front.  A ``Phi`` is special: a loop's
+        # back-edge incoming depends on the phi itself, so it is lowered as soon
+        # as one incoming is available and the rest are patched in afterwards
+        # (``pending_phi_incomings``, see ``_lower_inst``)
         progress = True
+        pending_phi_incomings: list[tuple[sllvm.Phi, mir.Value, mir.BasicBlock]] = []
         while progress:
             progress = False
             for block in blocks:
                 for inst in block.insts:
                     if id(inst) in self._lowered_ids:
                         continue
+                    if isinstance(inst, mir.Phi):
+                        # a phi may be lowered as soon as one of its incomings is
+                        # available (the others are added after the body, see
+                        # ``_lower_inst``); a phi whose incomings are all still
+                        # pending waits for a later pass
+                        ready = any(
+                            not (isinstance(value, mir.Inst) and id(value) not in self._lowered_ids)
+                            for value, _ in inst.incomings
+                        )
+                        if not ready:
+                            break
+                        self._lower_inst(block_map[id(block)], inst, arg_values, block_map, pending_phi_incomings)
+                        progress = True
+                        continue
                     if not self._operands_lowered(inst):
                         break
                     self._lower_inst(block_map[id(block)], inst, arg_values, block_map)
                     progress = True
+        # the back-edge incomings of the phis lowered above are available now
+        for phi, value, pred in pending_phi_incomings:
+            phi.add_incoming(self._value(value, arg_values), block_map[id(pred)])
         for block in blocks:
             for inst in block.insts:
                 if id(inst) not in self._lowered_ids:
@@ -369,6 +389,7 @@ class _Lowerer:
         inst: mir.Inst,
         arg_values: tuple[sllvm.Value, ...],
         block_map: dict[int, sllvm.BasicBlock],
+        pending_phi_incomings: list[tuple[sllvm.Phi, mir.Value, mir.BasicBlock]] | None = None,
     ) -> None:
         result: sllvm.Value | None = None
         match inst:
@@ -413,6 +434,7 @@ class _Lowerer:
             case mir.Arith():
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)
+                signed = isinstance(inst.type, mir.IntType) and inst.type.signed
                 match inst.op:
                     case '+':
                         result = block.add(lhs, rhs)
@@ -421,11 +443,28 @@ class _Lowerer:
                     case '*':
                         result = block.mul(lhs, rhs)
                     case '/':
-                        result = block.div(lhs, rhs, inst.signed)
+                        result = block.div(lhs, rhs, signed)
                     case '%':
-                        result = block.rem(lhs, rhs, inst.signed)
+                        result = block.rem(lhs, rhs, signed)
+                    case '|':
+                        result = block.or_(lhs, rhs)
+                    case '&':
+                        result = block.and_(lhs, rhs)
+                    case '^':
+                        result = block.xor(lhs, rhs)
+                    case '<<':
+                        result = block.shl(lhs, rhs)
+                    case '>>':
+                        result = block.ashr(lhs, rhs) if signed else block.lshr(lhs, rhs)
                     case _:
                         raise CompileError(f"unsupported MIR operation '{inst.op}'")
+            case mir.Floor():
+                result = block.floor(self._value(inst.value, arg_values))
+            case mir.Pow():
+                result = block.pow(
+                    self._value(inst.lhs, arg_values),
+                    self._value(inst.rhs, arg_values),
+                )
             case mir.Convert():
                 value = self._value(inst.value, arg_values)
                 to = self._to_llvm(inst.type)
@@ -478,22 +517,39 @@ class _Lowerer:
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)
                 op = _ICMP_OPS[inst.op]
-                if inst.kind == 'int':
-                    result = block.icmp(op, inst.signed, lhs, rhs)
-                elif inst.kind == 'ptr':
-                    # only equality is defined on pointers (``icmp eq/ne``)
-                    result = block.icmp(op, False, lhs, rhs)
-                else:
+                operand_type = inst.lhs.get_type()
+                if isinstance(operand_type, mir.FloatType):
                     result = block.fcmp(op, lhs, rhs)
+                else:
+                    # integers (a bool is an ``i1``) and pointers compare with
+                    # ``icmp``; only equality is defined on pointers, so their
+                    # signedness is irrelevant
+                    signed = isinstance(operand_type, mir.IntType) and operand_type.signed
+                    result = block.icmp(op, signed, lhs, rhs)
             case mir.Phi():
-                incomings = inst.incomings
-                first_value, first_block = incomings[0]
+                # a phi's incomings are defined in its predecessors; a loop's
+                # back-edge incoming is defined in the body and *depends on the
+                # phi itself*, so a phi is created as soon as one incoming is
+                # available and the rest are added once the body is lowered
+                # (``pending_phi_incomings``, see ``_lower_function_no_cache``)
+                available: list[tuple[mir.Value, mir.BasicBlock]] = []
+                pending: list[tuple[mir.Value, mir.BasicBlock]] = []
+                for value, pred in inst.incomings:
+                    if isinstance(value, mir.Inst) and id(value) not in self._lowered_ids:
+                        pending.append((value, pred))
+                    else:
+                        available.append((value, pred))
+                assert available, 'a phi needs at least one available incoming'
+                first_value, first_block = available[0]
                 phi = sllvm.Phi((self._value(first_value, arg_values), block_map[id(first_block)]))
-                for value, pred in incomings[1:]:
+                for value, pred in available[1:]:
                     phi.add_incoming(self._value(value, arg_values), block_map[id(pred)])
                 # an LLVM phi must lead its basic block
                 block.insts.insert(0, phi)
                 result = phi
+                if pending_phi_incomings is not None:
+                    for value, pred in pending:
+                        pending_phi_incomings.append((phi, value, pred))
             case mir.Call():
                 callee = self._value(inst.callee, arg_values)
                 result = block.call(
