@@ -9004,6 +9004,35 @@ def call_undef_return(n: i32) -> i32:
     return n
 
 
+@func()
+def undef_if() -> i32:
+    if undefined():
+        return 1
+    return 0
+
+
+@func()
+def undef_comptime_if() -> i32:
+    x: Comptime[spy_bool] = undefined()
+    if x:
+        return 1
+    return 0
+
+
+@func()
+def undef_while() -> i32:
+    while undefined():
+        return 1
+    return 0
+
+
+@func()
+def undef_and_condition(a: i32) -> i32:
+    if a > 0 and undefined():
+        return 1
+    return 0
+
+
 class SpyUndefinedTest(TestCase):
     """The ``std.core.undefined`` literal: a value of any type."""
 
@@ -9041,6 +9070,22 @@ class SpyUndefinedTest(TestCase):
     def test_the_literal_converts_at_a_return_location(self) -> None:
         self.assertEqual(call_undef_return(5), 5)
         self.assertEqual(call_undef_return(-5), -5)
+
+    def test_an_undefined_if_condition_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            undef_if()
+
+    def test_a_compile_time_undefined_bool_condition_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            undef_comptime_if()
+
+    def test_an_undefined_while_condition_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            undef_while()
+
+    def test_an_undefined_and_operand_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            undef_and_condition(1)
 
 
 all_tests = [

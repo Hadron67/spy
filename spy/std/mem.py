@@ -15,7 +15,7 @@ from ..compiler import (
 )
 from ..compiler.syntax import Opaque, ptr_cast
 from .c import free, malloc, realloc
-from .core import SlicePtr
+from .core import SlicePtr, undefined
 
 
 @struct()
@@ -63,7 +63,7 @@ class CAllocator:
     def resize(self, ptr: SlicePtr[u8], size: usize, align: usize) -> SlicePtr[u8]:
         if size == 0:
             free(ptr.ptr)
-            # TODO
+            return SlicePtr(undefined(), 0)
         if (ret := realloc(ptr.ptr, size)) is not None:
             return SlicePtr(ret, size)
         raise AllocError()

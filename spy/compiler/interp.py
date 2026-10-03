@@ -2326,6 +2326,8 @@ class HirRunner:
         frame = self._frames[-1]
         entry = frame.pc - 1
         cond = self.operand(inst.cond)
+        if _is_undefined_val(cond):
+            raise CompileError('the condition of an if is undefined')
         if isinstance(cond, ComptimeVal):
             p_else, p_end = self._scan_block(entry)
             if cond.obj:
@@ -2509,6 +2511,8 @@ class HirRunner:
         )
         if inst.cond is not None:
             cond = self.operand(inst.cond)
+            if _is_undefined_val(cond):
+                raise CompileError('the condition of a break_if is undefined')
             if isinstance(cond, ComptimeVal):
                 if not cond.obj:
                     return PollResult.AGAIN
@@ -5561,9 +5565,12 @@ class HirRunner:
         else is a condition."""
         type = _arg_type_of(value)
         if isinstance(type, sval.BoolType):
-            self._frames[-1].regs[ret] = self._arg_value(value)
+            ev = self._arg_value(value)
+            self._frames[-1].regs[ret] = ev
             return PollResult.AGAIN
         if isinstance(type, sval.StructType) and self._resolve_method(type, _BOOL_METHOD) is not None:
+            if _is_undefined_val(self._arg_value(value)):
+                raise CompileError('an if condition cannot be undefined')
             slot = self.alloca(InlineMode.NON_AGGREGATE)
             regs = self._frames[-1].regs
 
