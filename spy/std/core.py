@@ -130,16 +130,17 @@ class SlicePtr[T]:
         return self.ptr + index
 
     @func()
-    def slice(self, begin: Option[usize], end: Option[usize]) -> SlicePtr[T]:
-        start: usize = 0
-        if (b := begin) is not None:
-            start = b
-        stop: usize = self.length
-        if (e := end) is not None:
-            stop = e
+    def slice(self, begin: Option[usize], end: Option[usize] = None) -> SlicePtr[T]:
+        start: usize = unwrap_or(begin, 0)
+        stop: usize = unwrap_or(end, self.length)
         if start > stop or stop > self.length:
             self._out_of_bounds()
         return SlicePtr(self.ptr + start, stop - start)
+
+    @func()
+    def copy_from(self, source: ConstSlicePtr[T]):
+        for i in range(self.length):
+            self[i] = source[i]
 
     if TYPE_CHECKING:
         def __getitem__(self, index: int) -> T: ...
@@ -212,5 +213,13 @@ def unwrap[T](val: Option[T]) -> T:
         return ret
     raise NullException()
 
+def unwrap_or[T](val: Option[T], default: T) -> T:
+    if (ret := val) is not None:
+        return ret
+    return default
+
 @builtin_func
 def undefined() -> Any: ...
+
+@builtin_func
+def as_static_ptr[T](value: T) -> ConstPtr[T]: ...

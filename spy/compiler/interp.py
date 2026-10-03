@@ -560,6 +560,26 @@ def _is_comptime_val(val: InterpVal) -> bool:
                 todo.append(val.place)
     return True
 
+def _references_register(value: mir.Value) -> bool:
+    """Whether the MIR value tree ``value`` refers to a *register* - a
+    ``mir.Inst`` (the result of an instruction) or a ``mir.Param`` (a function
+    argument).  A global initializer may hold only constants and references to
+    globals, so a value that does (a load, a computation, an aggregate built by
+    an ``InsertValue`` chain, ...) cannot stand in one.  A ``mir.GlobalValue``
+    is a reference to a global and is not looked into (its body is not part of
+    the value it denotes)."""
+    todo: list[mir.Value] = [value]
+    while todo:
+        item = todo.pop()
+        if isinstance(item, (mir.Inst, mir.Param)):
+            return True
+        if isinstance(item, mir.GlobalValue):
+            continue
+        children = item.get_children()
+        if children is not None:
+            todo.extend(children)
+    return False
+
 def _is_inline_val(val: InterpVal) -> bool:
     """Whether the value may be *inlined* - kept as a compile-time value (in a
     :class:`ComptimeBox`, or as a :class:`ComptimeAggregatePtr` for an
@@ -3992,13 +4012,17 @@ class HirRunner:
             return None
 
     def _coerce(self, ev: InterpVal, target: sval.Type) -> InterpVal:
-        """Materialize a value of the spy type ``target``: a compile-time
-        value is converted with ``sval.coerce_const``, a runtime value
-        gets whatever numeric conversion the target needs - widening or
-        narrowing, see ``_convert_inst``.  A committed slot is the address
-        of the value it holds (``_shallow_normalize``), which is what an
-        operation that takes a value without loading it (taking an address,
-        ``ref``) hands over.
+        """A value of the spy type ``target``: a compile-time value is
+        converted with ``sval.coerce_const``, a runtime value gets whatever
+        numeric conversion the target needs - widening or narrowing, see
+        ``_convert_inst``.  A committed slot is the address of the value it
+        holds (``_shallow_normalize``), which is what an operation that takes a
+        value without loading it (taking an address, ``ref``) hands over.
+
+        An aggregate has no runtime representation of its own, so a
+        compile-time aggregate is only *type-checked* here and returned as it
+        is; building the runtime value of one is ``_to_runtime``'s job (the
+        callers that need a runtime value wrap the result with it).
 
         Raises :class:`~spy.errors.CoerceError` when the value has no
         materialization as ``target`` (see ``_try_coerce`` for the failing
@@ -4022,13 +4046,11 @@ class HirRunner:
         match ev:
             case ComptimeVal(obj) if isinstance(obj, sval.AggregateValue):
                 # an aggregate held as one compile-time object (see
-                # ``_as_aggregate``): it has no runtime representation of its
-                # own, so it is materialized like an interpreter aggregate value
+                # ``_as_aggregate``): like an interpreter aggregate value, it is
+                # only type-checked and returned (see ``_coerce_aggregate``)
                 aggregate = _as_aggregate(ev)
                 assert aggregate is not None
-                if not _is_aggregate(target):
-                    raise CoerceError(f'cannot materialize a {target} from an aggregate')
-                return self.load(self._materialize_aggregate(aggregate, target))
+                return self._coerce_aggregate(aggregate, target)
             case ComptimeVal(obj):
                 return ComptimeVal(sval.coerce_const(obj, target))
             case RuntimeVal(value, type):
@@ -4046,12 +4068,7 @@ class HirRunner:
                     )
                 return ev
             case ComptimeAggregate():
-                # an aggregate has no runtime representation to convert to: it
-                # is materialized into a temporary and read back as a runtime
-                # value
-                if not _is_aggregate(target):
-                    raise CoerceError(f'cannot materialize a {target} from an aggregate')
-                return self.load(self._materialize_aggregate(ev, target))
+                return self._coerce_aggregate(ev, target)
             case ComptimeCastedPtr():
                 # a pointer reinterpreted by ``ptr_cast``: reading or writing
                 # through it is not supported yet (see ``ComptimeCastedPtr``)
@@ -4060,6 +4077,16 @@ class HirRunner:
                 )
             case _:
                 raise CoerceError('cannot materialize this value')
+
+    def _coerce_aggregate(self, aggregate: ComptimeAggregate, target: sval.Type) -> InterpVal:
+        """A compile-time aggregate as a value of the aggregate type ``target``:
+        only the type is checked here - an aggregate is ever only its own type
+        (a zero-sized destination has no storage and takes anything) - and the
+        value is returned as it is; its runtime representation is built by
+        ``_to_runtime`` where one is actually needed."""
+        if not _is_aggregate(target) or (aggregate.type != target and not target.is_zst()):
+            raise CoerceError(f'cannot convert a {aggregate.type} value to {target}')
+        return aggregate
 
     def _materialize_aggregate(
         self, value: ComptimeAggregate, aggregate_type: sval.Type
@@ -5014,9 +5041,245 @@ class HirRunner:
                 raise CompileError('std.core.undefined takes no arguments')
             self.store(ret, ComptimeVal(sval.UntypedUndefined()))
             return PollResult.AGAIN
+        if fn.name == 'as_static_ptr':
+            return self._as_static_ptr(args, ret)
         if fn.name == 'layout_of':
             return self._layout_builtin(args, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
+
+    # -- ``std.core.as_static_ptr`` ------------------------------------------
+
+    def _as_static_ptr(self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+        """``std.core.as_static_ptr(value)``: a global static constant holding
+        ``value``, the result a pointer to it.  The value is lowered into a
+        global (see ``mir.GlobalConstant``); it may be a compile-time value or a
+        value built out of constants and global references, as long as the
+        constant it makes contains no *register* reference - a ``mir.Inst`` or
+        a ``mir.Param`` (see ``_references_register``).  A pointer inside it is
+        not followed: the value it points at becomes a global of its own, and
+        the pointer points at it (see ``_const_pointer_to_mir``)."""
+        if len(args.positional) != 1 or len(args.kwargs) > 0:
+            raise CompileError('std.core.as_static_ptr takes exactly one argument')
+        arg = args.positional[0]
+        value = _shallow_normalize(self._arg_value(arg))
+        type = _arg_type_of(arg)
+        if type is None:
+            raise CompileError('cannot determine the type of the value passed to as_static_ptr')
+        mir_type = type.to_mir_type(self._mir_cache)
+        if mir_type is None or type.classify() == sval.SpecialTypeKind.DST:
+            raise CompileError(f'a value of {type} has no runtime representation')
+        constant = self._const_to_mir(value, type)
+        pointer_type = sval.PointerType(type, is_const=True)
+        self.store(ret, RuntimeVal(mir.GlobalConstant(constant, mir.PointerType(mir_type, True)), pointer_type))
+        return PollResult.AGAIN
+
+    def _const_to_mir(self, ev: InterpVal, type: sval.Type) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
+        """The constant MIR value of the value ``ev`` of spy type ``type``: a
+        plain ``mir.Value`` for a scalar or a pointer/global reference, or an
+        ``AggregateConstant`` / ``UnionConstant`` for an aggregate (which cannot
+        be an instruction operand, see ``mir``).  Every representation follows
+        the MIR representation of ``type``; a value that refers to a register is
+        rejected (see ``_const_runtime_to_mir``)."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, RuntimeVal):
+            return self._const_runtime_to_mir(ev, type)
+        if isinstance(type, sval.PointerType):
+            # the value *is* the pointer (a pointer to compile-time storage): it
+            # is not followed here - the value it points at becomes a global of
+            # its own and the pointer points at it (see ``_const_pointer_to_mir``)
+            return self._const_pointer_to_mir(ev, type)
+        if isinstance(ev, (ComptimeAggregatePtr, ComptimeBox, ComptimeOptionPtr, ComptimeTaggedUnionPtr)):
+            ev = self.load(ev)
+        match type:
+            case sval.BoolType():
+                return mir.BoolValue(_comptime_bool(ev, 'the value passed to as_static_ptr'))
+            case sval.IntType():
+                obj = _to_comptime(ev)
+                if not isinstance(obj, sval.Int):
+                    raise CompileError(f'expected a compile-time integer, got {ev!r}')
+                return mir.Int(obj.value, mir.IntType(type.bits, type.signed))
+            case sval.FloatType():
+                obj = _to_comptime(ev)
+                if not isinstance(obj, sval.Float):
+                    raise CompileError(f'expected a compile-time float, got {ev!r}')
+                return mir.Float(obj.value, mir.FloatType(type.bits))
+            case sval.OptionType():
+                return self._const_option_to_mir(ev, type)
+            case sval.TaggedUnionType():
+                return self._const_tagged_union_to_mir(ev, type)
+            case sval.StructType():
+                return self._const_struct_to_mir(ev, type)
+            case sval.ArrayType():
+                return self._const_array_to_mir(ev, type)
+            case _:
+                raise CompileError(f'cannot make a static pointer to a value of {type}')
+
+    def _const_runtime_to_mir(self, ev: RuntimeVal, type: sval.Type) -> mir.Value:
+        """The constant of the runtime value ``ev``: only a value that refers
+        to no register may stand in a global initializer - a constant leaf, or a
+        reference to a global (another static constant, a function, an external
+        symbol).  Anything computed at runtime (a ``mir.Load``, a ``mir.Gep``,
+        an ``InsertValue`` chain, ...) is rejected."""
+        if _references_register(ev.value):
+            raise CompileError(
+                f'cannot make a static pointer to a {type} value that refers to a runtime register'
+            )
+        return ev.value
+
+    def _const_pointer_to_mir(self, ev: InterpVal, type: sval.PointerType) -> mir.Value:
+        """The constant of a pointer value: a null pointer, a function pointer,
+        an undefined pointer, or - for a pointer to compile-time storage - a
+        reference to a fresh global holding the content it points at."""
+        mir_type = type.to_mir_type(self._mir_cache)
+        assert isinstance(mir_type, mir.PointerType)
+        obj = _to_comptime(ev)
+        if isinstance(obj, (sval.Null, sval.TypedNull)):
+            return mir.NullValue(mir_type)
+        if isinstance(obj, sval.DeclareFunction):
+            return _sval_to_runtime(obj, self._mir_cache)
+        if isinstance(obj, sval.Undefined):
+            return mir.UndefValue(mir_type)
+        if isinstance(ev, (ComptimeAggregatePtr, ComptimeBox, ComptimeOptionPtr, ComptimeTaggedUnionPtr)):
+            # the pointer names compile-time storage: the content becomes a global
+            # of its own, and the pointer is a reference to it
+            elem = type.elem
+            elem_mir = elem.to_mir_type(self._mir_cache)
+            if elem_mir is None or elem.classify() == sval.SpecialTypeKind.DST:
+                raise CompileError(f'cannot make a static pointer to a pointer to {elem}')
+            content = self._const_to_mir(self.load(ev), elem)
+            return mir.GlobalConstant(content, mir.PointerType(elem_mir, mir_type.is_const))
+        raise CompileError(f'cannot make a static pointer to the pointer constant {ev!r}')
+
+    def _const_struct_to_mir(self, ev: InterpVal, type: sval.StructType) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
+        aggregate = _as_aggregate(ev)
+        if aggregate is None:
+            raise CompileError(f'cannot make a static pointer to the struct value {ev!r}')
+        mir_type = type.to_mir_type(self._mir_cache)
+        if not isinstance(mir_type, mir.StructType):
+            raise _no_runtime_type(type)
+        indices = type.get_field_mir_indices(self._mir_cache)
+        fields = list(type.fields().values())
+        if type.mirror_is_a_field(self._mir_cache):
+            for index, mir_index in enumerate(indices):
+                if mir_index is not None:
+                    return self._const_to_mir(aggregate.values[index], fields[index].type)
+            raise CompileError(f'{type} has no stored field')
+        members: dict[int, mir.Value | mir.AggregateConstant | mir.UnionConstant] = {}
+        for index, mir_index in enumerate(indices):
+            if mir_index is None:
+                continue
+            members[mir_index] = self._const_to_mir(aggregate.values[index], fields[index].type)
+        return mir.AggregateConstant(mir_type, tuple(members[i] for i in range(len(mir_type.fields))))
+
+    def _const_array_to_mir(self, ev: InterpVal, type: sval.ArrayType) -> mir.AggregateConstant:
+        aggregate = _as_aggregate(ev)
+        if aggregate is None:
+            raise CompileError(f'cannot make a static pointer to the array value {ev!r}')
+        mir_type = type.to_mir_type(self._mir_cache)
+        if not isinstance(mir_type, mir.ArrayType):
+            raise _no_runtime_type(type)
+        length = type.length_int
+        if length is None:
+            raise CompileError(f'cannot tell how many elements {type} holds')
+        members = tuple(self._const_to_mir(aggregate.values[index], type.elem) for index in range(length))
+        return mir.AggregateConstant(mir_type, members)
+
+    def _const_option_to_mir(self, ev: InterpVal, type: sval.OptionType) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
+        if isinstance(ev, ComptimeOption):
+            is_null, value = ev.is_null, ev.value
+        elif isinstance(_to_comptime(ev), (sval.Null, sval.TypedNull)):
+            is_null, value = ComptimeVal(True), None
+        else:
+            raise CompileError(f'cannot make a static pointer to the option value {ev!r}')
+        child = type.child
+        absent = _comptime_bool(is_null, 'the absence of the option')
+        if child.is_zst():
+            return mir.BoolValue(not absent)
+        tag_path = sval.find_first_pointer_type_pos(child)
+        if tag_path is None:
+            mir_type = type.to_mir_type(self._mir_cache)
+            assert isinstance(mir_type, mir.StructType)
+            payload: mir.Value | mir.AggregateConstant | mir.UnionConstant
+            if absent:
+                payload = mir.UndefValue(mir_type.fields[1].type)
+            else:
+                assert value is not None
+                payload = self._const_to_mir(self._coerce(value, child), child)
+            return mir.AggregateConstant(mir_type, (mir.BoolValue(not absent), payload))
+        if absent:
+            return self._absent_path_constant(child, tag_path)
+        assert value is not None
+        return self._const_to_mir(self._coerce(value, child), child)
+
+    def _absent_path_constant(self, child: sval.Type, path: tuple[int, ...]) -> mir.Value | mir.AggregateConstant:
+        """The constant an absent option with a pointer tag has: the child
+        constant with the pointer that tags the option (its first pointer, see
+        ``sval.find_first_pointer_type_pos``) left null.  The other fields are
+        undefined - nothing may read the payload of an absent option."""
+        node: sval.Type = child
+        layers: list[tuple[mir.Type, int]] = []
+        for index in path:
+            if isinstance(node, sval.OptionType):
+                node = node.child
+                continue
+            mir_index: int | None
+            if isinstance(node, sval.StructType):
+                if node.mirror_is_a_field(self._mir_cache):
+                    mir_index = None
+                else:
+                    mir_index = node.get_field_mir_indices(self._mir_cache)[index]
+            elif isinstance(node, sval.ArrayType):
+                mir_index = index
+            else:
+                raise CompileError(f'cannot take the tag pointer of Option[{child}]')
+            if mir_index is not None:
+                mir_type = node.to_mir_type(self._mir_cache)
+                assert mir_type is not None
+                layers.append((mir_type, mir_index))
+            node = node.get_type_children()[index]
+        assert isinstance(node, sval.PointerType)
+        mir_pointer = node.to_mir_type(self._mir_cache)
+        assert isinstance(mir_pointer, mir.PointerType)
+        result: mir.Value | mir.AggregateConstant = mir.NullValue(mir_pointer)
+        for outer_type, mir_index in reversed(layers):
+            if isinstance(outer_type, mir.StructType):
+                members = tuple(
+                    result if i == mir_index else mir.UndefValue(field.type)
+                    for i, field in enumerate(outer_type.fields)
+                )
+            else:
+                assert isinstance(outer_type, mir.ArrayType)
+                members = tuple(
+                    result if i == mir_index else mir.UndefValue(outer_type.elem)
+                    for i in range(outer_type.length)
+                )
+            result = mir.AggregateConstant(outer_type, members)
+        return result
+
+    def _const_tagged_union_to_mir(self, ev: InterpVal, type: sval.TaggedUnionType) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
+        if not isinstance(ev, ComptimeTaggedUnionValue):
+            raise CompileError(f'cannot make a static pointer to the union value {ev!r}')
+        tag = self._tagged_union_int(ev.tag)
+        shape = self._tagged_union_shape(type)
+        if shape == 'single':
+            return self._const_to_mir(self._coerce(ev.value, type.types[0]), type.types[0])
+        if shape == 'tag_only':
+            mir_type = type.to_mir_type(self._mir_cache)
+            assert isinstance(mir_type, mir.IntType)
+            return mir.Int(tag, mir_type)
+        mir_type = type.to_mir_type(self._mir_cache)
+        assert isinstance(mir_type, mir.StructType)
+        union = mir_type.fields[1].type
+        assert isinstance(union, mir.UnionType)
+        variant_type = type.types[tag]
+        variant = variant_type.to_mir_type(self._mir_cache)
+        if variant is None:
+            payload: mir.Value | mir.AggregateConstant | mir.UnionConstant = mir.UndefValue(union)
+        else:
+            payload = mir.UnionConstant(union, variant, self._const_to_mir(self._coerce(ev.value, variant_type), variant_type))
+        tag_type = mir_type.fields[0].type
+        assert isinstance(tag_type, mir.IntType)
+        return mir.AggregateConstant(mir_type, (mir.Int(tag, tag_type), payload))
 
     # -- ``std.mem.layout_of`` -----------------------------------------------
 

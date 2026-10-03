@@ -68,6 +68,9 @@ class Allocator(Protocol):
         layout = layout_of(T).repeat(count)
         return SlicePtr(ptr_cast(self.resize(ptr_cast(ptr.ptr, MultiPtr[u8]), layout_of(T).repeat(ptr.length), layout), MultiPtr[T]), count)
 
+    def deinit_array[T](self, ptr: SlicePtr[T]):
+        self.resize_array(ptr, 0)
+
 @struct()
 class AllocatorVtable:
     alloc: ConstPtr[AllocFn]

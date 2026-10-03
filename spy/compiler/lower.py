@@ -215,6 +215,7 @@ class _Lowerer:
     ) -> None:
         self._types = types
         self._target = target
+        self._layout = sllvm.DataLayout(target.pointer_size)
         self._lowered: dict[object, sllvm.Value] = {}
         # the instructions already lowered (a terminator has no lowered value,
         # so ``_lowered`` alone cannot tell whether one was lowered)
@@ -373,8 +374,127 @@ class _Lowerer:
                     return sllvm.DeclareFunction(name, fn_type)
                 else:
                     raise NotImplementedError(f"TODO: lower global {value!r}")
+            case mir.GlobalConstant():
+                return self._lower_global_constant(value)
             case _:
                 raise NotImplementedError(f"TODO: lower global {value!r}")
+
+    def _lower_global_constant(self, constant: mir.GlobalConstant) -> sllvm.GlobalValue:
+        """A global static constant: the location the pointer ``constant``
+        names holds the constant value.  The initializer is a scalar or an
+        aggregate; a value the module already names (a function pointer) stays
+        a reference to it."""
+        pointee = self._to_llvm(constant.type.elem)
+        align = self._layout.align_of(pointee)
+        lowered = self._lower_constant(constant.value)
+        if isinstance(lowered, sllvm.AggregateConstant):
+            return sllvm.GlobalAggregateValue(lowered, align=align)
+        return sllvm.GlobalScalarValue(lowered, align=align)
+
+    def _lower_constant(self, constant: mir.Value | mir.AggregateConstant | mir.UnionConstant) -> sllvm.Value | sllvm.AggregateConstant:
+        """Lower one constant of a global initializer: a scalar leaf to its
+        LLVM value, an aggregate/union constant to a literal (see
+        ``_lower_aggregate_constant`` / ``_lower_union_constant``)."""
+        match constant:
+            case mir.AggregateConstant():
+                return self._lower_aggregate_constant(constant)
+            case mir.UnionConstant():
+                return self._lower_union_constant(constant)
+            case _:
+                return self._value(constant, ())
+
+    def _needs_literal(self, constant: mir.AggregateConstant | mir.UnionConstant) -> bool:
+        """Whether the constant must be laid out with a literal type: an
+        aggregate constant can use the named types of its fields only when no
+        union along it holds a variant other than its storage variant."""
+        match constant:
+            case mir.UnionConstant():
+                return constant.variant != constant.union.payload
+            case mir.AggregateConstant():
+                return any(
+                    self._needs_literal(member)
+                    for member in constant.values
+                    if isinstance(member, (mir.AggregateConstant, mir.UnionConstant))
+                )
+            case _:
+                return False
+
+    def _member_type(self, member: sllvm.Value | sllvm.AggregateConstant) -> sllvm.Type:
+        if isinstance(member, sllvm.AggregateConstant):
+            return member.type
+        return member.get_type()
+
+    def _lower_union_constant(self, constant: mir.UnionConstant) -> sllvm.Value | sllvm.AggregateConstant:
+        """Lower a constant union value.  A variant that is the union's storage
+        variant is stored as itself; any other one is laid out the way clang
+        lays it out, as a literal ``{<variant>, [pad x i8]}`` padded to the
+        storage's size (see ``mir.UnionConstant``)."""
+        payload = self._to_llvm(constant.union.payload)
+        if constant.variant == constant.union.payload:
+            return self._lower_constant(constant.value)
+        variant = self._to_llvm(constant.variant)
+        pad = self._layout.size_of(payload) - self._layout.size_of(variant)
+        fields = [variant]
+        values: list[sllvm.Value | sllvm.AggregateConstant] = [self._lower_constant(constant.value)]
+        if pad > 0:
+            pad_type = sllvm.ArrayType(sllvm.I8, pad)
+            fields.append(pad_type)
+            values.append(sllvm.ZeroInitializer(pad_type))
+        return sllvm.AggregateConstant(sllvm.LiteralStructType(*fields), *values)
+
+    def _lower_aggregate_constant(self, constant: mir.AggregateConstant) -> sllvm.AggregateConstant:
+        """Lower a constant aggregate value.  When no union member forces a
+        literal type it uses the named struct/array type of the aggregate;
+        otherwise it builds a literal type whose members reproduce the layout
+        of that named type (explicit ``[pad x i8]`` between the fields), the way
+        clang lays out a global holding a union (see ``mir.AggregateConstant``)."""
+        if not self._needs_literal(constant):
+            values: list[sllvm.Value | sllvm.AggregateConstant] = []
+            for member in constant.values:
+                values.append(self._lower_constant(member))
+            mir_type = self._to_llvm(constant.type)
+            assert isinstance(mir_type, sllvm.AggregateType)
+            return sllvm.AggregateConstant(mir_type, *values)
+        if isinstance(constant.type, mir.StructType):
+            return self._lower_literal_struct(constant)
+        return self._lower_literal_array(constant)
+
+    def _lower_literal_array(self, constant: mir.AggregateConstant) -> sllvm.AggregateConstant:
+        values: list[sllvm.Value | sllvm.AggregateConstant] = [
+            self._lower_constant(member) for member in constant.values
+        ]
+        if values:
+            elem = self._member_type(values[0])
+        else:
+            elem = self._to_llvm(constant.type.elem)  # pyright: ignore[reportAttributeAccessIssue]
+        return sllvm.AggregateConstant(sllvm.ArrayType(elem, constant.type.length), *values)  # pyright: ignore[reportAttributeAccessIssue]
+
+    def _lower_literal_struct(self, constant: mir.AggregateConstant) -> sllvm.AggregateConstant:
+        assert isinstance(constant.type, mir.StructType)
+        fields: list[sllvm.Type] = []
+        values: list[sllvm.Value | sllvm.AggregateConstant] = []
+        offset = 0
+        align = 1
+        for field, member in zip(constant.type.fields, constant.values):
+            canonical = self._to_llvm(field.type)
+            field_align = self._layout.align_of(canonical)
+            pad = sllvm.align_up(offset, field_align) - offset
+            if pad > 0:
+                pad_type = sllvm.ArrayType(sllvm.I8, pad)
+                fields.append(pad_type)
+                values.append(sllvm.ZeroInitializer(pad_type))
+                offset += pad
+            lowered = self._lower_constant(member)
+            fields.append(self._member_type(lowered))
+            values.append(lowered)
+            offset += self._layout.size_of(canonical)
+            align = max(align, field_align)
+        tail = sllvm.align_up(offset, align) - offset
+        if tail > 0:
+            pad_type = sllvm.ArrayType(sllvm.I8, tail)
+            fields.append(pad_type)
+            values.append(sllvm.ZeroInitializer(pad_type))
+        return sllvm.AggregateConstant(sllvm.LiteralStructType(*fields), *values)
 
     def lower_global(self, value: mir.GlobalValue) -> sllvm.GlobalValue:
         """The lowered form of a function value: the in-module
@@ -399,12 +519,12 @@ class _Lowerer:
                 result = block.alloca(self._to_llvm(inst.type))
             case mir.Sizeof():
                 result = sllvm.IntValue(
-                    mir.estimated_size_of(inst.type, self._target.pointer_size),
+                    self._layout.size_of(self._to_llvm(inst.type)),
                     sllvm.IntType(inst.bits),
                 )
             case mir.Alignof():
                 result = sllvm.IntValue(
-                    mir.estimated_alignment_of(inst.type, self._target.pointer_size),
+                    self._layout.align_of(self._to_llvm(inst.type)),
                     sllvm.IntType(inst.bits),
                 )
             case mir.Store():
@@ -519,8 +639,8 @@ class _Lowerer:
                 src = inst.value.get_type()
                 assert isinstance(src, mir.Type), 'a union conversion operand has a type'
                 dst = inst.type
-                src_size = mir.estimated_size_of(src, self._target.pointer_size)
-                dst_size = mir.estimated_size_of(dst, self._target.pointer_size)
+                src_size = self._layout.size_of(self._to_llvm(src))
+                dst_size = self._layout.size_of(self._to_llvm(dst))
                 wide = dst if dst_size > src_size else src
                 slot = block.alloca(self._to_llvm(wide))
                 block.store(slot, value)

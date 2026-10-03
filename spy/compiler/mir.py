@@ -351,6 +351,41 @@ class UndefValue(Value):
         return (self.type,)
 
 
+@dataclass(frozen=True, slots=True)
+class AggregateConstant:
+    """A constant aggregate value: the initializer of a
+    :class:`GlobalConstant`.  It is deliberately *not* a ``Value`` - an
+    aggregate constant cannot be an operand of an instruction (an LLVM
+    aggregate constant only appears as an initializer) - so it is only ever the
+    ``value`` of a global or nested inside another aggregate constant.  The
+    members are in *layout* (mirror) order; a member is a plain ``Value`` (a
+    scalar, a global reference), a nested ``AggregateConstant``, or a
+    :class:`UnionConstant`."""
+
+    type: StructType | ArrayType
+    values: tuple[AggregateConstant | UnionConstant | Value, ...]
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type, *self.values)
+
+
+@dataclass(frozen=True, slots=True)
+class UnionConstant:
+    """A constant union value: the variant ``variant`` of the union ``union``,
+    with its constant ``value``.  Like :class:`AggregateConstant` it is not a
+    ``Value``: a union constant is only ever an initializer, and one that holds
+    a variant other than the union's storage variant is laid out the way clang
+    lays out such a global - as a literal ``{<variant>, [pad x i8]}`` (see
+    ``lower``)."""
+
+    union: UnionType
+    variant: Type
+    value: AggregateConstant | UnionConstant | Value
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.union, self.variant, self.value)
+
+
 class GlobalValue(Value):
     def __hash__(self) -> int:
         return object.__hash__(self)
@@ -400,6 +435,31 @@ class ExternAnonSymbol(GlobalValue):
     @override
     def get_name(self) -> tuple[str, bool]:
         return self.name_base, True
+
+
+@dataclass(eq=False, slots=True)
+class GlobalConstant(GlobalValue):
+    """A global static constant: the pointer to a static location holding the
+    constant ``value``.  ``type`` is the pointer type of the expression that
+    names the location (a ``ConstPtr[T]``); the lowerer emits the location (see
+    ``lower``).  The value is a plain ``Value`` for a scalar (or a global
+    reference), or an ``AggregateConstant`` / ``UnionConstant`` for an
+    aggregate (which cannot be an instruction operand)."""
+
+    value: AggregateConstant | UnionConstant | Value
+    type: PointerType
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type, self.value)
+
+    @override
+    def get_name(self) -> tuple[str, bool]:
+        return 'const', True
+
 
 @dataclass(eq=False)
 class Param(Value):
@@ -1389,7 +1449,7 @@ class Function(GlobalValue):
 
 def collect_symbols(entry: list[GlobalValue]) -> set[GlobalValue | StructType]:
     symbols: set[GlobalValue | StructType] = set()
-    todo: list[Value | StructType] = [a for a in entry]
+    todo: list[Any] = [a for a in entry]
     while todo:
         value = todo.pop()
         if value in symbols:

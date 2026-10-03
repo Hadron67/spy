@@ -5,6 +5,7 @@ from enum import Enum, IntEnum
 from types import EllipsisType
 from typing import final, override
 
+from .errors import CompileError
 from .util import ObjectCounter, StrBiMap, gen_get_children
 
 
@@ -32,14 +33,6 @@ class Type:
 
     def is_compatible(self, other: Type):
         return self == other
-
-    @abstractmethod
-    def size(self, pointer_size: int) -> int:
-        ...
-
-    @abstractmethod
-    def align(self, pointer_size: int) -> int:
-        ...
 
 class Value:
     @abstractmethod
@@ -80,14 +73,6 @@ class FloatType(Type):
     def from_float(self, value: float) -> Value:
         return FloatValue(value, self)
 
-    @override
-    def size(self, pointer_size: int) -> int:
-        return (self.bits + 7) // 8
-
-    @override
-    def align(self, pointer_size: int) -> int:
-        return self.size(pointer_size)
-
 F32 = FloatType(32)
 F64 = FloatType(64)
 
@@ -116,14 +101,6 @@ class IntType(Type):
             raise ValueError(f'value {value} out of range for {self}')
         return IntValue(value, self)
 
-    @override
-    def size(self, pointer_size: int) -> int:
-        return (self.bits + 7) // 8
-
-    @override
-    def align(self, pointer_size: int) -> int:
-        return self.size(pointer_size)
-
 I8 = IntType(8)
 I32 = IntType(32)
 I64 = IntType(64)
@@ -147,14 +124,6 @@ class PointerType(Type):
     @override
     def is_compatible(self, other: Type):
         return isinstance(other, PointerType)
-
-    @override
-    def size(self, pointer_size: int) -> int:
-        return pointer_size
-
-    @override
-    def align(self, pointer_size: int) -> int:
-        return pointer_size
 
 
 @dataclass(frozen=True)
@@ -247,13 +216,80 @@ class ArrayType(AggregateType):
     def stringify(self, name_context: NameContext | None = None) -> str:
         return f"[{self.length} x {self.child.stringify(name_context)}]"
 
-    @override
-    def size(self, pointer_size: int) -> int:
-        return self.length * self.child.size(pointer_size)
+
+class LiteralStructType(AggregateType):
+    """An anonymous struct type: LLVM's *literal* struct type, emitted inline
+    as ``{...}`` rather than by name.  It is the type the lowering of a global
+    constant with a union member builds: clang lays such a constant out with a
+    literal type whose members reproduce the layout of the named types (see
+    ``lower``), and the members of such a type do not all have a named type of
+    their own."""
+
+    def __init__(self, *fields: Type) -> None:
+        self.fields = list(fields)
+
+    def __str__(self) -> str:
+        return '{' + ', '.join(str(i) for i in self.fields) + '}'
 
     @override
-    def align(self, pointer_size: int) -> int:
-        return self.child.align(pointer_size)
+    def stringify(self, name_context: NameContext | None = None) -> str:
+        return '{' + ', '.join(i.stringify(name_context) for i in self.fields) + '}'
+
+    def get_children(self) -> list[Type]:
+        return list(self.fields)
+
+
+def align_up(offset: int, align: int) -> int:
+    return (offset + align - 1) // align * align
+
+
+@dataclass(frozen=True, slots=True)
+class DataLayout:
+    """The data layout of the target a module is lowered for.  It carries the
+    pointer size the layout depends on, and computes the *final* size and
+    alignment of a lowered type from it (mirroring LLVM's own rules for the
+    types this module emits).  It is the authority for ``mir.Sizeof``/
+    ``mir.Alignof`` and for the padding of a global constant's layout."""
+
+    pointer_size: int
+
+    def size_of(self, type: Type) -> int:
+        match type:
+            case VoidType():
+                return 0
+            case FloatType():
+                return (type.bits + 7) // 8
+            case IntType():
+                return (type.bits + 7) // 8
+            case PointerType():
+                return self.pointer_size
+            case ArrayType():
+                return type.length * self.size_of(type.child)
+            case StructType() | LiteralStructType():
+                offset = 0
+                for field in type.fields:
+                    offset = align_up(offset, self.align_of(field))
+                    offset += self.size_of(field)
+                return align_up(offset, self.align_of(type))
+            case _:
+                raise CompileError(f'type {type!r} has no size')
+
+    def align_of(self, type: Type) -> int:
+        match type:
+            case VoidType():
+                return 1
+            case FloatType():
+                return (type.bits + 7) // 8
+            case IntType():
+                return max(1, (type.bits + 7) // 8)
+            case PointerType():
+                return self.pointer_size
+            case ArrayType():
+                return self.align_of(type.child)
+            case StructType() | LiteralStructType():
+                return max((self.align_of(f) for f in type.fields), default=1)
+            case _:
+                raise CompileError(f'type {type!r} has no alignment')
 
 
 class LocalValue(Value):
@@ -349,6 +385,21 @@ class Undef(Value):
     @override
     def __str__(self) -> str:
         return "undef"
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+@dataclass(frozen=True, slots=True)
+class ZeroInitializer(Value):
+    """The zero value of a type (LLVM's ``zeroinitializer``): it fills the
+    padding arrays of a global constant's layout (see `lower`)."""
+
+    type: Type
+
+    @override
+    def stringify_value(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue] | None = None) -> str:
+        return 'zeroinitializer'
 
     @override
     def get_type(self) -> Type:
@@ -474,20 +525,43 @@ class GlobalValueFlags:
             ret += 'constant '
         return ret
 
+class AggregateConstant:
+    """A constant aggregate value: the initializer of a :class:`GlobalAggregateValue`.
+    It is deliberately *not* a :class:`Value` - an aggregate constant cannot be
+    an operand of an instruction (LLVM aggregate constants only appear as
+    initializers), so it is only ever held by a global or nested inside another
+    ``AggregateConstant``.  ``values`` holds the members in layout order; a
+    member is a ``Value`` (a scalar, a global reference, a ``ZeroInitializer``)
+    or a nested ``AggregateConstant``."""
+
+    def __init__(self, type: AggregateType, *values: Value | AggregateConstant) -> None:
+        self.type = type
+        self.values: list[Value | AggregateConstant] = list(values)
+
+    def stringify(self, name_context: NameContext) -> str:
+        inner = ', '.join(v.stringify(name_context) for v in self.values)
+        type_str = self.type.stringify(name_context)
+        if isinstance(self.type, ArrayType):
+            return f'{type_str} [{inner}]'
+        return f'{type_str} {{{inner}}}'
+
 @gen_get_children
 class GlobalScalarValue(GlobalValue):
     value: Value
     flags: int
+    align: int | None
 
     @override
-    def __init__(self, value: Value, flags: int = GlobalValueFlags.DEFAULT) -> None:
+    def __init__(self, value: Value, flags: int = GlobalValueFlags.DEFAULT, align: int | None = None) -> None:
         self.value = value
         self.flags = flags
+        self.align = align
 
     @override
     def write_definition(self, name_context: NameContext) -> list[str]:
         flags = GlobalValueFlags.str(self.flags)
-        return [f'@{name_context.get_global_name(self)} = {flags}{self.value.stringify(name_context)}']
+        align = f', align {self.align}' if self.align is not None else ''
+        return [f'@{name_context.get_global_name(self)} = {flags}{self.value.stringify(name_context)}{align}']
 
     @override
     def get_type(self) -> Type:
@@ -497,45 +571,45 @@ class GlobalScalarValue(GlobalValue):
     def get_default_name_prefix(self):
         return "global", True
 
-@gen_get_children
 class GlobalAggregateValue(GlobalValue):
-    values: list[Value]
-    flags: int
-    type: Type
+    """A global constant holding an aggregate: ``constant`` is its
+    initializer (see :class:`AggregateConstant`) and ``align`` the alignment
+    the layout asks for (the initializer's own literal type may imply a lower
+    one, see ``lower``)."""
 
-    @override
-    def __init__(self, type: Type, *values: Value, flags: int = GlobalValueFlags.DEFAULT) -> None:
-        self.values = list(values)
+    def __init__(self, constant: AggregateConstant, flags: int = GlobalValueFlags.DEFAULT, align: int | None = None) -> None:
+        self.constant = constant
         self.flags = flags
-        self.type = type
-        match type:
-            case StructType():
-                assert len(values) == len(type.fields), f"length mismatch: {len(values)} != {len(type.fields)}"
-                for value, result_type in zip(values, type.fields):
-                    value_type = value.get_type()
-                    assert result_type.is_compatible(value_type), f"incompatible types {result_type} and {value_type}"
-            case ArrayType():
-                assert len(values) == type.length, f"length mismatch: {len(values)} != {type.length}"
-                for value in values:
-                    value_type = value.get_type()
-                    assert type.child.is_compatible(value_type), f"incompatible types {type.child} and {value_type}"
-            case _:
-                raise TypeError(f"{type} is not an aggregate type")
+        self.align = align
 
     @override
     def write_definition(self, name_context: NameContext) -> list[str]:
         flags = GlobalValueFlags.str(self.flags)
-        type = self.type.stringify(name_context)
-        values = ', '.join(v.stringify(name_context) for v in self.values)
-        return [f'@{name_context.get_global_name(self)} = {flags}{type} {{{values}}}']
+        align = f', align {self.align}' if self.align is not None else ''
+        return [f'@{name_context.get_global_name(self)} = {flags}{self.constant.stringify(name_context)}{align}']
 
     @override
     def get_type(self) -> Type:
-        return PointerType(self.type)
+        return PointerType(self.constant.type)
+
+    def get_children(self) -> list[Value]:
+        return list(_constant_leaves(self.constant))
 
     @override
     def get_default_name_prefix(self):
         return "global", True
+
+
+def _constant_leaves(constant: Value | AggregateConstant) -> list[Value]:
+    """The ``Value`` leaves of a constant aggregate initializer, in order:
+    what the module has to declare (a referenced global, e.g. a function
+    pointer) is reached through them (see ``Module.add_recursively``)."""
+    if isinstance(constant, AggregateConstant):
+        ret: list[Value] = []
+        for member in constant.values:
+            ret.extend(_constant_leaves(member))
+        return ret
+    return [constant]
 
 @gen_get_children
 class GlobalZeroAggregateValue(GlobalValue):
