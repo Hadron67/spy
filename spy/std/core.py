@@ -1,9 +1,9 @@
 # This file is imported by the compiler, make sure to avoid circular imports.
 
-from typing import Protocol, Self, cast
+from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from ..compiler import syntax, usize
-from ..compiler.dsl import struct
+from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
     Array,
     ConstMultiPtr,
@@ -75,6 +75,33 @@ class ConstSlicePtr[T]:
     def refs(self) -> _ConstSliceRefIterator[T]:
         return _ConstSliceRefIterator(self.ptr, self.length)
 
+    def _out_of_bounds(self):
+        pass
+
+    def __spy_getitemptr__(self, index: usize) -> ConstPtr[T]:
+        if index >= self.length:
+            self._out_of_bounds()
+        return self.ptr + index
+
+    @func()
+    def slice(self, begin: Option[usize], end: Option[usize]) -> ConstSlicePtr[T]:
+        start: usize = 0
+        if (b := begin) is not None:
+            start = b
+        stop: usize = self.length
+        if (e := end) is not None:
+            stop = e
+        if start > stop or stop > self.length:
+            self._out_of_bounds()
+        return ConstSlicePtr(self.ptr + start, stop - start)
+
+    if TYPE_CHECKING:
+        # only so that the Python type checker accepts the ``s[i]`` spellings:
+        # the subscript compiles to ``hir.Subscript`` and goes through
+        # ``__spy_getitemptr__`` (see ``interp.HirRunner.subscript``), never
+        # through these
+        def __getitem__(self, index: int) -> T: ...
+
 @struct()
 class SlicePtr[T]:
     """The slice of a mutable multi pointer - the value ``arr_slice`` builds,
@@ -92,6 +119,30 @@ class SlicePtr[T]:
 
     def refs(self) -> _SliceRefIterator[T]:
         return _SliceRefIterator(self.ptr, self.length)
+
+    def _out_of_bounds(self):
+        pass
+
+    def __spy_getitemptr__(self, index: usize) -> Ptr[T]:
+        if index >= self.length:
+            self._out_of_bounds()
+        return self.ptr + index
+
+    @func()
+    def slice(self, begin: Option[usize], end: Option[usize]) -> SlicePtr[T]:
+        start: usize = 0
+        if (b := begin) is not None:
+            start = b
+        stop: usize = self.length
+        if (e := end) is not None:
+            stop = e
+        if start > stop or stop > self.length:
+            self._out_of_bounds()
+        return SlicePtr(self.ptr + start, stop - start)
+
+    if TYPE_CHECKING:
+        def __getitem__(self, index: int) -> T: ...
+        def __setitem__(self, index: int, value: T) -> None: ...
 
 @struct()
 class _SliceValueIterator[T]:

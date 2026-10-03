@@ -2263,6 +2263,75 @@ def slice_of_a_slice_without_an_upper(x: i32) -> u64:
     return s.ptr[1:].length
 
 
+@func()
+def slice_subscript_element(x: i32) -> i32:
+    # ``s[i]`` goes through ``SlicePtr.__spy_getitemptr__``, the place of the
+    # i-th element (see ``interp.HirRunner.subscript``)
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    return s[2]
+
+
+@func()
+def slice_subscript_write(x: i32) -> i32:
+    # the place the method returns is written through, landing in the array
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    s[1] = 99
+    return a[1]
+
+
+@func()
+def const_slice_subscript_element(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a)).as_const()
+    return s[1]
+
+
+@func()
+def slice_method_slice(x: i32) -> i32:
+    # ``slice(begin, end)`` is a sub-view: elements 1 and 2
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    t = s.slice(1, 3)
+    return t[0] + t[1]
+
+
+@func()
+def slice_method_open_bounds(x: i32) -> i32:
+    # an absent bound is 0 (begin) or the length (end)
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    t = s.slice(None, None)
+    return t[0] + t[3]
+
+
+@func()
+def const_slice_method_slice(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a)).as_const()
+    t = s.slice(1, 4)
+    return t[0] + t[1] + t[2]
+
+
+@func()
+def slice_out_of_bounds_calls_the_stub(x: i32) -> i32:
+    # an out-of-bounds slice calls ``_out_of_bounds`` (a no-op stub for now) and
+    # carries on - the result is never read
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    s.slice(0, 5)
+    return 7
+
+
+@func()
+def slice_subscript_out_of_bounds_calls_the_stub(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    s[s.length]
+    return 7
+
+
 # ---------------------------------------------------------------------------
 # subscript overloading: a struct value is subscripted through its own
 # ``__spy_getitemptr__`` method, which gives the *place* of the element
@@ -4166,6 +4235,26 @@ class SpySlicePtrTest(TestCase):
         with self.assertRaises(CompileError) as ctx:
             runtime_index_into_comptime_storage(1)
         self.assertIn('compile-time integer', str(ctx.exception))
+
+    def test_a_slice_is_subscripted_through_getitemptr(self) -> None:
+        # ``s[i]`` is the place ``(Const)SlicePtr.__spy_getitemptr__`` returns
+        self.assertEqual(slice_subscript_element(10), 12)
+        self.assertEqual(const_slice_subscript_element(10), 11)
+
+    def test_a_slice_subscript_write_lands_in_the_array(self) -> None:
+        self.assertEqual(slice_subscript_write(10), 99)
+
+    def test_the_slice_method_returns_a_sub_view(self) -> None:
+        self.assertEqual(slice_method_slice(10), 11 + 12)
+        self.assertEqual(const_slice_method_slice(10), 11 + 12 + 13)
+
+    def test_an_absent_slice_bound_is_open(self) -> None:
+        self.assertEqual(slice_method_open_bounds(10), 10 + 13)
+
+    def test_an_out_of_bounds_call_reaches_the_stub(self) -> None:
+        # the bounds check calls ``_out_of_bounds``, a no-op stub for now
+        self.assertEqual(slice_out_of_bounds_calls_the_stub(10), 7)
+        self.assertEqual(slice_subscript_out_of_bounds_calls_the_stub(10), 7)
 
 
 class SpySubscriptOverloadTest(TestCase):

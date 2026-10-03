@@ -77,10 +77,10 @@ typed it, see ``Analyser._request_function``).  The interpreter types an
 type information of its own.
 """
 
-from annotationlib import Format
 import operator
 import types as pytypes
 from abc import abstractmethod
+from annotationlib import Format
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
@@ -1194,6 +1194,11 @@ def _convert_inst(
         # (and a dynamically-sized one is not lowerable on its own)
         raise CoerceError(f'cannot convert a {from_type} value to {to_type}')
     if isinstance(from_type, sval.IntType) and isinstance(to_type, sval.IntType):
+        if from_type.bits == to_type.bits:
+            # same width: only the signedness differs, which is a compile-time
+            # notion with no runtime effect (both are the same ``i{bits}``), so
+            # the value is already the one the target names
+            return None
         if from_type.bits < to_type.bits:
             kind = 'sext' if from_type.signed else 'zext'
         else:
