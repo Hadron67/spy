@@ -23,7 +23,7 @@ from types import NoneType
 from typing import TYPE_CHECKING
 
 from . import builtins as _builtins
-from .dsl import decl_func, func, func_type, struct
+from .dsl import builtin_func, decl_func, func, func_type, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
 from .syntax import ConstMultiPtr, ConstPtr, ISize, MultiPtr, Option, Ptr, USize
@@ -79,6 +79,7 @@ __all__ = [
     'TypeMismatchError',
     'as_',
     'bool',
+    'builtin_func',
     'compile_log',
     'decl_func',
     'f32',

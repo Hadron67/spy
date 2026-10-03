@@ -150,3 +150,12 @@ def arr_slice[T, N: int](arr: Ptr[Array[T, N]]) -> SlicePtr[T]:
 def const_arr_slice[T, N: int](arr: ConstPtr[Array[T, N]]) -> ConstSlicePtr[T]:
     """Likewise for a const pointer: the slice of it is a ``ConstSlicePtr``."""
     return cast(ConstSlicePtr[T], ConstSlicePtr(ptr_cast(arr, syntax.ConstMultiPtr[T]), cast(int, N)))
+
+@struct()
+class NullException(Exception):
+    pass
+
+def unwrap[T](val: Option[T]) -> T:
+    if (ret := val) is not None:
+        return ret
+    raise NullException()

@@ -84,6 +84,17 @@ _BUILTINS: dict[Any, str] = {
 }
 
 
+def builtin_func[T](fn: T) -> T:
+    """Register a Python function as a spy builtin: the decorated name is bound
+    to a :class:`sval.BuiltinFn` (not to the function itself), which the
+    compile-time interpreter evaluates by name while running the HIR (see
+    ``interp._call_builtin``).  Unlike the ``spy.*`` builtins of
+    :mod:`spy.compiler.builtins`, which the host recognizes by object identity,
+    a ``@builtin_func`` builtin lives in a ``std`` module and is dispatched on
+    its own ``__name__``."""
+    return cast(T, sval.BuiltinFn(cast(Any, fn).__name__))
+
+
 @dataclass(frozen=True)
 class FnMetadata:
     sfv: bool  # self by value

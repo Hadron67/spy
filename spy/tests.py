@@ -63,6 +63,15 @@ from .compiler.syntax import (
 )
 from .compiler.util import FrozenArraySet, StrBiMap, TriState
 from .std import ConstSlicePtr, Numeric, SlicePtr, arr_slice, const_arr_slice
+from .std.reflect import (
+    ArrayType,
+    IntType,
+    OptionType,
+    PointerType,
+    StructType,
+    TaggedUnionType,
+    type_info,
+)
 
 # ---------------------------------------------------------------------------
 # functions under test
@@ -7002,7 +7011,7 @@ class SpyTypeClassifyTest(TestCase):
             self.assertTrue(type.is_zst())
 
     def test_compile_time_only_types(self) -> None:
-        for type in (sval.TypeType(0), sval.TypeVar('C'), sval.AnyIntType(),
+        for type in (sval.TypeType(), sval.TypeVar('C'), sval.AnyIntType(),
                      sval.TupleType((sval.IntType(32, True),), False),
                      sval.ResultType(sval.VoidType(), sval.FrozenArraySet()), sval.AnyFunction()):
             self.assertEqual(type.classify(), sval.SpecialTypeKind.COMPTIME)
@@ -7026,13 +7035,13 @@ class SpyTypeClassifyTest(TestCase):
         self.assertEqual(sval.ArrayType(i32_type, 3).classify(), sval.SpecialTypeKind.NONE)
         # a zero-length array holds no storage whatever its element type
         self.assertTrue(sval.ArrayType(_fn_type(), 0).is_zst())
-        self.assertTrue(sval.ArrayType(sval.TypeType(0), 0).is_zst())
+        self.assertTrue(sval.ArrayType(sval.TypeType(), 0).is_zst())
         self.assertTrue(sval.ArrayType(sval.VoidType(), 3).is_zst())
         self.assertEqual(
             sval.ArrayType(_fn_type(), 3).classify(), sval.SpecialTypeKind.DST
         )
         self.assertEqual(
-            sval.ArrayType(sval.TypeType(0), 3).classify(), sval.SpecialTypeKind.COMPTIME
+            sval.ArrayType(sval.TypeType(), 3).classify(), sval.SpecialTypeKind.COMPTIME
         )
         # a length that is not solved yet leaves the layout unknown
         self.assertEqual(
@@ -7052,7 +7061,7 @@ class SpyTypeClassifyTest(TestCase):
             sval.OptionType(_fn_type()).classify(), sval.SpecialTypeKind.DST
         )
         self.assertEqual(
-            sval.OptionType(sval.TypeType(0)).classify(), sval.SpecialTypeKind.COMPTIME
+            sval.OptionType(sval.TypeType()).classify(), sval.SpecialTypeKind.COMPTIME
         )
 
     def test_union_kinds(self) -> None:
@@ -7064,7 +7073,7 @@ class SpyTypeClassifyTest(TestCase):
             sval.UnionType(frozenset((_fn_type(),))).classify(), sval.SpecialTypeKind.DST
         )
         self.assertEqual(
-            sval.UnionType(frozenset((sval.TypeType(0),))).classify(), sval.SpecialTypeKind.COMPTIME
+            sval.UnionType(frozenset((sval.TypeType(),))).classify(), sval.SpecialTypeKind.COMPTIME
         )
 
     def test_struct_kinds(self) -> None:
@@ -7074,11 +7083,11 @@ class SpyTypeClassifyTest(TestCase):
             _make_struct(('f', _fn_type())).classify(), sval.SpecialTypeKind.DST
         )
         self.assertEqual(
-            _make_struct(('t', sval.TypeType(0))).classify(), sval.SpecialTypeKind.COMPTIME
+            _make_struct(('t', sval.TypeType())).classify(), sval.SpecialTypeKind.COMPTIME
         )
         # the compile-time kind outranks the dynamically-sized one
         self.assertEqual(
-            _make_struct(('f', _fn_type()), ('t', sval.TypeType(0))).classify(),
+            _make_struct(('f', _fn_type()), ('t', sval.TypeType())).classify(),
             sval.SpecialTypeKind.COMPTIME,
         )
         # ... and the dynamically-sized one outranks a field with storage
@@ -8341,6 +8350,180 @@ class SpyAsFuncPtrTest(TestCase):
         self.assertEqual(call_spy_func_ptr_typed(10), 11)
 
 
+# ---------------------------------------------------------------------------
+# compile-time reflection: ``std.reflect.type_info`` describes a compile-time
+# type (``type``) as a ``TypeInfo`` value the interpreter builds while running
+# the HIR - the ``type`` a body names, or the one ``spy.typeof`` yields
+# ---------------------------------------------------------------------------
+
+
+@struct()
+class ReflectPoint:
+    ab: i32
+    c: i32
+
+
+@struct()
+class ReflectA:
+    x: i32
+
+
+@struct()
+class ReflectB:
+    y: i32
+
+
+@struct()
+class ReflectBox[T]:
+    value: T
+
+
+@func()
+def reflect_int_bits() -> i32:
+    info: Comptime = type_info(i32)
+    if isinstance(v := info, IntType):
+        return v.bits
+    return -1
+
+
+@func()
+def reflect_int_signed() -> spy_bool:
+    info: Comptime = type_info(i32)
+    if isinstance(v := info, IntType):
+        return v.signed
+    return False
+
+
+@func()
+def reflect_typeof_bits(x: i64) -> i32:
+    info: Comptime = type_info(spy_typeof(x))
+    if isinstance(v := info, IntType):
+        return v.bits
+    return -1
+
+
+@func()
+def reflect_ptr_not_const() -> spy_bool:
+    info: Comptime = type_info(Ptr[i32])
+    if isinstance(v := info, PointerType):
+        return v.is_const
+    return True
+
+
+@func()
+def reflect_ptr_child() -> spy_bool:
+    info: Comptime = type_info(Ptr[i32])
+    if isinstance(v := info, PointerType):
+        return v.child == i32
+    return False
+
+
+@func()
+def reflect_array_child() -> spy_bool:
+    info: Comptime = type_info(Array[i32, 3])
+    if isinstance(v := info, ArrayType):
+        return v.child == i32
+    return False
+
+
+@func()
+def reflect_option_child() -> spy_bool:
+    info: Comptime = type_info(Option[i64])
+    if isinstance(v := info, OptionType):
+        return v.child == i64
+    return False
+
+
+@func()
+def reflect_field_count() -> i32:
+    info: Comptime = type_info(ReflectPoint)
+    if isinstance(v := info, StructType):
+        return v.fields.length
+    return -1
+
+
+@func()
+def reflect_field_name_byte() -> i32:
+    info: Comptime = type_info(ReflectPoint)
+    if isinstance(v := info, StructType):
+        field: Comptime = v.fields.ptr[0]
+        name: Comptime = field.name
+        return name.ptr[0]
+    return -1
+
+
+@func()
+def reflect_field_name_arith() -> i32:
+    info: Comptime = type_info(ReflectPoint)
+    if isinstance(v := info, StructType):
+        field: Comptime = v.fields.ptr[0]
+        name: Comptime = field.name
+        p: Comptime = name.ptr + 1
+        return p[...]
+    return -1
+
+
+@func()
+def reflect_tag_count() -> i32:
+    info: Comptime = type_info(ReflectA | ReflectB)
+    if isinstance(v := info, TaggedUnionType):
+        return v.types.length
+    return -1
+
+
+@func()
+def reflect_plain_has_head() -> spy_bool:
+    info: Comptime = type_info(ReflectPoint)
+    if isinstance(v := info, StructType):
+        return v.head is not None
+    return False
+
+
+@func()
+def reflect_generic_has_head() -> spy_bool:
+    info: Comptime = type_info(ReflectBox[i32])
+    if isinstance(v := info, StructType):
+        return v.head is not None
+    return False
+
+
+class SpyReflectTest(TestCase):
+    """``std.reflect.type_info`` at compile time."""
+
+    def test_an_integer_type_reflects_its_width_and_signedness(self) -> None:
+        self.assertEqual(reflect_int_bits(), 32)
+        self.assertTrue(reflect_int_signed())
+
+    def test_the_type_of_a_value_reflects_like_the_type(self) -> None:
+        self.assertEqual(reflect_typeof_bits(0), 64)
+
+    def test_a_pointer_type_reflects_its_child_and_constness(self) -> None:
+        self.assertFalse(reflect_ptr_not_const())
+        self.assertTrue(reflect_ptr_child())
+
+    def test_an_array_type_reflects_its_element_type(self) -> None:
+        self.assertTrue(reflect_array_child())
+
+    def test_an_option_type_reflects_its_child_type(self) -> None:
+        self.assertTrue(reflect_option_child())
+
+    def test_a_struct_type_reflects_its_fields(self) -> None:
+        self.assertEqual(reflect_field_count(), 2)
+        # the first field is named ``ab``: its bytes are readable through the
+        # ``ConstSlicePtr[u8]`` the name is stored as
+        self.assertEqual(reflect_field_name_byte(), ord('a'))
+        self.assertEqual(reflect_field_name_arith(), ord('b'))
+
+    def test_a_tagged_union_type_reflects_its_variants(self) -> None:
+        self.assertEqual(reflect_tag_count(), 2)
+
+    def test_a_generic_struct_reflects_its_head(self) -> None:
+        # a non-generic struct has no template head; a specialization of a
+        # generic one names the head it was specialized from
+        self.assertFalse(reflect_plain_has_head())
+        self.assertTrue(reflect_generic_has_head())
+
+
 all_tests = [
     SpyFunctionCallTest,
     SpyIfExprTest,
@@ -8388,4 +8571,5 @@ all_tests = [
     SpyExceptionsArgumentTest,
     SpyDeclFuncTest,
     SpyAsFuncPtrTest,
+    SpyReflectTest,
 ]

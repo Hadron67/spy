@@ -260,16 +260,13 @@ class Type(Value):
 
 @dataclass(frozen=True)
 class TypeType(Type):
-    level: int
-    @override
-    def get_type(self) -> Type:
-        return TypeType(self.level + 1)
+    """The type of every spy type: the values of this type are the compile-time
+    types themselves (``spy.typeof(a) == spy.i32``), so it is what the ``type``
+    annotation of a parameter that takes a type stands for."""
 
     @override
-    def is_subtype_of(self, other: Type) -> bool:
-        type = other.get_type()
-        assert isinstance(type, TypeType)
-        return self.level <= type.level
+    def get_type(self) -> Type:
+        return TYPE_TYPE
 
     @override
     def classify(self) -> SpecialTypeKind:
@@ -280,7 +277,29 @@ class TypeType(Type):
         return None
 
     def __str__(self) -> str:
-        return f'type({self.level})'
+        return 'type'
+
+@dataclass(frozen=True)
+class AnyType(Type):
+    """The type of an arbitrary compile-time value (the ``Any`` annotation):
+    it has no runtime representation and takes any value as it is, so it is what
+    a reflective field that names a value of no fixed type - a struct field's
+    default value - is declared with."""
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
+
+    def __str__(self) -> str:
+        return 'any'
 
 class TypeVar(Type):
     def __init__(self, name: str) -> None:
@@ -360,12 +379,7 @@ class UnionType(Type):
 
     @override
     def get_type(self) -> Type:
-        level = 0
-        for type in self.types:
-            child = type.get_type()
-            assert isinstance(child, TypeType)
-            level = max(level, child.level)
-        return TypeType(level)
+        return TYPE_TYPE
 
     @override
     def get_type_children(self) -> tuple[Type, ...]:
@@ -513,12 +527,7 @@ class TaggedUnionType(Type):
 
     @override
     def get_type(self) -> Type:
-        level = 0
-        for type in self.types:
-            child = type.get_type()
-            assert isinstance(child, TypeType)
-            level = max(level, child.level)
-        return TypeType(level)
+        return TYPE_TYPE
 
     @override
     def get_type_children(self) -> tuple[Type, ...]:
@@ -800,7 +809,7 @@ class StrDictType(Type):
     def __str__(self) -> str:
         return f'{{{", ".join(f"{k}: {v}" for k, v in self.values.items())}}}'
 
-TYPE_TYPE = TypeType(0)
+TYPE_TYPE = TypeType()
 
 @dataclass(frozen=True)
 class BoolType(Type):
@@ -1000,9 +1009,7 @@ class OptionType(Type):
 
     @override
     def get_type(self) -> Type:
-        child = self.child.get_type()
-        assert isinstance(child, TypeType)
-        return TypeType(child.level + 1)
+        return TYPE_TYPE
 
     @override
     def get_type_children(self) -> tuple[Type, ...]:
@@ -1125,6 +1132,30 @@ class ConstRef(Value):
 
     def __str__(self) -> str:
         return '&' + str(self.value)
+
+@dataclass(frozen=True, slots=True)
+class StrConstPtr(Value):
+    """A compile-time string constant, held as a ``ConstMultiPtr[u8]`` - the
+    bytes and the position ``cursor`` the pointer names (so that pointer
+    arithmetic and subscripting walk the constant without materializing an
+    array of boxes per character).  ``cursor`` is unsigned: a negative offset is
+    rejected where the constant is read (see ``interp``)."""
+
+    data: bytes
+    cursor: int = 0
+
+    @override
+    def get_type(self) -> Type:
+        return PointerType(IntType(8, False), is_const=True, variant=PointerVariant.MULTI)
+
+    def __add__(self, amount: int) -> StrConstPtr:
+        return StrConstPtr(self.data, self.cursor + amount)
+
+    def __sub__(self, amount: int) -> StrConstPtr:
+        return StrConstPtr(self.data, self.cursor - amount)
+
+    def __str__(self) -> str:
+        return f'c"{self.data[self.cursor:].decode(errors="replace")}"'
 
 class BuiltinFn(Value):
     """A ``spy.*`` builtin that the compile-time interpreter evaluates
@@ -1357,9 +1388,7 @@ class PointerType(Type):
 
     @override
     def get_type(self) -> Type:
-        child = self.elem.get_type()
-        assert isinstance(child, TypeType)
-        return TypeType(child.level + 1)
+        return TYPE_TYPE
 
     @override
     def get_type_children(self) -> tuple[Type, ...]:
@@ -1430,9 +1459,7 @@ class ArrayType(Type):
 
     @override
     def get_type(self) -> Type:
-        child = self.elem.get_type()
-        assert isinstance(child, TypeType)
-        return TypeType(child.level + 1)
+        return TYPE_TYPE
 
     @override
     def get_type_children(self) -> tuple[Type, ...]:
@@ -1662,20 +1689,7 @@ class FunctionType(Type):
 
     @override
     def get_type(self) -> Type:
-        level = 0
-        for arg in self.args:
-            child = arg.type.get_type()
-            assert isinstance(child, TypeType)
-            level = max(level, child.level)
-        for leaf_type in result_leaves(self.return_type):
-            child = leaf_type.get_type()
-            assert isinstance(child, TypeType)
-            level = max(level, child.level)
-        for exception in self.exceptions:
-            child = exception.get_type()
-            assert isinstance(child, TypeType)
-            level = max(level, child.level)
-        return TypeType(level)
+        return TYPE_TYPE
 
     @override
     def classify(self) -> SpecialTypeKind:
@@ -1803,6 +1817,14 @@ class StructTypeHead(Type, IdentityObj):
         self.fields: IndexedMap[str, StructField] = IndexedMap()
         self.methods: dict[str, Any] = {}
         self._specs: dict[tuple[AnyValue, ...], StructType] = {}
+
+    @override
+    def get_type(self) -> Type:
+        # a head is a type-level compile-time object (the template a struct
+        # specialization is an application of), so its own type is ``type``:
+        # that is what lets reflection carry it in an ``Any`` field (see
+        # ``std.reflect.StructType.head``)
+        return TYPE_TYPE
 
     def add_field(self, name: str, type: Type, default: AnyValue | None = None) -> None:
         """Declare one field, appended after the fields declared so far, with
@@ -1935,12 +1957,7 @@ class StructType(Type):
 
     @override
     def get_type(self) -> Type:
-        level = 0
-        for field in self.fields().values():
-            child = field.type.get_type()
-            assert isinstance(child, TypeType)
-            level = max(level, child.level)
-        return TypeType(level)
+        return TYPE_TYPE
 
     @override
     def get_unit_value(self) -> AnyValue | None:
@@ -2550,6 +2567,10 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         return FloatType(64)
     if value is str:
         return PointerType(IntType(8, False), is_const=True)
+    if value is type:
+        return TYPE_TYPE
+    if value is typing.Any:
+        return AnyType()
     if value is bool:
         return BoolType()
     if value is syntax.USize:
@@ -2613,10 +2634,10 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         elems = raw[:-1] if has_ellipsis else raw
         types: list[Type] = []
         for arg in elems:
-            type = as_value(arg, ctx, type_vars)
-            if not isinstance(type, Type):
+            elem_type = as_value(arg, ctx, type_vars)
+            if not isinstance(elem_type, Type):
                 raise TypeError(f'{arg!r} is not a type')
-            types.append(type)
+            types.append(elem_type)
         return TupleType(tuple(types), has_ellipsis)
     if typing.get_origin(value) is typing.Literal:
         # ``Literal[X]`` denotes the value ``X``: the default of a type
@@ -2766,9 +2787,9 @@ class TypeVarSolver:
     ``is_subtype=True``) - and ``finish`` solves them, binding every
     constrained type parameter to a value.  Spy types have structural
     subtyping only where the type defines it - integers by range, floats
-    by width, types by level; elsewhere a subtype is equal to its
-    supertype.  The solver tracks the bounds of a parameter separately
-    so that ``finish`` can bind a parameter that only ever appears on the
+    by width; elsewhere a subtype is equal to its supertype.  The solver
+    tracks the bounds of a parameter separately so that ``finish`` can bind a
+    parameter that only ever appears on the
     right of subtype constraints (as the supertype of its bounds).  A
     constraint that cannot be satisfied is recorded in ``_unsatisfied``
     (and is not reported yet); a generic parameter that stays unsolved
@@ -3000,6 +3021,12 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
         # an already-typed constant (the value a compile-time location holds):
         # the target type governs, like the constant of any other location
         value = value.value
+    if isinstance(value, StrConstPtr):
+        # a string constant is a ``ConstMultiPtr[u8]``: it may only be used as a
+        # pointer (of any constness/variant) to a byte
+        if not (isinstance(type, PointerType) and type.elem == IntType(8, False)):
+            raise CompileError(f"cannot use {value!r} as a constant of {type}")
+        return value
     match type:
         case BoolType():
             if not isinstance(value, bool):
@@ -3038,6 +3065,9 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
                 raise CompileError(f"cannot use {value} as a type constant")
             if value.get_type() != type:
                 raise CompileError(f"cannot use {value} as a type constant")
+            return value
+        case AnyType():
+            # an ``Any`` value takes the value as it is: it names no fixed type
             return value
         case OptionType():
             # a value of an option is either the null value, or a value of the

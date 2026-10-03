@@ -77,6 +77,7 @@ typed it, see ``Analyser._request_function``).  The interpreter types an
 type information of its own.
 """
 
+from annotationlib import Format
 import operator
 import types as pytypes
 from abc import abstractmethod
@@ -2897,6 +2898,10 @@ class HirRunner:
                 # a reference to an immutable compile-time global behaves like
                 # the value it refers to
                 return ComptimeVal(obj.value)
+            case ComptimeVal(obj) if isinstance(obj, sval.StrConstPtr):
+                # ``*p`` of a string constant: the byte the cursor names
+                byte = self._str_constant_byte(obj, obj.cursor, 'load')
+                return ComptimeVal(sval.Int(byte, sval.IntType(8, False)))
             case RuntimeVal():
                 if type.elem.classify() == sval.SpecialTypeKind.DST:
                     raise CompileError(
@@ -4491,7 +4496,160 @@ class HirRunner:
             print(' '.join(parts))
             self.store(ret, ComptimeVal(sval.Void()))
             return PollResult.AGAIN
+        if fn.name == 'type_info':
+            if len(args.positional) != 1 or len(args.kwargs) > 0:
+                raise CompileError('spy.type_info takes exactly one argument')
+            obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[0])))
+            if not isinstance(obj, sval.Type):
+                raise CompileError(f'spy.type_info takes a type, got {obj!r}')
+            self.store(ret, self._build_type_info(obj))
+            return PollResult.AGAIN
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
+
+    # -- compile-time reflection (``std.reflect``) ---------------------------
+
+    def _reflect_struct(self, name: str) -> sval.StructType:
+        """The ``std.reflect`` struct type ``name`` declares, resolved in the
+        host context this body is compiled for (so that every context reflects
+        into its own copy of the struct, like any other ``std`` type)."""
+        from ..std import reflect
+        resolved = self._analyser._resolver.resolve_global(getattr(reflect, name))
+        assert isinstance(resolved, sval.StructType), f'reflect.{name} is not a struct'
+        return resolved
+
+    def _reflect_type_info(self) -> sval.TaggedUnionType:
+        """The ``std.reflect.TypeInfo`` tagged union, from the ``type`` alias
+        itself: evaluating the alias yields its ``IntType | ...`` expression,
+        which ``as_value`` resolves in the host context (so the variants are
+        this context's own copies, in the order the alias declares them - the
+        order is the tag)."""
+        from ..std import reflect
+        union = sval.as_value(reflect.TypeInfo.evaluate_value(Format.VALUE), ctx=self._analyser._resolver)
+        assert isinstance(union, sval.TaggedUnionType), 'TypeInfo is not a tagged union'
+        return union
+
+    def _build_type_info(self, ty: sval.Type) -> InterpVal:
+        """The ``TypeInfo`` value that describes the compile-time type ``ty``:
+        the variant struct that matches it, tagged in the union."""
+        fields: tuple[InterpVal, ...]
+        if isinstance(ty, sval.IntType):
+            variant = 'IntType'
+            fields = (ComptimeVal(ty.bits), ComptimeVal(ty.signed))
+        elif isinstance(ty, sval.PointerType):
+            variant = 'PointerType'
+            fields = (ComptimeVal(ty.elem), ComptimeVal(ty.is_const))
+        elif isinstance(ty, sval.ArrayType):
+            variant = 'ArrayType'
+            fields = (ComptimeVal(ty.elem), self._size_option(ty.length_int))
+        elif isinstance(ty, sval.OptionType):
+            variant = 'OptionType'
+            fields = (ComptimeVal(ty.child),)
+        elif isinstance(ty, sval.StructType):
+            variant = 'StructType'
+            fields = (
+                self._const_slice(
+                    self._reflect_struct('StructField'),
+                    tuple(self._build_struct_field(field) for field in ty.fields().values()),
+                ),
+                self._head_option(ty),
+            )
+        elif isinstance(ty, sval.TaggedUnionType):
+            variant = 'TaggedUnionType'
+            fields = (self._type_slice(tuple(ty.types)),)
+        elif isinstance(ty, sval.UnionType):
+            variant = 'UnionType'
+            # the variants of a union are a set: order them by their rendered
+            # form, so that the reflected order is stable
+            fields = (self._type_slice(tuple(sorted(ty.types, key=str))),)
+        else:
+            raise CompileError(f'cannot reflect the type {ty}')
+        union = self._reflect_type_info()
+        struct_type = self._reflect_struct(variant)
+        index = union.variant_index(struct_type)
+        assert index is not None, f'{struct_type} is not a TypeInfo variant'
+        return ComptimeTaggedUnionValue(
+            union,
+            ComptimeVal(sval.Int(index, union.tag_type())),
+            ComptimeAggregate(struct_type, fields),
+        )
+
+    def _build_struct_field(self, field: sval.StructField) -> InterpVal:
+        """The ``std.reflect.StructField`` value describing one field of a
+        struct: its name as a ``ConstSlicePtr[u8]``, its type and its default
+        value (absent when the field declares none)."""
+        default: InterpVal
+        if field.default is None:
+            default = ComptimeOption(
+                ComptimeVal(True), ComptimeVal(sval.Undefined(sval.AnyType()))
+            )
+        else:
+            default = ComptimeOption(
+                ComptimeVal(False),
+                self._coerce(ComptimeVal(field.default), sval.AnyType()),
+            )
+        return ComptimeAggregate(self._reflect_struct('StructField'), (
+            self._str_const_slice(field.name),
+            ComptimeVal(field.type),
+            default,
+        ))
+
+    def _head_option(self, ty: sval.StructType) -> InterpVal:
+        """The ``Option[Any]`` a reflected struct's ``head`` is: the template
+        head (:class:`sval.StructTypeHead`) of a struct that declares generic
+        parameters, the absent option of a non-generic one."""
+        if len(ty.head.generic_args) == 0:
+            return ComptimeOption(
+                ComptimeVal(True), ComptimeVal(sval.Undefined(sval.AnyType()))
+            )
+        return ComptimeOption(
+            ComptimeVal(False), self._coerce(ComptimeVal(ty.head), sval.AnyType())
+        )
+
+    def _size_option(self, length: int | None) -> InterpVal:
+        """The ``Option[int]`` a reflected array size is: an unsized array
+        (``None``) as the absent option, a length as the present one."""
+        if length is None:
+            return ComptimeOption(
+                ComptimeVal(True), ComptimeVal(sval.Undefined(sval.AnyIntType()))
+            )
+        return ComptimeOption(ComptimeVal(False), ComptimeVal(length))
+
+    def _type_slice(self, types: tuple[sval.Type, ...]) -> InterpVal:
+        """A ``ConstSlicePtr[type]`` of the compile-time types ``types``."""
+        return self._const_slice(sval.TYPE_TYPE, tuple(ComptimeVal(type) for type in types))
+
+    def _const_slice(self, elem: sval.Type, values: tuple[InterpVal, ...]) -> InterpVal:
+        """A ``ConstSlicePtr[elem]`` compile-time value over ``values``: the
+        values in a fresh array place of their own, the (const) pointer to it and
+        the number of elements - the value ``slice_ptr`` builds for a slice of
+        compile-time storage (see ``ComptimeAggregate``)."""
+        array = self.init_inline_aggregate(sval.ArrayType(elem, len(values)))
+        for index, value in enumerate(values):
+            self.store(self.field_index_addr(array, _index_value(index)), value)
+        slice_type = self._special_type.slice_ptr_of(elem, True)
+        return ComptimeAggregate(slice_type, (
+            array,
+            ComptimeVal(sval.Int(len(values), self._usize_type())),
+        ))
+
+    def _str_const_slice(self, text: str) -> InterpVal:
+        """A ``ConstSlicePtr[u8]`` compile-time value over the bytes of ``text``,
+        backed by a :class:`sval.StrConstPtr` rather than by a box per byte."""
+        elem = sval.IntType(8, False)
+        data = text.encode()
+        slice_type = self._special_type.slice_ptr_of(elem, True)
+        return ComptimeAggregate(slice_type, (
+            ComptimeVal(sval.StrConstPtr(data, 0)),
+            ComptimeVal(sval.Int(len(data), self._usize_type())),
+        ))
+
+    def _str_constant_byte(self, ptr: sval.StrConstPtr, pos: int, what: str) -> int:
+        """The byte at ``pos`` of the string constant ``ptr``; the constant is
+        read-only and its positions unsigned, so a position outside the data is
+        an error."""
+        if not 0 <= pos < len(ptr.data):
+            raise CompileError(f'the string constant is out of bounds ({what})')
+        return ptr.data[pos]
 
     def _call_fn_ptr(
         self,
@@ -5023,6 +5181,23 @@ class HirRunner:
                 f'dereferenced with ``p[...]`` (index a ``MultiPtr`` instead)'
             )
         pointer = self.load(base)
+        if isinstance(pointer, ComptimeVal) and isinstance(pointer.obj, sval.StrConstPtr):
+            # a string constant: the element's own place, a read-only box holding
+            # the byte at the compile-time index (a store through it is rejected,
+            # the constant is const)
+            index_value = self._coerce(index_ev, self._usize_type())
+            index_int = _comptime_int(index_value)
+            if index_int is None:
+                raise CompileError('a string constant needs a constant index')
+            byte = self._str_constant_byte(
+                pointer.obj, pointer.obj.cursor + index_int, 'subscript'
+            )
+            self._frames[-1].regs[ret] = ComptimeBox(
+                sval.IntType(8, False),
+                ComptimeVal(sval.Int(byte, sval.IntType(8, False))),
+                is_const=True,
+            )
+            return PollResult.AGAIN
         if isinstance(pointer, ComptimeAggregatePtr) and isinstance(pointer.type, sval.ArrayType):
             # compile-time storage of the elements: the n-th element's own place,
             # which a compile-time index picks - there is no runtime address to
