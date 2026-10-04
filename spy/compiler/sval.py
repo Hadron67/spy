@@ -1212,9 +1212,10 @@ class StrConstPtr(Value):
 
 class BuiltinFn(Value):
     """A ``spy.*`` builtin that the compile-time interpreter evaluates
-    while running the HIR (``spy.typeof``, ``spy.compile_log``).  The
-    name identifies the builtin to the interpreter; ``spy.as_`` is not
-    a compile-time builtin (it only exists at the call boundary)."""
+    while running the HIR (``spy.compile_log``).  The name identifies the
+    builtin to the interpreter; ``spy.as_`` is not a compile-time builtin
+    (it only exists at the call boundary), and ``spy.typeof`` is a
+    ``syntax`` marker lowered to a type probe rather than a builtin."""
 
     def __init__(self, name: str) -> None:
         self.name = name

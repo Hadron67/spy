@@ -78,7 +78,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 
 ### 编译期（comptime）
 
-- `spy.typeof(x)`：查询参数/表达式的静态类型（返回类型值），对编译期值也适用。
+- `spy.typeof(x)`：查询参数/表达式的静态类型（返回类型值），对编译期值也适用。它是一个 `syntax` 标记而非常规调用：实参**只被类型检查**（其中引用的 spy 函数会被触发编译），但不会发射任何代码，因此没有任何运行时行为——`spy.typeof(bar(foo(), x))` 只类型化（并编译）`bar`/`foo`，不会真正调用它们。
 - `spy.compile_log(...)`：编译期打印日志（运行时无任何动作）。
 - 条件为编译期常量的 `if`（例如 `if spy.typeof(a) == spy.u64: ... else: ...`）在编译期折叠，未选中的分支不会被编译。
 - `spy.as_` 只能用在 Python 调用边界，不能出现在函数体内。
@@ -294,7 +294,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 | `compiler/lower.py` | MIR → LLVM IR → 机器码（llvmlite MCJIT） |
 | `compiler/fn.py` | 函数签名（`Signature`：形参绑定、类型参数求解、返回类型推导）、函数值与编译产物、链接名表（`SymbolTable`）与函数入口 thunk |
 | `compiler/sval.py` | spy 类型系统（含结构体类型）、编译期值、Python 值 → spy 域的映射（`as_value`）与类型参数约束求解（`TypeVarSolver`） |
-| `compiler/syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`/`ConstPtr`/`MultiPtr`/`ConstMultiPtr`、取地址 `ref`、指针强转 `ptr_cast`、数组类型 `Array` 与构造 `array`、`Option`、编译期变量标注 `Comptime` |
+| `compiler/syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`/`ConstPtr`/`MultiPtr`/`ConstMultiPtr`、取地址 `ref`、指针强转 `ptr_cast`、数组类型 `Array` 与构造 `array`、`Option`、编译期变量标注 `Comptime`、类型探针 `typeof` |
 | `compiler/errors.py` | `SpyError`、`CompileError`、`CoerceError`、`TypeMismatchError`（同时是 `TypeError` 子类） |
 | `compiler/binop.py` | 运算符的字面量类型 |
 | `compiler/builtins.py` | 函数体内使用的 `spy.*` builtin |

@@ -41,8 +41,8 @@ A decorated function used from inside another spy function body is
 resolved to its function entry when the reference runs (see ``interp``);
 calling it is compiled to a native ``call``.  An *undecorated* plain
 Python function reached the same way is inlined instead.  The ``spy.*``
-builtins (``spy.typeof``, ``spy.compile_log``) are evaluated at compile
-time.
+builtins (``spy.compile_log``) are evaluated at compile time; ``spy.typeof``
+is a ``syntax`` marker, lowered by the parser to a type probe.
 """
 
 import ctypes
@@ -60,7 +60,7 @@ from typing import (
 )
 
 from . import astgen, mir, sval
-from .builtins import spy_as, spy_compile_log, spy_typeof
+from .builtins import spy_as, spy_compile_log
 from .errors import CompileError, SpyError
 from .fn import (
     AnyValue,
@@ -82,7 +82,6 @@ from .util import FrozenArraySet, frozendict
 
 # the ``spy.*`` builtins, by the name the interpreter knows them by
 _BUILTINS: dict[Any, str] = {
-    spy_typeof: 'typeof',
     spy_compile_log: 'compile_log',
     spy_as: 'as',
 }

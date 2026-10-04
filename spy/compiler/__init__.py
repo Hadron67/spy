@@ -26,9 +26,10 @@ from . import builtins as _builtins
 from .dsl import builtin_func, decl_func, func, func_type, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
-from .syntax import ConstMultiPtr, ConstPtr, ISize, MultiPtr, Option, Ptr, USize
+from .syntax import ConstMultiPtr, ConstPtr, ISize, MultiPtr, Option, Ptr, USize, typeof
 
-typeof = _builtins.spy_typeof  # ``spy.typeof`` is evaluated at compile time
+# ``spy.typeof`` is a ``syntax`` marker: ``astgen`` recognizes it by identity and
+# types its argument without emitting code (see ``syntax.typeof``).
 compile_log = _builtins.spy_compile_log
 # ``as`` is a keyword, so the public spelling is ``spy.as_``; the attribute
 # ``spy.as`` stays reachable through ``getattr`` for parity with the docs.

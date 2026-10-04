@@ -134,7 +134,7 @@ _DEFER_CALLS: dict[Any, hir.DeferKind] = {
 # the ``syntax.*`` markers that are *calls* in the source and are recognized by
 # identity (unlike ``syntax.array`` and ``syntax.Comptime``, which are resolved
 # through ``_gen_call``/``_split_comptime``)
-_SYNTAX_CALLS = (syntax.ref, syntax.unroll, syntax.comptime, syntax.ptr_cast, syntax.as_func_ptr)
+_SYNTAX_CALLS = (syntax.ref, syntax.unroll, syntax.comptime, syntax.ptr_cast, syntax.as_func_ptr, syntax.typeof)
 
 # the ``syntax.*`` classes that name a pointer type, by the (is_const, is_multi)
 # of the pointer each one is; ``Array``/``Option`` are handled alongside them in
@@ -1385,6 +1385,19 @@ class _Builder:
             type = self._as_value(self._gen_expr(args[0])[0])
             obj = self._as_value(self._gen_expr(args[1])[0])
             return ArgEntry(self.add(hir.AsFuncPtr(type, obj)), False), False
+
+        if callee is syntax.typeof:
+            # ``typeof(expr)``: a *type probe* (see ``hir.TypeOfBegin``).  The
+            # argument's instructions follow, but the interpreter runs them into
+            # a detached block - they are only typed (compiling whatever
+            # functions they name) and never reach the MIR - so the probe yields
+            # ``expr``'s static type with no runtime effect.
+            if len(args) != 1:
+                raise CompileError('typeof takes exactly one argument')
+            self.add(hir.TypeOfBegin())
+            entry = self._gen_expr(args[0])[0]
+            end = self.add(hir.TypeOfEnd(entry.value, entry.is_ref))
+            return ArgEntry(end, False), False
 
         if callee is syntax.unroll:
             # it is a *statement* marker placed before a loop (see

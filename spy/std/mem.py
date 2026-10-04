@@ -10,6 +10,7 @@ from ..compiler import (
     func,
     func_type,
     struct,
+    typeof,
     u8,
     usize,
 )

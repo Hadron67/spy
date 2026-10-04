@@ -11,8 +11,11 @@ from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
     Comptime,
+    Ptr,
+    ref,
 )
 from .basics import inc
+from .errors import ErrorA
 
 # ---------------------------------------------------------------------------
 # ``syntax.comptime()``: the statement marker that declares the variable of the
@@ -295,7 +298,91 @@ class SpyTupleTest(TestCase):
             bad_comptime_tuple_branch(True)
 
 
+# ---------------------------------------------------------------------------
+# ``syntax.typeof``: the *type probe*.  Its argument is only *typed* - its
+# instructions run into a detached block that is never lowered, which compiles
+# whatever spy functions the expression names - so ``typeof(f(x))`` yields the
+# type of the call without emitting (or ever running) it.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def probe_inner(x: i32) -> i32:
+    return x * 2
+
+
+@func()
+def probe_outer(x: i32) -> i32:
+    return x + 1
+
+
+@func()
+def typeof_a_nested_call(x: i32) -> i32:
+    # ``typeof`` accepts any expression: both calls are typed (and compiled)
+    # while nothing is emitted
+    t: Comptime = spy_typeof(probe_outer(probe_inner(x)))
+    if t == i32:
+        return 1
+    return 0
+
+
+@func()
+def probe_bump(p: Ptr[i32]) -> i32:
+    p[...] = p[...] + 1
+    return p[...]
+
+
+@func()
+def typeof_has_no_runtime_effect(p: Ptr[i32]) -> i32:
+    # the argument is only typed: ``probe_bump`` is compiled but never emitted,
+    # so the pointee keeps its value
+    t: Comptime = spy_typeof(probe_bump(p))
+    if t == i32:
+        return p[...]
+    return -1
+
+
+@func()
+def call_typeof_has_no_runtime_effect(x: i32) -> i32:
+    v = x
+    return typeof_has_no_runtime_effect(ref(v))
+
+
+@func(exceptions=(ErrorA,))
+def probe_raises() -> i32:
+    raise ErrorA(7)
+
+
+@func()
+def typeof_a_raising_call() -> i32:
+    # the error path of a raising call would have to leave the probe, which is
+    # rejected
+    t: Comptime = spy_typeof(probe_raises())
+    if t == i32:
+        return 0
+    return 1
+
+
+class SpyTypeOfTest(TestCase):
+    """``syntax.typeof`` is a type probe: it types its argument (compiling the
+    functions it names) without emitting any code, so the argument has no
+    runtime effect."""
+
+    def test_a_nested_call(self) -> None:
+        self.assertEqual(typeof_a_nested_call(1), 1)
+
+    def test_the_argument_has_no_runtime_effect(self) -> None:
+        # the pointee is untouched: ``probe_bump`` was typed, not called
+        self.assertEqual(call_typeof_has_no_runtime_effect(5), 5)
+
+    def test_a_raising_call_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            typeof_a_raising_call()
+        self.assertIn('typeof', str(ctx.exception))
+
+
 all_tests = [
     SpyComptimeMarkerTest,
     SpyTupleTest,
+    SpyTypeOfTest,
 ]

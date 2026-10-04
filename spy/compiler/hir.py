@@ -374,6 +374,30 @@ class AsFuncPtr(Inst):
 
 
 @dataclass(eq=False)
+class TypeOfBegin(Inst):
+    """``syntax.typeof(expr)``: open a *type probe*.  The instructions that
+    evaluate ``expr`` follow this marker in the same list, closed by the matching
+    :class:`TypeOfEnd`.  The probe emits no MIR: the interpreter builds the
+    probe's instructions into a detached block that no path reaches, so they
+    only *type* ``expr`` - compiling whatever functions it names - and are then
+    discarded.  A transfer out of the probe (a ``return``/``raise``/
+    ``break``/``continue``, or a call whose error is not caught inside) is
+    rejected; the probe only ever types (see ``interp``)."""
+
+
+@dataclass(eq=False)
+class TypeOfEnd(Inst):
+    """Close the type probe opened by :class:`TypeOfBegin`: ``value`` is the
+    probe expression's place (a reference when ``is_ref``), and this
+    instruction's register is its spy type, held as a compile-time value.  The
+    probe's instructions are never lowered, so the type is the only thing it
+    produces (see ``interp``)."""
+
+    value: Value
+    is_ref: bool
+
+
+@dataclass(eq=False)
 class MakeClosure(Inst):
     """Create a closure value: the nested ``def``/``lambda`` ``fn`` bound to
     the captured variables ``captures`` (the enclosing function's slots, or an
@@ -717,9 +741,9 @@ def scan_block(insts: tuple[Inst, ...], entry: int) -> tuple[int | None, int]:
     p_else: int | None = None
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, (If, Loop, Block, Try, Defer)):
+        if isinstance(inst, (If, Loop, Block, Try, Defer, TypeOfBegin)):
             depth += 1
-        elif isinstance(inst, End):
+        elif isinstance(inst, (End, TypeOfEnd)):
             if depth == 0:
                 return p_else, i
             depth -= 1
@@ -737,9 +761,9 @@ def scan_try(insts: tuple[Inst, ...], entry: int) -> tuple[list[int], int]:
     excepts: list[int] = []
     for i in range(entry + 1, len(insts)):
         inst = insts[i]
-        if isinstance(inst, (If, Loop, Block, Try, Defer)):
+        if isinstance(inst, (If, Loop, Block, Try, Defer, TypeOfBegin)):
             depth += 1
-        elif isinstance(inst, End):
+        elif isinstance(inst, (End, TypeOfEnd)):
             if depth == 0:
                 return excepts, i
             depth -= 1

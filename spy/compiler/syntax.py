@@ -87,6 +87,14 @@ def unroll():
 def ptr_cast[T](ptr: Any, target: type[T]) -> T:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
+def typeof[T](value: T) -> type[T]:
+    """The spy type of ``value``, evaluated at compile time.  The argument is
+    not evaluated for runtime: its instructions are *typed* to resolve the value's
+    type - compiling whatever spy functions the expression names - but produce no
+    code.  Recognized by identity in ``astgen`` (a *type probe*, see ``hir``),
+    not a call."""
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
 class USize:
     pass
 

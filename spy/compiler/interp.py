@@ -47,12 +47,15 @@ spy type always lowers to a valid MIR type (open loop), exactly like
 
 Calls are dispatched at compile time:
 
-* calls to the ``spy`` builtins (``spy.typeof``, ``spy.compile_log``) are
-  evaluated eagerly,
+* calls to the ``spy`` builtins (``spy.compile_log``) are evaluated eagerly,
 * calls to other spy functions (jit or aot) become native ``call``
   instructions to the specialization selected by the argument types,
 * calls to plain Python functions inline the callee body into the
   current stream.
+
+``spy.typeof`` is not a call at all: it is a ``syntax`` marker the parser
+lowers to a *type probe* (see ``hir.TypeOfBegin``), which types its argument
+without emitting anything.
 
 An inlined body is emitted into the block the call sits in; the caller's
 continuation is a fresh *exit block* that every return of the body jumps
@@ -672,6 +675,21 @@ class DeferBlockData(BlockFrameData):
     variant: hir.DeferKind
     entry: mir.BasicBlock
     body_defers: list[_DeferEntry]
+    saved_block: mir.BasicBlock
+
+
+@dataclass
+class TypeOfBlockData(BlockFrameData):
+    """The state of the ``syntax.typeof`` type probe currently being walked.
+
+    The probe's instruction stream follows the ``hir.TypeOfBegin`` that opened
+    it, closed by the matching ``hir.TypeOfEnd``.  The interpreter builds the
+    probe into a *detached* block - never linked to the function's CFG, so it is
+    never lowered - rather than into the block being built, which is what makes
+    the probe emit no code; ``saved_block`` is the block the walk continues in
+    once the probe closes.  A transfer that would leave the probe is rejected
+    (see ``_collect_exit_defers``/``_cut``): the probe only ever types."""
+
     saved_block: mir.BasicBlock
 
 
@@ -2084,6 +2102,9 @@ class HirRunner:
             return data.then_defers if data.region == 0 else data.else_defers
         if isinstance(data, (LoopBlockData, PlainBlockData)):
             return data.body_defers
+        if isinstance(data, TypeOfBlockData):
+            # a type probe declares no deferred bodies of its own
+            return []
         assert isinstance(data, TryExceptBlockData)
         return data.region_defers[data.region]
 
@@ -2121,6 +2142,8 @@ class HirRunner:
                     return tuple(ret)
                 if isinstance(bf.data, DeferBlockData):
                     raise CompileError('cannot jump out of a defer block')
+                if isinstance(bf.data, TypeOfBlockData):
+                    raise CompileError('cannot jump out of a typeof block')
                 _append_defers(ret, self._region_defers(bf.data), is_error)
             _append_defers(ret, frame.body_defers, is_error)
             if current_frame_only:
@@ -2168,6 +2191,37 @@ class HirRunner:
             BlockFrame(entry, DeferBlockData(inst.variant, template, [], self._cur_block))
         )
         self._cur_block = template
+
+    def _exec_typeof_begin(self) -> None:
+        """Open a ``syntax.typeof`` *type probe* (``hir.TypeOfBegin``): the
+        probe's instructions follow in the flat list, closed by the matching
+        ``hir.TypeOfEnd``.  The probe is built into a detached block - never
+        linked to the function's CFG, so it is never lowered - which is what
+        makes it emit no code: its instructions only *type* the probed
+        expression (compiling whatever functions it names) and are discarded.
+        The block the probe was opened in is restored by ``_exec_typeof_end``."""
+        frame = self._frames[-1]
+        frame.block_stack.append(
+            BlockFrame(frame.pc - 1, TypeOfBlockData(self._cur_block))
+        )
+        self._cur_block = mir.BasicBlock()
+
+    def _exec_typeof_end(self, inst: hir.TypeOfEnd) -> None:
+        """Close the type probe opened by ``hir.TypeOfBegin``: the probed
+        expression is the place ``inst.value`` denotes, and the instruction's
+        register is its spy type as a compile-time value.  The probe's detached
+        block is abandoned and the walk resumes in the block the probe was
+        opened in."""
+        frame = self._frames[-1]
+        bf = frame.block_stack[-1]
+        data = bf.data
+        assert isinstance(data, TypeOfBlockData)
+        type = _arg_type_of(ArgEntry(self.operand(inst.value), inst.is_ref))
+        if type is None:
+            raise CompileError('cannot determine the type of this value')
+        frame.block_stack.pop()
+        self._cur_block = data.saved_block
+        frame.regs[inst] = ComptimeVal(type)
 
     def _exec_inst(self, inst: hir.Inst) -> PollResult:
         """Execute one instruction of the executing frame.  A control
@@ -2368,6 +2422,10 @@ class HirRunner:
                 regs[inst] = self.exec_ptr_cast(self.operand(inst.value), self.operand(inst.type))
             case hir.AsFuncPtr():
                 return self.exec_as_func_ptr(inst)
+            case hir.TypeOfBegin():
+                self._exec_typeof_begin()
+            case hir.TypeOfEnd():
+                self._exec_typeof_end(inst)
             case hir.MakeClosure():
                 return self.exec_make_closure(inst)
             case _:
@@ -2876,6 +2934,14 @@ class HirRunner:
                 # body ended elsewhere: the body never completes, so the defer
                 # would never run
                 raise CompileError('the body of a defer must complete')
+            if isinstance(data, TypeOfBlockData):
+                # the probed expression ended its path (a call that never
+                # returns, or an error that no clause caught): a type probe only
+                # ever types, so it cannot leave the block
+                raise CompileError(
+                    'the argument of typeof must produce a value: it cannot end '
+                    'the path'
+                )
             if isinstance(data, TryExceptBlockData):
                 # the region that ended (the try body, or a clause) returned or
                 # raised: a later clause some error reached is typed next;
@@ -5120,14 +5186,6 @@ class HirRunner:
     ) -> PollResult:
         """Evaluate one ``spy.*`` builtin at compile time and hand its
         result to the call's result location."""
-        if fn.name == 'typeof':
-            if len(args.positional) != 1 or len(args.kwargs) > 0:
-                raise CompileError('spy.typeof takes exactly one argument')
-            type = _arg_type_of(args.positional[0])
-            if type is None:
-                raise CompileError('cannot determine the type of this value')
-            self.store(ret, ComptimeVal(type))
-            return PollResult.AGAIN
         if fn.name == 'compile_log':
             parts: list[str] = []
             for arg in args.positional:
