@@ -596,8 +596,15 @@ def _is_inline_val(val: InterpVal) -> bool:
     inline even when what it holds is a runtime value - a tuple, a box, ... has
     no runtime representation of its own, so it only exists while the HIR runs
     (a ``Comptime`` variable may hold one, see ``_is_comptime_val`` for the
-    deep property)."""
+    deep property).  A runtime value that refers to no register - a constant leaf
+    or a reference to a global (a static constant, a function) - may also be
+    inlined: it is the same on every path, so a compile-time box can hold it
+    (see ``_references_register``)."""
     return not isinstance(_shallow_normalize(val), RuntimeVal)
+    # ev = _shallow_normalize(val)
+    # if isinstance(ev, RuntimeVal):
+    #     return not _references_register(ev.value)
+    # return True
 
 def _is_aggregate(type: sval.Type) -> bool:
     """Whether ``type`` is an *aggregate*: a struct or an array.  An aggregate
@@ -4227,6 +4234,14 @@ class HirRunner:
         self.store(slot, value)
         return _shallow_normalize(slot)
 
+    def _zst_pointer(self, type: sval.Type) -> mir.Value:
+        """The runtime value of a pointer to the zero-sized type ``type``: the
+        pointee has no storage, so the pointer is only ever passed around (never
+        dereferenced into storage) - it materializes as an undefined pointer."""
+        mir_type = sval.PointerType(type, is_const=False).to_mir_type(self._mir_cache)
+        assert isinstance(mir_type, mir.PointerType)
+        return mir.UndefValue(mir_type)
+
     def _to_runtime(self, ev: InterpVal) -> mir.Value:
         """Materialize a value as a typed MIR value: a runtime value yields its
         MIR object, a compile-time value a constant built from it
@@ -4245,6 +4260,10 @@ class HirRunner:
             case ComptimeVal():
                 return _sval_to_runtime(ev.obj, self._mir_cache)
             case ComptimeAggregatePtr(aggregate_type, _):
+                if aggregate_type.is_zst():
+                    # a pointer to a zero-sized aggregate: the pointee has no
+                    # storage, so the pointer is materialized as an undefined one
+                    return self._zst_pointer(aggregate_type)
                 aggregate = self.load(ev)
                 if not isinstance(aggregate, ComptimeAggregate):
                     # a zero-sized aggregate: its value *is* its unit value, which
@@ -4281,6 +4300,10 @@ class HirRunner:
                 # the compile-time *storage* of a tagged union: what a value of
                 # its pointer type delivers is the address of fresh memory the
                 # union is written into (like an option's storage)
+                if type.is_zst():
+                    # a pointer to a zero-sized tagged union: like a zero-sized
+                    # aggregate, the pointee has no storage - an undefined pointer
+                    return self._zst_pointer(type)
                 mir_type = type.to_mir_type(self._mir_cache)
                 assert mir_type is not None
                 alloca = self._emit(mir.Alloca(mir_type))
@@ -4533,17 +4556,24 @@ class HirRunner:
             return PollResult.AGAIN
         if not isinstance(obj, FunctionValue):
             raise CompileError(f'as_func_ptr expects a spy function, got {obj!r}')
+        capture_specs: tuple[SpecializedFormalArg, ...] = ()
         if isinstance(obj, ClosureValue):
-            # only a capture-free, non-inlined closure is an ordinary runtime
-            # function; a capturing or inlined one has no pointer of its own
+            # a non-inlined closure is an ordinary runtime function when none of
+            # its captures refers to a runtime register: a runtime capture would
+            # become a hidden pointer parameter (its address), which a function
+            # pointer typed ``T`` has no place for, while a compile-time capture
+            # is baked into the specialization (no runtime parameter).
             if obj.force_inline:
                 raise CompileError(
                     'cannot take the function pointer of an inlined closure'
                 )
-            if len(obj.captures) > 0:
-                raise CompileError(
-                    'cannot take the function pointer of a closure that captures variables'
-                )
+            capture_specs, _ = self._compile_capture_args(obj)
+            for spec in capture_specs:
+                if isinstance(spec, SpecializedRuntimeArg):
+                    raise CompileError(
+                        'cannot take the function pointer of a closure that captures '
+                        'a runtime value'
+                    )
             declared = obj.hir.signature.as_non_generic_fn_type()
             if declared != fn_type:
                 raise CompileError(
@@ -4565,6 +4595,8 @@ class HirRunner:
             tuple(plain_provided_arg(arg.type) for arg in sig.positional.by_id), (), frozendict(),
         )
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
+        if len(capture_specs) > 0:
+            call_sig = replace(call_sig, captures=capture_specs)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
             regs[inst] = RuntimeVal(fn_mir, sval.PointerType(fn_type, is_const=True))

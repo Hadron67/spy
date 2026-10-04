@@ -14,7 +14,7 @@ from ..compiler import (
     u8,
     usize,
 )
-from ..compiler.syntax import Opaque, as_func_ptr, closure, ptr_cast
+from ..compiler.syntax import Comptime, Opaque, as_func_ptr, closure, comptime, ptr_cast
 from .c import free, malloc, realloc
 from .core import SlicePtr, as_static_ptr, undefined
 
@@ -44,13 +44,19 @@ class Allocator(Protocol):
     def alloc(self, layout: Layout) -> SlicePtr[u8]: ...
     def resize(self, ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]: ...
 
+    def _free_failed(self):
+        pass
+
     def new[T](self, typ: type[T]) -> Ptr[T]:
         layout = layout_of(typ)
         return ptr_cast(self.alloc(layout).ptr, Ptr[T])
 
     def free[T](self, ptr: Ptr[T]):
         layout = layout_of(T)
-        self.resize(ptr_cast(ptr, MultiPtr[u8]), layout, layout_of(T).repeat(0))
+        try:
+            self.resize(ptr_cast(ptr, MultiPtr[u8]), layout, layout_of(T).repeat(0))
+        except AllocError:
+            self._free_failed()
 
     def new_array[T](self, typ: type[T], count: usize) -> SlicePtr[T]:
         layout = layout_of(typ).repeat(count)
@@ -58,10 +64,13 @@ class Allocator(Protocol):
 
     def resize_array[T](self, ptr: SlicePtr[T], count: usize) -> SlicePtr[T]:
         layout = layout_of(T).repeat(count)
-        return SlicePtr(ptr_cast(self.resize(ptr_cast(ptr.ptr, MultiPtr[u8]), layout_of(T).repeat(ptr.length), layout), MultiPtr[T]), count)
+        return SlicePtr(ptr_cast(self.resize(ptr_cast(ptr.ptr, MultiPtr[u8]), layout_of(T).repeat(ptr.length), layout).ptr, MultiPtr[T]), count)
 
     def free_array[T](self, ptr: SlicePtr[T]):
-        self.resize_array(ptr, 0)
+        try:
+            self.resize_array(ptr, 0)
+        except AllocError:
+            self._free_failed()
 
 @func_type(exceptions=AllocError)
 class AllocFn(Protocol):
@@ -81,24 +90,25 @@ class DynamicAllocator(Allocator):
     data: Ptr[Opaque]
     vtable: ConstPtr[AllocatorVtable]
 
-    @func()
     @staticmethod
+    @func()
     def create(allocator) -> DynamicAllocator:
-        t = typeof(allocator[...])
+        t: Comptime = typeof(allocator[...])
 
-        @closure(inline=False)
+        @closure(inline=False, exceptions=AllocError)
         def alloc(data: Ptr[Opaque], layout: Layout) -> SlicePtr[u8]:
             return ptr_cast(data, Ptr[t])[...].alloc(layout)
 
-        @closure(inline=False)
+        @closure(inline=False, exceptions=AllocError)
         def resize(data: Ptr[Opaque], ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]:
             return ptr_cast(data, Ptr[t])[...].resize(ptr, layout, new_layout)
 
-        vtable = as_static_ptr(AllocatorVtable(
+        comptime()
+        vtable: AllocatorVtable = AllocatorVtable(
             as_func_ptr(AllocFn, alloc),
             as_func_ptr(ResizeFn, resize),
-        ))
-        return DynamicAllocator(ptr_cast(allocator, Ptr[Opaque]), vtable)
+        )
+        return DynamicAllocator(ptr_cast(allocator, Ptr[Opaque]), as_static_ptr(vtable))
 
     def alloc(self, layout: Layout) -> SlicePtr[u8]:
         return self.vtable[...].alloc[...](self.data, layout)
