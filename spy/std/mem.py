@@ -14,9 +14,9 @@ from ..compiler import (
     u8,
     usize,
 )
-from ..compiler.syntax import Opaque, ptr_cast
+from ..compiler.syntax import Opaque, as_func_ptr, closure, ptr_cast
 from .c import free, malloc, realloc
-from .core import SlicePtr, undefined
+from .core import SlicePtr, as_static_ptr, undefined
 
 
 @struct()
@@ -44,16 +44,16 @@ class Allocator(Protocol):
     def alloc(self, layout: Layout) -> SlicePtr[u8]: ...
     def resize(self, ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]: ...
 
-    def new[T](self, type: type[T]) -> Ptr[T]:
-        layout = layout_of(type)
+    def new[T](self, typ: type[T]) -> Ptr[T]:
+        layout = layout_of(typ)
         return ptr_cast(self.alloc(layout).ptr, Ptr[T])
 
     def free[T](self, ptr: Ptr[T]):
         layout = layout_of(T)
         self.resize(ptr_cast(ptr, MultiPtr[u8]), layout, layout_of(T).repeat(0))
 
-    def new_array[T](self, type: type[T], count: usize) -> SlicePtr[T]:
-        layout = layout_of(type).repeat(count)
+    def new_array[T](self, typ: type[T], count: usize) -> SlicePtr[T]:
+        layout = layout_of(typ).repeat(count)
         return SlicePtr(ptr_cast(self.alloc(layout).ptr, MultiPtr[T]), count)
 
     def resize_array[T](self, ptr: SlicePtr[T], count: usize) -> SlicePtr[T]:
@@ -80,6 +80,25 @@ class AllocatorVtable:
 class DynamicAllocator(Allocator):
     data: Ptr[Opaque]
     vtable: ConstPtr[AllocatorVtable]
+
+    @func()
+    @staticmethod
+    def create(allocator) -> DynamicAllocator:
+        t = typeof(allocator[...])
+
+        @closure(inline=False)
+        def alloc(data: Ptr[Opaque], layout: Layout) -> SlicePtr[u8]:
+            return ptr_cast(data, Ptr[t])[...].alloc(layout)
+
+        @closure(inline=False)
+        def resize(data: Ptr[Opaque], ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]:
+            return ptr_cast(data, Ptr[t])[...].resize(ptr, layout, new_layout)
+
+        vtable = as_static_ptr(AllocatorVtable(
+            as_func_ptr(AllocFn, alloc),
+            as_func_ptr(ResizeFn, resize),
+        ))
+        return DynamicAllocator(ptr_cast(allocator, Ptr[Opaque]), vtable)
 
     def alloc(self, layout: Layout) -> SlicePtr[u8]:
         return self.vtable[...].alloc[...](self.data, layout)

@@ -58,7 +58,7 @@ import inspect
 import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast, get_args, get_origin
 
 from . import hir, syntax
 from .binop import BoolOp
@@ -925,6 +925,18 @@ class _Builder:
             return True, node.slice
         return False, node
 
+    def _split_type_value(self, node: ast.expr) -> tuple[bool, ast.expr]:
+        """Split a parameter annotation into its ``type[X]`` marker and the
+        type it wraps: ``type[X]`` splits to ``(True, X)`` and anything else to
+        ``(False, node)``.  The marker is recognized by the global name it is
+        written as (the builtin ``type``), so a variable of the same name
+        shadows it like any global."""
+        if isinstance(node, ast.Subscript) and self._try_resolve_object(node.value) is type:
+            if isinstance(node.slice, ast.Tuple):
+                raise CompileError('type[...] takes exactly one type argument')
+            return True, node.slice
+        return False, node
+
     def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], inline_mode: hir.InlineMode = hir.InlineMode.NONE) -> hir.Value:
         """The tuple of addresses a destructuring target denotes: a plain
         target contributes the address of its slot (or field), a nested
@@ -1029,6 +1041,10 @@ class _Builder:
         if builtin is isinstance:
             # ``isinstance(value, T)`` against a tagged union: the parser lowers
             # it to the tag test itself (see ``_gen_isinstance``)
+            return builtin
+        if builtin is type:
+            # ``type[X]`` annotates a type-valued parameter (see
+            # ``_split_type_value``): the marker is recognized by identity
             return builtin
         raise CompileError(
             f"name '{name}' is not defined in the scope of function {self._fn_ir.name}"
@@ -1798,11 +1814,14 @@ class _Builder:
             n = len(param_names)
             annotations: list[hir.Value | None] = [None] * n
             is_comptime = [False] * n
+            is_type_value = [False] * n
             for i, a in enumerate(args.args):
                 if a.annotation is not None:
                     ct, type_node = self._split_comptime(a.annotation)
                     is_comptime[i] = ct
                     if type_node is not None:
+                        tv, type_node = self._split_type_value(type_node)
+                        is_type_value[i] = tv
                         annotations[i] = self._as_value(self._gen_expr(type_node)[0])
             defaults: list[hir.Value | None] = [None] * n
             offset = n - len(args.defaults)
@@ -1822,6 +1841,7 @@ class _Builder:
                 name=name,
                 local_name=f'{name}#{self._closure_counter}',
                 body=(), param_names=tuple(param_names), is_comptime=tuple(is_comptime),
+                is_type_value=tuple(is_type_value),
                 arg_is_ref=tuple([False] * n),
                 generic_args=tuple(generic_args), force_inline=force_inline,
                 exceptions=exceptions, callconv=callconv, may_panic=may_panic,
@@ -2049,6 +2069,17 @@ def parse_function(
         # ``SignatureFormalArg``): the marker is split off the annotation and
         # the type it wraps is the parameter's declared type
         is_comptime, annotated = unwrap_comptime(annotations.get(arg.arg))
+        # ``type[X]`` annotates a *type-valued* parameter: the argument is the
+        # spy type the call passes and ``X`` (usually a type parameter of this
+        # signature) is what it solves to (see ``SignatureFormalArg``)
+        is_type_value = get_origin(annotated) is type
+        if is_type_value:
+            inner = get_args(annotated)
+            if len(inner) != 1:
+                raise CompileError(
+                    f"type[...] of parameter '{arg.arg}' takes exactly one type argument"
+                )
+            annotated = inner[0]
         arg_type = annotation_of(annotated)
         if i == 0 and self_type is not None:
             # the ``self`` of a method: its declared type is a pointer to the
@@ -2057,7 +2088,7 @@ def parse_function(
             # ``FunctionIR.arg_is_ref`` and ``interp``)
             arg_type = self_type if self_by_value else PointerType(self_type)
         positional.add(
-            arg.arg, SignatureFormalArg(arg_type, is_comptime, default_value, TriState.UNKNOWN)
+            arg.arg, SignatureFormalArg(arg_type, is_comptime, default_value, TriState.UNKNOWN, is_type_value)
         )
         # a method's ``self`` is bound directly to its argument (the receiver's
         # address); every other parameter is passed as the signature says

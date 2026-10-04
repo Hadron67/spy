@@ -70,9 +70,12 @@ from .fn import (
     FunctionValue,
     NativeFn,
     PartialReturnSignature,
+    ProvidedArg,
     RawArgList,
+    Signature,
     SpecializedComptimeArg,
     SymbolTable,
+    plain_provided_arg,
 )
 from .interp import Analyser
 from .lower import LLVMBackend, to_ctype
@@ -242,6 +245,27 @@ def _call_multi_value(
 
 _INT_LITERAL_BITS = 64
 
+def _provided_arglist(sig: Signature, arglist: ArgList[sval.AnyValue]) -> ArgList[ProvidedArg]:
+    """The ``provided`` argument list of one Python-boundary call (see
+    ``Signature.solve_param_types``): the spy type of every argument, and - for
+    a ``type[X]`` parameter - the spy type its argument denotes."""
+    positional: list[ProvidedArg] = []
+    for (name, param), value in zip(sig.positional.items(), arglist.positional):
+        type = sval.type_of(value, _INT_LITERAL_BITS)
+        if param.is_type_value:
+            if not isinstance(value, sval.Type):
+                raise CompileError(
+                    f"the argument of parameter '{name}' must be a spy type"
+                )
+            positional.append((type, value))
+        else:
+            positional.append(plain_provided_arg(type))
+    varargs = tuple(plain_provided_arg(sval.type_of(v, _INT_LITERAL_BITS)) for v in arglist.varargs)
+    kwargs = frozendict(
+        (k, plain_provided_arg(sval.type_of(v, _INT_LITERAL_BITS))) for k, v in arglist.kwargs.items()
+    )
+    return ArgList(tuple(positional), varargs, kwargs)
+
 class _RegisteredFn:
     def __init__(self, fn, cls, meta: FnMetadata, context: _Context) -> None:
         self.fn = fn
@@ -275,7 +299,9 @@ class _RegisteredFn:
             ),
             lambda e: e,
         )
-        arg_types: ArgList[sval.Type | None] = arglist.map(lambda a: sval.type_of(a, _INT_LITERAL_BITS))
+        arg_types: ArgList[ProvidedArg] = _provided_arglist(
+            entry.hir.signature, arglist,
+        )
         call_sig, ret_sig = entry.hir.signature.specialize(
             arg_types, self.context.mir_lower_cache,
         )

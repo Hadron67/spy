@@ -104,6 +104,7 @@ from .fn import (
     FunctionValue,
     NativeFn,
     PartialReturnSignature,
+    ProvidedArg,
     RawArgList,
     ReturnSignature,
     Signature,
@@ -111,6 +112,7 @@ from .fn import (
     SpecializedComptimeArg,
     SpecializedFormalArg,
     SpecializedRuntimeArg,
+    plain_provided_arg,
     signature_of_fn_type,
 )
 from .hir import InlineMode
@@ -4489,6 +4491,7 @@ class HirRunner:
                 default_value = self._operand_comptime_value(default)
             positional.add(name, SignatureFormalArg(
                 declared, fn.is_comptime[i], default_value, TriState.UNKNOWN,
+                fn.is_type_value[i],
             ))
         ret_type: sval.Type | None = None
         if inst.ret_annotation is not None:
@@ -4559,7 +4562,7 @@ class HirRunner:
                 )
             sig = obj.hir.signature
         provided = ArgList(
-            tuple(arg.type for arg in sig.positional.by_id), (), frozendict(),
+            tuple(plain_provided_arg(arg.type) for arg in sig.positional.by_id), (), frozendict(),
         )
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
 
@@ -5709,7 +5712,7 @@ class HirRunner:
         sig = signature_of_fn_type(fn_type)
         binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
         _check_comptime_args(sig, binded_args)
-        call_sig, partial_ret_sig = sig.specialize(binded_args.map(_arg_type_of), self._mir_cache)
+        call_sig, partial_ret_sig = sig.specialize(self._provided_types(sig, binded_args), self._mir_cache)
         ret_sig = partial_ret_sig.complete()
         res = self._make_runtime_call(
             self._to_runtime(callee), binded_args, ret, call_sig, ret_sig,
@@ -6881,6 +6884,34 @@ class HirRunner:
     def operand_arg(self, arg: ArgEntry[hir.Value]) -> ArgEntry[InterpVal]:
         return ArgEntry(self.operand(arg.value), arg.is_ref)
 
+    def _type_value_arg(self, arg: ArgEntry[InterpVal], what: str) -> sval.Type:
+        """The spy type a *type-valued* argument denotes - the argument of a
+        ``type[X]`` parameter (see ``SignatureFormalArg.is_type_value``).  The
+        argument is read as a compile-time value and has to be a spy type."""
+        obj = _to_comptime(_shallow_normalize(self._arg_value(arg)))
+        if not isinstance(obj, sval.Type):
+            raise CompileError(f'{what} must be a spy type, got {obj!r}')
+        return obj
+
+    def _provided_types(
+        self, sig: Signature, binded_args: ArgList[ArgEntry[InterpVal]]
+    ) -> ArgList[ProvidedArg]:
+        """The ``provided`` argument list of one call (see
+        ``Signature.solve_param_types``): the spy type of every argument, and -
+        for a ``type[X]`` parameter - the spy type its argument denotes."""
+        positional: list[ProvidedArg] = []
+        for (name, param), arg in zip(sig.positional.items(), binded_args.positional):
+            type = _arg_type_of(arg)
+            if param.is_type_value:
+                positional.append((type, self._type_value_arg(arg, f"the argument of parameter '{name}'")))
+            else:
+                positional.append(plain_provided_arg(type))
+        varargs = tuple(plain_provided_arg(_arg_type_of(arg)) for arg in binded_args.varargs)
+        kwargs = frozendict(
+            (k, plain_provided_arg(_arg_type_of(arg))) for k, arg in binded_args.kwargs.items()
+        )
+        return ArgList(tuple(positional), varargs, kwargs)
+
     def _call_function_entry(
         self,
         fn: FunctionValue,
@@ -6923,7 +6954,7 @@ class HirRunner:
             # since the body may name them in a type expression
             # (``syntax.MultiPtr[T]``, see ``astgen``): the frame then resolves
             # them like the type arguments of a compiled call (see ``operand``)
-            solved = sig.solve_param_types(binded_args.map(_arg_type_of))
+            solved = sig.solve_param_types(self._provided_types(sig, binded_args))
             frame_values: dict[sval.TypeVar, sval.AnyValue] = dict(zip(sig.generic_args, solved))
             if generic_var_values:
                 frame_values.update(generic_var_values)
@@ -6934,8 +6965,7 @@ class HirRunner:
                 value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
                 on_done=on_return,
             )
-        arg_types = binded_args.map(_arg_type_of)
-        spec_sig = sig.specialize(arg_types, self._mir_cache)
+        spec_sig = sig.specialize(self._provided_types(sig, binded_args), self._mir_cache)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
             res = self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
@@ -6964,7 +6994,7 @@ class HirRunner:
         binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
         _check_comptime_args(sig, binded_args)
         if closure.force_inline:
-            solved = sig.solve_param_types(binded_args.map(_arg_type_of))
+            solved = sig.solve_param_types(self._provided_types(sig, binded_args))
             frame_values: dict[sval.TypeVar, sval.AnyValue] = dict(zip(sig.generic_args, solved))
             return self._start_inline(
                 closure.hir.body, closure.hir.arg_is_ref, binded_args, ret,
@@ -6975,11 +7005,11 @@ class HirRunner:
                 closure_values=self._inline_capture_values(closure),
             )
         capture_specs, capture_args = self._compile_capture_args(closure)
-        arg_types = binded_args.map(_arg_type_of)
-        for arg_type in arg_types.values():
-            if isinstance(arg_type, sval.ClosureType):
+        provided = self._provided_types(sig, binded_args)
+        for entry in provided.values():
+            if isinstance(entry[0], sval.ClosureType):
                 raise CompileError('a closure can only be passed to an inline function')
-        call_sig, partial_ret_sig = sig.specialize(arg_types, self._mir_cache)
+        call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
         call_sig = replace(call_sig, captures=capture_specs)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:

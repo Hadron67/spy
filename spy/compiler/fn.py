@@ -57,6 +57,11 @@ class SignatureFormalArg:
     # type parameter - its layout is not known before a call substitutes it,
     # so the specialization decides (see ``Signature.specialize``).
     by_ref: TriState = TriState.UNKNOWN
+    # Whether the annotation is ``type[X]``: the parameter takes a *type value*
+    # (the ``type`` above is then ``X``, what the parameter solves to).  The
+    # argument is the spy type the call passes, held as a compile-time value -
+    # there is no runtime argument (see ``Signature.solve_param_types``).
+    is_type_value: bool = False
 
     def map_type(self, f: Callable[[Type], Type]) -> SignatureFormalArg:
         return SignatureFormalArg(
@@ -64,12 +69,24 @@ class SignatureFormalArg:
             self.is_comptime,
             self.default_value,
             self.by_ref,
+            self.is_type_value,
         )
 
 @dataclass(frozen=True, slots=True)
 class ArgEntry[T]:
     value: T
     is_ref: bool
+
+
+# one argument of a call as ``Signature.solve_param_types``/``specialize`` see it:
+# the spy type of the value, and - only for a ``type[X]`` parameter - the spy
+# type its argument denotes (None otherwise)
+type ProvidedArg = tuple[Type | None, Value | None]
+
+def plain_provided_arg(type: Type | None) -> ProvidedArg:
+    """A :data:`ProvidedArg` for an argument that is not a type value: the
+    argument's spy type, with no denoted type."""
+    return (type, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,19 +368,22 @@ class Signature:
         return ArgList(tuple(bound), tuple(varargs_out), frozendict(kwargs_out))
 
     def solve_param_types(
-        self, provided: ArgList[Type | None]
+        self, provided: ArgList[ProvidedArg]
     ) -> tuple[AnyValue, ...]:
         """The concrete value of every declared generic type parameter of
-        one call.  ``provided`` carries the marshaled type of each
-        argument the call provides and ``None`` for a parameter the call
-        leaves out (its default value applies).
+        one call.  ``provided`` carries one :data:`ProvidedArg` per argument
+        the call provides - the marshal type of its value and, for a
+        ``type[X]`` parameter, the spy type its argument denotes - and ``None``
+        for a parameter the call leaves out (its default value applies).
 
         Every provided argument records a subtype constraint on the type
         parameter of the parameter it is provided for; ``finish`` solves
-        each parameter to the peer type of those bounds.  A parameter
-        annotated with a concrete type constrains nothing here - it keeps
-        its annotation, and the call specialized for it converts the
-        argument to that type (see :meth:`specialize`).  A missing
+        each parameter to the peer type of those bounds.  A ``type[X]``
+        parameter constrains ``X`` with the type its argument denotes
+        (``denoted <: X``).  A parameter annotated with a concrete type
+        constrains nothing here - it keeps its annotation, and the call
+        specialized for it converts the argument to that type (see
+        :meth:`specialize`).  A missing
         argument can still solve a type parameter when its default value
         has a spy type.  A parameter that stands for something other than
         a type - the length of an ``Array[T, N]`` - is solved to the value
@@ -374,8 +394,15 @@ class Signature:
         # are recorded as subtype bounds, which the solver binds the
         # parameter to the peer type of
         solver = TypeVarSolver()
-        for param, cand in zip(self.positional.by_id, provided.positional):
+        for param, entry in zip(self.positional.by_id, provided.positional):
             declared = param.type
+            if param.is_type_value:
+                # ``type[X]``: the argument denotes a spy type, which is the
+                # bound of ``X`` (usually a type parameter of the signature)
+                if declared is not None and entry is not None and entry[1] is not None:
+                    solver.add_constraint(entry[1], declared, True)
+                continue
+            cand = entry[0] if entry is not None else None
             # only an annotation that names a type parameter of this signature
             # constrains one - directly (``b: T``), or inside a generic type
             # (``p: Pair[T]``); any other annotation is just the type the
@@ -389,11 +416,13 @@ class Signature:
                 if default_type is not None:
                     solver.add_constraint(default_type, declared, True)
         if self.varargs is not None and isinstance(self.varargs.type, TypeVar):
-            for cand in provided.varargs:
+            for entry in provided.varargs:
+                cand = entry[0] if entry is not None else None
                 if cand is not None:
                     solver.add_constraint(cand, self.varargs.type, True)
         if self.kwargs is not None and isinstance(self.kwargs.type, TypeVar):
-            for cand in provided.kwargs.values():
+            for entry in provided.kwargs.values():
+                cand = entry[0] if entry is not None else None
                 if cand is not None:
                     solver.add_constraint(cand, self.kwargs.type, True)
         solver.finish()
@@ -454,7 +483,7 @@ class Signature:
             exceptions=None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute),
         )
 
-    def specialize(self, provided: ArgList[Type | None], cache: MirLowerCache) -> tuple[CallSignature, PartialReturnSignature]:
+    def specialize(self, provided: ArgList[ProvidedArg], cache: MirLowerCache) -> tuple[CallSignature, PartialReturnSignature]:
         """Specialize one call of this signature: the concrete typing of
         its arguments and the return convention this signature declares.
 
@@ -490,7 +519,17 @@ class Signature:
                 raise TypeMismatchError(f"type variable {replaced.name} is not solved")
             return replaced
 
-        def resolve(name: str, param: SignatureFormalArg, cand: Type | None) -> SpecializedFormalArg:
+        def resolve(name: str, param: SignatureFormalArg, entry: ProvidedArg | None) -> SpecializedFormalArg:
+            cand = entry[0] if entry is not None else None
+            if param.is_type_value:
+                # ``type[X]``: the parameter holds the spy type its argument
+                # denotes, as a compile-time value - there is no runtime argument
+                den = entry[1] if entry is not None else None
+                if not isinstance(den, Type):
+                    raise TypeMismatchError(
+                        f"the argument of parameter '{name}' must be a spy type"
+                    )
+                return SpecializedComptimeArg(den)
             resolved: Type | None = None
             if param.type is not None:
                 resolved = substitute(param.type)
@@ -521,23 +560,23 @@ class Signature:
             return SpecializedRuntimeArg(resolved, by_ref is not TriState.FALSE)
 
         positional = tuple(
-            (name, resolve(name, param, cand))
-            for (name, param), cand in zip(self.positional.items(), provided.positional)
+            (name, resolve(name, param, entry))
+            for (name, param), entry in zip(self.positional.items(), provided.positional)
         )
 
         varargs: tuple[SpecializedFormalArg, ...] | None = None
         if self.varargs is not None:
             formal = self.varargs
             varargs = tuple(
-                resolve('*args', formal, cand) for cand in provided.varargs
+                resolve('*args', formal, entry) for entry in provided.varargs
             )
 
         kwargs: frozendict[str, SpecializedFormalArg] | None = None
         if self.kwargs is not None:
             kw = self.kwargs
             kwargs = frozendict(
-                (name, resolve(name, kw, cand))
-                for name, cand in provided.kwargs.items()
+                (name, resolve(name, kw, entry))
+                for name, entry in provided.kwargs.items()
             )
 
         call_sig = CallSignature(
@@ -697,6 +736,9 @@ class ClosureFunction:
     param_names: tuple[str, ...]
     # whether each declared parameter is a compile-time one (``Comptime``)
     is_comptime: tuple[bool, ...]
+    # whether each declared parameter's annotation is ``type[X]`` (a
+    # type-valued parameter, see ``SignatureFormalArg.is_type_value``)
+    is_type_value: tuple[bool, ...]
     # for each declared positional parameter, whether the HIR binds its
     # argument directly as an address (see ``FunctionIR.arg_is_ref``)
     arg_is_ref: tuple[bool, ...]
