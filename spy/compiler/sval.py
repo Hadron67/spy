@@ -2289,6 +2289,33 @@ class AnyFunction(Type):
         return "anyfn"
 
 @dataclass(frozen=True, slots=True)
+class ClosureType(Type):
+    """The type of a *closure* value: a nested ``def``/``lambda`` that
+    captures variables of an enclosing spy function.  A closure only exists
+    at compile time - only an inline function can take one as an argument -
+    so it has no MIR mirror (see ``SpecialTypeKind.COMPTIME``).  ``fn_type``
+    is the closure's declared signature as a function type when it is
+    complete, and ``None`` otherwise."""
+
+    fn_type: FunctionType | None = None
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
+
+    def __str__(self) -> str:
+        return 'closure' if self.fn_type is None else f'closure({self.fn_type})'
+
+
+@dataclass(frozen=True, slots=True)
 class BoundMethod(Value):
     """A method of one struct *specialization*: the function value of the
     method together with the type-argument values of the struct it was

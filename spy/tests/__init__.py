@@ -20,6 +20,7 @@ from .annotations import all_tests as annotations_tests
 from .arrays import all_tests as arrays_tests
 from .basics import all_tests as basics_tests
 from .classname import all_tests as classname_tests
+from .closures import all_tests as closures_tests
 from .comptime import all_tests as comptime_tests
 from .comptime_structs import all_tests as comptime_structs_tests
 from .cross_context import all_tests as cross_context_tests
@@ -62,6 +63,7 @@ all_tests: list[type[TestCase]] = [
     *types_tests,
     *cross_context_tests,
     *classname_tests,
+    *closures_tests,
     *defer_tests,
     *func_types_tests,
     *reflect_tests,

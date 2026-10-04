@@ -4,6 +4,7 @@ from ..compiler import (
     Option,
     Ptr,
     decl_func,
+    i32,
     struct,
     u8,
     usize,
@@ -25,8 +26,19 @@ def realloc(ptr: MultiPtr[u8], size: usize) -> Option[MultiPtr[u8]]: ...
 def puts(ptr: MultiPtr[u8]) -> None: ...
 
 @struct()
+class CError(Exception):
+    code: i32
+
+@struct()
 class FILE:
     inner: Opaque
+
+    @staticmethod
+    def open(path: MultiPtr[u8], mode: MultiPtr[u8]) -> Ptr[FILE]:
+        ptr = fopen(path, mode)
+        if ptr is None:
+            raise CError(0)
+        return ptr
 
     def close(self):
         fclose(ref(self))

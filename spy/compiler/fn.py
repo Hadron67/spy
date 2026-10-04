@@ -4,13 +4,14 @@ import ctypes
 from abc import abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from typing import override
+from typing import Any, override
 
 from . import hir, mir, opt
 from .errors import CompileError, TypeMismatchError
 from .sval import (
     AnyFunction,
     AnyValue,
+    ClosureType,
     FormalArg,
     FunctionType,
     MirLowerCache,
@@ -221,6 +222,10 @@ class CallSignature:
     positional: tuple[tuple[str, SpecializedFormalArg], ...]
     varargs: tuple[SpecializedFormalArg, ...] | None
     kwargs: frozendict[str, SpecializedFormalArg] | None
+    # the hidden capture parameters of a closure (see ``ClosureFunction``):
+    # independent of ``positional``/``varargs``/``kwargs``, so the declared
+    # argument layout can grow ``*args``/``**kwargs`` without disturbing them
+    captures: tuple[SpecializedFormalArg, ...] = ()
 
     def __str__(self) -> str:
         """Note: return type not included"""
@@ -233,6 +238,9 @@ class CallSignature:
         if self.kwargs is not None:
             s = ", ".join(f"{k}={v}" for k, v in self.kwargs.items())
             parts.append(f"**{{{s}}}")
+        if len(self.captures) > 0:
+            s = ", ".join(str(a) for a in self.captures)
+            parts.append(f"@({s})")
         return f"[{generic}]({', '.join(parts)})"
 
 
@@ -660,6 +668,80 @@ class FunctionValue(Value):
     @override
     def get_type(self) -> Type:
         return self.hir.signature.as_non_generic_fn_type() or AnyFunction()
+
+@dataclass
+class ClosureFunction:
+    """The parsed body of one nested ``def``/``lambda`` (see
+    :class:`~spy.compiler.hir.MakeClosure`).  It is shared by every closure
+    value the statement creates.  The declared parameters and the captures are
+    kept separate: ``arg_is_ref`` describes the declared ones only, while the
+    captures are named by :class:`~spy.compiler.hir.Closure` and passed as the
+    ``captures`` of a :class:`CallSignature`.
+
+    It carries only a *local* name (``name``/``local_name``); the native symbol
+    of a compiled closure is prefixed at creation with the name of the function
+    the closure is created in (the specialization's name, which is only known
+    when that function is compiled - see ``ClosureValue``)."""
+
+    # the bare name of the nested function (``add``, ``<lambda>``), for error
+    # messages
+    name: str
+    # a name unique among the closures of the builder (``add#1``), prefixed
+    # with the creating frame's function name to form the native symbol
+    local_name: str
+    # the parsed body (see ``astgen``): its declared parameters are
+    # ``hir.Arg(i)`` and its captures ``hir.Closure(i)``
+    body: tuple[hir.Inst, ...]
+    # the declared parameter names, in position (parallel to the annotation
+    # and default operands of the ``hir.MakeClosure`` that creates it)
+    param_names: tuple[str, ...]
+    # whether each declared parameter is a compile-time one (``Comptime``)
+    is_comptime: tuple[bool, ...]
+    # for each declared positional parameter, whether the HIR binds its
+    # argument directly as an address (see ``FunctionIR.arg_is_ref``)
+    arg_is_ref: tuple[bool, ...]
+    # the type parameters the closure itself declares (``[T]``), which a call
+    # solves; a capture is never one of these
+    generic_args: tuple[TypeVar, ...]
+    # whether the closure is forced to be inlined at its call sites
+    force_inline: bool
+    # the declared exception set (None: inferred from the body)
+    exceptions: ArraySet[Type] | None
+    callconv: str = 'default'
+    may_panic: bool = False
+
+class ClosureValue(FunctionValue):
+    """One closure value: the parsed :class:`ClosureFunction` together with
+    the capture places the creating statement resolved and the concrete
+    signature its annotations evaluated to (an annotation may name a type
+    argument of the enclosing function, which is concrete per creation).
+
+    It is a :class:`FunctionValue` so the call/compile machinery treats it
+    like any other function entry; a call dispatches through
+    ``interp._call_closure``, which inlines a forced-inline closure and
+    compiles the others.  ``name_base`` is built by the ``hir.MakeClosure``
+    that creates it, from the *creating frame's* function name (the
+    specialization's name, with its signature) and the closure's local name -
+    so a closure compiled inside ``foo(i32)`` is named ``foo(i32).add#1(...)``.
+    Every creation caches its own specializations: two creations of one ``def``
+    may have different concrete signatures (an annotation naming an enclosing
+    type argument), which a shared cache keyed by the call signature alone
+    could not tell apart."""
+
+    def __init__(self, fn: ClosureFunction, hir_ir: FunctionIR, captures: tuple[Any, ...], name_base: str) -> None:
+        super().__init__(name_base, hir_ir, force_inline=fn.force_inline)
+        self.closure_fn = fn
+        # the capture places, in the order of the closure's ``hir.Closure``
+        # indices (interpreter values, kept untyped here - ``fn`` cannot name
+        # ``interp``'s ``InterpVal``)
+        self.captures = captures
+
+    @override
+    def get_type(self) -> Type:
+        return ClosureType(self.hir.signature.as_non_generic_fn_type())
+
+    def __repr__(self) -> str:
+        return f'ClosureValue({self.hir.name})'
 
 class SymbolTable:
     """The link names of every compiled function of the process, and the

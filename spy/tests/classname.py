@@ -146,7 +146,7 @@ class SpyClassNameCallTest(TestCase):
 
     def test_std_mem_allocator_methods_are_inherited(self) -> None:
         dyn = struct_type(DynamicAllocator)
-        for name in ('alloc', 'resize', 'new', 'deinit', 'new_array', 'resize_array'):
+        for name in ('alloc', 'resize', 'new', 'free', 'new_array', 'resize_array'):
             self.assertIsNotNone(dyn.get_method(name))
 
 

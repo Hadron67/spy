@@ -82,7 +82,7 @@ from enum import IntEnum, auto
 from typing import Any
 
 from .binop import BinaryOp, CompareOp, UnaryOp
-from .fn import ArgEntry, RawArgList, frozendict
+from .fn import ArgEntry, ClosureFunction, RawArgList, frozendict
 
 
 class Value:
@@ -143,6 +143,18 @@ class ConstRef(Value):
 class Arg(Value):
     """The address of the index-th argument of the function being
     executed (parameters are passed by reference at HIR level)."""
+
+    index: int
+
+
+@dataclass(frozen=True)
+class Closure(Value):
+    """The address (the place) of the index-th variable a closure captured
+    from the enclosing function (see :class:`MakeClosure` and ``interp``).
+    Unlike :class:`Arg` it does not name a declared parameter: a closure's
+    captures are carried by the frame's ``closure_values``, which the
+    interpreter fills from the capture pointers a call passes (a compiled
+    closure) or from the closure value itself (an inlined one)."""
 
     index: int
 
@@ -359,6 +371,25 @@ class AsFuncPtr(Inst):
 
     type: Value
     obj: Value
+
+
+@dataclass(eq=False)
+class MakeClosure(Inst):
+    """Create a closure value: the nested ``def``/``lambda`` ``fn`` bound to
+    the captured variables ``captures`` (the enclosing function's slots, or an
+    enclosing closure's :class:`Closure` - every capture is a place).  The
+    parameter annotations/default values/return annotation are value operands
+    evaluated here (in the enclosing frame); the interpreter assembles the
+    closure's concrete signature from them (see ``interp``).  ``fn`` is a
+    :class:`~spy.compiler.fn.ClosureFunction`, the parsed body of the nested
+    function - its declared parameters stay separate from the captures, so
+    ``*args``/``**kwargs`` can be added later without disturbing them."""
+
+    fn: ClosureFunction
+    annotations: tuple[Value | None, ...]
+    defaults: tuple[Value | None, ...]
+    ret_annotation: Value | None
+    captures: tuple[Value, ...]
 
 @dataclass(eq=False)
 class InitTuple(Inst):

@@ -1,15 +1,14 @@
 # This file is imported by the compiler, make sure to avoid circular imports.
 
-from typing import TYPE_CHECKING, Any, Never, Protocol, Self, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
-from ..compiler import builtin_func, i64, syntax, u64, usize
+from ..compiler import builtin_func, usize
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
     Array,
     ConstMultiPtr,
     ConstPtr,
     MultiPtr,
-    Opaque,
     Option,
     Ptr,
     comptime,
@@ -198,11 +197,11 @@ def arr_slice[T, N: int](arr: Ptr[Array[T, N]]) -> SlicePtr[T]:
     """The slice of the whole array the pointer ``arr`` names: the
     ``*[N]T -> SlicePtr[T]`` conversion, written out with ``ptr_cast`` (a
     pointer to an array already carries the address of its first element)."""
-    return cast(SlicePtr[T], SlicePtr(ptr_cast(arr, syntax.MultiPtr[T]), cast(int, N)))
+    return cast(SlicePtr[T], SlicePtr(ptr_cast(arr, MultiPtr[T]), cast(int, N)))
 
 def const_arr_slice[T, N: int](arr: ConstPtr[Array[T, N]]) -> ConstSlicePtr[T]:
     """Likewise for a const pointer: the slice of it is a ``ConstSlicePtr``."""
-    return cast(ConstSlicePtr[T], ConstSlicePtr(ptr_cast(arr, syntax.ConstMultiPtr[T]), cast(int, N)))
+    return cast(ConstSlicePtr[T], ConstSlicePtr(ptr_cast(arr, ConstMultiPtr[T]), cast(int, N)))
 
 @struct()
 class NullException(Exception):

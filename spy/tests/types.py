@@ -60,7 +60,7 @@ def unsized_ptr_index(x: i32) -> i32:
     # a pointer to an unsized array converts to the multi pointer of its
     # elements: ``*[?]T`` and ``*T`` carry the same address
     a = array(x, x + 1, x + 2, x + 3)
-    p = ptr_cast(ref(a), Ptr[Array[i32, None]])  # pyright: ignore
+    p = ptr_cast(ref(a), Ptr[Array[i32, None]])
     m: MultiPtr[i32] = p  # pyright: ignore
     return m[2]
 
@@ -69,7 +69,7 @@ def unsized_ptr_index(x: i32) -> i32:
 class FamCarrier:
     # a struct with an unsized-array field: a C flexible array member
     n: i32
-    data: Array[i32, None]  # pyright: ignore
+    data: Array[i32, None]
 
 
 @func()

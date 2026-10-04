@@ -39,15 +39,6 @@ def size_of(type: Any) -> usize:
 def align_of(type: Any) -> usize:
     return layout_of(type).align
 
-@func_type(exceptions=AllocError)
-class AllocFn(Protocol):
-    def __call__(self, data: Ptr[Opaque], layout: Layout) -> SlicePtr[u8]: ...
-
-@func_type(exceptions=AllocError)
-class ResizeFn(Protocol):
-    def __call__(self, data: Ptr[Opaque], ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]: ...
-
-
 class Allocator(Protocol):
     def alloc(self, layout: Layout) -> SlicePtr[u8]: ...
     def resize(self, ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]: ...
@@ -56,9 +47,9 @@ class Allocator(Protocol):
         layout = layout_of(type)
         return ptr_cast(self.alloc(layout).ptr, Ptr[T])
 
-    def deinit[T](self, ptr: Ptr[T]):
+    def free[T](self, ptr: Ptr[T]):
         layout = layout_of(T)
-        self.resize(ptr_cast(self.alloc(layout).ptr, MultiPtr[u8]), layout, layout_of(T).repeat(0))
+        self.resize(ptr_cast(ptr, MultiPtr[u8]), layout, layout_of(T).repeat(0))
 
     def new_array[T](self, type: type[T], count: usize) -> SlicePtr[T]:
         layout = layout_of(type).repeat(count)
@@ -68,8 +59,16 @@ class Allocator(Protocol):
         layout = layout_of(T).repeat(count)
         return SlicePtr(ptr_cast(self.resize(ptr_cast(ptr.ptr, MultiPtr[u8]), layout_of(T).repeat(ptr.length), layout), MultiPtr[T]), count)
 
-    def deinit_array[T](self, ptr: SlicePtr[T]):
+    def free_array[T](self, ptr: SlicePtr[T]):
         self.resize_array(ptr, 0)
+
+@func_type(exceptions=AllocError)
+class AllocFn(Protocol):
+    def __call__(self, data: Ptr[Opaque], layout: Layout) -> SlicePtr[u8]: ...
+
+@func_type(exceptions=AllocError)
+class ResizeFn(Protocol):
+    def __call__(self, data: Ptr[Opaque], ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]: ...
 
 @struct()
 class AllocatorVtable:
@@ -92,6 +91,8 @@ class CAllocator(Allocator):
     @func(exceptions=AllocError)
     @override
     def alloc(self, layout: Layout) -> SlicePtr[u8]:
+        if layout.size == 0:
+            return SlicePtr(undefined(), 0)
         if (ptr := malloc(layout.size)) is not None:
             return SlicePtr(ptr, layout.size)
         raise AllocError()
@@ -101,7 +102,7 @@ class CAllocator(Allocator):
     def resize(self, ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]:
         if new_layout.size == 0:
             free(ptr)
-            return SlicePtr(undefined(), 0)
+            return SlicePtr[u8](undefined(), 0)
         if new_layout.size <= layout.size and new_layout.align <= layout.align:
             return SlicePtr(ptr, new_layout.size)
         if (ret := realloc(ptr, new_layout.size)) is not None:

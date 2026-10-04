@@ -1,7 +1,6 @@
-from spy.compiler.dsl import func
-from spy.std.core import SlicePtr
-
-from ..compiler import MultiPtr, struct, usize
+from ..compiler import struct, usize
+from ..compiler.dsl import func
+from .core import SlicePtr
 from .mem import Allocator, AllocError
 
 
@@ -12,7 +11,7 @@ class Vec[T, A: Allocator]:
     allocator: A
 
     def deinit(self):
-        self.allocator.deinit_array(self.ptr)
+        self.allocator.free_array(self.ptr)
 
     @func(exceptions=AllocError)
     def ensure_capacity(self, cap: usize):
@@ -25,7 +24,9 @@ class Vec[T, A: Allocator]:
     @func(exceptions=AllocError)
     def reserve(self, count: usize) -> SlicePtr[T]:
         self.ensure_capacity(self.size + count)
-        return self.ptr.slice(self.size)
+        ret = self.ptr.slice(self.size)
+        self.size += count
+        return ret
 
     def push(self, value: T):
         self.reserve(1)[0] = value
@@ -40,6 +41,9 @@ class Vec[T, A: Allocator]:
 
     def __iter__(self):
         return iter(self.ptr)
+
+    def __bool__(self):
+        return self.size > 0
 
     def refs(self):
         return self.ptr.refs()

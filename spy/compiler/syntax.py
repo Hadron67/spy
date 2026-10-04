@@ -62,7 +62,7 @@ class MultiPtr[T](ConstMultiPtr[T], Ptr[T]):
     def __setitem__(self, value: int | EllipsisType, val: T) -> None:
         ...
 
-class Array[T, L: int]:
+class Array[T, L: int | None]:
     def __getitem__(self, value: int) -> T:
         ...
 
@@ -114,3 +114,17 @@ def errdefer():
 
 def as_func_ptr[T](type: type[T], obj: T) -> ConstPtr[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+def closure(*, inline: bool = True, exceptions=None, callconv: str = 'default', may_panic: bool = False):
+    """The decorator of a nested ``def`` inside a spy function (a *closure*).
+    It only exists at parse time - the nested function is never executed by
+    Python - so ``astgen`` recognizes it by identity and reads its arguments
+    as the closure's declaration, standing in for the ``@func`` decorator a
+    closure cannot carry (see ``dsl.func``): ``exceptions`` is the exceptions
+    it may raise (``None``, the default, means it raises nothing, ``"infer"``
+    that they are inferred from the body), ``inline`` whether it is forced to
+    be inlined (the default) or compiled into a runtime function, and
+    ``callconv``/``may_panic`` as in ``@func``."""
+    def wrapper[T](func: T) -> T:
+        raise RuntimeError("Cannot call directly: this is a spy closure decorator")
+    return wrapper

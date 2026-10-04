@@ -63,7 +63,14 @@ from typing import Any, Literal, TypeVar, cast
 from . import hir, syntax
 from .binop import BoolOp
 from .errors import CompileError
-from .fn import ArgEntry, FunctionIR, RawArgList, Signature, SignatureFormalArg
+from .fn import (
+    ArgEntry,
+    ClosureFunction,
+    FunctionIR,
+    RawArgList,
+    Signature,
+    SignatureFormalArg,
+)
 from .sval import (
     AnyValue,
     CompileContext,
@@ -155,15 +162,36 @@ class _Scope:
     sees - and only a name that is bound *nowhere* is declared: it gets a
     fresh block-local slot, which is not visible outside its block.  The
     chain of enclosing blocks is the scope stack of the :class:`_Builder`
-    translating the function (see ``_Builder._lookup``)."""
+    translating the function (see ``_Builder._lookup``).
 
-    __slots__ = ('vars',)
+    ``pending`` names the slots the body's pre-scan declared but whose
+    declaration statement has not run yet (see ``_Builder._predeclare``):
+    such a slot is committed by the first statement that initializes it."""
+
+    __slots__ = ('pending', 'vars')
 
     def __init__(self) -> None:
         # every binding names a *pointer to the referenced object*: a
         # variable's slot, the option a ``:=`` binds, or the payload of one an
         # unwrap binds (see ``_Builder._gen_walrus``/``_gen_unwrap``)
         self.vars: dict[str, hir.Value] = {}
+        self.pending: set[str] = set()
+
+class _ClosureScope(_Scope):
+    """The root scope of one closure body: like a :class:`_Scope`, plus the
+    captures the body resolved through the enclosing scopes (see
+    ``_Builder._tunnel_through_closures``).  ``captures`` holds each captured
+    place in the order the body's ``hir.Closure`` indices name it, and
+    ``capture_index`` maps a captured name to its index so the same variable is
+    captured once."""
+
+    __slots__ = ('capture_index', 'captures', 'closure_fn')
+
+    def __init__(self, closure_fn: ClosureFunction) -> None:
+        super().__init__()
+        self.captures: list[hir.Value] = []
+        self.capture_index: dict[str, int] = {}
+        self.closure_fn = closure_fn
 
 class _Pragma:
     pass
@@ -192,9 +220,13 @@ class _Builder:
     through the stack.
     """
 
-    def __init__(self, fn: Any, fn_ir: FunctionIR, type_vars: dict[TypeVar, Value]) -> None:
+    def __init__(self, fn: Any, fn_ir: FunctionIR, type_vars: dict[TypeVar, Value], resolver: CompileContext) -> None:
         self.fn = fn
         self._fn_ir = fn_ir
+        # the host the annotations/declarations are resolved in (see
+        # ``parse_function``); a closure's ``@syntax.closure(exceptions=...)``
+        # is resolved through it
+        self._resolver = resolver
         # the open lexical blocks, innermost last: names resolve through
         # this stack (see ``_lookup``) and a declaration goes into its top
         # (see ``_declare``)
@@ -209,15 +241,59 @@ class _Builder:
         self._generic_names: dict[str, Value] = {tp.__name__: v for tp, v in type_vars.items()}
         self._pragmas: set[_Pragma] = set()
         self.insts: list[hir.Inst] = []
+        # the type parameters of the closure body currently being generated, or
+        # None outside one: a closure body may only name its own type
+        # parameters, not the enclosing function's (see ``_gen_expr``)
+        self._own_generic_names: set[str] | None = None
+        # a counter that keeps the native names of the closures of one function
+        # apart
+        self._closure_counter: int = 0
 
     def _lookup(self, name: str) -> hir.Value | None:
         """The pointer the nearest binding of ``name`` holds, or None when the
-        name is not bound in any open block."""
-        for scope in reversed(self._scopes):
+        name is not bound in any open block.  A binding that lies outside the
+        innermost closure body the name is read in is threaded through every
+        closure between it and the reader (see ``_tunnel_through_closures``),
+        so the returned value is a ``hir.Closure`` leaf of the reader's
+        frame."""
+        for i in range(len(self._scopes) - 1, -1, -1):
+            slot = self._scopes[i].vars.get(name)
+            if slot is not None:
+                return self._tunnel_through_closures(i, name, slot)
+        return None
+
+    def _lookup_within_function(self, name: str) -> hir.Value | None:
+        """The nearest binding of ``name`` in the *current* function body,
+        searching every open block down to (and including) the innermost
+        closure scope - but never crossing it.  It is what decides whether an
+        assignment declares a fresh variable: a name assigned in a closure body
+        is local to that closure, whatever the enclosing function binds."""
+        for i in range(len(self._scopes) - 1, -1, -1):
+            scope = self._scopes[i]
             slot = scope.vars.get(name)
             if slot is not None:
                 return slot
+            if isinstance(scope, _ClosureScope):
+                break
         return None
+
+    def _tunnel_through_closures(self, found: int, name: str, slot: hir.Value) -> hir.Value:
+        """Bring the binding at scope index ``found`` to the innermost scope:
+        for every closure boundary between it and the reader, capture the
+        current value (the enclosing slot, or an enclosing closure's
+        ``hir.Closure``) in that closure scope and replace the binding with the
+        ``hir.Closure`` that names it.  A name is captured at most once per
+        closure (see ``_ClosureScope.capture_index``)."""
+        for i in range(found + 1, len(self._scopes)):
+            scope = self._scopes[i]
+            if isinstance(scope, _ClosureScope):
+                index = scope.capture_index.get(name)
+                if index is None:
+                    index = len(scope.captures)
+                    scope.captures.append(slot)
+                    scope.capture_index[name] = index
+                slot = hir.Closure(index)
+        return slot
 
     def _declare(self, name: str, slot: hir.Value) -> None:
         """Bind ``name`` to ``slot`` in the innermost open block."""
@@ -239,12 +315,86 @@ class _Builder:
         return None
 
     def _gen_body(self, stmts: list[ast.stmt]) -> None:
-        """Generate a whole statement list, rejecting a marker that no loop or
-        declaration follows at its end."""
+        """Generate a whole statement list.  Every declaration of the block -
+        an assignment target, an annotated declaration, a ``def`` - is
+        *pre-declared* first (see ``_predeclare``), so a nested closure written
+        before a variable is assigned can still capture it, and a name assigned
+        in a closure body is local to that closure.  A marker that no loop or
+        declaration follows at its end is rejected."""
+        self._predeclare(stmts)
         for stmt in stmts:
             self._gen_stmt(stmt)
         if self._pragmas:
             raise CompileError('unused pragmas')
+
+    def _predeclare(self, stmts: list[ast.stmt]) -> None:
+        """Declare, in the current block, every name the *direct* statements of
+        ``stmts`` will bind: an assignment target, an annotated declaration (its
+        annotation is evaluated here, so its type is fixed before the closure
+        bodies below can capture it) and a ``def`` name (a full compile-time
+        slot the closure value is written into).  A name bound already -
+        by a parameter, an enclosing block, or a preceding marker - is left
+        alone.  Compound statements are not descended into: their own bodies
+        pre-declare the names they bind."""
+        composable = False
+        for stmt in stmts:
+            marker = self._as_marker(stmt)
+            if marker is _COMPTIME:
+                composable = True
+                continue
+            if isinstance(stmt, ast.FunctionDef):
+                self._predeclare_name(stmt.name, hir.InlineMode.FULL)
+            elif isinstance(stmt, ast.Assign):
+                mode = hir.InlineMode.FULL if composable else hir.InlineMode.NONE
+                if len(stmt.targets) > 0:
+                    self._predeclare_target(stmt.targets[0], mode)
+            elif isinstance(stmt, ast.AnnAssign):
+                self._predeclare_ann(stmt, composable)
+            composable = False
+
+    def _predeclare_name(self, name: str, mode: hir.InlineMode) -> None:
+        if self._lookup_within_function(name) is not None:
+            return
+        slot = self.add(hir.Alloca(mode))
+        self._declare(name, slot)
+        self._scopes[-1].pending.add(name)
+
+    def _predeclare_target(self, target: ast.expr, mode: hir.InlineMode) -> None:
+        if isinstance(target, ast.Name):
+            self._predeclare_name(target.id, mode)
+        elif isinstance(target, ast.Tuple):
+            for elt in target.elts:
+                self._predeclare_target(elt, mode)
+
+    def _predeclare_ann(self, node: ast.AnnAssign, marker_comptime: bool) -> None:
+        target = node.target
+        if not isinstance(target, ast.Name):
+            return
+        if self._lookup_within_function(target.id) is not None:
+            return
+        is_comptime, type_node = self._split_comptime(node.annotation)
+        if is_comptime and marker_comptime:
+            raise CompileError(
+                f"'{target.id}' is already declared compile-time by its "
+                f"annotation; drop the syntax.comptime() marker before it"
+            )
+        is_comptime = is_comptime or marker_comptime
+        declared = None if type_node is None else self._as_value(self._gen_expr(type_node)[0])
+        slot = self.add(hir.Alloca(
+            hir.InlineMode.FULL if is_comptime else hir.InlineMode.NONE, declared
+        ))
+        self._declare(target.id, slot)
+        self._scopes[-1].pending.add(target.id)
+
+    def _consume_pending(self, name: str) -> bool:
+        """Whether ``name`` is a slot this body pre-declared and whose
+        declaration statement has not run yet; a consuming caller emits the
+        ``CommitSlot`` that materializes it."""
+        pending = self._scopes[-1].pending
+        if name in pending:
+            pending.discard(name)
+            return True
+        return False
 
     def _gen_stmt(self, node: ast.stmt) -> None:
         if (marker := self._as_marker(node)) is not None:
@@ -290,6 +440,8 @@ class _Builder:
                 else:
                     self.add(hir.StoreVoidRetloc())
                 self.add(hir.Ret())
+            case ast.FunctionDef():
+                self._gen_function_def(node)
             case ast.Raise():
                 # the exception is built into a slot of its own (result-location
                 # semantics); ``hir.Raise`` then tags and dispatches it (see
@@ -639,11 +791,17 @@ class _Builder:
             # the right-hand side is generated straight into them (result-
             # location semantics), so no intermediate tuple value is built
             return self._gen_target_tuple(target, new_slots, inline_mode)
-        if isinstance(target, ast.Name) and self._lookup(target.id) is None:
-            # the name is bound nowhere: declare it here, in the current block
-            slot = self.add(hir.Alloca(inline_mode))
-            self._declare(target.id, slot)
-            new_slots.append(slot)
+        if isinstance(target, ast.Name):
+            slot = self._lookup_within_function(target.id)
+            if slot is None:
+                # the name is bound nowhere: declare it here, in the current block
+                slot = self.add(hir.Alloca(inline_mode))
+                self._declare(target.id, slot)
+                new_slots.append(slot)
+                return slot
+            if self._consume_pending(target.id):
+                # a slot the body pre-declared: commit it once initialized
+                new_slots.append(slot)
             return slot
         lhs = self._gen_expr(target, False)[0]
         if not lhs.is_ref:
@@ -687,14 +845,18 @@ class _Builder:
         """Whether an assignment to ``target`` declares a name that is bound
         nowhere - a declaration, which is what a ``syntax.comptime()`` marker
         marks (see ``_gen_assign`` and ``_gen_lhs``, whose declaration rule this
-        mirrors)."""
+        mirrors).  A slot the body pre-declared but has not initialized yet is
+        a declaration all the same."""
         match target:
             case ast.Name():
-                return self._lookup(target.id) is None
+                return self._lookup_within_function(target.id) is None or self._is_pending(target.id)
             case ast.Tuple():
                 return all(self._declares_a_fresh_name(elt) for elt in target.elts)
             case _:
                 return False
+
+    def _is_pending(self, name: str) -> bool:
+        return name in self._scopes[-1].pending
 
     def _gen_ann_assign(self, node: ast.AnnAssign, by_marker: bool = False) -> None:
         """One annotated declaration ``name: T`` or ``name: T = expr``.  The
@@ -717,6 +879,15 @@ class _Builder:
                 f"only a name can be annotated in spy function {fn_name}, "
                 f"got {ast.unparse(target)!r}"
             )
+        if self._is_pending(target.id):
+            # the body pre-declared it (its annotation was evaluated there):
+            # this statement only initializes the slot
+            slot = self._scopes[-1].vars[target.id]
+            self._consume_pending(target.id)
+            if node.value is not None:
+                self._gen_result_loc(node.value, slot)
+            self.add(hir.CommitSlot(slot))
+            return
         if self._lookup(target.id) is not None:
             raise CompileError(
                 f"'{target.id}' is already bound in spy function {fn_name}; "
@@ -765,10 +936,14 @@ class _Builder:
             if isinstance(elt, ast.Tuple):
                 elems.append(ArgEntry(self._gen_target_tuple(elt, new_slots, inline_mode), False))
                 continue
-            if isinstance(elt, ast.Name) and self._lookup(elt.id) is None:
-                slot = self.add(hir.Alloca(inline_mode))
-                self._declare(elt.id, slot)
-                new_slots.append(slot)
+            if isinstance(elt, ast.Name):
+                slot = self._lookup_within_function(elt.id)
+                if slot is None:
+                    slot = self.add(hir.Alloca(inline_mode))
+                    self._declare(elt.id, slot)
+                    new_slots.append(slot)
+                elif self._consume_pending(elt.id):
+                    new_slots.append(slot)
             ref = self._gen_expr(elt, False)[0]
             if not ref.is_ref:
                 raise CompileError(
@@ -915,7 +1090,14 @@ class _Builder:
                     # a type parameter of the function (or of the struct a
                     # method belongs to) used as a value: the interpreter
                     # resolves it to the type the call solved it to, from
-                    # the frame it runs in (see ``interp.operand``)
+                    # the frame it runs in (see ``interp.operand``).  A closure
+                    # body may only name its *own* type parameters: the
+                    # enclosing function's are not available where it runs
+                    if self._own_generic_names is not None and node.id not in self._own_generic_names:
+                        raise CompileError(
+                            f"a closure may not reference the enclosing function's "
+                            f"type parameter '{node.id}' in spy function {self._fn_ir.name}"
+                        )
                     return ArgEntry(hir.Const(generic), False), False
                 ref = self._gen_name(node.id)
                 # the name of a class denotes a struct: calling it constructs
@@ -959,6 +1141,9 @@ class _Builder:
             case ast.Tuple():
                 values = tuple(self._gen_expr(elt)[0] for elt in node.elts)
                 return ArgEntry(self.add(hir.Tuple(values)), False), False
+            case ast.Lambda():
+                # a lambda is a forced-inline closure (see ``_gen_lambda``)
+                return ArgEntry(self._gen_lambda(node), False), False
             case ast.Call() if self._is_syntax_call(node.func):
                 callee = self._try_resolve_object(node.func)
                 assert callee is not None
@@ -1450,6 +1635,211 @@ class _Builder:
                 )
         self.add(hir.FinishArray(result_loc, tuple(elements)))
 
+    # -- closures -------------------------------------------------------------
+
+    def _gen_function_def(self, node: ast.FunctionDef) -> None:
+        """Translate a nested ``def`` into a closure value.  The body's
+        pre-scan already declared the name (a full compile-time slot), so this
+        only writes the closure into that slot.  A ``@syntax.closure(...)``
+        decorator stands in for the ``@func`` decorator a closure cannot carry
+        (see ``_parse_closure_decorators``)."""
+        if len(node.decorator_list) == 0:
+            inline = True
+            exceptions: ArraySet[Type] | None = ArraySet()
+            callconv = 'default'
+            may_panic = False
+        else:
+            inline, exceptions, callconv, may_panic = self._parse_closure_decorators(node)
+
+        def gen_body() -> None:
+            self._gen_body(node.body)
+            self.add(hir.StoreVoidRetloc())
+
+        closure = self._gen_closure(
+            node.name, node.type_params, node.args, node.returns, gen_body,
+            force_inline=inline, exceptions=exceptions,
+            callconv=callconv, may_panic=may_panic,
+        )
+        slot = self._lookup(node.name)
+        assert slot is not None, 'the pre-scan declares every def name'
+        self.add(hir.Store(slot, closure))
+        self.add(hir.CommitSlot(slot))
+
+    def _gen_lambda(self, node: ast.Lambda) -> hir.MakeClosure:
+        """A ``lambda`` is a closure that is forced to be inlined: its body is a
+        single expression, returned from the closure's result location."""
+        def gen_body() -> None:
+            self._gen_result_loc(node.body, hir.ResultLoc())
+            self.add(hir.Ret())
+
+        return self._gen_closure(
+            '<lambda>', (), node.args, None, gen_body,
+            force_inline=True, exceptions=ArraySet(),
+            callconv='default', may_panic=False,
+        )
+
+    def _parse_closure_decorators(self, node: ast.FunctionDef) -> tuple[bool, ArraySet[Type] | None, str, bool]:
+        """The declaration a ``@syntax.closure(...)`` decorator gives: whether
+        the closure is inlined, its exception set (as ``@func``), and its
+        calling convention.  Any other decorator is rejected."""
+        inline = True
+        exceptions: ArraySet[Type] | None = ArraySet()
+        callconv = 'default'
+        may_panic = False
+        for dec in node.decorator_list:
+            call = dec if isinstance(dec, ast.Call) else ast.Call(dec, [], [])
+            if self._try_resolve_object(call.func) is not syntax.closure:
+                raise CompileError(
+                    f"only @syntax.closure(...) may decorate the nested def "
+                    f"'{node.name}' in spy function {self._fn_ir.name}"
+                )
+            for kw in call.keywords:
+                if kw.arg is None:
+                    raise CompileError('@syntax.closure() takes no **kwargs')
+                if kw.arg == 'inline':
+                    inline = self._bool_constant(kw.value, 'inline')
+                elif kw.arg == 'exceptions':
+                    exceptions = self._closure_exception_set(kw.value)
+                elif kw.arg == 'callconv':
+                    callconv = self._str_constant(kw.value, 'callconv')
+                elif kw.arg == 'may_panic':
+                    may_panic = self._bool_constant(kw.value, 'may_panic')
+                else:
+                    raise CompileError(
+                        f'@syntax.closure() got an unexpected keyword argument {kw.arg!r}'
+                    )
+        return inline, exceptions, callconv, may_panic
+
+    def _bool_constant(self, node: ast.expr, what: str) -> bool:
+        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+            return node.value
+        raise CompileError(f'@syntax.closure({what}=...) needs a bool constant')
+
+    def _str_constant(self, node: ast.expr, what: str) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        raise CompileError(f'@syntax.closure({what}=...) needs a string constant')
+
+    def _closure_exception_set(self, node: ast.expr) -> ArraySet[Type] | None:
+        """The exception set of a closure from its ``exceptions=`` declaration:
+        ``None`` raises nothing, ``"infer"`` is inferred from the body, and a
+        struct class (or a tuple of them, in error-code order) is the set of
+        exceptions it may raise."""
+        if isinstance(node, ast.Constant) and node.value is None:
+            return ArraySet()
+        if isinstance(node, ast.Constant) and node.value == 'infer':
+            return None
+        names = node.elts if isinstance(node, ast.Tuple) else [node]
+        ret: ArraySet[Type] = ArraySet()
+        for name in names:
+            obj = self._try_resolve_object(name)
+            if obj is None:
+                raise CompileError(f'cannot resolve the exception {ast.unparse(name)!r}')
+            value = as_value(obj, self._resolver, self._type_vars)
+            if not isinstance(value, StructType):
+                raise CompileError(f'cannot use {obj!r} as an exception: it must be a spy struct')
+            ret.add(value)
+        return ret
+
+    def _gen_closure(
+        self,
+        name: str,
+        type_params: Any,
+        args: ast.arguments,
+        ret_node: ast.expr | None,
+        body_gen: Callable[[], None],
+        *,
+        force_inline: bool,
+        exceptions: ArraySet[Type] | None,
+        callconv: str,
+        may_panic: bool,
+    ) -> hir.MakeClosure:
+        """Parse one closure (a nested ``def`` or a ``lambda``) into a
+        :class:`~spy.compiler.fn.ClosureFunction` and emit the ``hir.MakeClosure``
+        that creates it.  The parameter annotations, defaults and return
+        annotation are lowered into the *enclosing* stream (they are evaluated
+        where the closure is created); the body is generated into an instruction
+        list of its own, under a :class:`_ClosureScope` that records the captures
+        it resolves through the enclosing scopes."""
+        if args.vararg is not None or args.kwarg is not None:
+            raise CompileError(f'*args/**kwargs are not supported in spy closure {name}')
+        if len(args.posonlyargs) > 0:
+            raise CompileError(f'positional-only arguments are not supported in spy closure {name}')
+        if len(args.kwonlyargs) > 0:
+            raise CompileError(f'keyword-only arguments are not supported in spy closure {name}')
+
+        own: dict[str, Value] = {}
+        generic_args: list[SpyTypeVar] = []
+        for tp in type_params:
+            tpname = getattr(tp, 'name', None)
+            if tpname is None:
+                raise CompileError(f'unsupported type parameter in spy closure {name}')
+            var = SpyTypeVar(tpname)
+            own[tpname] = var
+            generic_args.append(var)
+
+        saved_generics = self._generic_names
+        self._generic_names = {**saved_generics, **own}
+        try:
+            param_names = [a.arg for a in args.args]
+            n = len(param_names)
+            annotations: list[hir.Value | None] = [None] * n
+            is_comptime = [False] * n
+            for i, a in enumerate(args.args):
+                if a.annotation is not None:
+                    ct, type_node = self._split_comptime(a.annotation)
+                    is_comptime[i] = ct
+                    if type_node is not None:
+                        annotations[i] = self._as_value(self._gen_expr(type_node)[0])
+            defaults: list[hir.Value | None] = [None] * n
+            offset = n - len(args.defaults)
+            for i, default in enumerate(args.defaults):
+                defaults[offset + i] = self._as_value(self._gen_expr(default)[0])
+            if ret_node is None:
+                ret_operand: hir.Value | None = None
+            elif isinstance(ret_node, ast.Constant) and ret_node.value is None:
+                # an explicit ``-> None`` declares a void function (an absent
+                # annotation lets the return type be inferred)
+                ret_operand = hir.Const(VoidType())
+            else:
+                ret_operand = self._as_value(self._gen_expr(ret_node)[0])
+
+            self._closure_counter += 1
+            closure = ClosureFunction(
+                name=name,
+                local_name=f'{name}#{self._closure_counter}',
+                body=(), param_names=tuple(param_names), is_comptime=tuple(is_comptime),
+                arg_is_ref=tuple([False] * n),
+                generic_args=tuple(generic_args), force_inline=force_inline,
+                exceptions=exceptions, callconv=callconv, may_panic=may_panic,
+            )
+            scope = _ClosureScope(closure)
+            self._scopes.append(scope)
+            try:
+                for i, pname in enumerate(param_names):
+                    scope.vars[pname] = hir.Arg(i)
+                saved_insts = self.insts
+                saved_own = self._own_generic_names
+                saved_pragmas = self._pragmas
+                self.insts = []
+                self._pragmas = set()
+                self._own_generic_names = set(own)
+                try:
+                    body_gen()
+                    closure.body = tuple(self.insts)
+                finally:
+                    self.insts = saved_insts
+                    self._pragmas = saved_pragmas
+                    self._own_generic_names = saved_own
+            finally:
+                self._scopes.pop()
+            return cast(hir.MakeClosure, self.add(hir.MakeClosure(
+                closure, tuple(annotations), tuple(defaults), ret_operand,
+                tuple(scope.captures),
+            )))
+        finally:
+            self._generic_names = saved_generics
+
     def _gen_name(self, name: str) -> hir.Value:
         """Always returns a reference to the name ``name``: the pointer its
         binding holds (a variable's slot, the option a ``:=`` bound, or the
@@ -1675,7 +2065,7 @@ def parse_function(
     # struct a method belongs to) refers to the compile-time value the call
     # solved it to; the function's own parameters are added last, so they
     # shadow a struct's parameter of the same name, like Python scoping
-    builder = _Builder(fn, ir, type_vars)
+    builder = _Builder(fn, ir, type_vars, resolver)
     # At HIR level, parameters are passed by ref (pointer); they are the
     # function body's block, the bottom scope of the builder's stack
     for i, name in enumerate(positional.keys):

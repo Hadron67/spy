@@ -83,9 +83,9 @@ import types as pytypes
 from abc import abstractmethod
 from annotationlib import Format
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import IntEnum, auto
-from typing import Any, Self, override
+from typing import Any, Self, cast, override
 
 from . import hir, mir, sval
 from .binop import BinaryOp, CompareOp, UnaryOp
@@ -94,14 +94,17 @@ from .fn import (
     ArgEntry,
     ArgList,
     CallSignature,
+    ClosureValue,
     CompileBatch,
     FunctionInstance,
+    FunctionIR,
     FunctionValue,
     NativeFn,
     PartialReturnSignature,
     RawArgList,
     ReturnSignature,
     Signature,
+    SignatureFormalArg,
     SpecializedComptimeArg,
     SpecializedFormalArg,
     SpecializedRuntimeArg,
@@ -788,9 +791,18 @@ class BlockFrame:
     data: BlockFrameData
 
 class InlineFrame:
-    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResult, insts: tuple[hir.Inst, ...], value_is_empty: bool = False, on_done: Callable[[], None] | None = None, compile_vars: CompileVars | None = None) -> None:
+    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResult, insts: tuple[hir.Inst, ...], fn_name: str, value_is_empty: bool = False, on_done: Callable[[], None] | None = None, compile_vars: CompileVars | None = None, closure_values: tuple[InterpVal, ...] = ()) -> None:
         self.generic_var_values = generic_var_values
         self.arg_values = arg_values
+        # the name of the function this frame executes (the specialization's
+        # name, with its signature, for the function proper; the closure's or
+        # the inlined function's own name otherwise): a nested closure created
+        # here prefixes its native name with it (see ``exec_make_closure``)
+        self.fn_name = fn_name
+        # the capture places of a closure body (see ``hir.Closure``): the
+        # enclosing slots an inlined closure captures, or the pointers a
+        # compiled closure was passed - empty for an ordinary body
+        self.closure_values = closure_values
         # the compile-time configuration of this body, as a stack so a nested
         # scope can push an override and pop it again; the bottom entry is
         # inherited from the caller (a fresh default for the function proper)
@@ -1477,10 +1489,14 @@ class HirRunner:
                 self._error_types.add(exception)
         frame = InlineFrame(
             generic_var_values, (), self._reserve_result_loc(ret_sig), body,
+            self._fn_instance.mir.name_base,
         )
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
         args = self._init_args_from_signature(sig, mir_args, arg_is_ref)
+        # the closure captures a call passed become the frame's capture places,
+        # bound after the declared arguments (see ``hir.Closure``)
+        frame.closure_values = self._init_closure_captures(sig.captures, mir_args)
         for arg in mir_args:
             assert arg is not None
         frame.arg_values = args
@@ -1565,6 +1581,30 @@ class HirRunner:
             arg_values.append(ComptimeDict({k: ArgEntry(self._init_one_arg(v, mir_args, False), True) for k, v in signature.kwargs.items()}))
 
         return tuple(arg_values)
+
+    def _init_closure_captures(
+        self, captures: tuple[SpecializedFormalArg, ...], mir_args: list[mir.Type]
+    ) -> tuple[InterpVal, ...]:
+        """The capture places of a closure body, from the captures a call
+        passed (see :class:`~spy.compiler.hir.Closure`).  A runtime capture is a
+        by-value pointer parameter (the address of the captured variable); a
+        compile-time capture carries no runtime argument - it becomes a const
+        reference to its value, so reading it loads the value."""
+        out: list[InterpVal] = []
+        for capture in captures:
+            match capture:
+                case SpecializedComptimeArg(value):
+                    out.append(ComptimeVal(sval.ConstRef(value)))
+                case SpecializedRuntimeArg(type=ptr_type) if isinstance(ptr_type, sval.PointerType):
+                    index = len(mir_args)
+                    mir_type = ptr_type.to_mir_type(self._mir_cache)
+                    if mir_type is None:
+                        raise _no_runtime_type(ptr_type)
+                    mir_args.append(mir_type)
+                    out.append(RuntimeVal(mir.Param(index, mir_type), ptr_type))
+                case _:
+                    raise CompileError(f'unsupported closure capture {capture!r}')
+        return tuple(out)
 
     def _ret_spec_place(self, node: RetSpec) -> InterpVal:
         """The result place one declared result is delivered into: a fresh slot
@@ -2328,6 +2368,8 @@ class HirRunner:
                 regs[inst] = self.exec_ptr_cast(self.operand(inst.value), self.operand(inst.type))
             case hir.AsFuncPtr():
                 return self.exec_as_func_ptr(inst)
+            case hir.MakeClosure():
+                return self.exec_make_closure(inst)
             case _:
                 raise CompileError(f"unsupported instruction {inst}")
         return PollResult.AGAIN
@@ -2927,12 +2969,15 @@ class HirRunner:
         function (or of the struct a method belongs to) is a compile-time
         value (see ``astgen``); the frame carries the type the call solved
         it to, so ``Foo[T]``, ``spy.typeof(x) == T``, ... see the concrete
-        type."""
+        type.  A type parameter that is *not* bound here stands for itself:
+        that is how a closure's own type parameter is evaluated while its
+        annotations are read at its creation site (a closure's ``[T]`` is
+        only solved when the closure is called, not when it is created)."""
         if not isinstance(obj, sval.TypeVar):
             return None
         value = self._frames[-1].generic_var_values.get(obj)
         if value is None:
-            raise CompileError(f'type parameter {obj.name} is not bound here')
+            return ComptimeVal(obj)
         return value
 
     def operand(self, value: hir.Value) -> InterpVal:
@@ -2975,6 +3020,11 @@ class HirRunner:
                 frame = self._frames[-1]
                 assert index < len(frame.arg_values), 'Arg index out of range'
                 return frame.arg_values[index]
+            case hir.Closure(index):
+                assert len(self._frames) > 0, 'Closure outside of any function frame'
+                frame = self._frames[-1]
+                assert index < len(frame.closure_values), 'Closure index out of range'
+                return frame.closure_values[index]
             case hir.ResultLoc():
                 # ``hir.ResultLoc`` names the declared results: the value part
                 # of the frame's result location (its error part is separate)
@@ -4051,6 +4101,16 @@ class HirRunner:
                 aggregate = _as_aggregate(ev)
                 assert aggregate is not None
                 return self._coerce_aggregate(aggregate, target)
+            case ComptimeVal(obj) if isinstance(obj, sval.Value):
+                # a compile-time object that already *is* a value of the target
+                # type (a closure, ...): there is nothing to build a constant
+                # from - it is its own value.  Only a compile-time-only type has
+                # such a value; a dynamically-sized one (a function type) is
+                # still rejected by ``coerce_const``
+                value_type = sval.type_of(obj)
+                if value_type == target and target.classify() == sval.SpecialTypeKind.COMPTIME:
+                    return ev
+                return ComptimeVal(sval.coerce_const(obj, target))
             case ComptimeVal(obj):
                 return ComptimeVal(sval.coerce_const(obj, target))
             case RuntimeVal(value, type):
@@ -4341,6 +4401,46 @@ class HirRunner:
             return coerced
         return ComptimeCastedPtr(ev, target_obj)
 
+    def exec_make_closure(self, inst: hir.MakeClosure) -> PollResult:
+        """Create a closure value (see ``hir.MakeClosure``): evaluate the
+        nested def's parameter annotations, defaults and return annotation into
+        the concrete signature, then evaluate the capture places, and package
+        them into a :class:`ClosureValue`.  A closure only exists at compile
+        time; the captures are kept as they are - the compiler decides at the
+        call site whether each is passed as a pointer (a runtime place) or used
+        as a compile-time value (a compile-time place), and an inlined closure
+        forwards them as they came (see ``_call_closure``)."""
+        fn = inst.fn
+        positional: IndexedMap[str, SignatureFormalArg] = IndexedMap()
+        for i, name in enumerate(fn.param_names):
+            declared: sval.Type | None = None
+            annotation = inst.annotations[i]
+            if annotation is not None:
+                declared = self._declared_type(annotation)
+            default_value: sval.AnyValue | None = None
+            default = inst.defaults[i]
+            if default is not None:
+                default_value = self._operand_comptime_value(default)
+            positional.add(name, SignatureFormalArg(
+                declared, fn.is_comptime[i], default_value, TriState.UNKNOWN,
+            ))
+        ret_type: sval.Type | None = None
+        if inst.ret_annotation is not None:
+            ret_type = self.type_operand(inst.ret_annotation, 'the closure return type')
+        sig = Signature(
+            fn.generic_args, positional, None, None, ret_type, fn.exceptions,
+            fn.callconv, fn.may_panic,
+        )
+        hir_ir = FunctionIR(fn.name, sig, fn.arg_is_ref, fn.body)
+        captures = tuple(self.operand(capture) for capture in inst.captures)
+        # the native name is prefixed with the creating frame's function name
+        # (the enclosing specialization, its signature included) - known only
+        # here, not at parse time
+        name_base = f'{self._frames[-1].fn_name}.{fn.local_name}'
+        regs = self._frames[-1].regs
+        regs[inst] = ComptimeVal(ClosureValue(fn, hir_ir, captures, name_base))
+        return PollResult.AGAIN
+
     def exec_as_func_ptr(self, inst: hir.AsFuncPtr) -> PollResult:
         """``syntax.as_func_ptr(T, f)``: the runtime function pointer to the spy
         function ``f``, typed as ``ConstPtr[T]``.  The pointer is the address of
@@ -4364,16 +4464,34 @@ class HirRunner:
             return PollResult.AGAIN
         if not isinstance(obj, FunctionValue):
             raise CompileError(f'as_func_ptr expects a spy function, got {obj!r}')
-        if obj.force_inline:
+        if isinstance(obj, ClosureValue):
+            # only a capture-free, non-inlined closure is an ordinary runtime
+            # function; a capturing or inlined one has no pointer of its own
+            if obj.force_inline:
+                raise CompileError(
+                    'cannot take the function pointer of an inlined closure'
+                )
+            if len(obj.captures) > 0:
+                raise CompileError(
+                    'cannot take the function pointer of a closure that captures variables'
+                )
+            declared = obj.hir.signature.as_non_generic_fn_type()
+            if declared != fn_type:
+                raise CompileError(
+                    f'as_func_ptr: closure {obj.hir.name} has type {declared}, not {fn_type}'
+                )
+            sig = obj.hir.signature
+        elif obj.force_inline:
             raise CompileError(
                 'cannot take the function pointer of an inlined Python function'
             )
-        declared = obj.get_type()
-        if declared != fn_type:
-            raise CompileError(
-                f'as_func_ptr: function {obj.hir.name} has type {declared}, not {fn_type}'
-            )
-        sig = obj.hir.signature
+        else:
+            declared = obj.get_type()
+            if declared != fn_type:
+                raise CompileError(
+                    f'as_func_ptr: function {obj.hir.name} has type {declared}, not {fn_type}'
+                )
+            sig = obj.hir.signature
         provided = ArgList(
             tuple(arg.type for arg in sig.positional.by_id), (), frozendict(),
         )
@@ -4970,6 +5088,8 @@ class HirRunner:
         callee = self._auto_deref(callee)
         target = _callee_object(callee)
         if target is not None:
+            if isinstance(target, ClosureValue):
+                return self._call_closure(target, args, ret, on_return=on_return)
             if isinstance(target, FunctionValue):
                 return self._call_function_entry(target, args, ret, on_return=on_return)
             if isinstance(target, sval.BoundMethod):
@@ -6751,6 +6871,7 @@ class HirRunner:
                 frame_values.update(generic_var_values)
             return self._start_inline(
                 fn.hir.body, fn.hir.arg_is_ref, binded_args, ret,
+                fn.name_base,
                 frozendict(frame_values),
                 value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
                 on_done=on_return,
@@ -6767,6 +6888,90 @@ class HirRunner:
             return res
 
         return self._request_function(fn, spec_sig[0], spec_sig[1], _resumer, generic_var_values)
+
+    def _call_closure(
+        self,
+        closure: ClosureValue,
+        args: RawArgList[ArgEntry[InterpVal]],
+        ret: InterpVal,
+        on_return: Callable[[], None] | None = None,
+    ) -> PollResult:
+        """Call a closure (see :class:`ClosureValue`).  A forced-inline closure
+        is inlined like a plain Python function, its captures handed over as the
+        frame's ``closure_values``; any other is compiled into a runtime
+        function whose declarations come first and whose captures follow as
+        hidden parameters (a runtime capture a by-value pointer, a compile-time
+        one a compile-time argument that never reaches the MIR)."""
+        sig = closure.hir.signature
+        binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
+        _check_comptime_args(sig, binded_args)
+        if closure.force_inline:
+            solved = sig.solve_param_types(binded_args.map(_arg_type_of))
+            frame_values: dict[sval.TypeVar, sval.AnyValue] = dict(zip(sig.generic_args, solved))
+            return self._start_inline(
+                closure.hir.body, closure.hir.arg_is_ref, binded_args, ret,
+                closure.name_base,
+                frozendict(frame_values),
+                value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
+                on_done=on_return,
+                closure_values=self._inline_capture_values(closure),
+            )
+        capture_specs, capture_args = self._compile_capture_args(closure)
+        arg_types = binded_args.map(_arg_type_of)
+        for arg_type in arg_types.values():
+            if isinstance(arg_type, sval.ClosureType):
+                raise CompileError('a closure can only be passed to an inline function')
+        call_sig, partial_ret_sig = sig.specialize(arg_types, self._mir_cache)
+        call_sig = replace(call_sig, captures=capture_specs)
+
+        def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
+            res = self0._make_runtime_call(
+                fn_mir, binded_args, ret, call_sig, ret_sig, capture_args,
+            )
+            if on_return is not None and not ret_sig.value_is_empty():
+                on_return()
+            return res
+
+        return self._request_function(closure, call_sig, partial_ret_sig, _resumer)
+
+    def _inline_capture_values(self, closure: ClosureValue) -> tuple[InterpVal, ...]:
+        """The capture places an inlined closure body is run with: the places
+        the closure value kept, each materialized if it is still a pending slot."""
+        out: list[InterpVal] = []
+        for capture in closure.captures:
+            if isinstance(capture, PendingSlot) and capture.committed is None:
+                self._commit_pending_slot(capture)
+            out.append(_shallow_normalize(capture))
+        return tuple(out)
+
+    def _compile_capture_args(
+        self, closure: ClosureValue
+    ) -> tuple[tuple[SpecializedFormalArg, ...], tuple[ArgEntry[InterpVal], ...]]:
+        """The capture parameters and arguments of a compiled closure call: a
+        runtime place becomes a by-value pointer parameter, a compile-time place
+        a compile-time argument (there is no runtime parameter for it)."""
+        specs: list[SpecializedFormalArg] = []
+        cargs: list[ArgEntry[InterpVal]] = []
+        for capture in closure.captures:
+            if isinstance(capture, PendingSlot) and capture.committed is None:
+                self._commit_pending_slot(capture)
+            ev = _shallow_normalize(capture)
+            if isinstance(ev, RuntimeVal) and isinstance(ev.type, sval.PointerType):
+                specs.append(SpecializedRuntimeArg(ev.type, False))
+                cargs.append(ArgEntry(ev, False))
+                continue
+            value = _to_comptime(ev)
+            if isinstance(value, sval.ConstRef):
+                value = value.value
+            if value is None:
+                # a compile-time place (a box, a const reference): read it
+                value = _to_comptime(self.load(ev))
+            if value is None:
+                raise CompileError(
+                    'cannot capture this compile-time value in a non-inlined closure'
+                )
+            specs.append(SpecializedComptimeArg(cast(sval.Value, value)))
+        return tuple(specs), tuple(cargs)
 
     def _request_function(
         self,
@@ -6795,7 +7000,7 @@ class HirRunner:
         self._fn_req_resumer = None
         return resumer(self, fn_mir, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature) -> PollResult:
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature, capture_args: tuple[ArgEntry[InterpVal], ...] = ()) -> PollResult:
         """Emit the native call of an already-resolved callee and hand its
         result to the call's result location.  A callee that cannot return
         normally (no value and no error, or no value at all) ends the current
@@ -6840,6 +7045,11 @@ class HirRunner:
         if call_sig.kwargs is not None:
             for name, arg in args.kwargs.items():
                 convert_one(arg, call_sig.kwargs[name])
+
+        # the hidden capture parameters of a closure call come after every
+        # declared argument (see ``_call_closure``)
+        for arg, sig_arg in zip(capture_args, call_sig.captures):
+            convert_one(arg, sig_arg)
 
         spec = ret_sig.ret_spec(self._mir_cache)
         callee_result = ret_sig.result_type()
@@ -7107,9 +7317,11 @@ class HirRunner:
         arg_is_ref: tuple[bool, ...],
         args: ArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
+        fn_name: str,
         generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
         value_is_empty: bool = False,
         on_done: Callable[[], None] | None = None,
+        closure_values: tuple[InterpVal, ...] = (),
     ) -> PollResult:
         """Start the inlined body of a plain Python callee: convert its
         bound arguments into addressable values (the callee's ``hir.Arg``
@@ -7160,8 +7372,9 @@ class HirRunner:
         frame = InlineFrame(
             frame_values, tuple(arg_values),
             ComptimeResult(ret, error.code, error.payload),
-            body, value_is_empty=value_is_empty, on_done=on_done,
+            body, fn_name, value_is_empty=value_is_empty, on_done=on_done,
             compile_vars=self._inherit_compile_vars(),
+            closure_values=closure_values,
         )
         self._frames.append(frame)
         return PollResult.AGAIN
