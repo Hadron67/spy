@@ -639,26 +639,27 @@ class BlockFrameData:
 
 @dataclass(frozen=True, slots=True)
 class _DeferEntry:
-    """One ``with syntax.defer():`` region declared in an open region: its kind
-    and the entry block of the deferred body the interpreter emitted (the
-    template every transfer that triggers it refers to, see
-    ``mir.EndDefer``/``Terminator.get_defer_blocks``)."""
+    """One ``with syntax.defer():`` region declared in an open region: the
+    exits that trigger it (``flags``, a ``hir.DeferPath``) and the entry block
+    of the deferred body the interpreter emitted (the template every transfer
+    that triggers it refers to, see ``mir.EndDefer``/``Terminator.get_defer_blocks``)."""
 
-    kind: hir.DeferKind
+    flags: hir.DeferPath
     entry: mir.BasicBlock
 
 
 @dataclass
 class DeferBlockData(BlockFrameData):
     """The state of the defer body currently being walked (a
-    ``with syntax.defer():`` region).  ``variant`` is the kind of the defer,
-    ``entry`` the entry block of the body (appended to the enclosing region's
-    defer list), ``body_defers`` the defers declared inside the body itself -
-    they are what its ``mir.EndDefer`` triggers - and ``saved_block`` the block
-    the walk continues in after the body, which is emitted detached from the
-    current one (see ``HirRunner._exec_defer``)."""
+    ``with syntax.defer():`` region).  ``flags`` is the exits the defer
+    triggers (``hir.DeferPath``), ``entry`` the entry block of the body
+    (appended to the enclosing region's defer list), ``body_defers`` the
+    defers declared inside the body itself - they are what its
+    ``mir.EndDefer`` triggers - and ``saved_block`` the block the walk
+    continues in after the body, which is emitted detached from the current
+    one (see ``HirRunner._exec_defer``)."""
 
-    variant: hir.DeferKind
+    flags: hir.DeferPath
     entry: mir.BasicBlock
     body_defers: list[_DeferEntry]
     saved_block: mir.BasicBlock
@@ -855,18 +856,12 @@ class InlineFrame:
 # ---------------------------------------------------------------------------
 
 
-def _append_defers(out: list[mir.BasicBlock], defers: list[_DeferEntry], is_error: bool) -> None:
-    """Append the entries of ``defers`` a transfer that exits with ``is_error``
+def _append_defers(out: list[mir.BasicBlock], defers: list[_DeferEntry], path: hir.DeferPath) -> None:
+    """Append the entries of ``defers`` a transfer that exits along ``path``
     triggers, in the order they run - reverse declaration order (see
-    ``hir.DeferKind``): ``defer`` always, ``okdefer`` only on a normal exit and
-    ``errdefer`` only on an error one."""
+    ``hir.DeferPath``): an entry runs when its flags hold the exit's bit."""
     for entry in reversed(defers):
-        if entry.kind is hir.DeferKind.DEFER:
-            out.append(entry.entry)
-        elif entry.kind is hir.DeferKind.OKDEFER:
-            if not is_error:
-                out.append(entry.entry)
-        elif is_error:
+        if entry.flags & path:
             out.append(entry.entry)
 
 
@@ -874,7 +869,7 @@ def _normal_defers(defers: list[_DeferEntry]) -> tuple[mir.BasicBlock, ...]:
     """The entries of ``defers`` a *normal* exit of the region they were
     declared in triggers (``defer`` and ``okdefer``), in the order they run."""
     out: list[mir.BasicBlock] = []
-    _append_defers(out, defers, False)
+    _append_defers(out, defers, hir.DeferPath.OK)
     return tuple(out)
 
 
@@ -1415,6 +1410,10 @@ class HirRunner:
         # location has been materialized, together with the deferred bodies the
         # return runs first
         self._deferred_returns: list[tuple[mir.Insertion, tuple[mir.BasicBlock, ...]]] = []
+        # the function-wide block a panic resumes in after a ``CallMayPanic``'s
+        # unwind edge ran its deferred bodies (see ``_resume_block``); None until
+        # the first may-panic call needs it
+        self._unwind_resume_block: mir.BasicBlock | None = None
         # the exception set of the function proper's own error location, in
         # first-delivery order (its error codes follow from this order, see
         # ``sval.ResultType``); it grows with every delivery while the set is
@@ -1486,6 +1485,7 @@ class HirRunner:
         self._deferred_returns = []
         self._pending_error_code_writes = []
         self._error_types = ArraySet()
+        self._unwind_resume_block = None
         if ret_sig is not None and ret_sig.exceptions is not None:
             # a declared exception set is the function's own from the start: its
             # order fixes the error codes, whatever the value type turns out to be
@@ -1851,6 +1851,16 @@ class HirRunner:
         its type when there is one, or written into the function's error
         location and returned otherwise; the enclosing HIR blocks are then
         unwound like a ``return``'s (see ``_cut``)."""
+        self._dispatch_exception(slot)
+        return self._cut()
+
+    def _dispatch_exception(self, slot: InterpVal) -> None:
+        """Route an exception built into the slot ``slot`` to the clause that
+        catches its type, or into the function's own error location (see
+        ``_raise``).  Ends the current block either way but does not unwind the
+        interpreter's open regions: the ``catch_unwind`` builtin dispatches its
+        caught exception from a detached catch block and then continues in the
+        normal one (see ``_make_runtime_call``)."""
         exception = _place_type(slot)
         if not isinstance(exception, sval.StructType):
             raise CompileError(f'cannot raise {exception!r}: an exception must be a struct')
@@ -1858,7 +1868,7 @@ class HirRunner:
         if target is not None:
             data, index = target
             defer_blocks = self._collect_exit_defers(
-                True, data, inclusive=True, current_frame_only=False,
+                hir.DeferPath.RAISE, data, inclusive=True, current_frame_only=False,
             )
             if exception.is_zst():
                 incoming = ComptimeVal(sval.Undefined(sval.PointerType(exception, is_const=False)))
@@ -1868,7 +1878,7 @@ class HirRunner:
             self._route_to_clause(data, index, incoming, exception, defer_blocks)
         else:
             defer_blocks = self._collect_exit_defers(
-                True, None, inclusive=False, current_frame_only=False,
+                hir.DeferPath.RAISE, None, inclusive=False, current_frame_only=False,
             )
             self._add_function_exception(exception)
             self._defer_error_code_write(exception)
@@ -1879,7 +1889,23 @@ class HirRunner:
                 assert isinstance(dest, RuntimeVal)
                 self._commit_pending_slot(slot, exception, ptr=dest.value)
             self._end_error_path(defer_blocks)
-        return self._cut()
+
+    def _build_catch_path(self, catch_data: InterpVal) -> None:
+        """Build the catch block of a ``catch_unwind`` (see ``mir.CatchUnwind``):
+        the landing pad has written the caught ``PanicData`` pointer into the
+        place ``catch_data`` points at, so it is read back and wrapped in an
+        ``UnwindException`` through the ordinary construction path - the value is
+        materialized with ``_to_runtime`` from an aggregate whose mirror is its
+        single ``data`` field (see ``sval.StructType.mirror_is_a_field``) - and
+        then dispatched as a raise.  The current block is the catch block when
+        this runs."""
+        exception = self._unwind_exception_type()
+        pointer = self.load(catch_data)          # the ``Ptr[PanicData]`` caught
+        data = self.load(pointer)                # the caught ``PanicData``
+        slot = self.alloca(InlineMode.NONE)
+        self._commit_pending_slot(slot, exception)
+        self.store(slot, ComptimeAggregate(exception, (data,)))
+        self._dispatch_exception(slot)
 
     # -- error locations ---------------------------------------------------
 
@@ -2104,47 +2130,81 @@ class HirRunner:
 
     def _collect_exit_defers(
         self,
-        is_error: bool,
+        path: hir.DeferPath,
         stop_data: BlockFrameData | None,
         inclusive: bool,
         current_frame_only: bool,
     ) -> tuple[mir.BasicBlock, ...]:
         """The deferred bodies a transfer out of the currently walked regions
         triggers, in the order they run: from the innermost region outwards,
-        every region's ``defer``/``okdefer`` (on a normal exit) or
-        ``defer``/``errdefer`` (on an error exit), each in reverse declaration
-        order.  The walk stops at the region of ``stop_data`` - included or not
-        per ``inclusive`` - and, when ``current_frame_only`` is set, at the
-        current inline frame's own body (an inlined ``return``); otherwise it
-        continues into the caller's frames, so that an error escaping an inlined
-        body runs the defers of the caller's regions too.  A transfer that would
-        leave a defer body is rejected."""
+        every region's deferred bodies whose ``flags`` hold ``path``'s bit, each
+        in reverse declaration order.  ``path`` is ``OK`` for a normal exit (a
+        ``return``/``break``/``continue``/falling off), ``RAISE`` for a spy
+        error leaving the function and ``UNWIND`` for a panic unwinding
+        through it.  The walk stops at the region of ``stop_data`` - included
+        or not per ``inclusive`` - and, when ``current_frame_only`` is set, at
+        the current inline frame's own body (an inlined ``return``); otherwise
+        it continues into the caller's frames, so that an error escaping an
+        inlined body runs the defers of the caller's regions too.  A transfer
+        that would leave a defer body is rejected."""
         ret: list[mir.BasicBlock] = []
         for frame in reversed(self._frames):
             for bf in reversed(frame.block_stack):
                 if bf.data is stop_data:
                     if inclusive:
-                        _append_defers(ret, self._region_defers(bf.data), is_error)
+                        _append_defers(ret, self._region_defers(bf.data), path)
                     return tuple(ret)
                 if isinstance(bf.data, DeferBlockData):
+                    if path == hir.DeferPath.UNWIND:
+                        # a panic unwinding out of a defer body leaves it: the
+                        # defers declared *inside* the body run, then the walk
+                        # stops - the body's own defer (registered in the region
+                        # it was declared in) must not run a second time
+                        _append_defers(ret, self._region_defers(bf.data), path)
+                        return tuple(ret)
                     raise CompileError('cannot jump out of a defer block')
                 if isinstance(bf.data, TypeOfBlockData):
                     raise CompileError('cannot jump out of a typeof block')
-                _append_defers(ret, self._region_defers(bf.data), is_error)
-            _append_defers(ret, frame.body_defers, is_error)
+                _append_defers(ret, self._region_defers(bf.data), path)
+            _append_defers(ret, frame.body_defers, path)
             if current_frame_only:
                 return tuple(ret)
         if stop_data is not None:
             raise CompileError('the target of a transfer is not an open region')
         return tuple(ret)
 
-    def _run_defers_on_fallthrough(self, defers: list[_DeferEntry], is_error: bool) -> None:
+    def _unwind_defers(self) -> tuple[mir.BasicBlock, ...]:
+        """The deferred bodies a panic raised at the current position would run
+        on its way out of the function (see ``_collect_exit_defers`` with
+        ``UNWIND``).  A ``syntax.typeof`` probe emits no code, so a may-panic
+        call inside one has no landing pad and this is empty."""
+        for frame in reversed(self._frames):
+            for bf in reversed(frame.block_stack):
+                if isinstance(bf.data, TypeOfBlockData):
+                    return ()
+        return self._collect_exit_defers(
+            hir.DeferPath.UNWIND, None, inclusive=False, current_frame_only=False,
+        )
+
+    def _resume_block(self) -> mir.BasicBlock:
+        """The single block per function that carries a panic on after the
+        deferred bodies of every ``CallMayPanic`` unwind edge have run (the
+        ``unwind_path``), created on first use.  It holds one ``mir.Resume``;
+        ``lower`` loads the exception the landing pad stored into the function's
+        unwind slot and resumes with it."""
+        if self._unwind_resume_block is None:
+            block = mir.BasicBlock()
+            block.emit(mir.Resume())
+            self._unwind_resume_block = block
+        return self._unwind_resume_block
+
+    def _run_defers_on_fallthrough(self, defers: list[_DeferEntry], path: hir.DeferPath) -> None:
         """A region ended by falling off its end into a continuation that has no
         transfer instruction of its own (a compile-time ``if`` whose chosen
         branch fell through): when its deferred bodies have to run, split the
         block - jump through them to a fresh block and continue there."""
         out: list[mir.BasicBlock] = []
-        _append_defers(out, defers, is_error)
+        _append_defers(out, defers, path)
         if len(out) == 0:
             return
         cont = mir.BasicBlock()
@@ -2163,7 +2223,14 @@ class HirRunner:
 
         A compile-time (``syntax.unroll``) loop has no transfer between its
         unrolled iterations, so a defer declared inside one has no exit to be
-        deferred to; it is rejected for now."""
+        deferred to; it is rejected for now.  ``inst.flags`` is evaluated here -
+        its instructions were run just before the ``Defer`` - and has to be a
+        compile-time integer."""
+        flags_value = self.operand(inst.flags)
+        flags_int = _comptime_int(flags_value)
+        if flags_int is None:
+            raise CompileError('the flags of syntax.defer must be known at compile time')
+        flags = hir.DeferPath(flags_int)
         frame = self._frames[-1]
         for bf in reversed(frame.block_stack):
             if isinstance(bf.data, LoopBlockData) and bf.data.is_inline:
@@ -2172,9 +2239,9 @@ class HirRunner:
         p_else, _p_end = self._scan_block(entry)
         assert p_else is None, 'a defer body has no else marker'
         template = mir.BasicBlock()
-        self._current_defers().append(_DeferEntry(inst.variant, template))
+        self._current_defers().append(_DeferEntry(flags, template))
         frame.block_stack.append(
-            BlockFrame(entry, DeferBlockData(inst.variant, template, [], self._cur_block))
+            BlockFrame(entry, DeferBlockData(flags, template, [], self._cur_block))
         )
         self._cur_block = template
 
@@ -2241,14 +2308,14 @@ class HirRunner:
                         self._cur_block.emit(mir.Jmp(
                             frame.continuation(),
                             self._collect_exit_defers(
-                                False, None, inclusive=False, current_frame_only=True,
+                                hir.DeferPath.OK, None, inclusive=False, current_frame_only=True,
                             ),
                         ))
                     return self._cut()
                 # a ``return`` of the function proper runs the defers of every
                 # region it leaves, up to the function body
                 defer_blocks = self._collect_exit_defers(
-                    False, None, inclusive=False, current_frame_only=False,
+                    hir.DeferPath.OK, None, inclusive=False, current_frame_only=False,
                 )
                 self.store(self._function_result().code, ComptimeVal(sval.Int(0, sval.IntType(0, False))))
                 if self.ret_sig is None:
@@ -2539,7 +2606,7 @@ class HirRunner:
         if not self._cur_block.is_finished:
             self._cur_block.emit(mir.Jmp(
                 exit_block,
-                self._collect_exit_defers(False, data, inclusive=True, current_frame_only=False),
+                self._collect_exit_defers(hir.DeferPath.OK, data, inclusive=True, current_frame_only=False),
             ))
         return self._cut()
 
@@ -2561,7 +2628,7 @@ class HirRunner:
         if not self._cur_block.is_finished:
             self._cur_block.emit(mir.Jmp(
                 nxt,
-                self._collect_exit_defers(False, data, inclusive=True, current_frame_only=False),
+                self._collect_exit_defers(hir.DeferPath.OK, data, inclusive=True, current_frame_only=False),
             ))
         return self._cut()
 
@@ -2613,7 +2680,7 @@ class HirRunner:
         assert isinstance(target, PlainBlockData)
         exit_block = self._block_exit(target)
         defer_blocks = self._collect_exit_defers(
-            False, target, inclusive=True, current_frame_only=False,
+            hir.DeferPath.OK, target, inclusive=True, current_frame_only=False,
         )
         if inst.cond is not None:
             cond = self.operand(inst.cond)
@@ -2656,7 +2723,7 @@ class HirRunner:
         # which fell off its end: the (unchosen) else branch is dead - the
         # then-region's defers still run before the code after the ``if``
         assert data.chosen
-        self._run_defers_on_fallthrough(self._region_defers(data), False)
+        self._run_defers_on_fallthrough(self._region_defers(data), hir.DeferPath.OK)
         frame.block_stack.pop()
         frame.pc = data.p_end + 1
 
@@ -2843,7 +2910,7 @@ class HirRunner:
         if data.chosen is not None:
             # a compile-time ``if``: the chosen branch fell off its end, a
             # normal exit of its region
-            self._run_defers_on_fallthrough(self._region_defers(data), False)
+            self._run_defers_on_fallthrough(self._region_defers(data), hir.DeferPath.OK)
             frame.block_stack.pop()
             return PollResult.AGAIN
         exit_block = data.exit_block
@@ -5234,7 +5301,66 @@ class HirRunner:
             return self._as_static_ptr(args, ret)
         if fn.name == 'layout_of':
             return self._layout_builtin(args, ret)
+        if fn.name == 'panic':
+            return self._builtin_panic(args)
+        if fn.name == 'catch_unwind':
+            return self._builtin_catch_unwind(args, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
+
+    # -- ``std.core.panic`` / ``std.core.catch_unwind`` ----------------------
+
+    def _panic_data_type(self) -> sval.Type:
+        """The ``std.core.PanicData`` tagged union the host resolves in its own
+        context (an alias, whose underlying type is the union of the panic
+        payloads)."""
+        from ..std.core import PanicData
+        ret = sval.as_value(PanicData, self._analyser._resolver)
+        assert isinstance(ret, sval.Type)
+        return ret
+
+    def _unwind_exception_type(self) -> sval.StructType:
+        """The ``std.core.UnwindException`` struct of the host's context (the
+        panic a ``catch_unwind`` raises as a spy error)."""
+        from ..std.core import UnwindException
+        ret = sval.as_value(UnwindException, self._analyser._resolver)
+        assert isinstance(ret, sval.StructType)
+        return ret
+
+    def _builtin_panic(self, args: RawArgList[ArgEntry[InterpVal]]) -> PollResult:
+        """``std.core.panic(data)``: throw a panic carrying ``data`` (see
+        ``mir.Panic``).  It never returns, so it ends the current path."""
+        if len(args.positional) != 1 or len(args.kwargs) > 0:
+            raise CompileError('std.core.panic takes exactly one argument')
+        panic_type = self._panic_data_type()
+        value = self._arg_value(args.positional[0])
+        slot = self.alloca(InlineMode.NONE)
+        self._commit_pending_slot(slot, panic_type)
+        self.store(slot, value)
+        pointer = self._to_runtime(_shallow_normalize(slot))
+        # a panic runs the enclosing regions' deferred bodies on its way out
+        # (like a may-panic call: see ``mir.Panic``); when there are none the
+        # throw needs no landing pad
+        defers = self._unwind_defers()
+        unwind_path = self._resume_block() if len(defers) > 0 else None
+        self._emit(mir.Panic(pointer, unwind_path, defers))
+        return self._cut()
+
+    def _builtin_catch_unwind(self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+        """``std.core.catch_unwind(fn)``: call the non-inline closure ``fn`` and
+        catch a panic it raises (see ``mir.CatchUnwind``); the caught payload is
+        delivered as an ``UnwindException`` through the ordinary error path."""
+        if len(args.positional) != 1 or len(args.kwargs) > 0:
+            raise CompileError('std.core.catch_unwind takes exactly one argument')
+        target = _callee_object(self._arg_value(args.positional[0]))
+        if not isinstance(target, ClosureValue):
+            raise CompileError('the argument of std.core.catch_unwind must be a closure')
+        if target.force_inline:
+            raise CompileError(
+                'the closure passed to std.core.catch_unwind must be compiled '
+                'into a runtime function (@syntax.closure(inline=False))'
+            )
+        empty: RawArgList[ArgEntry[InterpVal]] = RawArgList((), frozendict())
+        return self._call_closure(target, empty, ret, catch_unwind=True)
 
     # -- ``std.core.as_static_ptr`` ------------------------------------------
 
@@ -7019,6 +7145,7 @@ class HirRunner:
         args: RawArgList[ArgEntry[InterpVal]],
         ret: InterpVal,
         on_return: Callable[[], None] | None = None,
+        catch_unwind: bool = False,
     ) -> PollResult:
         """Call a closure (see :class:`ClosureValue`).  A forced-inline closure
         is inlined like a plain Python function, its captures handed over as the
@@ -7051,6 +7178,7 @@ class HirRunner:
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
             res = self0._make_runtime_call(
                 fn_mir, binded_args, ret, call_sig, ret_sig, capture_args,
+                catch_unwind=catch_unwind,
             )
             if on_return is not None and not ret_sig.value_is_empty():
                 on_return()
@@ -7124,7 +7252,7 @@ class HirRunner:
         self._fn_req_resumer = None
         return resumer(self, fn_mir, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature, capture_args: tuple[ArgEntry[InterpVal], ...] = ()) -> PollResult:
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature, capture_args: tuple[ArgEntry[InterpVal], ...] = (), catch_unwind: bool = False) -> PollResult:
         """Emit the native call of an already-resolved callee and hand its
         result to the call's result location.  A callee that cannot return
         normally (no value and no error, or no value at all) ends the current
@@ -7178,12 +7306,23 @@ class HirRunner:
         spec = ret_sig.ret_spec(self._mir_cache)
         callee_result = ret_sig.result_type()
         value_is_empty = ret_sig.value_is_empty()
+        # a call that may panic while the enclosing regions still hold deferred
+        # bodies a panic would run needs a landing pad: it is emitted as a
+        # ``CallMayPanic`` whose unwind edge runs those bodies and reaches the
+        # function-wide resume block.  ``catch_unwind`` instead catches the
+        # panic itself (a ``CatchUnwind``), so it never takes this path.
+        unwind_defers: tuple[mir.BasicBlock, ...] | None = None
+        if call_sig.may_panic and not catch_unwind:
+            defers = self._unwind_defers()
+            if len(defers) > 0:
+                unwind_defers = defers
         if len(ret_sig.exceptions) == 0:
             # the callee has no error part in its MIR: deliver its value alone
             # (and when that value is the empty type, nothing comes back at all)
             self._deliver_result(
                 callee, mir_args, ret, ret_sig.ret_type_spec,
                 noreturn=ret_sig.is_noreturn(),
+                unwind_defers=unwind_defers, catch_unwind=catch_unwind,
             )
             if value_is_empty:
                 return self._cut()
@@ -7200,7 +7339,10 @@ class HirRunner:
         else:
             payload_place = self.alloca(InlineMode.NONE)
         error_tuple: InterpVal = ComptimeResult(ret, code_place, payload_place)
-        self._deliver_result(callee, mir_args, error_tuple, spec)
+        self._deliver_result(
+            callee, mir_args, error_tuple, spec,
+            unwind_defers=unwind_defers, catch_unwind=catch_unwind,
+        )
         self._check_call_error(
             callee_exceptions, callee_result, code_place, payload_place,
             use_ret_payload, value_is_empty,
@@ -7271,13 +7413,13 @@ class HirRunner:
             data, clause = target
             assert not use_ret_payload
             defer_blocks = self._collect_exit_defers(
-                True, data, inclusive=True, current_frame_only=False,
+                hir.DeferPath.RAISE, data, inclusive=True, current_frame_only=False,
             )
             incoming = self._union_variant_ptr(payload_place, exception)
             self._route_to_clause(data, clause, incoming, exception, defer_blocks)
         else:
             defer_blocks = self._collect_exit_defers(
-                True, None, inclusive=False, current_frame_only=False,
+                hir.DeferPath.RAISE, None, inclusive=False, current_frame_only=False,
             )
             self._add_function_exception(exception)
             self._defer_error_code_write(exception)
@@ -7293,6 +7435,8 @@ class HirRunner:
         ret: InterpVal,
         spec: RetSpec,
         noreturn: bool = False,
+        unwind_defers: tuple[mir.BasicBlock, ...] | None = None,
+        catch_unwind: bool = False,
     ) -> None:
         """Emit the native call of a callee returning the value(s) of ``spec``
         and hand every result to its place.
@@ -7349,7 +7493,35 @@ class HirRunner:
         if noreturn:
             # the callee never comes back: the call ends the block it is in
             ret_type = mir.NORETURN
-        call_inst = self._emit(mir.Call(callee, (*mir_args, *result_args), ret_type))
+        if catch_unwind and not noreturn:
+            # catch the panic the callee may raise (see ``mir.CatchUnwind``):
+            # the unwind edge lands in a fresh catch block the interpreter fills
+            # with the construction of the ``UnwindException`` and its dispatch,
+            # and the normal edge continues in a fresh block of its own
+            normal = mir.BasicBlock()
+            catch_block = mir.BasicBlock()
+            panic_type = self._panic_data_type()
+            catch_data = self.alloca(InlineMode.NONE)
+            self._commit_pending_slot(catch_data, sval.PointerType(panic_type, is_const=False))
+            catch_data_ptr = self._to_runtime(_shallow_normalize(catch_data))
+            call_inst = self._emit(mir.CatchUnwind(
+                callee, (*mir_args, *result_args), ret_type,
+                normal, catch_block, catch_data_ptr,
+            ))
+            self._cur_block = catch_block
+            self._build_catch_path(catch_data)
+            self._cur_block = normal
+        elif unwind_defers is not None and not noreturn:
+            # run the deferred bodies the panic would trigger on the unwind edge
+            # and let the function-wide resume block carry the unwinding on
+            normal = mir.BasicBlock()
+            call_inst = self._emit(mir.CallMayPanic(
+                callee, (*mir_args, *result_args), ret_type,
+                normal, self._resume_block(), unwind_defers,
+            ))
+            self._cur_block = normal
+        else:
+            call_inst = self._emit(mir.Call(callee, (*mir_args, *result_args), ret_type))
         if by_value is not None:
             place, type = by_value
             if isinstance(type, sval.UnionType):

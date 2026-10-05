@@ -123,12 +123,13 @@ _CMP_OPS: dict[type[ast.AST], hir.CompareOp] = {
     ast.GtE: '>=',
 }
 
-# the ``syntax.*`` markers that start a deferred region when they are the
-# context manager of a ``with`` statement (see ``_Builder._gen_defer``)
-_DEFER_CALLS: dict[Any, hir.DeferKind] = {
-    syntax.defer: hir.DeferKind.DEFER,
-    syntax.okdefer: hir.DeferKind.OKDEFER,
-    syntax.errdefer: hir.DeferKind.ERRDEFER,
+# the ``syntax.*`` markers that start a deferred region with a fixed set of
+# triggering exits when they are the context manager of a ``with`` statement
+# (see ``_Builder._gen_defer``); ``syntax.defer(flags)`` carries the flags
+# itself and is handled separately
+_DEFER_CALLS: dict[Any, hir.DeferPath] = {
+    syntax.okdefer: hir.DeferPath.OK,
+    syntax.errdefer: hir.DeferPath.ERR,
 }
 
 # the ``syntax.*`` markers that are *calls* in the source and are recognized by
@@ -737,16 +738,18 @@ class _Builder:
         self.add(hir.End())
 
     def _gen_defer(self, node: ast.With) -> None:
-        """Translate one ``with syntax.defer(): body`` (or ``okdefer``/``errdefer``)
-        into a deferred region: a :class:`hir.Defer` marker carrying the kind the
-        context manager names, the body in a lexical block of its own, and the
-        matching ``hir.End``.  The body is not run where it is written - it is
-        deferred to the exit of the enclosing region (see ``interp``) - and it
-        may not jump out of itself (``return``/``break``/``continue``/``raise``
-        that would leave it are rejected by the interpreter).
+        """Translate one ``with syntax.defer(...): body`` (or ``okdefer``/
+        ``errdefer``) into a deferred region: a :class:`hir.Defer` marker carrying
+        the exits that trigger it (``syntax.defer``'s bitflags; ``okdefer``/
+        ``errdefer`` are the ``OK``/``ERR`` spellings), the body in a lexical block
+        of its own, and the matching ``hir.End``.  The body is not run where it is
+        written - it is deferred to the exit of the enclosing region (see
+        ``interp``) - and it may not jump out of itself (``return``/``break``/
+        ``continue``/``raise`` that would leave it are rejected by the
+        interpreter).
 
-        Only a single, unbound context manager is accepted, and it has to be one
-        of the three ``syntax`` markers."""
+        Only a single, unbound context manager is accepted, and it has to be a
+        ``syntax`` marker (see ``_gen_defer_flags``)."""
         fn_name = self._fn_ir.name
         if len(node.items) != 1:
             raise CompileError(
@@ -758,20 +761,55 @@ class _Builder:
             raise CompileError(
                 f'a defer statement binds no name in spy function {fn_name}'
             )
-        call = item.context_expr
-        kind = (
-            _DEFER_CALLS.get(self._try_resolve_object(call.func))
-            if isinstance(call, ast.Call) and len(call.args) == 0 and len(call.keywords) == 0
-            else None
-        )
-        if kind is None:
-            raise CompileError(
-                f'expected syntax.defer()/syntax.okdefer()/syntax.errdefer() '
-                f'in spy function {fn_name}'
-            )
-        self.add(hir.Defer(kind))
+        flags = self._gen_defer_flags(item.context_expr, fn_name)
+        self.add(hir.Defer(flags))
         self._gen_block(node.body)
         self.add(hir.End())
+
+    def _gen_defer_flags(self, call: ast.expr, fn_name: str) -> hir.Value:
+        """The compile-time value the exits a ``with syntax.defer(...):`` region
+        triggers are read off, from the context-manager call: ``defer(flags)``
+        takes any compile-time integer expression of the ``syntax`` bitflags (no
+        argument means ``ALL``), while ``okdefer``/``errdefer`` are the fixed
+        ``OK``/``ERR`` spellings (see ``_DEFER_CALLS``)."""
+        if not isinstance(call, ast.Call):
+            raise CompileError(self._defer_what(fn_name))
+        target = self._try_resolve_object(call.func)
+        if target is syntax.defer:
+            if len(call.args) == 0 and len(call.keywords) == 0:
+                return hir.Const(int(hir.DeferPath.ALL))
+            if len(call.args) == 1 and len(call.keywords) == 0:
+                value = call.args[0]
+            elif (
+                len(call.args) == 0
+                and len(call.keywords) == 1
+                and call.keywords[0].arg == 'flags'
+            ):
+                value = call.keywords[0].value
+            else:
+                raise CompileError(
+                    f'syntax.defer takes at most one flags argument in spy '
+                    f'function {fn_name}'
+                )
+            # the flags are an ordinary compile-time integer expression (the
+            # interpreter folds it when the region is opened, see
+            # ``interp._exec_defer``)
+            return self._as_value(self._gen_expr(value)[0])
+        flags = _DEFER_CALLS.get(target)
+        if flags is None:
+            raise CompileError(self._defer_what(fn_name))
+        if len(call.args) > 0 or len(call.keywords) > 0:
+            raise CompileError(
+                f'syntax.okdefer()/syntax.errdefer() take no argument in spy '
+                f'function {fn_name}'
+            )
+        return hir.Const(int(flags))
+
+    def _defer_what(self, fn_name: str) -> str:
+        return (
+            f'expected syntax.defer(...)/syntax.okdefer()/syntax.errdefer() '
+            f'in spy function {fn_name}'
+        )
 
     # -- variables ------------------------------------------------------------
 
@@ -1676,7 +1714,7 @@ class _Builder:
             inline = True
             exceptions: ArraySet[Type] | None = ArraySet()
             callconv = 'default'
-            may_panic = False
+            may_panic = True
         else:
             inline, exceptions, callconv, may_panic = self._parse_closure_decorators(node)
 
@@ -1704,7 +1742,7 @@ class _Builder:
         return self._gen_closure(
             '<lambda>', (), node.args, None, gen_body,
             force_inline=True, exceptions=ArraySet(),
-            callconv='default', may_panic=False,
+            callconv='default', may_panic=True,
         )
 
     def _parse_closure_decorators(self, node: ast.FunctionDef) -> tuple[bool, ArraySet[Type] | None, str, bool]:
@@ -1714,7 +1752,7 @@ class _Builder:
         inline = True
         exceptions: ArraySet[Type] | None = ArraySet()
         callconv = 'default'
-        may_panic = False
+        may_panic = True
         for dec in node.decorator_list:
             call = dec if isinstance(dec, ast.Call) else ast.Call(dec, [], [])
             if self._try_resolve_object(call.func) is not syntax.closure:
@@ -1898,7 +1936,7 @@ def parse_function(
     context_type_vars: dict[TypeVar, Value] | None = None,
     exceptions: tuple[Any, ...] | Literal["infer"] | None = None,
     callconv: str = 'default',
-    may_panic: bool = False,
+    may_panic: bool = True,
 ) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 

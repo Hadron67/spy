@@ -198,6 +198,22 @@ def py_entry_arg_ctype(type: mir.Type) -> Any:
     return ctype
 
 
+class _UnwindCtx:
+    """The exception support of one function being lowered: the slot a landing
+    pad leaves its exception pair in (so the function-wide resume block can pick
+    it up) and the LLVM blocks that already got a landing pad.  It is *not* on
+    the lowerer itself, because lowering one function may recurse into another
+    (a call lowers its callee), so the state has to be per invocation."""
+
+    def __init__(self, fn: sllvm.Function) -> None:
+        self.fn = fn
+        # the ``{ ptr, i32 }`` slot a landing pad stores the exception it caught
+        # into, shared by every may-panic call's unwind edge of this function
+        self.slot: sllvm.Value | None = None
+        # the ids of the LLVM blocks that already hold a landing pad
+        self.landing_pads: set[int] = set()
+
+
 class _Lowerer:
     """Lowers the flat instruction lists of the MIR functions of one
     module onto their shared ``sllvm.Function`` definitions (each list
@@ -238,9 +254,24 @@ class _Lowerer:
         first be stored inside a runtime branch, and its address must then
         be defined on every path that stores to it or reads it later."""
         assert fn not in self.lowered_globals
+        blocks = fn.entry.collect_blocks()
+        # the exception support of this body: a may-panic call with deferred
+        # bodies to run, a ``catch_unwind`` and the function-wide resume all use
+        # a landing pad, so the frame needs a personality (see ``_UnwindCtx``)
+        needs_personality = any(
+            isinstance(inst, (mir.CallMayPanic, mir.CatchUnwind, mir.Resume))
+            or (isinstance(inst, mir.Panic) and inst.unwind_path is not None)
+            for block in blocks for inst in block.insts
+        )
+        needs_slot = any(
+            isinstance(inst, (mir.CallMayPanic, mir.Resume))
+            or (isinstance(inst, mir.Panic) and inst.unwind_path is not None)
+            for block in blocks for inst in block.insts
+        )
         llvm_fn = sllvm.Function(
             self._globals.get_key(fn),
             noreturn=isinstance(fn.ret_type, mir.NoReturn),
+            personality=sllvm.GXX_PERSONALITY if needs_personality else None,
         )
         # register the definition before lowering the body: a call to this
         # function inside its own body (recursion) must resolve to it
@@ -249,17 +280,22 @@ class _Lowerer:
         llvm_fn.set_return_type(self._to_llvm(fn.ret_type))
 
         arg_values = llvm_fn.get_args()
-        blocks = fn.entry.collect_blocks()
         # the MIR entry block *is* the LLVM entry block, so that the
         # hoisted slots have a unique home; every other block is fresh
         block_map: dict[int, sllvm.BasicBlock] = {
             id(block): (llvm_fn.entry if block is fn.entry else sllvm.BasicBlock())
             for block in blocks
         }
+        ctx = _UnwindCtx(llvm_fn)
+        if needs_slot:
+            # the exception pair a landing pad hands over is kept in one slot per
+            # function, so the shared resume block can pick it up; it lives in
+            # the entry block like every other slot
+            ctx.slot = llvm_fn.entry.alloca(sllvm.LANDING_PAD_TYPE)
         for block in blocks:
             for inst in block.insts:
                 if isinstance(inst, mir.Alloca):
-                    self._lower_inst(llvm_fn.entry, inst, arg_values, block_map)
+                    self._lower_inst(llvm_fn.entry, inst, arg_values, block_map, ctx)
         # a pointer ``BitCast`` of a stable pointer (an alloca or a parameter)
         # is resolved into the entry block first, so that it is available to
         # every block that takes the address of a union variant through it (it
@@ -287,7 +323,7 @@ class _Lowerer:
                     else:
                         continue
                     if stable:
-                        self._lower_inst(llvm_fn.entry, inst, arg_values, block_map)
+                        self._lower_inst(llvm_fn.entry, inst, arg_values, block_map, ctx)
                         hoisted = True
         # lower every remaining instruction, iterating the blocks until no
         # progress: an instruction is lowered once every value it uses is, and
@@ -316,12 +352,12 @@ class _Lowerer:
                         )
                         if not ready:
                             break
-                        self._lower_inst(block_map[id(block)], inst, arg_values, block_map, pending_phi_incomings)
+                        self._lower_inst(block_map[id(block)], inst, arg_values, block_map, ctx, pending_phi_incomings)
                         progress = True
                         continue
                     if not self._operands_lowered(inst):
                         break
-                    self._lower_inst(block_map[id(block)], inst, arg_values, block_map)
+                    self._lower_inst(block_map[id(block)], inst, arg_values, block_map, ctx)
                     progress = True
         # the back-edge incomings of the phis lowered above are available now
         for phi, value, pred in pending_phi_incomings:
@@ -513,6 +549,7 @@ class _Lowerer:
         inst: mir.Inst,
         arg_values: tuple[sllvm.Value, ...],
         block_map: dict[int, sllvm.BasicBlock],
+        ctx: _UnwindCtx,
         pending_phi_incomings: list[tuple[sllvm.Phi, mir.Value, mir.BasicBlock]] | None = None,
     ) -> None:
         result: sllvm.Value | None = None
@@ -711,11 +748,121 @@ class _Lowerer:
                 block.ret(
                     None if inst.value is None else self._value(inst.value, arg_values)
                 )
+            case mir.Panic():
+                result = self._lower_panic(block, inst, arg_values, block_map, ctx)
+            case mir.CallMayPanic():
+                result = self._lower_call_may_panic(block, inst, arg_values, block_map, ctx)
+            case mir.CatchUnwind():
+                result = self._lower_catch_unwind(block, inst, arg_values, block_map)
+            case mir.Resume():
+                assert ctx.slot is not None, 'a Resume needs the function unwind slot'
+                exception = block.load(ctx.slot, sllvm.LANDING_PAD_TYPE)
+                block.resume(exception)
             case _:
                 raise CompileError(f'unsupported MIR instruction {type(inst).__name__}')
         self._lowered_ids.add(id(inst))
         if result is not None:
             self._lowered[id(inst)] = result
+
+    def _lower_panic(
+        self,
+        block: sllvm.BasicBlock,
+        inst: mir.Panic,
+        arg_values: tuple[sllvm.Value, ...],
+        block_map: dict[int, sllvm.BasicBlock],
+        ctx: _UnwindCtx,
+    ) -> None:
+        """Throw a C++ exception carrying the ``PanicData`` ``inst.data`` points
+        at (``__cxa_throw``), then ``unreachable``: the exception's ``type_info``
+        is ``@_ZTIi``, the one a ``catch_unwind``'s landing pad matches.  When the
+        panic would run the frame's deferred bodies, the throw is an ``invoke``
+        whose unwind edge runs them first (the normal edge is unreachable)."""
+        data = self._value(inst.data, arg_values)
+        pointer_type = inst.data.get_type()
+        assert isinstance(pointer_type, mir.PointerType)
+        size = self._layout.size_of(self._to_llvm(pointer_type.elem))
+        size_value = sllvm.IntValue(size, sllvm.I64)
+        obj = block.call(sllvm.CXA_ALLOCATE_EXCEPTION, size_value)
+        block.call(sllvm.LLVM_MEMCPY, obj, data, size_value, sllvm.BOOL_FALSE)
+        throw_args = (obj, sllvm.ZTI_INT, sllvm.NullValue(sllvm.I8_PTR))
+        if inst.unwind_path is not None:
+            dead = sllvm.BasicBlock()
+            unwind = block_map[id(inst.unwind_path)]
+            self._install_unwind_landing_pad(unwind, ctx)
+            block.invoke(sllvm.CXA_THROW, throw_args, dead, unwind)
+            dead.unreachable()
+        else:
+            block.call(sllvm.CXA_THROW, *throw_args)
+            block.unreachable()
+
+    def _lower_call_may_panic(
+        self,
+        block: sllvm.BasicBlock,
+        inst: mir.CallMayPanic,
+        arg_values: tuple[sllvm.Value, ...],
+        block_map: dict[int, sllvm.BasicBlock],
+        ctx: _UnwindCtx,
+    ) -> sllvm.Value:
+        """Lower a may-panic call to an ``invoke`` whose unwind edge lands in
+        the entry of the instantiated deferred-body chain (a landing pad that
+        saves the exception and runs the bodies, then resumes)."""
+        callee = self._value(inst.callee, arg_values)
+        args = tuple(self._value(arg, arg_values) for arg in inst.args)
+        normal = block_map[id(inst.normal_path)]
+        unwind = block_map[id(inst.unwind_path)]
+        self._install_unwind_landing_pad(unwind, ctx)
+        return block.invoke(callee, args, normal, unwind)
+
+    def _lower_catch_unwind(
+        self,
+        block: sllvm.BasicBlock,
+        inst: mir.CatchUnwind,
+        arg_values: tuple[sllvm.Value, ...],
+        block_map: dict[int, sllvm.BasicBlock],
+    ) -> sllvm.Value:
+        """Lower a ``catch_unwind`` call to an ``invoke`` whose unwind edge lands
+        in a landing pad that catches the panic and hands the thrown object (the
+        ``PanicData``) to the interpreter's catch block through ``catch_data``."""
+        callee = self._value(inst.callee, arg_values)
+        args = tuple(self._value(arg, arg_values) for arg in inst.args)
+        normal = block_map[id(inst.normal_path)]
+        catch = block_map[id(inst.catch_path)]
+        catch_data = self._value(inst.catch_data, arg_values)
+        self._install_catch_landing_pad(catch, catch_data)
+        return block.invoke(callee, args, normal, catch)
+
+    def _first_non_phi(self, block: sllvm.BasicBlock) -> int:
+        """The position a landing pad belongs at in ``block``: an LLVM landing
+        pad must lead its block but every phi must still come first."""
+        index = 0
+        while index < len(block.insts) and isinstance(block.insts[index], sllvm.Phi):
+            index += 1
+        return index
+
+    def _install_unwind_landing_pad(self, block: sllvm.BasicBlock, ctx: _UnwindCtx) -> None:
+        """Give the unwind target ``block`` its cleanup landing pad: it catches
+        the panic pair and stores it into the function's unwind slot, so the
+        function-wide resume block can resume with it once the deferred bodies
+        have run.  Created once per block (several may-panic calls can share the
+        same instantiated chain)."""
+        if id(block) in ctx.landing_pads:
+            return
+        ctx.landing_pads.add(id(block))
+        assert ctx.slot is not None, 'a CallMayPanic needs the function unwind slot'
+        pad = sllvm.LandingPad((), is_cleanup=True)
+        at = self._first_non_phi(block)
+        block.insts.insert(at, pad)
+        block.insts.insert(at + 1, sllvm.Store(ctx.slot, pad))
+
+    def _install_catch_landing_pad(self, block: sllvm.BasicBlock, catch_data: sllvm.Value) -> None:
+        """Give a ``catch_unwind``'s unwind target its catching landing pad: it
+        matches the panic ``type_info`` and passes the thrown object (the
+        ``PanicData``) to the interpreter's catch block through ``catch_data``."""
+        pad = sllvm.LandingPad((sllvm.ZTI_INT,), is_cleanup=False)
+        exception = sllvm.ExtractValue(pad, (0,))
+        caught = sllvm.Call(sllvm.CXA_BEGIN_CATCH, (exception,))
+        at = self._first_non_phi(block)
+        block.insts[at:at] = [pad, exception, caught, sllvm.Store(catch_data, caught)]
 
 
 class _NativeFn(NativeFn):
@@ -767,7 +914,7 @@ class LLVMBackend(Backend):
         # one JIT for the whole process: every module becomes a named JIT
         # library, and a later library lists the earlier ones as prerequisites
         # so that cross-module references resolve by name
-        self._jit = llvm.create_lljit_compiler(tm)
+        self._jit = llvm.create_lljit_compiler(tm, use_jit_link=True)
         self._libraries: list[str] = []
         # the trackers keep the linked libraries (and their code) alive; the
         # backend lives as long as the process, so the addresses stay valid

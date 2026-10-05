@@ -189,8 +189,9 @@ class FunctionType(Type):
     # the calling convention: ``'default'`` is the spy one; any other value
     # names a C one (see ``sval.FunctionType.callconv``)
     callconv: str = 'default'
-    # whether the function may panic; carried through only (no logic yet)
-    may_panic: bool = False
+    # whether the function may panic: a call of one may have an unwind edge
+    # (see ``CallMayPanic``); a function may panic by default
+    may_panic: bool = True
 
     def get_children(self) -> tuple[Any, ...]:
         return (*self.args, self.return_type)
@@ -1269,6 +1270,147 @@ class EndDefer(Terminator):
 
 
 @dataclass(eq=False)
+class Panic(Terminator):
+    """End the path by throwing a panic carrying the ``PanicData`` in ``data``
+    (a pointer to the value, see ``interp``): it never returns, so it ends its
+    block.  ``lower`` emits the throw inline (allocate the C++ exception, copy
+    the data in, ``__cxa_throw``, ``unreachable``), so no runtime helper is
+    needed (see ``interp._call_builtin``).
+
+    Like ``CallMayPanic``, when the panic would run deferred bodies on its way
+    out of the enclosing regions the throw is an ``invoke`` whose unwind edge
+    runs ``unwind_defers`` and reaches ``unwind_path`` (the function-wide resume
+    block).  Both are unset when no deferred body would run: the throw is then a
+    plain ``call`` and unwinding passes straight through the frame."""
+
+    data: Value
+    unwind_path: BasicBlock | None = None
+    unwind_defers: tuple[BasicBlock, ...] = ()
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return () if self.unwind_path is None else (self.unwind_path,)
+
+    @override
+    def get_defer_blocks(self) -> tuple[BasicBlock, ...]:
+        return self.unwind_defers
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.data,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        data = f(self.data)
+        return self if data is self.data else replace(self, data=data)
+
+
+@dataclass(eq=False)
+class CallMayPanic(Terminator):
+    """A call that may panic while the enclosing regions still have deferred
+    bodies a panic would run (see ``interp``): a terminator with two
+    successors, which also produces the value of the call (like ``Call``).
+
+    ``normal_path`` is where a normal return continues (the value of ``type``
+    is produced there).  The unwind edge first runs ``unwind_defers`` - the
+    deferred bodies the panic triggers on its way out, the shared templates of
+    ``Terminator.get_defer_blocks`` - and then reaches ``unwind_path``, the
+    single block per function holding the ``Resume`` that carries the unwinding
+    on.  A call whose panic would run no deferred body is a plain ``Call``
+    instead: unwinding through the frame then needs no landing pad."""
+
+    callee: Value
+    args: tuple[Value, ...]
+    type: ReturnType
+    normal_path: BasicBlock
+    unwind_path: BasicBlock
+    unwind_defers: tuple[BasicBlock, ...] = ()
+
+    def is_noreturn(self) -> bool:
+        return isinstance(self.type, NoReturn)
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return VOID if isinstance(self.type, NoReturn) else self.type
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return (self.normal_path, self.unwind_path)
+
+    @override
+    def get_defer_blocks(self) -> tuple[BasicBlock, ...]:
+        return self.unwind_defers
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.callee, *self.args)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        callee = f(self.callee)
+        args = tuple(f(arg) for arg in self.args)
+        if callee is self.callee and all(a is b for a, b in zip(args, self.args)):
+            return self
+        return replace(self, callee=callee, args=args)
+
+
+@dataclass(eq=False)
+class CatchUnwind(Terminator):
+    """A call of a closure that catches a panic the callee may throw (the
+    ``std.core.catch_unwind`` builtin, see ``interp``): like ``CallMayPanic`` it
+    produces the value of the call on ``normal_path``, but its unwind edge goes
+    straight to ``catch_path`` - a block the interpreter filled with the
+    construction of the ``UnwindException`` and its dispatch (a ``raise``) - and
+    not through any deferred body: the panic is caught here, so the enclosing
+    regions are not left.  The caught ``PanicData`` pointer is written into the
+    place ``catch_data`` points at by the landing pad ``lower`` synthesizes."""
+
+    callee: Value
+    args: tuple[Value, ...]
+    type: ReturnType
+    normal_path: BasicBlock
+    catch_path: BasicBlock
+    catch_data: Value
+
+    def is_noreturn(self) -> bool:
+        return isinstance(self.type, NoReturn)
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return VOID if isinstance(self.type, NoReturn) else self.type
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return (self.normal_path, self.catch_path)
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.callee, *self.args, self.catch_data)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        callee = f(self.callee)
+        args = tuple(f(arg) for arg in self.args)
+        catch_data = f(self.catch_data)
+        if (
+            callee is self.callee
+            and all(a is b for a, b in zip(args, self.args))
+            and catch_data is self.catch_data
+        ):
+            return self
+        return replace(self, callee=callee, args=args, catch_data=catch_data)
+
+
+@dataclass(eq=False)
+class Resume(Terminator):
+    """Resume unwinding after the deferred bodies of a panic have run: the tail
+    of every ``CallMayPanic``'s unwind chain reaches the single block holding one
+    of these (the function-wide ``unwind_path``).  ``lower`` emits the ``resume``
+    with the exception the landing pad stored (see ``interp``)."""
+
+    @override
+    def get_targets(self) -> tuple[BasicBlock, ...]:
+        return ()
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
+
+
+@dataclass(eq=False)
 class Insertion(Inst):
     """A placeholder standing for the instructions that deliver a slot's
     pending action (or its storage), and, when ``value`` is set, for the
@@ -1599,6 +1741,20 @@ def _clone_template(root: BasicBlock, cont: BasicBlock) -> tuple[BasicBlock, Bas
             else:
                 new.insts[-1] = Jmp(cont)
                 tail = new
+        elif isinstance(term, CallMayPanic) and len(term.unwind_defers) > 0:
+            entry, chain_tail = _instantiate_chain(term.unwind_defers, term.unwind_path)
+            _repoint_phi_incoming(term.unwind_path, new, chain_tail)
+            term.unwind_path = entry
+            term.unwind_defers = ()
+        elif isinstance(term, Panic) and len(term.unwind_defers) > 0:
+            assert term.unwind_path is not None
+            entry, chain_tail = _instantiate_chain(term.unwind_defers, term.unwind_path)
+            _repoint_phi_incoming(term.unwind_path, new, chain_tail)
+            term.unwind_path = entry
+            term.unwind_defers = ()
+        elif isinstance(term, CatchUnwind):
+            # the catch edge carries no deferred body: the panic is caught here
+            pass
     assert tail is not None, 'a deferred body copy has an EndDefer'
     return bmap[root], tail
 
@@ -1614,6 +1770,18 @@ def _remap_targets(inst: Inst, bmap: dict[BasicBlock, BasicBlock]) -> Inst:
         case Br():
             inst.if_true = bmap[inst.if_true]
             inst.if_false = bmap[inst.if_false]
+            return inst
+        case CallMayPanic():
+            inst.normal_path = bmap[inst.normal_path]
+            inst.unwind_path = bmap[inst.unwind_path]
+            return inst
+        case CatchUnwind():
+            inst.normal_path = bmap[inst.normal_path]
+            inst.catch_path = bmap[inst.catch_path]
+            return inst
+        case Panic():
+            if inst.unwind_path is not None:
+                inst.unwind_path = bmap[inst.unwind_path]
             return inst
         case Switch():
             inst.default = bmap[inst.default]
@@ -1752,6 +1920,16 @@ def instantiate_defers(fn: Function) -> None:
             # a return has no target to send the chain to: it ends in a fresh
             # copy of the return itself
             block.insts[-1] = Jmp(return_chain(last.defer_blocks, last.value, block))
+        elif isinstance(last, CallMayPanic) and len(last.unwind_defers) > 0:
+            # the unwind edge runs its deferred bodies first and reaches the
+            # function-wide resume block (which holds no phis: the exception is
+            # carried through the landing pad slot, see ``lower``)
+            last.unwind_path = jump_chain(last.unwind_defers, last.unwind_path, block)
+            last.unwind_defers = ()
+        elif isinstance(last, Panic) and len(last.unwind_defers) > 0:
+            assert last.unwind_path is not None
+            last.unwind_path = jump_chain(last.unwind_defers, last.unwind_path, block)
+            last.unwind_defers = ()
     # every trigger is known now: the continuations no longer receive their
     # values from the triggers themselves (the shared tail reaches them instead),
     # so replace those incoming edges by the one merged value the entry holds
@@ -1767,5 +1945,5 @@ def instantiate_defers(fn: Function) -> None:
         for inst in block.insts:
             if isinstance(inst, EndDefer):
                 raise CompileError('a deferred body was not instantiated')
-            if isinstance(inst, (Jmp, Br, Ret)) and len(inst.get_defer_blocks()) > 0:
+            if isinstance(inst, (Jmp, Br, Ret, CallMayPanic, Panic)) and len(inst.get_defer_blocks()) > 0:
                 raise CompileError('a deferred body was not instantiated')

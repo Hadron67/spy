@@ -243,6 +243,9 @@ class CallSignature:
     # independent of ``positional``/``varargs``/``kwargs``, so the declared
     # argument layout can grow ``*args``/``**kwargs`` without disturbing them
     captures: tuple[SpecializedFormalArg, ...] = ()
+    # whether the callee may panic (see ``Signature.may_panic``): a call of it
+    # may unwind through the enclosing deferred bodies (see ``interp``)
+    may_panic: bool = True
 
     def __str__(self) -> str:
         """Note: return type not included"""
@@ -301,8 +304,9 @@ class Signature:
     # returned by value, and the function may not raise (see
     # ``sval.FunctionType``)
     callconv: str = 'default'
-    # whether the function may panic; passed through only (no logic yet)
-    may_panic: bool = False
+    # whether the function may panic (a call of one may unwind through the
+    # enclosing deferred bodies); a function may panic by default
+    may_panic: bool = True
 
     def bind_arg_pos[T](
         self,
@@ -580,7 +584,8 @@ class Signature:
             )
 
         call_sig = CallSignature(
-            tuple(type_var_values), positional, varargs, kwargs
+            tuple(type_var_values), positional, varargs, kwargs,
+            may_panic=self.may_panic,
         )
 
         # the parts the definition declares; the interpreter infers the ones it
@@ -750,7 +755,7 @@ class ClosureFunction:
     # the declared exception set (None: inferred from the body)
     exceptions: ArraySet[Type] | None
     callconv: str = 'default'
-    may_panic: bool = False
+    may_panic: bool = True
 
 class ClosureValue(FunctionValue):
     """One closure value: the parsed :class:`ClosureFunction` together with

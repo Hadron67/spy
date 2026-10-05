@@ -1786,8 +1786,9 @@ class FunctionType(Type):
     # passed by value, the result is returned by value, and the function may
     # not raise
     callconv: str = 'default'
-    # whether the function may panic; passed through only (no logic yet)
-    may_panic: bool = False
+    # whether the function may panic (see ``interp``: a call of one may unwind
+    # through the enclosing deferred bodies); a function may panic by default
+    may_panic: bool = True
 
     def ret_spec(self, cache: MirLowerCache) -> RetSpec:
         """How a call of a function of this signature delivers its result
@@ -2741,6 +2742,13 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         if type_vars is None or value not in type_vars:
             raise TypeError(f'cannot convert {value} to a value')
         return type_vars[value]
+    if isinstance(value, typing.TypeAliasType):
+        # a PEP 695 ``type X = ...`` alias used *without* subscripting: Python
+        # keeps the alias object itself on the evaluated annotation, so it is
+        # unwrapped to the type it stands for (a subscripted use is a generic
+        # alias whose origin is the alias, handled by the ``get_origin`` cases
+        # below)
+        return as_value(value.__value__, ctx, type_vars)
     if isinstance(value, StructTypeApplication):
         # ``Foo[T]``: resolve the template in the host (a struct declared by
         # another context resolves to this context's copy), then its arguments

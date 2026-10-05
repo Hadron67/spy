@@ -697,6 +697,31 @@ class DeclareFunction(GlobalValue):
     def get_default_name_prefix(self):
         return self.name, False
 
+@gen_get_children
+class DeclareGlobal(GlobalValue):
+    """An external global symbol of a known type: an imported data object the
+    body references by name, such as the libc++abi ``type_info`` of ``int``
+    (``@_ZTIi``) a catch clause matches against (see ``lower``)."""
+
+    name: str
+    type: Type
+
+    def __init__(self, name: str, type: Type) -> None:
+        self.name = name
+        self.type = type
+
+    @override
+    def get_type(self) -> Type:
+        return PointerType(self.type)
+
+    @override
+    def write_definition(self, name_context: NameContext) -> list[str]:
+        return [f'@{self.name} = external global {self.type.stringify(name_context)}']
+
+    @override
+    def get_default_name_prefix(self):
+        return self.name, False
+
 class FunctionState(IntEnum):
     BUILDING_ARGS = 0
     BUILDING_RETURN_TYPE = 1
@@ -729,7 +754,7 @@ class FunctionArgs(IFunction):
         return ret
 
 class Function(GlobalValue, IFunction):
-    def __init__(self, name: str | None = None, internal: bool = False, entry: BasicBlock | None = None, noreturn: bool = False) -> None:
+    def __init__(self, name: str | None = None, internal: bool = False, entry: BasicBlock | None = None, noreturn: bool = False, personality: Value | None = None) -> None:
         self.name = name
         self._entry = entry if entry is not None else BasicBlock()
         self._args: list[ArgValue] = []
@@ -739,6 +764,11 @@ class Function(GlobalValue, IFunction):
         # attribute, and the blocks of its body hold no terminator after a call
         # of it
         self._noreturn = noreturn
+        # the personality function of the frame (an LLVM ``personality``
+        # attribute), when its body has landing pads - a may-panic call's
+        # cleanup or a ``catch_unwind``'s catch clause (see ``lower``); None for
+        # a body no exception ever unwinds through
+        self._personality = personality
 
     @property
     def entry(self):
@@ -750,7 +780,11 @@ class Function(GlobalValue, IFunction):
         ret: list[str] = []
         local_counter: ObjectCounter[LocalValue] = ObjectCounter()
         attributes = ' noreturn' if self._noreturn else ''
-        ret.append(f'define {'internal ' if self._internal else ''}{self._type.return_type.stringify(name_context)} @{name_context.get_global_name(self)}({', '.join(i.stringify(name_context, local_counter) for i in self._args)}){attributes} {{')
+        personality = (
+            f' personality {self._personality.stringify(name_context)}'
+            if self._personality is not None else ''
+        )
+        ret.append(f'define {'internal ' if self._internal else ''}{self._type.return_type.stringify(name_context)} @{name_context.get_global_name(self)}({', '.join(i.stringify(name_context, local_counter) for i in self._args)}){attributes}{personality} {{')
 
         blocks = self._entry.collect_blocks()
 
@@ -801,6 +835,8 @@ class Function(GlobalValue, IFunction):
         # nor the blocks they branch to
 
         ret: list[Value] = []
+        if self._personality is not None:
+            ret.append(self._personality)
         for b in self._entry.collect_blocks():
             for inst in b.insts:
                 ret.extend(i for i in inst.get_children() if not isinstance(i, Inst) and not isinstance(i, BasicBlock))
@@ -1036,6 +1072,15 @@ class BasicBlock(LocalValue):
 
     def call(self, fn: Value, *args: Value):
         return self.emit(Call(fn, args))
+
+    def invoke(self, fn: Value, args: tuple[Value, ...], to: BasicBlock, unwind: BasicBlock) -> Value:
+        return self.emit(Invoke(fn, args, to, unwind))
+
+    def landingpad(self, *clauses: Value, is_cleanup: bool = True) -> Value:
+        return self.emit(LandingPad(tuple(clauses), is_cleanup))
+
+    def resume(self, value: Value) -> None:
+        self.emit(Resume(value))
 
     def float_func(self, value: Value, f32_fn: Value, f64_fn: Value):
         type = value.get_type()
@@ -1640,6 +1685,9 @@ class ExtractValue(Inst):
                 case StructType():
                     assert i < len(type.fields), f"index {i} is out of bounds for type {type}"
                     type = type.fields[i]
+                case LiteralStructType():
+                    assert i < len(type.fields), f"index {i} is out of bounds for type {type}"
+                    type = type.fields[i]
                 case ArrayType():
                     assert i < type.length, f"index {i} is out of bounds for type {type}"
                     type = type.child
@@ -1825,6 +1873,99 @@ class Unreachable(Branch):
         return 'unreachable'
 
 @gen_get_children
+class Invoke(Branch):
+    """A call that transfers control to ``to`` on a normal return and to
+    ``unwind`` when it raises a panic (LLVM's ``invoke``): the terminator of a
+    ``mir.CallMayPanic``/``mir.CatchUnwind`` (see ``lower``).  ``unwind`` must
+    be a block that starts with a :class:`LandingPad`."""
+
+    fn: Value
+    args: tuple[Value, ...]
+    fn_type: FnType
+    to: BasicBlock
+    unwind: BasicBlock
+
+    def __init__(self, fn: Value, args: tuple[Value, ...], to: BasicBlock, unwind: BasicBlock) -> None:
+        self.fn = fn
+        self.args = args
+        self.to = to
+        self.unwind = unwind
+        fn_ptr_type = fn.get_type()
+        assert isinstance(fn_ptr_type, PointerType), "expected pointer type"
+        fn_type = fn_ptr_type.child
+        assert isinstance(fn_type, FnType), "expected function type"
+        if not fn_type.varargs:
+            assert len(args) == len(fn_type.args), "argument mismatch"
+        else:
+            assert len(args) >= len(fn_type.args), "argument mismatch"
+        for i in range(len(fn_type.args)):
+            expected = fn_type.args[i]
+            arg_type = args[i].get_type()
+            assert expected.is_compatible(arg_type), f"argument type mismatch at {i}-th arg, expected {expected}, got {arg_type}"
+        self.fn_type = fn_type
+
+    @override
+    def get_type(self) -> Type:
+        return self.fn_type.return_type
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        ret_type = self.fn_type.return_type.stringify(name_context)
+        fn = self.fn.stringify_value(name_context, local_counter)
+        args = ', '.join(arg.stringify(name_context, local_counter) for arg in self.args)
+        to = self.to.stringify(name_context, local_counter)
+        unwind = self.unwind.stringify(name_context, local_counter)
+        return f'invoke {ret_type} {fn}({args}) to {to} unwind {unwind}'
+
+@gen_get_children
+class LandingPad(Inst):
+    """The landing pad of an :class:`Invoke`'s unwind edge (LLVM's
+    ``landingpad``): it produces the exception pair a personality function hands
+    over, ``{ ptr, i32 }``.  ``clauses`` are the ``catch`` typeinfo globals it
+    matches (each a reference to a libc++abi ``type_info``); ``is_cleanup``
+    emits the leading ``cleanup`` clause (a resuming pad runs the cleanup and
+    then :class:`Resume`s)."""
+
+    clauses: tuple[Value, ...]
+    is_cleanup: bool
+
+    def __init__(self, clauses: tuple[Value, ...] = (), is_cleanup: bool = True) -> None:
+        self.clauses = clauses
+        self.is_cleanup = is_cleanup
+
+    @override
+    def get_type(self) -> Type:
+        return LANDING_PAD_TYPE
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        parts: list[str] = []
+        if self.is_cleanup:
+            parts.append('cleanup')
+        for clause in self.clauses:
+            parts.append(f'catch ptr {clause.stringify_value(name_context, local_counter)}')
+        return f'landingpad {LANDING_PAD_TYPE.stringify(name_context)} {(" ".join(parts))}'
+
+@gen_get_children
+class Resume(Branch):
+    """Resume unwinding with the exception pair a :class:`LandingPad` produced
+    (LLVM's ``resume``): the terminator of the function-wide resume block a
+    ``mir.Resume`` lowers to (see ``lower``)."""
+
+    value: Value
+
+    def __init__(self, value: Value) -> None:
+        self.value = value
+
+    @override
+    def get_type(self) -> Type:
+        return VoidType()
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        return f'resume {self.value.stringify(name_context, local_counter)}'
+
+@gen_get_children
 class Phi(Inst):
     type: Type
     incomings: list[tuple[Value, BasicBlock]]
@@ -1978,3 +2119,20 @@ SIN_F32 = DeclareFunction('llvm.sin.f32', FnType((F32,), F64))
 SIN_F64 = DeclareFunction('llvm.sin.f64', FnType((F64,), F64))
 COS_F32 = DeclareFunction('llvm.cos.f32', FnType((F32,), F32))
 COS_F64 = DeclareFunction('llvm.cos.f64', FnType((F64,), F64))
+
+# the C++ (Itanium ABI) exception support the panic mechanism reuses (see
+# ``lower``): a ``mir.Panic`` throws a C++ exception carrying the panic payload,
+# a ``mir.CallMayPanic``'s cleanup landing pad runs the enclosing deferred
+# bodies and resumes, and a ``mir.CatchUnwind`` catches the panic.  The
+# exception's ``type_info`` is the libc++abi ``typeid(int)`` (``@_ZTIi``), so the
+# throw and the catch agree on it without a custom typeinfo object (whose vtable
+# would have to be a real one).
+I8_PTR = PointerType(I8)
+LANDING_PAD_TYPE = LiteralStructType(I8_PTR, I32)
+ZTI_INT = DeclareGlobal('_ZTIi', I8)
+GXX_PERSONALITY = DeclareFunction('__gxx_personality_v0', FnType((), I32, varargs=True))
+CXA_ALLOCATE_EXCEPTION = DeclareFunction('__cxa_allocate_exception', FnType((I64,), I8_PTR))
+CXA_THROW = DeclareFunction('__cxa_throw', FnType((I8_PTR, I8_PTR, I8_PTR), VoidType()))
+CXA_BEGIN_CATCH = DeclareFunction('__cxa_begin_catch', FnType((I8_PTR,), I8_PTR))
+CXA_END_CATCH = DeclareFunction('__cxa_end_catch', FnType((), VoidType()))
+LLVM_MEMCPY = DeclareFunction('llvm.memcpy', FnType((I8_PTR, I8_PTR, I64, BOOL_TYPE), VoidType()))

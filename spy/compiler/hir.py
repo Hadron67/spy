@@ -78,7 +78,7 @@ leaves the loop (jumping to the code after its ``End``) and a
 """
 
 from dataclasses import dataclass
-from enum import IntEnum, auto
+from enum import IntEnum, IntFlag, auto
 from typing import Any
 
 from .binop import BinaryOp, CompareOp, UnaryOp
@@ -110,13 +110,20 @@ class InlineMode(IntEnum):
     FULL = auto()
 
 
-class DeferKind(IntEnum):
+class DeferPath(IntFlag):
     """Which exits of the enclosing region trigger a ``with syntax.defer():``
-    block (see :class:`Defer`)."""
+    block (see :class:`Defer`), as the bitflags ``syntax.defer`` is written
+    with: ``OK`` a normal exit (a ``return``/``break``/``continue``/falling off
+    the region's end), ``RAISE`` a spy error leaving it and ``UNWIND`` a panic
+    unwinding through it.  The values mirror the ``syntax.OK``/``syntax.RAISE``/
+    ... constants, so an ``syntax.defer(flags)`` argument is these flags
+    directly."""
 
-    DEFER = auto()
-    OKDEFER = auto()
-    ERRDEFER = auto()
+    OK = 1
+    RAISE = 2
+    UNWIND = 4
+    ERR = RAISE | UNWIND
+    ALL = OK | ERR
 
 
 @dataclass(frozen=True)
@@ -666,12 +673,15 @@ class Defer(Inst):
     region - so the interpreter emits it into a detached block tree and the
     transfers that leave the region carry its entry (see ``interp``/``mir``).
 
-    ``variant`` says which exits trigger the body: ``DEFER`` runs on any exit of
-    the enclosing region, ``OKDEFER`` only on a normal one (a ``return``, a
-    ``break``/``continue``, or falling off the region's end) and ``ERRDEFER``
-    only when an error leaves it."""
+    ``flags`` is the compile-time integer value the exits are read off: it is
+    evaluated where the region is opened (a ``hir.Value``, so an expression such
+    as ``syntax.UNWIND | syntax.OK`` is allowed), and its bits say which exits
+    trigger the body (see :class:`DeferPath`): ``ALL`` (the ``syntax.defer()``
+    default) runs on any exit of the enclosing region, ``OK`` only on a normal
+    one (a ``return``, a ``break``/``continue``, or falling off the region's
+    end), ``ERR`` only when an error or a panic leaves it."""
 
-    variant: DeferKind
+    flags: Value
 
 
 @dataclass(eq=False)

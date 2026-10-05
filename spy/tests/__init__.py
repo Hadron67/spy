@@ -33,6 +33,7 @@ from .inline_loops import all_tests as inline_loops_tests
 from .loops import all_tests as loops_tests
 from .operators import all_tests as operators_tests
 from .options import all_tests as options_tests
+from .panic import all_tests as panic_tests
 from .pointers import all_tests as pointers_tests
 from .reflect import all_tests as reflect_tests
 from .returns import all_tests as returns_tests
@@ -58,6 +59,7 @@ all_tests: list[type[TestCase]] = [
     *ifexpr_tests,
     *comptime_structs_tests,
     *options_tests,
+    *panic_tests,
     *returns_tests,
     *errors_tests,
     *tagged_unions_tests,

@@ -147,6 +147,15 @@ def simplify(fn: mir.Function) -> None:
             case mir.Call():
                 inst.callee = resolve(inst.callee)
                 inst.args = tuple(resolve(arg) for arg in inst.args)
+            case mir.Panic():
+                inst.data = resolve(inst.data)
+            case mir.CallMayPanic():
+                inst.callee = resolve(inst.callee)
+                inst.args = tuple(resolve(arg) for arg in inst.args)
+            case mir.CatchUnwind():
+                inst.callee = resolve(inst.callee)
+                inst.args = tuple(resolve(arg) for arg in inst.args)
+                inst.catch_data = resolve(inst.catch_data)
             case mir.Ret():
                 if inst.value is not None:
                     inst.value = resolve(inst.value)
@@ -253,6 +262,16 @@ def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
             return ((inst.callee, 'use'),) + tuple(
                 (arg, 'use') for arg in inst.args
             )
+        case mir.Panic():
+            return ((inst.data, 'use'),)
+        case mir.CallMayPanic():
+            return ((inst.callee, 'use'),) + tuple(
+                (arg, 'use') for arg in inst.args
+            )
+        case mir.CatchUnwind():
+            return ((inst.callee, 'use'),) + tuple(
+                (arg, 'use') for arg in inst.args
+            ) + ((inst.catch_data, 'use'),)
         case mir.Ret():
             return ((inst.value, 'use'),) if inst.value is not None else ()
         case mir.Br():

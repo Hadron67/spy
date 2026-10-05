@@ -197,7 +197,7 @@ class SpyFuncTypeTest(TestCase):
         i32_mir = mir.IntType(32, True)
         # no by-ref argument and no result pointer: ``fn(i32, i32) -> i32``
         self.assertEqual(
-            t.to_mir_type(MIR_CACHE), mir.FunctionType((i32_mir, i32_mir), i32_mir, 'c', False),
+            t.to_mir_type(MIR_CACHE), mir.FunctionType((i32_mir, i32_mir), i32_mir, 'c', True),
         )
 
     def test_a_c_function_type_returns_an_aggregate_by_value(self) -> None:

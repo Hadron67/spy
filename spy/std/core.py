@@ -228,11 +228,19 @@ def as_static_ptr[T](value: T) -> ConstPtr[T]: ...
 class DestructorFn:
     def __call__(self, ptr: Ptr[Opaque]): ...
 
+@struct()
 class OpaqueWithDestructor:
     ptr: Ptr[Opaque]
-    destructotr: ConstPtr[DestructorFn]
+    destructor: ConstPtr[DestructorFn]
+
+    def deinit(self):
+        self.destructor[...](self.ptr)
 
 type PanicData = i32 | u32 | i64 | u64 | Ptr[Opaque] | OpaqueWithDestructor
+
+def deinit_panic_data(data: PanicData) -> None:
+    if isinstance(v := data, OpaqueWithDestructor):
+        v.deinit()
 
 @struct()
 class UnwindException(Exception):

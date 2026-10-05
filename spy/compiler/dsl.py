@@ -117,8 +117,9 @@ class FnMetadata:
     # the calling convention (see ``sval.FunctionType.callconv``): ``'default'``
     # is the spy one, any other value names a C one
     callconv: str = 'default'
-    # whether the function may panic; passed through only
-    may_panic: bool = False
+    # whether the function may panic (a call of one may unwind through the
+    # enclosing deferred bodies); a function may panic by default
+    may_panic: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -805,7 +806,7 @@ class _Context(CompileContext):
         sym = analyser.finish()
         sym.compile(self._symbol_table, self.backend, self.target_info())
 
-    def func(self, sfv: bool = False, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = False):
+    def func(self, sfv: bool = False, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = True):
         meta = FnMetadata(
             sfv=sfv, extern=extern, linkname=linkname,
             exceptions=_normalize_exceptions(exceptions),
@@ -820,7 +821,7 @@ class _Context(CompileContext):
             return cast(T, result)
         return wrapper
 
-    def func_type(self, callconv: str = 'default', may_panic: bool = False, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None):
+    def func_type(self, callconv: str = 'default', may_panic: bool = True, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None):
         """Declare a spy function *type*: the decorated ``Protocol`` names the
         signature through its ``__call__`` (whose receiver is dropped), and
         the decorated name is the handle that resolves to a
@@ -838,7 +839,7 @@ class _Context(CompileContext):
             return cast(type[T], result)
         return wrapper
 
-    def decl_func(self, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'c', may_panic: bool = False):
+    def decl_func(self, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'c', may_panic: bool = True):
         """Declare an external function of the link name ``linkname``: the
         decorated function names the signature through its annotations, and the
         decorated name is the handle that resolves to a

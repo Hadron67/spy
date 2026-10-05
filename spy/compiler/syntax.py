@@ -129,7 +129,7 @@ def errdefer():
 def as_func_ptr[T](type: type[T], obj: T) -> ConstPtr[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
-def closure(*, inline: bool = True, exceptions=None, callconv: str = 'default', may_panic: bool = False):
+def closure(*, inline: bool = True, exceptions=None, callconv: str = 'default', may_panic: bool = True):
     """The decorator of a nested ``def`` inside a spy function (a *closure*).
     It only exists at parse time - the nested function is never executed by
     Python - so ``astgen`` recognizes it by identity and reads its arguments
