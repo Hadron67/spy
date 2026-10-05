@@ -73,6 +73,7 @@ from .fn import (
 )
 from .sval import (
     AnyValue,
+    BytesType,
     CompileContext,
     Null,
     PointerType,
@@ -1076,6 +1077,19 @@ class _Builder:
         if builtin is range or builtin is StopIteration:
             from ..std import core
             return core.range if builtin is range else core.StopIteration
+        if builtin is bytes:
+            # ``bytes`` names the compile-time byte-string type: its spy value is
+            # the type itself, so ``Comptime[bytes]`` and friends resolve
+            return BytesType()
+        if builtin is str:
+            raise CompileError(
+                'the str type is not available in spy: use bytes (a string '
+                'literal is encoded to bytes automatically)'
+            )
+        if builtin is ord:
+            # ``ord(x)`` is lowered to ``hir.Ord`` by the call parser (see
+            # ``_gen_call``)
+            return builtin
         if builtin is isinstance:
             # ``isinstance(value, T)`` against a tagged union: the parser lowers
             # it to the tag test itself (see ``_gen_isinstance``)
@@ -1167,8 +1181,13 @@ class _Builder:
                     raise AttributeError(f"Attribute '{node.attr}' not found on {base.value}")
                 return ArgEntry(self.add(hir.FieldAddr(base, node.attr)), True), False
             case ast.Constant():
-                if isinstance(node.value, (int, float, str, bool)) or node.value is None:
-                    return ArgEntry(hir.Const(node.value), False), False
+                value = node.value
+                if isinstance(value, str):
+                    # spy has no ``str`` type: a string literal is a byte string,
+                    # encoded at parse time (``b'...'`` is already ``bytes``)
+                    value = value.encode()
+                if isinstance(value, (int, float, bytes, bool)) or value is None:
+                    return ArgEntry(hir.Const(value), False), False
                 raise CompileError(f"unsupported constant {node.value!r}")
             case ast.UnaryOp(op=ast.Not()):
                 # ``not`` is value -> value (``hir.Not``), so it needs no result
@@ -1661,6 +1680,14 @@ class _Builder:
                 # ``isinstance(value, T)`` against a tagged union (see
                 # ``_gen_isinstance``)
                 self._gen_isinstance(node, result_loc)
+                return
+            if fn_global is ord:
+                # ``ord(x)``: the encoding of the byte the compile-time byte
+                # string ``x`` holds (see ``hir.Ord``)
+                if len(node.args) != 1 or len(node.keywords) > 0:
+                    raise CompileError('ord takes exactly one argument')
+                operand = self._as_value(self._gen_expr(node.args[0])[0])
+                self.add(hir.Ord(operand, result_loc))
                 return
         if isinstance(node.func, ast.Attribute):
             # a method of the struct ``base``: the method and its self

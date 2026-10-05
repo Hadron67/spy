@@ -44,7 +44,7 @@ Python 值在调用边界按以下规则映射：
 | `bool` | `spy.bool` |
 | `int` | `spy.i64`（见 `dsl._INT_LITERAL_BITS`） |
 | `float` | `spy.f64` |
-| `str` | `const u8*`（只作为常量指针传递，尚不支持运算） |
+| `bytes` | 编译期字节串（`sval.BytesType`，只在编译期存在；用 `std.core.gstr`/`sstr` 转成运行时指针/切片。`str` 字面量在解析时被编码为 `bytes`，spy 函数内不允许 `str`） |
 | `None` | `Null`（`sval.Null()`，类型 `NullType`；是 `Option[T]` 的“缺席”值，也可以当 void 值用） |
 | `syntax.Ptr[T]` | `sval.PointerType`（见下） |
 | `syntax.Option[T]` | `sval.OptionType`（见下） |
@@ -87,6 +87,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
   编译期分**浅**、**深**两层（代码里叫 inline / comptime）：
   - **浅（inline）**：值本身不是运行时值（`RuntimeVal`），可以放进编译期 box 或编译期聚合而不落内存。`name: Comptime` 要求的只是这一层，所以一个编译期变量能持有一个编译期结构（类型、元组、结构体、数组……），即使它里面的元素是运行时值（例如多返回值打包成的元组）。
   - **深（comptime）**：整个值在编译期就完全确定，可以在 Python 里直接算出来。只有这些地方要求深层编译期：编译期 `if`、编译期一元运算的折叠，以及给 `Comptime` 参数传参（实参是运行时值时报错，而不是被默默丢掉）。
+- **字节串（`bytes`）**：字节串字面量/值只在编译期存在（`sval.BytesType`，没有运行时表示；`str` 字面量在 `astgen` 里被编码成 `bytes`，spy 函数内不允许 `str`）。编译期字节串可**下标** `b[i]` 与**切片** `b[a:c]`（下界缺省为 0、上界缺省为长度、step 必须为 1，越界报错），两者都产出一个*引用*（`ComptimeVal(sval.ConstRef(<子串>))`；`b[i]` 是单字节子串）。`ord(b)` 取**恰好一个字节**的字节串的编码（一个无类型整数，见 `hir.Ord`）。要把字节串落成运行时值用 `std.core.gstr(b) -> ConstMultiPtr[u8]`（一个持有其字节的全局常量，字节末尾附一个 NUL 结束符）与 `std.core.sstr(b) -> ConstSlicePtr[u8]`（`{gstr(b), 字节数}`，长度**不含**那个 NUL）；内容相同的字节串共用一个全局常量。持有字节串的局部变量必须写成 `Comptime` 变量。
 
 ### 运行时控制流
 
@@ -301,7 +302,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 | `compiler/builtins.py` | 函数体内使用的 `spy.*` builtin |
 | `compiler/util.py` | 共用工具 |
 | `std/__init__.py` | 标准库对外入口：把 `std.core` 的类型与 `compiler.syntax` 的标记一并再导出 |
-| `std/core.py` | 标准库核心类型：`Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr` 及 `arr_slice`/`const_arr_slice` |
+| `std/core.py` | 标准库核心类型：`Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`，以及 `gstr`/`sstr` 等内置函数 |
 | `std/mem.py` | 内存相关工具：`layout_of` / `size_of` / `align_of`（布局反射）与分配器（更多尚未实现） |
 | `tests/` | 集成测试（按特性拆分成多个模块） |
 
@@ -309,7 +310,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 
 - 赋值仅支持 `=`（含元组解包）与 `+=`（无链式赋值 `a = b = e`、其它增强赋值）。
 - `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、对**单指针**的下标 `p[i]`（单指针只有解引用 `p[...]` 可用；多指针的 `p[i]` 与数组的 `a[i]` 已实现）。
-- 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字符串的运算。
+- 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字节串（`bytes`）除编译期下标/切片与 `ord`/`gstr`/`sstr` 外的运算（拼接、比较、`len` ……）。
 - 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、结构体整体比较。
 - 数组：运行时长度的数组、数组之间的转换（如 `i32[2]` → `i64[2]`）、以及 Python 侧实例表示（带数组参数/返回值的函数还不能从 Python 侧直接调用）。切片已由 `std.arr_slice`/`std.const_arr_slice` 提供。
 - 类型标注：局部变量的标注按函数体内的表达式求值，支持能当值求出的类型（具体类型、类型参数、结构体及结构体特化）与 `Comptime` 标记；`Ptr[T]`/`ConstPtr[T]`/`MultiPtr[T]`/`ConstMultiPtr[T]`/`Array[T, N]`/`Option[T]` 这类 `syntax` 类型标记在函数体里也是可用作值的表达式（由 `hir.PointerType`/`hir.ArrayType`/`hir.OptionType` 在编译期构造），此外也能写在形参、返回值与结构体字段注解里。

@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING, Any, Never, Protocol, Self, cast
 
-from ..compiler import builtin_func, i32, i64, u32, u64, usize
+from ..compiler import builtin_func, i32, i64, u8, u32, u64, usize
 from ..compiler.dsl import Callable, func, func_type, struct
 from ..compiler.syntax import (
     Array,
@@ -220,6 +220,16 @@ def unwrap_or[T](val: Option[T], default: T) -> T:
 
 @builtin_func
 def undefined() -> Any: ...
+
+# ``gstr(s)``: the compile-time byte string ``s`` as a global static constant,
+# the result a ``ConstMultiPtr[u8]`` to its bytes (see ``interp``).
+@builtin_func
+def gstr(s: bytes) -> ConstMultiPtr[u8]: ...
+
+# ``sstr(s)``: the compile-time byte string ``s`` as a ``ConstSlicePtr[u8]`` -
+# the pointer ``gstr(s)`` returns and the number of bytes.
+@builtin_func
+def sstr(s: bytes) -> ConstSlicePtr[u8]: ...
 
 @builtin_func
 def as_static_ptr[T](value: T) -> ConstPtr[T]: ...

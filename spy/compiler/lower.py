@@ -414,6 +414,8 @@ class _Lowerer:
                     raise NotImplementedError(f"TODO: lower global {value!r}")
             case mir.GlobalConstant():
                 return self._lower_global_constant(value)
+            case mir.GlobalStringValue():
+                return self._lower_global_string(value)
             case _:
                 raise NotImplementedError(f"TODO: lower global {value!r}")
 
@@ -428,6 +430,12 @@ class _Lowerer:
         if isinstance(lowered, sllvm.AggregateConstant):
             return sllvm.GlobalAggregateValue(lowered, align=align)
         return sllvm.GlobalScalarValue(lowered, align=align)
+
+    def _lower_global_string(self, value: mir.GlobalStringValue) -> sllvm.GlobalValue:
+        """A global static constant holding a byte string: the bytes are emitted
+        into a read-only global (see ``llvm.GlobalStringValue``); ``value.data``
+        already carries the trailing NUL."""
+        return sllvm.GlobalStringValue(value.data)
 
     def _lower_constant(self, constant: mir.Value | mir.AggregateConstant | mir.UnionConstant) -> sllvm.Value | sllvm.AggregateConstant:
         """Lower one constant of a global initializer: a scalar leaf to its

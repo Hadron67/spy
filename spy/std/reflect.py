@@ -1,6 +1,6 @@
 from typing import Any
 
-from ..compiler import Option, builtin_func, struct, u8
+from ..compiler import Option, builtin_func, struct
 from .core import ConstSlicePtr
 
 type TypeInfo = IntType | PointerType | ArrayType | StructType | UnionType | TaggedUnionType | OptionType
@@ -24,7 +24,7 @@ class ArrayType:
 
 @struct()
 class StructField:
-    name: ConstSlicePtr[u8]
+    name: bytes
     type: type
     default_value: Option[Any]
 

@@ -493,6 +493,17 @@ class Unary(Inst):
     ret: Value
 
 @dataclass(eq=False)
+class Ord(Inst):
+    """``ord(x)``: the encoding of the byte the compile-time byte string
+    ``operand`` holds, written into the result location ``ret``.  The operand
+    has to be a ``bytes`` value of exactly one byte (see ``interp``); the
+    result is an *untyped* integer, so the destination gives it its type."""
+
+    operand: Value
+    ret: Value
+
+
+@dataclass(eq=False)
 class Ret(Inst):
     """End one path of the function; a path is terminated by a ``return``
     statement, whose expression was already evaluated into the function's

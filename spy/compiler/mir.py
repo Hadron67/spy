@@ -462,6 +462,28 @@ class GlobalConstant(GlobalValue):
         return 'const', True
 
 
+@dataclass(eq=False, slots=True)
+class GlobalStringValue(GlobalValue):
+    """A global static constant holding a byte string: the pointer to a static
+    read-only location the bytes are emitted into (see ``lower``).  ``data``
+    already carries the trailing NUL the ``std.core.gstr``/``sstr`` builtins
+    append; the pointer type is always ``*u8`` - the constness/variant are the
+    expression's own, carried by the sval type the interpreter types a value
+    with (LLVM lowers every pointer to the same opaque ``ptr``).  Two byte
+    strings are deduplicated by their content (see ``interp``), so the same
+    bytes share one global."""
+
+    data: bytes
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return PointerType(IntType(8, False))
+
+    @override
+    def get_name(self) -> tuple[str, bool]:
+        return 'str', True
+
+
 @dataclass(eq=False)
 class Param(Value):
     """The index-th formal argument of the enclosing function's lowered

@@ -25,8 +25,10 @@ from .core import (
     arr_slice,
     as_static_ptr,
     const_arr_slice,
+    gstr,
     range,
     slice,
+    sstr,
     undefined,
 )
 
@@ -45,9 +47,11 @@ __all__ = [
     'as_static_ptr',
     'comptime',
     'const_arr_slice',
+    'gstr',
     'ptr_cast',
     'range',
     'slice',
+    'sstr',
     'struct',
     'syntax',
     'undefined',

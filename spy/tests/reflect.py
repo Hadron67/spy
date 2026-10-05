@@ -121,7 +121,7 @@ def reflect_field_name_byte() -> i32:
     if isinstance(v := info, StructType):
         field: Comptime = v.fields.ptr[0]
         name: Comptime = field.name
-        return name.ptr[0]
+        return ord(name[0])
     return -1
 
 
@@ -131,8 +131,7 @@ def reflect_field_name_arith() -> i32:
     if isinstance(v := info, StructType):
         field: Comptime = v.fields.ptr[0]
         name: Comptime = field.name
-        p: Comptime = name.ptr + 1
-        return p[...]
+        return ord(name[1])
     return -1
 
 
@@ -182,8 +181,8 @@ class SpyReflectTest(TestCase):
 
     def test_a_struct_type_reflects_its_fields(self) -> None:
         self.assertEqual(reflect_field_count(), 2)
-        # the first field is named ``ab``: its bytes are readable through the
-        # ``ConstSlicePtr[u8]`` the name is stored as
+        # the first field is named ``ab``: its bytes are readable as the
+        # compile-time ``bytes`` value the name is stored as
         self.assertEqual(reflect_field_name_byte(), ord('a'))
         self.assertEqual(reflect_field_name_arith(), ord('b'))
 

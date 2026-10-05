@@ -2430,6 +2430,8 @@ class HirRunner:
                 return self._eval_not(self.operand(inst.value), inst)
             case hir.Unary():
                 return self._eval_unary(inst.op, self.operand_arg(inst.operand), self.operand(inst.ret))
+            case hir.Ord():
+                return self._eval_ord(self.operand(inst.operand), self.operand(inst.ret))
             case hir.CallInplace():
                 return self.call(self.operand(inst.callee), self.operand_arglist(inst.args), self.operand(inst.ret))
             case hir.CallMethodInplace():
@@ -3114,7 +3116,7 @@ class HirRunner:
                 type_var_value = self._type_var_value(obj)
                 if type_var_value is not None:
                     return type_var_value
-                if not isinstance(obj, (int, float, str, bool, pytypes.NoneType)):
+                if not isinstance(obj, (int, float, bytes, bool, pytypes.NoneType)):
                     resolved = self._analyser._resolver.resolve_global(obj)
                     if resolved is not None:
                         return ComptimeVal(resolved)
@@ -3189,10 +3191,6 @@ class HirRunner:
                 # a reference to an immutable compile-time global behaves like
                 # the value it refers to
                 return ComptimeVal(obj.value)
-            case ComptimeVal(obj) if isinstance(obj, sval.StrConstPtr):
-                # ``*p`` of a string constant: the byte the cursor names
-                byte = self._str_constant_byte(obj, obj.cursor, 'load')
-                return ComptimeVal(sval.Int(byte, sval.IntType(8, False)))
             case RuntimeVal():
                 if type.elem.classify() == sval.SpecialTypeKind.DST:
                     raise CompileError(
@@ -5199,6 +5197,25 @@ class HirRunner:
             return PollResult.AGAIN
         raise CompileError(f"unsupported unary operator '{op}'")
 
+    def _eval_ord(self, value: InterpVal, ret: InterpVal) -> PollResult:
+        """``ord(x)`` (``hir.Ord``): the encoding of the byte the compile-time
+        byte string ``value`` holds.  The operand has to be a compile-time
+        ``bytes`` of exactly one byte; the result is an *untyped* integer, so the
+        result location gives it its type."""
+        obj = _to_comptime(_shallow_normalize(value))
+        if not isinstance(obj, bytes):
+            type = _type_of(value)
+            raise CompileError(
+                f'ord expects a compile-time byte string, got '
+                f'{type if type is not None else value!r}'
+            )
+        if len(obj) != 1:
+            raise CompileError(
+                f'ord expects a byte string of exactly one byte, got {len(obj)}'
+            )
+        self.store(ret, ComptimeVal(obj[0]))
+        return PollResult.AGAIN
+
     def binary_assign(self, op: BinaryOp, left: InterpVal, right: ArgEntry[InterpVal]) -> PollResult:
         # ``x op= y`` calls the target's in-place magic method when its struct
         # declares one (``__iadd__``, ...); otherwise it is ``x = x op y``
@@ -5272,12 +5289,18 @@ class HirRunner:
                 if obj is None:
                     type = _type_of(ev)
                     parts.append(f'<{type}>' if type is not None else '<value>')
+                elif isinstance(obj, bytes):
+                    # a byte string is rendered as its text, not as a ``b'...'`` repr
+                    parts.append(obj.decode(errors='replace'))
                 else:
                     parts.append(str(obj))
             for arg in args.kwargs.values():
                 ev = self._arg_value(arg)
                 obj = _to_comptime(ev)
-                parts.append(str(obj) if obj is not None else '<value>')
+                if isinstance(obj, bytes):
+                    parts.append(obj.decode(errors='replace'))
+                else:
+                    parts.append(str(obj) if obj is not None else '<value>')
             print(' '.join(parts))
             self.store(ret, ComptimeVal(sval.Void()))
             return PollResult.AGAIN
@@ -5305,7 +5328,59 @@ class HirRunner:
             return self._builtin_panic(args)
         if fn.name == 'catch_unwind':
             return self._builtin_catch_unwind(args, ret)
+        if fn.name == 'gstr':
+            return self._builtin_gstr(args, ret)
+        if fn.name == 'sstr':
+            return self._builtin_sstr(args, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
+
+    # -- ``std.core.gstr`` / ``std.core.sstr`` -------------------------------
+
+    def _bytes_builtin_arg(self, args: RawArgList[ArgEntry[InterpVal]], what: str) -> bytes:
+        """The compile-time ``bytes`` value the one argument of a byte-string
+        builtin holds."""
+        if len(args.positional) != 1 or len(args.kwargs) > 0:
+            raise CompileError(f'{what} takes exactly one argument')
+        obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[0])))
+        if not isinstance(obj, bytes):
+            raise CompileError(f'{what} expects a compile-time byte string')
+        return obj
+
+    def _string_global(self, data: bytes) -> mir.GlobalStringValue:
+        """The global static constant holding the bytes ``data`` plus a trailing
+        NUL (the C-style terminator; a caller that wants a length, such as
+        ``sstr``, does not count it).  Identical byte strings share one global
+        through the analyser's cache, so a body that names the same bytes twice
+        emits one location."""
+        cache = self._analyser._string_globals
+        global_value = cache.get(data)
+        if global_value is None:
+            global_value = mir.GlobalStringValue(data + b'\0')
+            cache[data] = global_value
+        return global_value
+
+    def _string_ptr_type(self) -> sval.PointerType:
+        return sval.PointerType(
+            sval.IntType(8, False), is_const=True, variant=sval.PointerVariant.MULTI
+        )
+
+    def _builtin_gstr(self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+        """``std.core.gstr(s)``: a global static constant holding the bytes of the
+        compile-time byte string ``s``, the result a ``ConstMultiPtr[u8]`` to it."""
+        data = self._bytes_builtin_arg(args, 'std.core.gstr')
+        self.store(ret, RuntimeVal(self._string_global(data), self._string_ptr_type()))
+        return PollResult.AGAIN
+
+    def _builtin_sstr(self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+        """``std.core.sstr(s)``: the ``ConstSlicePtr[u8]`` of the compile-time byte
+        string ``s`` - ``gstr(s)`` and the number of bytes."""
+        data = self._bytes_builtin_arg(args, 'std.core.sstr')
+        slice_type = self._special_type.slice_ptr_of(sval.IntType(8, False), True)
+        self.store(ret, ComptimeAggregate(slice_type, (
+            RuntimeVal(self._string_global(data), self._string_ptr_type()),
+            ComptimeVal(sval.Int(len(data), self._usize_type())),
+        )))
+        return PollResult.AGAIN
 
     # -- ``std.core.panic`` / ``std.core.catch_unwind`` ----------------------
 
@@ -5754,8 +5829,8 @@ class HirRunner:
 
     def _build_struct_field(self, field: sval.StructField) -> InterpVal:
         """The ``std.reflect.StructField`` value describing one field of a
-        struct: its name as a ``ConstSlicePtr[u8]``, its type and its default
-        value (absent when the field declares none)."""
+        struct: its name as a compile-time ``bytes`` value, its type and its
+        default value (absent when the field declares none)."""
         default: InterpVal
         if field.default is None:
             default = ComptimeOption(
@@ -5767,7 +5842,7 @@ class HirRunner:
                 self._coerce(ComptimeVal(field.default), sval.AnyType()),
             )
         return ComptimeAggregate(self._reflect_struct('StructField'), (
-            self._str_const_slice(field.name),
+            ComptimeVal(field.name.encode()),
             ComptimeVal(field.type),
             default,
         ))
@@ -5810,25 +5885,6 @@ class HirRunner:
             array,
             ComptimeVal(sval.Int(len(values), self._usize_type())),
         ))
-
-    def _str_const_slice(self, text: str) -> InterpVal:
-        """A ``ConstSlicePtr[u8]`` compile-time value over the bytes of ``text``,
-        backed by a :class:`sval.StrConstPtr` rather than by a box per byte."""
-        elem = sval.IntType(8, False)
-        data = text.encode()
-        slice_type = self._special_type.slice_ptr_of(elem, True)
-        return ComptimeAggregate(slice_type, (
-            ComptimeVal(sval.StrConstPtr(data, 0)),
-            ComptimeVal(sval.Int(len(data), self._usize_type())),
-        ))
-
-    def _str_constant_byte(self, ptr: sval.StrConstPtr, pos: int, what: str) -> int:
-        """The byte at ``pos`` of the string constant ``ptr``; the constant is
-        read-only and its positions unsigned, so a position outside the data is
-        an error."""
-        if not 0 <= pos < len(ptr.data):
-            raise CompileError(f'the string constant is out of bounds ({what})')
-        return ptr.data[pos]
 
     def _call_fn_ptr(
         self,
@@ -6306,7 +6362,11 @@ class HirRunner:
         definition of what an element of it is (e.g. ``std.SlicePtr``).  The
         method is called with the subscript's own ``ret`` register as a
         callback target, since a method call delivers into a result location
-        rather than a register (see ``_call_function_entry``)."""
+        rather than a register (see ``_call_function_entry``).
+
+        ``b[i]`` / ``b[a:c]`` where ``b`` is a compile-time byte string: the
+        substring the subscript names, held as a reference (see
+        ``_subscript_bytes``)."""
         array_type = _array_elem_type_of(base)
         if array_type is not None:
             if array_type.length is None:
@@ -6328,6 +6388,8 @@ class HirRunner:
             return PollResult.AGAIN
 
         base_type = _type_of(base)
+        if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.BytesType):
+            return self._subscript_bytes(base, index, ret)
         if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.PointerType):
             return self._subscript_pointer(base, base_type.elem, index, ret)
 
@@ -6383,6 +6445,57 @@ class HirRunner:
         self._frames[-1].regs[ret] = ComptimeVal(instance)
         return PollResult.AGAIN
 
+    def _subscript_bytes(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
+        """``b[i]`` / ``b[a:c]`` of the compile-time byte string the place
+        ``base`` holds: the substring the subscript names, held as a reference
+        (:class:`sval.ConstRef`) - a subscript yields a place.  An integer index
+        picks one byte (checked against the length), a ``std.slice`` object a
+        range (a missing lower bound is 0, a missing upper bound the length, and
+        a step has to be 1); every bound has to be compile-time."""
+        data = _to_comptime(_shallow_normalize(self.load(base)))
+        if not isinstance(data, bytes):
+            raise CompileError('cannot subscript a value that is not a byte string')
+        index_ev = self._arg_value(index)
+        index_type = _type_of(index_ev)
+        if isinstance(index_type, sval.StructType) and index_type.head is self._special_type.slice_type:
+            start, end = self._bytes_slice_bounds(self.as_comptime_aggregate(index_ev), len(data))
+            piece = data[start:end]
+        else:
+            index_value = self._coerce(index_ev, self._usize_type())
+            index_int = _comptime_int(index_value)
+            if index_int is None:
+                raise CompileError('a byte string needs a constant index')
+            if not 0 <= index_int < len(data):
+                raise CompileError(
+                    f'the index {index_int} is out of bounds for a byte string of '
+                    f'length {len(data)}'
+                )
+            piece = data[index_int:index_int + 1]
+        self._frames[-1].regs[ret] = ComptimeVal(sval.ConstRef(piece))
+        return PollResult.AGAIN
+
+    def _bytes_slice_bounds(self, slice_obj: ComptimeAggregate, length: int) -> tuple[int, int]:
+        """The ``(start, end)`` a ``std.slice`` object names over a byte string
+        of ``length`` bytes: a missing lower bound is 0, a missing upper bound
+        the length, and a step (if written) has to be 1.  Every bound has to be
+        a compile-time integer, and the range is bounds-checked."""
+        start_raw, end_raw, step_raw = slice_obj.values
+        start_ev = self._slice_bound_value(start_raw, 'the start of a slice')
+        start = 0 if start_ev is None else _comptime_int(start_ev)
+        end_ev = self._slice_bound_value(end_raw, 'the end of a slice')
+        end = length if end_ev is None else _comptime_int(end_ev)
+        step_ev = self._slice_bound_value(step_raw, 'the step of a slice')
+        if step_ev is not None and _comptime_int(step_ev) != 1:
+            raise CompileError('a slice of a byte string has no step')
+        if start is None or end is None:
+            raise CompileError('a slice of a byte string needs constant bounds')
+        if end < start or end > length:
+            raise CompileError(
+                f'the slice {start}:{end} is out of bounds for a byte string of '
+                f'length {length}'
+            )
+        return start, end
+
     def _subscript_pointer(self, base: InterpVal, ptr_type: sval.PointerType, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
         """The place a subscript of the pointer ``ptr_type`` - the value the
         place ``base`` holds - names: the ``SlicePtr`` of a slice, or the
@@ -6403,23 +6516,6 @@ class HirRunner:
                 f'dereferenced with ``p[...]`` (index a ``MultiPtr`` instead)'
             )
         pointer = self.load(base)
-        if isinstance(pointer, ComptimeVal) and isinstance(pointer.obj, sval.StrConstPtr):
-            # a string constant: the element's own place, a read-only box holding
-            # the byte at the compile-time index (a store through it is rejected,
-            # the constant is const)
-            index_value = self._coerce(index_ev, self._usize_type())
-            index_int = _comptime_int(index_value)
-            if index_int is None:
-                raise CompileError('a string constant needs a constant index')
-            byte = self._str_constant_byte(
-                pointer.obj, pointer.obj.cursor + index_int, 'subscript'
-            )
-            self._frames[-1].regs[ret] = ComptimeBox(
-                sval.IntType(8, False),
-                ComptimeVal(sval.Int(byte, sval.IntType(8, False))),
-                is_const=True,
-            )
-            return PollResult.AGAIN
         if isinstance(pointer, ComptimeAggregatePtr) and isinstance(pointer.type, sval.ArrayType):
             # compile-time storage of the elements: the n-th element's own place,
             # which a compile-time index picks - there is no runtime address to
@@ -7770,6 +7866,10 @@ class Analyser:
         # creates is made through (see ``sval.MirLowerCache``)
         self.mir_lower_cache = mir_lower_cache
         self._analyse_stack: list[HirRunner] = []
+        # the byte-string globals the bodies compiled by this analyser share,
+        # deduplicated by content (see ``HirRunner._string_global``): identical
+        # byte strings lower to one global across every function of the analysis
+        self._string_globals: dict[bytes, mir.GlobalStringValue] = {}
         self._symbol_table = CompileBatch(
             extern_anon_symbols={},
             newly_compiled=set(),

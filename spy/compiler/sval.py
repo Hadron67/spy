@@ -45,7 +45,7 @@ class Value:
     def get_type(self) -> Type:
         ...
 
-type AnyValue = Value | int | float | str | bool
+type AnyValue = Value | int | float | bytes | bool
 
 class AsValue(Value):
     """A Python value bound to an explicit spy type (``spy.as_(x, T)``).
@@ -820,6 +820,29 @@ class StrDictType(Type):
 TYPE_TYPE = TypeType()
 
 @dataclass(frozen=True)
+class BytesType(Type):
+    """A compile-time byte string: the spy type of a ``bytes`` literal/value.
+    A byte string only exists at compile time - it has no MIR mirror of its own
+    - and is turned into a runtime pointer/slice by the ``std.core.gstr`` /
+    ``std.core.sstr`` builtins (see ``interp``).  Its compile-time value is the
+    raw Python ``bytes`` object."""
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
+
+    def __str__(self) -> str:
+        return 'bytes'
+
+@dataclass(frozen=True)
 class BoolType(Type):
     """The boolean type; values are ``i1`` at the LLVM level."""
 
@@ -1185,30 +1208,6 @@ class ConstRef(Value):
 
     def __str__(self) -> str:
         return '&' + str(self.value)
-
-@dataclass(frozen=True, slots=True)
-class StrConstPtr(Value):
-    """A compile-time string constant, held as a ``ConstMultiPtr[u8]`` - the
-    bytes and the position ``cursor`` the pointer names (so that pointer
-    arithmetic and subscripting walk the constant without materializing an
-    array of boxes per character).  ``cursor`` is unsigned: a negative offset is
-    rejected where the constant is read (see ``interp``)."""
-
-    data: bytes
-    cursor: int = 0
-
-    @override
-    def get_type(self) -> Type:
-        return PointerType(IntType(8, False), is_const=True, variant=PointerVariant.MULTI)
-
-    def __add__(self, amount: int) -> StrConstPtr:
-        return StrConstPtr(self.data, self.cursor + amount)
-
-    def __sub__(self, amount: int) -> StrConstPtr:
-        return StrConstPtr(self.data, self.cursor - amount)
-
-    def __str__(self) -> str:
-        return f'c"{self.data[self.cursor:].decode(errors="replace")}"'
 
 class BuiltinFn(Value):
     """A ``spy.*`` builtin that the compile-time interpreter evaluates
@@ -2649,8 +2648,13 @@ def type_of(value: AnyValue, int_literal_bits: int | None = None) -> Type:
             return AnyIntType() if int_literal_bits is None else IntType(int_literal_bits, True)
         case float():
             return FloatType(64)
+        case bytes():
+            return BytesType()
         case str():
-            return PointerType(IntType(8, False), True)
+            raise CompileError(
+                'the str type is not available in spy: use bytes (a string '
+                'literal is encoded to bytes automatically)'
+            )
 
 class StructDecl:
     """A Python-level object that declares a spy struct: the handle a
@@ -2709,8 +2713,15 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
     ``dsl._Context.resolve_global``).  The resolver is required: an object
     only the host knows cannot be converted without one, and converting it in
     the wrong context would break the isolation between contexts."""
-    if isinstance(value, (Value, int, float, str, bool)):
+    if isinstance(value, (Value, int, float, bytes, bool)):
         return value
+    if isinstance(value, str) or value is str:
+        # spy has no ``str`` type: a string is a byte string (``bytes``), and a
+        # string literal is encoded at parse time (see ``astgen``)
+        raise CompileError(
+            'the str type is not available in spy: use bytes (a string literal '
+            "is encoded to bytes automatically)"
+        )
     if value is None:
         # ``None`` denotes the null value: the absent value of an option
         return Null()
@@ -2718,8 +2729,8 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         return AnyIntType()
     if value is float:
         return FloatType(64)
-    if value is str:
-        return PointerType(IntType(8, False), is_const=True)
+    if value is bytes:
+        return BytesType()
     if value is type:
         return TYPE_TYPE
     if value is typing.Any:
@@ -2804,7 +2815,7 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         # parameter (the constness of a pointer, ``C: bool = Literal[False]``)
         # evaluates to one
         args = typing.get_args(value)
-        if len(args) == 1 and isinstance(args[0], (bool, int, str)):
+        if len(args) == 1 and isinstance(args[0], (bool, int, bytes)):
             return args[0]
         raise TypeError(f'cannot convert {value!r} to a value')
     if typing.get_origin(value) in _POINTER_TYPES:
@@ -3186,16 +3197,14 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
         # an already-typed constant (the value a compile-time location holds):
         # the target type governs, like the constant of any other location
         value = value.value
-    if isinstance(value, StrConstPtr):
-        # a string constant is a ``ConstMultiPtr[u8]``: it may only be used as a
-        # pointer (of any constness/variant) to a byte
-        if not (isinstance(type, PointerType) and type.elem == IntType(8, False)):
-            raise CompileError(f"cannot use {value!r} as a constant of {type}")
-        return value
     match type:
         case BoolType():
             if not isinstance(value, bool):
                 raise CompileError(f"cannot use {value!r} as a bool constant")
+            return value
+        case BytesType():
+            if not isinstance(value, bytes):
+                raise CompileError(f"cannot use {value!r} as a bytes constant")
             return value
         case AnyIntType():
             # the type of an untyped integer literal: its values are the plain
