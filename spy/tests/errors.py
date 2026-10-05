@@ -1,10 +1,10 @@
+import contextlib
 import ctypes
 from typing import Any, Never
 from unittest import TestCase
 
 from ..compiler import (
     CompileError,
-    SpyError,
     i32,
     i64,
     mir,
@@ -537,17 +537,18 @@ def catch_big(n: i32) -> i32:
 
 
 def call_with_error(handle: Any, arg: int) -> tuple[int, int, int]:
-    """Compile ``handle`` (a Python-side call is rejected after compiling it)
-    and invoke its native form directly, with the hidden error-code and payload
-    pointers filled in by this helper.  Returns ``(result, error code, payload
-    read as i32)``; the payload is only meaningful when the code is not zero."""
+    """Compile ``handle`` (a Python-side call compiles it and then either
+    returns or raises the spy exception) and invoke its *value form* directly,
+    with the hidden error-code and payload pointers filled in by this helper.
+    Returns ``(result, error code, payload read as i32)``; the payload is only
+    meaningful when the code is not zero."""
     entry = handle.get_entry()
     if len(entry.specs) == 0:
-        with TestCase().assertRaises(SpyError):
+        with contextlib.suppress(Exception):
             handle(arg)
     assert len(entry.specs) == 1, entry.specs
     instance = next(iter(entry.specs.values()))
-    native = instance.wrapper_fn or instance.native_fn
+    native = instance.native_fn
     assert native is not None
     code = ctypes.c_uint8(255)
     payload = ctypes.c_int32(-1)
@@ -604,15 +605,17 @@ class SpyErrorUnionTest(TestCase):
         assert signature.exceptions is not None
         self.assertEqual(list(signature.exceptions.values), [struct_type(ErrorA)])
 
-    def test_calling_a_raising_function_from_python_is_rejected(self) -> None:
-        with self.assertRaises(SpyError) as ctx:
-            raise_a(1)
-        self.assertIn('not supported', str(ctx.exception))
+    def test_calling_a_raising_function_from_python_raises_it(self) -> None:
+        # the boundary raises the spy exception struct itself (which is a
+        # Python ``Exception`` too)
+        with self.assertRaises(Exception) as ctx:
+            raise_a(-1)
+        self.assertEqual(ctx.exception.code, 7)  # pyright: ignore
 
     def _compile(self, handle: Any, arg: int) -> None:
-        # a call from Python compiles the function before the boundary rejects
-        # it: the Python-side handling of errors is not implemented yet
-        with self.assertRaises(SpyError):
+        # a call from Python compiles the function, and then either returns or
+        # raises the spy exception it delivered
+        with contextlib.suppress(Exception):
             handle(arg)
 
 

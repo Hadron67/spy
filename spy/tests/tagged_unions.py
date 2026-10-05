@@ -398,6 +398,29 @@ class SpyTaggedUnionTest(TestCase):
             tu_bad_pattern()
 
 
+class SpyPythonSideUnionTest(TestCase):
+    """Tagged unions from the Python side: a union value unwraps to the value of
+    the variant it holds (it has no Python-side representation of its own)."""
+
+    def test_a_union_unwraps_to_its_variant(self) -> None:
+        a = tu_make(0)
+        self.assertEqual(a.x, 3) # pyright: ignore
+        b = tu_make(1)
+        self.assertEqual(b.y, 4) # pyright: ignore
+
+    def test_a_variant_instance_crosses_as_a_union(self) -> None:
+        self.assertEqual(tu_unwrap(tu_make(0)), 3)  # pyright: ignore
+        self.assertEqual(tu_unwrap(tu_make(1)), 4)  # pyright: ignore
+
+    def test_a_constructed_variant_crosses_as_a_union(self) -> None:
+        self.assertEqual(tu_unwrap(TU_A(9)), 9)  # pyright: ignore
+
+    def test_a_scalar_union_unwraps_to_its_variant(self) -> None:
+        self.assertEqual(tu_scalar(0), 5)
+        self.assertEqual(tu_scalar(1), 100)
+
+
 all_tests = [
     SpyTaggedUnionTest,
+    SpyPythonSideUnionTest,
 ]

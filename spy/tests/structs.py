@@ -601,9 +601,94 @@ class SpyZeroSizedResultTest(TestCase):
             choose_two_zst_structs(True)
 
 
+class SpyPythonSideStructTest(TestCase):
+    """Struct values from the Python side: a construction builds a
+    ``_StructInstance``, its fields are readable and writable, its methods are
+    callable, and it crosses the boundary as a function argument or result."""
+
+    def test_construct_and_read_fields(self) -> None:
+        s = Small(1, 2)
+        self.assertEqual((s.a, s.b), (1, 2))
+
+    def test_write_a_field(self) -> None:
+        s = Small(1, 2)
+        s.b = 10
+        self.assertEqual((s.a, s.b), (1, 10))
+
+    def test_a_construction_crosses_as_an_argument(self) -> None:
+        self.assertEqual(sum_small(Small(3, 4)), 7)
+
+    def test_a_mutated_instance_crosses_as_an_argument(self) -> None:
+        s = make_small(5)
+        s.b = 9
+        self.assertEqual(sum_small(s), 14)
+
+    def test_a_result_is_an_instance(self) -> None:
+        s = make_small(5)
+        self.assertEqual((s.a, s.b), (5, 2))
+
+    def test_a_registered_method_is_callable(self) -> None:
+        c = Counter(1)
+        self.assertEqual(c.bump(2), 3)
+        self.assertEqual(c.n, 3)
+
+    def test_a_class_name_call_passes_no_self(self) -> None:
+        c = Counter(4)
+        self.assertEqual(Counter.bump(c, 1), 5)  # pyright: ignore
+        self.assertEqual(c.n, 5)
+
+    def test_a_large_struct_round_trips(self) -> None:
+        s = make_large(7, True)
+        self.assertEqual((s.a, s.b, s.c, s.d), (7, 1, 2, 3))
+
+    def test_a_single_field_struct_round_trips(self) -> None:
+        o = One(5)
+        self.assertEqual(o.a, 5)
+
+    def test_defaults_fill_left_out_fields(self) -> None:
+        d = Defaulted(1)
+        self.assertEqual((d.x, d.y, d.z), (1, 7, 9))
+        d2 = Defaulted(1, 2)
+        self.assertEqual((d2.x, d2.y, d2.z), (1, 2, 9))
+
+    def test_a_generic_struct_is_inferred(self) -> None:
+        g = GenericDefault(3)
+        self.assertEqual((g.value, g.other), (3, 0))
+
+    def test_a_generic_struct_is_specialized_explicitly(self) -> None:
+        g = GenericDefault[i32](3)  # pyright: ignore
+        self.assertEqual((g.value, g.other), (3, 0))
+
+    def test_reordered_fields(self) -> None:
+        m = Mixed(10, 3)
+        self.assertEqual((m.wide, m.narrow), (10, 3))
+
+    def test_extern_c_fields(self) -> None:
+        e = ExternMixed(10, 3)
+        self.assertEqual((e.wide, e.narrow), (10, 3))
+
+    def test_a_nested_field_is_a_view(self) -> None:
+        n = Nested(One(5))
+        self.assertEqual(n.inner.a, 5)
+
+    def test_a_zero_sized_field_reads_as_none(self) -> None:
+        h = Holder(None, 5)
+        self.assertEqual(h.n, 5)
+        self.assertIsNone(h.v)
+
+    def test_missing_a_required_field(self) -> None:
+        with self.assertRaises(TypeError):
+            Defaulted()  # pyright: ignore
+
+    def test_an_unknown_field_is_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            Small(a=1, b=2, c=3)  # pyright: ignore
+
+
 all_tests = [
     SpyStructTest,
     SpyStructDefaultsTest,
     SpyStructMirrorTest,
     SpyZeroSizedResultTest,
+    SpyPythonSideStructTest,
 ]

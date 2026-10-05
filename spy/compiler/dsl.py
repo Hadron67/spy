@@ -45,7 +45,6 @@ builtins (``spy.compile_log``) are evaluated at compile time; ``spy.typeof``
 is a ``syntax`` marker, lowered by the parser to a type probe.
 """
 
-import ctypes
 import types as pytypes
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -59,26 +58,20 @@ from typing import (
     override,
 )
 
-from . import astgen, mir, sval
+from . import astgen, glue, sval
 from .builtins import spy_as, spy_compile_log
-from .errors import CompileError, SpyError
+from .errors import CompileError
 from .fn import (
     AnyValue,
-    ArgList,
     Backend,
     CallSignature,
     FunctionValue,
-    NativeFn,
     PartialReturnSignature,
-    ProvidedArg,
     RawArgList,
-    Signature,
-    SpecializedComptimeArg,
     SymbolTable,
-    plain_provided_arg,
 )
 from .interp import Analyser
-from .lower import LLVMBackend, to_ctype
+from .lower import LLVMBackend
 from .sval import CompileContext, MirLowerCache, StructDecl
 from .target import TargetInfo
 from .util import FrozenArraySet, frozendict
@@ -157,116 +150,6 @@ def _normalize_exceptions(
     return (exceptions,)
 
 
-def _to_py_arg(value: sval.AnyValue) -> Any:
-    """The Python value a marshaled spy value is passed to the native
-    function as."""
-    match value:
-        case sval.AsValue():
-            return value.value
-        case sval.Int():
-            return value.value
-        case sval.Float():
-            return value.value
-        case sval.Void():
-            return None
-        case sval.Null():
-            return None
-        case _:
-            return value
-
-
-def _call_multi_value(
-    native_fn: NativeFn,
-    py_args: list[Any],
-    ret_spec: sval.RetSpec,
-    mir_lower_cache: sval.MirLowerCache,
-) -> tuple[Any, ...]:
-    """Call a native artifact that returns several values from Python.  The
-    lowered function returns one result directly and delivers every other
-    one through a caller-provided result pointer, so a ctypes buffer is
-    allocated for each of those pointers and the values are gathered into a
-    tuple, in declaration order.  A nested ``tuple[...]`` result is gathered
-    into a tuple of its own, so the Python value mirrors the annotation.  A
-    zero-sized result is ``None``.
-
-    A by-value aggregate result would need the Python-entry thunk's trailing
-    out pointer, which this path does not build; like passing an aggregate
-    from Python, that is not supported yet."""
-    by_value = sval.ret_returned_type(ret_spec)
-    if by_value is not None:
-        mir_ret = by_value.to_mir_type(mir_lower_cache)
-        if isinstance(mir_ret, (mir.StructType, mir.ArrayType)):
-            raise SpyError(
-                'cannot call a function that returns several values from Python '
-                'when one result is a by-value aggregate yet'
-            )
-    buffers: list[Any] = []
-    call_args: list[Any] = list(py_args)
-    for leaf in sval.iter_ret_leaves(ret_spec):
-        if not leaf.via_result_ptr:
-            continue
-        mir_type = leaf.type.to_mir_type(mir_lower_cache)
-        assert mir_type is not None and not leaf.type.is_zst()
-        buffer = to_ctype(mir_type)()
-        buffers.append(buffer)
-        call_args.append(ctypes.c_void_p(ctypes.addressof(buffer)))
-    result = native_fn.call(*call_args)
-    pending = iter(buffers)
-
-    def leaf_value(leaf: sval.RetValue) -> Any:
-        if leaf.type.get_unit_value() is not None:
-            return None
-        if leaf.via_result_ptr:
-            buffer = next(pending)
-            # a scalar buffer reads back through ``.value``; an aggregate one
-            # stays the ctypes object (Python-side struct values are not
-            # supported yet)
-            return getattr(buffer, 'value', buffer)
-        return result
-
-    # regroup the leaves into the (possibly nested) tuple of the annotation
-    assert isinstance(ret_spec, sval.RetTuple)
-    groups: list[list[Any]] = [[]]
-    work: list[sval.RetSpec | None] = list(reversed(ret_spec.values))
-    while work:
-        node = work.pop()
-        if node is None:
-            nested = tuple(groups.pop())
-            groups[-1].append(nested)
-            continue
-        match node:
-            case sval.RetValue():
-                groups[-1].append(leaf_value(node))
-            case sval.RetTuple(values=values):
-                work.append(None)
-                work.extend(reversed(values))
-                groups.append([])
-    return tuple(groups[0])
-
-
-_INT_LITERAL_BITS = 64
-
-def _provided_arglist(sig: Signature, arglist: ArgList[sval.AnyValue]) -> ArgList[ProvidedArg]:
-    """The ``provided`` argument list of one Python-boundary call (see
-    ``Signature.solve_param_types``): the spy type of every argument, and - for
-    a ``type[X]`` parameter - the spy type its argument denotes."""
-    positional: list[ProvidedArg] = []
-    for (name, param), value in zip(sig.positional.items(), arglist.positional):
-        type = sval.type_of(value, _INT_LITERAL_BITS)
-        if param.is_type_value:
-            if not isinstance(value, sval.Type):
-                raise CompileError(
-                    f"the argument of parameter '{name}' must be a spy type"
-                )
-            positional.append((type, value))
-        else:
-            positional.append(plain_provided_arg(type))
-    varargs = tuple(plain_provided_arg(sval.type_of(v, _INT_LITERAL_BITS)) for v in arglist.varargs)
-    kwargs = frozendict(
-        (k, plain_provided_arg(sval.type_of(v, _INT_LITERAL_BITS))) for k, v in arglist.kwargs.items()
-    )
-    return ArgList(tuple(positional), varargs, kwargs)
-
 class _RegisteredFn:
     def __init__(self, fn, cls, meta: FnMetadata, context: _Context) -> None:
         self.fn = fn
@@ -295,14 +178,12 @@ class _RegisteredFn:
         entry = self.get_entry()
         arglist = entry.hir.signature.bind_arg_pos(
             RawArgList(
-                tuple(sval.as_value(a, self.context) for a in args),
-                frozendict((k, sval.as_value(v, self.context)) for k, v in kwds.items()),
+                tuple(glue.boundary_arg(a, self.context) for a in args),
+                frozendict((k, glue.boundary_arg(v, self.context)) for k, v in kwds.items()),
             ),
             lambda e: e,
         )
-        arg_types: ArgList[ProvidedArg] = _provided_arglist(
-            entry.hir.signature, arglist,
-        )
+        arg_types = glue.provided_arglist(entry.hir.signature, arglist)
         call_sig, ret_sig = entry.hir.signature.specialize(
             arg_types, self.context.mir_lower_cache,
         )
@@ -312,32 +193,7 @@ class _RegisteredFn:
         sym = analyser.finish()
         sym.compile(self.context._symbol_table, self.context.backend, self.context.target_info())
 
-        instance = entry.specs[call_sig]
-        # a function whose value form ctypes cannot call directly has a
-        # Python-entry thunk (see ``fn._fn_thunk``); call that instead
-        native_fn = instance.wrapper_fn or instance.native_fn
-        assert native_fn is not None
-        ret_sig = instance.ret_sig
-        assert ret_sig is not None
-        if len(ret_sig.exceptions) > 0:
-            raise SpyError(
-                'calling a function that may raise from Python is not supported yet'
-            )
-
-        # the native call takes the arguments of the *lowered* signature:
-        # a zero-sized (compile-time) parameter is not passed
-        py_args = [
-            _to_py_arg(value)
-            for (_, sig_arg), value in zip(call_sig.positional, arglist.positional)
-            if not isinstance(sig_arg, SpecializedComptimeArg)
-        ]
-        if ret_sig.is_single_value():
-            return native_fn.call(*py_args)
-        # no exception part here (a raising function is rejected above): the
-        # values alone, which never include the zero-sized empty error union
-        value_spec = ret_sig.ret_type_spec
-        assert value_spec is not None
-        return _call_multi_value(native_fn, py_args, value_spec, self.context.mir_lower_cache)
+        return glue.invoke(entry.specs[call_sig], call_sig, arglist, self.context)
 
     def get_entry(self):
         if self.entry is None:
@@ -477,22 +333,21 @@ class _RegisteredClass(StructDecl):
                         head.static_methods.discard(name)
         return self.entry
 
-    def __getitem__(self, key: Any) -> sval.StructTypeApplication:
+    def __getitem__(self, key: Any) -> glue.SpecializedStruct:
         """``Foo[i32]``: an application of the struct template to generic
-        arguments.  Python evaluates an annotation lazily, in the annotation
-        scope of the annotated function or class, so this is what a
-        subscripted struct *annotation* evaluates to; the arguments name the
-        type parameters of that scope, which ``__getitem__`` does not see -
-        ``sval.as_value`` turns the application into the struct
-        specialization once it is given the scope (see
+        arguments, which is also callable (a construction).  Python evaluates an
+        annotation lazily, in the annotation scope of the annotated function or
+        class, so this is what a subscripted struct *annotation* evaluates to;
+        the arguments name the type parameters of that scope, which
+        ``__getitem__`` does not see - ``sval.as_value`` turns the application
+        into the struct specialization once it is given the scope (see
         :class:`sval.StructTypeApplication`).  A ``Foo[i32]`` used as an
         expression inside a body is the HIR's ``hir.Subscript`` instead,
         resolved by the interpreter.
 
         A *class-name method access* (``Foo[i32].m(x)``) resolves the same
         specialization through this path (see ``interp``)."""
-        args = key if isinstance(key, tuple) else (key,)
-        return sval.StructTypeApplication(self, args)
+        return glue.specialized_struct(self, key, self.context)
 
     def as_spy_value(self) -> sval.AnyValue:
         """The spy value of this class: the struct type it declares, built in
@@ -504,11 +359,20 @@ class _RegisteredClass(StructDecl):
             return entry.specialize(())
         return entry
 
+    def __getattr__(self, name: str) -> Any:
+        """``Foo.m``: the method ``m`` of this struct, called from Python with
+        no implicit ``self`` (``Foo.m(x, ...)`` passes every argument, ``self``
+        included)."""
+        method = self.get_entry().methods.get(name)
+        if method is None:
+            raise AttributeError(f'{self.cls.__name__} has no method {name!r}')
+        return method
+
     def __call__(self, *args: Any, **kwds: Any) -> Any:
-        raise SpyError(
-            f'struct {self.cls.__name__} cannot be constructed from Python yet: '
-            'it is a compile-time type only'
-        )
+        """``Foo(...)``: construct a spy struct value from Python.  The
+        specialization of a generic struct is inferred from the provided field
+        values (or written explicitly as ``Foo[i32](...)``)."""
+        return glue.construct(self.get_entry(), None, args, kwds, self.context)
 
 
 class _FuncTypeDecl:

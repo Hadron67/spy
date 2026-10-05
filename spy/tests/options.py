@@ -919,9 +919,37 @@ class SpyOptionUnwrapTest(TestCase):
             walrus_duplicate(1, True)
 
 
+class SpyPythonSideOptionTest(TestCase):
+    """Option values from the Python side: an option unwraps to the value of
+    its ``T`` or to ``None`` (it has no Python-side representation of its
+    own)."""
+
+    def test_an_option_unwraps_to_the_value(self) -> None:
+        self.assertEqual(maybe_add(1, 2, True), 3)
+
+    def test_an_option_unwraps_to_none(self) -> None:
+        self.assertIsNone(maybe_add(1, 2, False))
+
+    def test_an_aggregate_option_unwraps_to_an_instance(self) -> None:
+        o = maybe_large(7, True)
+        self.assertEqual((o.a, o.b, o.c, o.d), (7, 1, 2, 3))  # pyright: ignore
+        self.assertIsNone(maybe_large(7, False))
+
+    def test_none_crosses_as_an_absent_option(self) -> None:
+        self.assertEqual(opt_width(None), 1)  # pyright: ignore
+        self.assertEqual(opt_width(5), 1)
+
+    def test_an_option_field_unwraps(self) -> None:
+        h = OptHolder(5, 1)
+        self.assertEqual((h.o, h.n), (5, 1))
+        h2 = OptHolder(None, 1)
+        self.assertIsNone(h2.o)
+
+
 all_tests = [
     SpyOptionTest,
     SpyOptionNestingTest,
     SpyBoolOpTest,
     SpyOptionUnwrapTest,
+    SpyPythonSideOptionTest,
 ]

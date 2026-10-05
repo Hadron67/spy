@@ -598,8 +598,6 @@ def _is_union_unit(val: InterpVal) -> bool:
     (:class:`sval.UnionValue`): it says only which union it belongs to, so a
     storage destination has no variant to write."""
     obj = _to_comptime(val)
-    if isinstance(obj, sval.AsValue):
-        obj = obj.value
     return isinstance(obj, sval.UnionValue)
 
 def _is_undefined_val(val: InterpVal) -> bool:
@@ -3577,17 +3575,6 @@ class HirRunner:
 
     # -- tagged unions -------------------------------------------------------
 
-    def _tagged_union_shape(self, type: sval.TaggedUnionType) -> str:
-        """How the tagged union ``type`` is represented: ``'single'`` (a single
-        variant, represented as the variant itself), ``'tag_only'`` (every
-        variant is zero-sized, so only the tag is stored) or ``'tag_payload'``
-        (a struct of the tag and the payload union)."""
-        if len(type.types) == 1:
-            return 'single'
-        if type.payload_type().to_mir_type(self._mir_cache) is None:
-            return 'tag_only'
-        return 'tag_payload'
-
     def _tagged_union_int(self, tag: InterpVal) -> int:
         """The compile-time int a tag value denotes."""
         obj = _to_comptime(tag)
@@ -3637,7 +3624,7 @@ class HirRunner:
             return ev.tag
         type = _type_of(ev)
         assert isinstance(type, sval.TaggedUnionType)
-        shape = self._tagged_union_shape(type)
+        shape = sval.tagged_union_shape(type, self._mir_cache)
         if shape == 'single':
             return ComptimeVal(sval.Int(0, type.tag_type()))
         assert isinstance(ev, RuntimeVal)
@@ -3678,7 +3665,7 @@ class HirRunner:
             # the current variant differs (a payload is only read once the tag
             # matched, so such a place is never written through)
             return self._fresh_place(variant_type, ComptimeVal(sval.Undefined(variant_type)))
-        if self._tagged_union_shape(type) == 'single':
+        if sval.tagged_union_shape(type, self._mir_cache) == 'single':
             return RuntimeVal(self._to_runtime(place), sval.PointerType(variant_type, is_const=ptr_type.is_const))
         return self._union_variant_ptr(self._tagged_union_field_ptr(place), variant_type)
 
@@ -3696,7 +3683,7 @@ class HirRunner:
                     place.payload_ptr = self._fresh_place(variant, ComptimeVal(sval.Undefined(variant)))
             return place
         assert isinstance(place, RuntimeVal)
-        shape = self._tagged_union_shape(type)
+        shape = sval.tagged_union_shape(type, self._mir_cache)
         if shape == 'single':
             return place
         tag_mir = type.tag_type().to_mir_type(self._mir_cache)
@@ -3757,7 +3744,7 @@ class HirRunner:
         ``type``): its tag and its payload - the variant value for a
         single-variant union, the payload union storage otherwise (see
         ``ComptimeTaggedUnionValue``)."""
-        shape = self._tagged_union_shape(type)
+        shape = sval.tagged_union_shape(type, self._mir_cache)
         if shape == 'single':
             return ComptimeTaggedUnionValue(
                 type, ComptimeVal(sval.Int(0, type.tag_type())),
@@ -3780,7 +3767,7 @@ class HirRunner:
         payload union storage (see ``ComptimeTaggedUnionValue``).  A zero-sized
         payload keeps the tag alone, and a single-variant union is the variant
         itself."""
-        shape = self._tagged_union_shape(type)
+        shape = sval.tagged_union_shape(type, self._mir_cache)
         if shape == 'single':
             return self._to_runtime(self._coerce(value, type.types[0]))
         if shape == 'tag_only':
@@ -3829,8 +3816,8 @@ class HirRunner:
         payload the variant value when the tag is compile-time (a single-variant
         union on either side) and the payload union storage otherwise (see
         ``ComptimeTaggedUnionValue``)."""
-        shape = self._tagged_union_shape(to_type)
-        from_shape = self._tagged_union_shape(from_type)
+        shape = sval.tagged_union_shape(to_type, self._mir_cache)
+        from_shape = sval.tagged_union_shape(from_type, self._mir_cache)
         if shape == 'single':
             # a subset of a single-variant union is that variant
             return ComptimeTaggedUnionValue(
@@ -5650,7 +5637,7 @@ class HirRunner:
         if not isinstance(ev, ComptimeTaggedUnionValue):
             raise CompileError(f'cannot make a static pointer to the union value {ev!r}')
         tag = self._tagged_union_int(ev.tag)
-        shape = self._tagged_union_shape(type)
+        shape = sval.tagged_union_shape(type, self._mir_cache)
         if shape == 'single':
             return self._const_to_mir(self._coerce(ev.value, type.types[0]), type.types[0])
         if shape == 'tag_only':
@@ -7873,6 +7860,7 @@ class Analyser:
         self._symbol_table = CompileBatch(
             extern_anon_symbols={},
             newly_compiled=set(),
+            mir_lower_cache=mir_lower_cache,
         )
 
     def _resolve_extern_anon_symbol(self, name: str, fn: NativeFn, type: mir.Type) -> mir.ExternAnonSymbol:
@@ -7936,6 +7924,7 @@ class Analyser:
             return instance.mir, actual
         mir_fn = mir.Function(name, [], [], mir.VOID)
         instance = FunctionInstance(mir_fn)
+        instance.call_sig = call_sig
         st.newly_compiled.add(instance)
         fn_entry.specs[call_sig] = instance
         runner = HirRunner(self, instance)

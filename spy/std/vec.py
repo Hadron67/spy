@@ -1,18 +1,21 @@
-from ..compiler import struct, usize
+from typing import TYPE_CHECKING, cast
+
+from ..compiler import Option, Ptr, struct, usize
 from ..compiler.dsl import func
-from .core import SlicePtr, undefined
+from ..compiler.syntax import ref
+from .core import SlicePtr, panic, sstr, undefined
 from .mem import Allocator, AllocError, CAllocator
 
 
 @struct()
-class Vec[T, A: Allocator]:
+class Vec[T, A: Allocator = CAllocator]:
     ptr: SlicePtr[T]
-    size: usize
-    allocator: A
+    size: usize = 0
+    allocator: A = cast(A, CAllocator())
 
     @staticmethod
-    def new[T2](t: type[T2]) -> Vec[T2, CAllocator]:
-        return Vec(SlicePtr(undefined(), 0), 0, CAllocator())
+    def new(allocator: A) -> Vec[T, A]:
+        return Vec(SlicePtr(undefined(), 0), 0, allocator)
 
     def deinit(self):
         self.allocator.free_array(self.ptr)
@@ -36,6 +39,8 @@ class Vec[T, A: Allocator]:
         self.reserve(1)[0] = value
 
     def pop(self):
+        if self.size == 0:
+            panic(sstr(b'pop from empty vector'))
         self.size -= 1
 
     @func(exceptions=AllocError)
@@ -51,3 +56,15 @@ class Vec[T, A: Allocator]:
 
     def refs(self):
         return self.ptr.refs()
+
+    def __spy_getitemptr__(self, index: usize) -> Ptr[T]:
+        if index >= self.size:
+            panic(sstr(b'index out of bounds'))
+        return ref(self.ptr[index])
+
+    def slice(self, begin: Option[usize], end: Option[usize] = None) -> SlicePtr[T]:
+        return self.ptr.slice(begin, end)
+
+    if TYPE_CHECKING:
+        def __getitem__(self, index: int) -> T: ...
+        def __setitem__(self, index: int, value: T) -> None: ...

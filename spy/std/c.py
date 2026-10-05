@@ -1,3 +1,7 @@
+from typing import override
+
+from spy.std.io import Readable, Writable
+
 from ..compiler import (
     ConstMultiPtr,
     MultiPtr,
@@ -30,7 +34,7 @@ class CError(Exception):
     code: i32
 
 @struct()
-class FILE:
+class FILE(Readable, Writable):
     inner: Opaque
 
     @staticmethod
@@ -43,11 +47,13 @@ class FILE:
     def close(self):
         fclose(ref(self))
 
-    def read(self, buf: ConstSlicePtr[u8]) -> usize:
-        return fread(buf.ptr, 1, buf.length, ref(self))
+    @override
+    def read(self, data: SlicePtr[u8]) -> usize:
+        return fread(data.ptr, 1, data.length, ref(self))
 
-    def write(self, buf: SlicePtr[u8]) -> usize:
-        return fwrite(buf.ptr, 1, buf.length, ref(self))
+    @override
+    def write(self, data: ConstSlicePtr[u8]) -> usize:
+        return fwrite(data.ptr, 1, data.length, ref(self))
 
 @decl_func()
 def fopen(path: MultiPtr[u8], mode: MultiPtr[u8]) -> Option[Ptr[FILE]]: ...
@@ -56,7 +62,7 @@ def fopen(path: MultiPtr[u8], mode: MultiPtr[u8]) -> Option[Ptr[FILE]]: ...
 def fclose(ptr: Ptr[FILE]) -> None: ...
 
 @decl_func()
-def fread(ptr: ConstMultiPtr[u8], size: usize, count: usize, file: Ptr[FILE]) -> usize: ...
+def fread(ptr: MultiPtr[u8], size: usize, count: usize, file: Ptr[FILE]) -> usize: ...
 
 @decl_func()
-def fwrite(ptr: MultiPtr[u8], size: usize, count: usize, file: Ptr[FILE]) -> usize: ...
+def fwrite(ptr: ConstMultiPtr[u8], size: usize, count: usize, file: Ptr[FILE]) -> usize: ...

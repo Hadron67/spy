@@ -117,7 +117,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 
 ## 结构体
 
-`@spy.struct()` 把带类型注解的 Python 类变成 spy 结构体：注解字段按声明顺序构成布局；类里的方法（`@spy.func()` 装饰或未装饰）成为结构体的方法。结构体目前是**纯编译期类型**——只能在 spy 函数体内注解、构造和调用方法，Python 侧还不能构造实例。
+`@spy.struct()` 把带类型注解的 Python 类变成 spy 结构体：注解字段按声明顺序构成布局；类里的方法（`@spy.func()` 装饰或未装饰）成为结构体的方法。结构体既能在 spy 函数体内注解、构造和调用方法，也能从 Python 侧直接构造、读写字段、调用方法，并作为参数/返回值跨边界（见下「Python 侧使用」）。
 
 使用示例：
 
@@ -169,6 +169,37 @@ def use_pair(x: spy.i32) -> spy.i32:
     p = Pair[i32](x, 3)         # 显式特化：局部变量的 slot 类型未知
     return p.total()            # 方法携带 {T: i32}
 ```
+
+### Python 侧使用
+
+结构体值也能从 Python 侧直接使用。`Point(1, 2)` 构造一个实例：位置实参按字段声明序、关键字实参按名写入，省略的字段取类体默认值（没有默认值的字段必须给全）；泛型结构体 `Foo(...)` 的特化由字段值的类型推断，也可写成 `Foo[i32](...)`。实例的字段可读可写（`p.x`、`p.y = 5`），方法可调用（`p.m()` 隐式传 `self`；`Foo.m(p, ...)`、`Foo[i32].m(p, ...)` 是类名调用，**不**隐式传 `self`，`self` 由调用处显式给出）。实例可以作为实参传给带结构体参数的函数，函数的返回值也是实例：按值/按引用/结果指针的 ABI、字段布局（重排、ZST 字段、单字段镜像）都由边界层（`compiler/glue.py`）透明处理。
+
+```python
+@spy.struct()
+class Point:
+    x: spy.i32
+    y: spy.i32
+
+    @spy.func()
+    def total(self) -> spy.i32:
+        return self.x + self.y
+
+@spy.func()
+def make_point(x: spy.i32) -> Point:
+    return Point(x, 1)
+
+@spy.func()
+def sum_point(p: Point) -> spy.i32:
+    return p.total()
+
+p = make_point(5)          # 一个实例
+assert p.x == 5
+p.y = 2
+assert sum_point(p) == 7   # 作为实参传回去
+assert Point.total(p) == 7 # 类名调用：显式传 self
+```
+
+`Option[T]` 与 tagged union 在回到 Python 时**脱壳**：`Option[T]` 是 `T` 的值或 `None`，union 是其具体 variant 的值；`None` 也可以作为 `Option[T]` 的缺席值传回。可能 raise 的 spy 函数从 Python 调用时，抛出的是一个继承 `Exception` 的异常结构体实例（`except Exception as e` 可捕获并读它的字段）。指针是**非空**的 `Ptr[T]`（`Option[Ptr[T]]` 才是可空指针）。数组、以及自定义 `__eq__` 之外的 Python 侧实例运算尚未实现。
 
 ## 指针
 
@@ -278,7 +309,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 - **解构赋值**：`a, b = f()` 把每个结果写进对应目标的地址（目标可嵌套，也不必是新声明的变量）。
 - **不解构**：调用结果是一个**打包**的结果（每个结果所在位置的编译期元组），它没有自己的运行时类型，只能放进编译期变量：`a: Comptime = f()`（之后还可以 `x, y = a` 再解构）。用普通变量接一个多值结果会报错，也不能把一个嵌套子组单独打包进一个普通变量（未来会加入单独声明 `Comptime` 目标的方式）。
 - **`return f()`**：把一个多返回值调用直接作为另一个多返回值函数的返回值，逐个写进自己的 result location。
-- **Python 侧调用**：返回值打包成 Python 的 `tuple`（嵌套结果打包成嵌套 `tuple`；result 指针的存储由 Python 侧分配）。按值返回的**聚合**结果（小结构体）还不能从 Python 侧调用，和“返回结构体”的限制一样。
+- **Python 侧调用**：返回值打包成 Python 的 `tuple`（嵌套结果打包成嵌套 `tuple`；result 指针的存储由 Python 侧分配）；按值返回的聚合结果（小结构体）解包成实例。
 - **限制**：`tuple[T, ...]`（变长）不是固定的返回值集合，在任意嵌套层级都会报错。
 
 ## 模块结构
@@ -286,7 +317,8 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 | 文件 | 作用 |
 |---|---|
 | `compiler/__init__.py` | 公开接口：`func`、`struct`、`typeof`、`compile_log`、`as_`，以及各类型常量（`spy.i32` 等） |
-| `compiler/dsl.py` | `func`/`struct` 装饰器、注册与全局 context（`_Context`）、Python 侧调用入口（实参绑定、特化、原生调用） |
+| `compiler/dsl.py` | `func`/`struct` 装饰器、注册与全局 context（`_Context`）、各声明句柄（含 parse 与特化/编译编排） |
+| `compiler/glue.py` | Python 侧边界：实参编组与结果脱壳、`_StructInstance`/`_PtrInstance`/异常实例、构造与方法调用 |
 | `compiler/astgen.py` | 源码 → 无类型 HIR；把函数签名（注解/默认值/泛型参数）转成 spy 域的 `fn.Signature` |
 | `compiler/hir.py` | 无类型 HIR 指令定义 |
 | `compiler/interp.py` | 编译期运行 HIR → 有类型 MIR（comptime 语义所在）；结构体的字段寻址、方法分发与就地构造 |
@@ -311,10 +343,10 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 - 赋值仅支持 `=`（含元组解包）与 `+=`（无链式赋值 `a = b = e`、其它增强赋值）。
 - `*args`/`**kwargs`、仅位置/仅关键字参数、链式比较、对**单指针**的下标 `p[i]`（单指针只有解引用 `p[...]` 可用；多指针的 `p[i]` 与数组的 `a[i]` 已实现）。
 - 整数 `/`、`//`、`**`（浮点的 `//`、`**` 亦然）；字节串（`bytes`）除编译期下标/切片与 `ord`/`gstr`/`sstr` 外的运算（拼接、比较、`len` ……）。
-- 结构体：Python 侧实例表示（因此返回结构体、或带结构体参数的函数还不能从 Python 侧直接调用）、结构体整体比较。
+- 结构体：Python 侧实例之间的整体比较（实例本身还没有 `__eq__`）。
 - 数组：运行时长度的数组、数组之间的转换（如 `i32[2]` → `i64[2]`）、以及 Python 侧实例表示（带数组参数/返回值的函数还不能从 Python 侧直接调用）。切片已由 `std.arr_slice`/`std.const_arr_slice` 提供。
 - 类型标注：局部变量的标注按函数体内的表达式求值，支持能当值求出的类型（具体类型、类型参数、结构体及结构体特化）与 `Comptime` 标记；`Ptr[T]`/`ConstPtr[T]`/`MultiPtr[T]`/`ConstMultiPtr[T]`/`Array[T, N]`/`Option[T]` 这类 `syntax` 类型标记在函数体里也是可用作值的表达式（由 `hir.PointerType`/`hir.ArrayType`/`hir.OptionType` 在编译期构造），此外也能写在形参、返回值与结构体字段注解里。
-- 多返回值：不能嵌套元组返回值（`-> tuple[i32, tuple[i32, i32]]`），且按值返回的聚合结果还不能从 Python 侧调用。
+- 多返回值：不能嵌套元组返回值（`-> tuple[i32, tuple[i32, i32]]`）。
 - Option：还没有模式匹配（`match`，解包目前用 `is None` / 海牙语法 `(name := expr) is not None`）；以 `T` 的某个指针当标签的表示下，`T` 自身令该指针为空值（或内层选项为缺席）时会被误读为外层缺席（与 Zig/Rust 的 niche 优化同样的局限）。
 - 普通 Python 函数的内联不支持运行期递归（递归驱动参数是运行期值时会在内联嵌套上限处报错，而非编译期展开）；运行期的函数值调用（把函数存进变量/字段后再调用）也尚未实现。
 - 闭包：没有 `nonlocal`——闭包体内被赋值的名字是闭包局部，对外层变量的写回要通过捕获量的字段/指针；不能把闭包传给运行时函数或存进运行时位置；闭包体引用外层函数的类型参数（泛型参数）暂不支持（闭包可有自己的 `[T]`）；`lambda` 不能写注解，其参数靠实参定型。

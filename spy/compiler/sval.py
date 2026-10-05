@@ -47,26 +47,6 @@ class Value:
 
 type AnyValue = Value | int | float | bytes | bool
 
-class AsValue(Value):
-    """A Python value bound to an explicit spy type (``spy.as_(x, T)``).
-
-    It appears only at the Python call boundary: the interpreter reads
-    the type off it (``type_of`` returns :attr:`type`) to type the call,
-    while the native call is handed the wrapped Python value.  Defining
-    it here (rather than in ``builtins``) keeps the boundary marshaling
-    of ``sval`` self-contained."""
-
-    def __init__(self, value: Any, type: Type) -> None:
-        self.value = value
-        self.type = type
-
-    @override
-    def get_type(self) -> Type:
-        return self.type
-
-    def __repr__(self) -> str:
-        return f'AsValue({self.value!r}, {self.type!r})'
-
 class SpecialTypeKind(IntEnum):
     """How a spy type maps onto runtime code (see ``Type.classify``).
 
@@ -1143,6 +1123,21 @@ def find_first_pointer_type_pos(type: Type, shift: int = 0) -> tuple[int, ...] |
     return None
 
 
+def tagged_union_shape(
+    type: TaggedUnionType, cache: MirLowerCache,
+) -> Literal['single', 'tag_only', 'tag_payload']:
+    """How the tagged union ``type`` is represented (see
+    ``TaggedUnionType.to_mir_type``): ``'single'`` (a single variant, which is
+    represented as the variant itself), ``'tag_only'`` (every variant is
+    zero-sized, so only the tag is stored) or ``'tag_payload'`` (a struct of
+    the tag and the payload union)."""
+    if len(type.types) == 1:
+        return 'single'
+    if type.payload_type().to_mir_type(cache) is None:
+        return 'tag_only'
+    return 'tag_payload'
+
+
 def alignment_of(type: Type, cache: MirLowerCache) -> int:
     """The alignment in bytes of the spy type ``type`` for the target of
     ``cache``.  A type that has a MIR mirror is measured through it
@@ -1353,7 +1348,7 @@ class FloatType(Type):
         return f"f{self.bits}"
 
 @dataclass(frozen=True)
-class Float(Type):
+class Float(Value):
     value: float
     type: FloatType
 
@@ -3201,8 +3196,6 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     ``type`` (an ``Int``/``Float``/``Void``/``Type``/``bool``, or the value
     itself for the untyped type of an integer literal); the interpreter
     builds the MIR constant from it later."""
-    if isinstance(value, AsValue):
-        value = value.value
     if isinstance(value, UntypedUndefined):
         # the undefined literal is the value of any type: of a zero-sized type it
         # is that type's unit value, of any other the typed undefined of it

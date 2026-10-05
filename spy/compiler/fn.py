@@ -17,14 +17,17 @@ from .sval import (
     MirLowerCache,
     ResultType,
     RetSpec,
+    RetTuple,
     RetValue,
     Type,
     TypeVar,
     TypeVarSolver,
     Value,
+    iter_ret_leaves,
     make_ret_spec,
     pass_by_ref,
     replace_type_vars_type,
+    ret_by_value_index,
     ret_spec_value_is_empty,
     type_of,
 )
@@ -668,14 +671,28 @@ class FunctionInstance:
     """The compiled artifact of one specialization of a registered
     function: the lowered MIR function it was compiled into (``mir``),
     its return convention (``ret_sig``) and the native functions a
-    Python-side call invokes - ``native_fn``, and ``wrapper_fn`` (the
-    Python-entry thunk) when the value form cannot be called through
-    ctypes (see ``_needs_thunk``/:class:`NativeFn`)."""
+    Python-side call invokes - ``native_fn`` (the value form, called by
+    spy-to-spy calls) and ``wrapper_fn`` (the always-generated
+    Python-entry thunk, see ``_make_thunk``).
+
+    ``call_sig`` is the specialized signature the instance was compiled
+    for; ``thunk_call_sig``/``thunk_ret`` describe, in the spy domain, how
+    the thunk is called and how it returns - what the Python-side marshaling
+    (``glue``) reads (see ``_make_thunk``)."""
 
     mir: mir.Function
     ret_sig: ReturnSignature | None = None
     wrapper_fn: NativeFn | None = None
     native_fn: NativeFn | None = None
+    # the specialized signature: set when the instance is created (see
+    # ``interp.Analyser._request_function``)
+    call_sig: CallSignature | None = None
+    # the Python-entry calling convention: ``thunk_call_sig`` mirrors
+    # ``call_sig`` with the runtime arguments whose aggregate form is passed
+    # as a pointer there, and ``thunk_ret`` walks the result leaves with every
+    # storage leaf delivered through a result pointer (the thunk returns void)
+    thunk_call_sig: CallSignature | None = None
+    thunk_ret: RetSpec | None = None
 
 class FunctionValue(Value):
     """The function value of a registered function: only compiled - and
@@ -835,77 +852,138 @@ def _must_pass_by_ref(type: mir.ReturnType) -> bool:
     union) by value, so those are passed by pointer there."""
     return isinstance(type, (mir.StructType, mir.ArrayType, mir.UnionType))
 
-def _needs_thunk(fn: mir.Function) -> bool:
-    """Whether this function's value form cannot be called through
-    ctypes directly, so that a Python-entry thunk is needed."""
-    return _must_pass_by_ref(fn.ret_type) or any(
-        _must_pass_by_ref(a) for a in fn.args
-    )
+def _storage_leaves(spec: RetSpec) -> list[RetValue]:
+    """The leaves of ``spec`` that have storage, in depth-first declaration
+    order: a zero-sized leaf is delivered as its unit value and needs no result
+    location of its own."""
+    return [leaf for leaf in iter_ret_leaves(spec) if leaf.type.get_unit_value() is None]
 
-def _make_thunk(fn: mir.Function) -> mir.Function:
-    """The Python-facing entry of this function: a MIR function that
-    adapts its value form to the ABI ctypes can call - a by-value
-    aggregate argument is taken as a pointer and loaded, and a
-    by-value aggregate result is written through a trailing out
-    pointer (the thunk then returns void).  Spy-to-spy calls never go
-    through it: they call this function directly."""
+
+def _make_thunk(fn: mir.Function, ret_spec: RetSpec, cache: MirLowerCache) -> mir.Function:
+    """The always-generated Python-facing entry of this function: a MIR
+    function that adapts its value form to the ABI ctypes can call.  A by-value
+    aggregate argument is taken as a pointer and loaded; every *storage* result
+    leaf - the one the value form returns by value included - is delivered
+    through a trailing out pointer, in depth-first declaration order (the thunk
+    finally returns void).  Spy-to-spy calls never go through it: they call the
+    value form directly.
+
+    A future revision catches a panic here (see ``may_panic``), which is why
+    every function has one."""
+    # the value form's arguments are the declared ones followed by the result
+    # pointers it was given for the leaves it delivers through one (see
+    # ``interp._ret_leaf_ptr``)
+    all_leaves = list(iter_ret_leaves(ret_spec))
+    storage_leaves = _storage_leaves(ret_spec)
+    result_ptr_count = sum(
+        1 for leaf in all_leaves
+        if leaf.type.get_unit_value() is None and leaf.via_result_ptr
+    )
+    n_declared = len(fn.args) - result_ptr_count
+    assert n_declared >= 0
+
     arg_types: list[mir.Type] = []
     arg_names: list[str | None] = []
     by_refs: list[bool] = []
-    for arg in fn.args:
+    for arg in fn.args[:n_declared]:
         br = _must_pass_by_ref(arg)
         by_refs.append(br)
         arg_types.append(mir.PointerType(arg) if br else arg)
         # the interpreter does not name the formals of a specialization
         arg_names.append(None)
 
-    out_arg: mir.Param | None = None
-    ret_type: mir.ReturnType = fn.ret_type
-    if not isinstance(ret_type, (mir.VoidType, mir.NoReturn)) and _must_pass_by_ref(ret_type):
-        out_arg = mir.Param(len(arg_types), mir.PointerType(ret_type))
-        arg_types.append(out_arg.type)
+    # one out pointer per storage leaf, in depth-first declaration order
+    for leaf in storage_leaves:
+        mir_type = leaf.type.to_mir_type(cache)
+        assert mir_type is not None and not isinstance(mir_type, (mir.VoidType, mir.NoReturn)), \
+            'a storage result leaf has a MIR type'
+        arg_types.append(mir.PointerType(mir_type))
         arg_names.append('$result')
-        ret_type = mir.VOID
 
     thunk = mir.Function(
-        f'{fn.name_base}.thunk', arg_types, arg_names, ret_type,
+        f'{fn.name_base}.thunk', arg_types, arg_names, mir.VOID,
         is_complete=True,
     )
 
+    # the call's arguments: the declared ones (an aggregate is loaded out of
+    # the pointer the thunk took) followed by the value form's result pointers,
+    # each fed from the thunk parameter of the leaf it delivers
     call_args: list[mir.Value] = []
-    for i, (arg_type, by_ref) in enumerate(zip(arg_types, by_refs)):
+    for i, (arg_type, by_ref) in enumerate(zip(arg_types[:n_declared], by_refs)):
         if by_ref:
             value = mir.Load(mir.Param(i, arg_type))
             thunk.entry.emit(value)
             call_args.append(value)
         else:
             call_args.append(mir.Param(i, arg_type))
+    for position, leaf in enumerate(storage_leaves):
+        if leaf.via_result_ptr:
+            index = n_declared + position
+            call_args.append(mir.Param(index, arg_types[index]))
 
     if isinstance(fn.ret_type, mir.NoReturn):
         # the callee never returns, so neither does the thunk: its entry ends
         # with the call (and a Python-side call of the function never returns
         # either)
         thunk.entry.emit(mir.Call(fn, tuple(call_args), mir.NORETURN))
-    elif out_arg is not None:
-        assert not isinstance(fn.ret_type, mir.VoidType)
-        value = mir.Call(fn, tuple(call_args), fn.ret_type)
-        thunk.entry.emit(value)
-        thunk.entry.emit(mir.Store(out_arg, value))
-        thunk.entry.emit(mir.Ret(None))
-    elif isinstance(fn.ret_type, mir.VoidType):
-        thunk.entry.emit(mir.Call(fn, tuple(call_args), mir.VOID))
-        thunk.entry.emit(mir.Ret(None))
-    else:
-        value = mir.Call(fn, tuple(call_args), fn.ret_type)
-        thunk.entry.emit(value)
-        thunk.entry.emit(mir.Ret(value))
+        return thunk
 
+    if isinstance(fn.ret_type, mir.VoidType):
+        thunk.entry.emit(mir.Call(fn, tuple(call_args), mir.VOID))
+    else:
+        # the value form's one by-value leaf is stored into its own out pointer
+        value = mir.Call(fn, tuple(call_args), fn.ret_type)
+        thunk.entry.emit(value)
+        by_value_index = ret_by_value_index(ret_spec)
+        assert by_value_index is not None
+        by_value_leaf = all_leaves[by_value_index]
+        position = next(
+            position for position, leaf in enumerate(storage_leaves)
+            if leaf is by_value_leaf
+        )
+        index = n_declared + position
+        thunk.entry.emit(mir.Store(mir.Param(index, arg_types[index]), value))
+    thunk.entry.emit(mir.Ret(None))
     return thunk
+
+
+def _thunk_ret(ret_spec: RetSpec) -> RetSpec:
+    """The return convention the Python-side marshaling (``glue``) works with:
+    the leaves of ``ret_spec`` with every storage leaf marked ``via_result_ptr``
+    (the thunk always delivers it through an out pointer; a zero-sized leaf
+    keeps its unit value and is not passed at all)."""
+    match ret_spec:
+        case RetValue():
+            return RetValue(ret_spec.type, ret_spec.type.get_unit_value() is None)
+        case RetTuple():
+            return RetTuple(
+                ret_spec.type, tuple(_thunk_ret(value) for value in ret_spec.values),
+            )
+
+
+def _thunk_call_sig(call_sig: CallSignature, fn: mir.Function) -> CallSignature:
+    """The specialized call signature of the Python-entry thunk: ``call_sig``
+    with every runtime argument whose aggregate form crosses the boundary as a
+    pointer marked ``is_ref`` (its value is then the address)."""
+    positional: list[tuple[str, SpecializedFormalArg]] = []
+    index = 0
+    for name, arg in call_sig.positional:
+        match arg:
+            case SpecializedComptimeArg():
+                positional.append((name, arg))
+            case SpecializedRuntimeArg():
+                is_ref = arg.is_ref or _must_pass_by_ref(fn.args[index])
+                positional.append((name, SpecializedRuntimeArg(arg.type, is_ref)))
+                index += 1
+    return replace(call_sig, positional=tuple(positional))
 
 @dataclass
 class CompileBatch:
     extern_anon_symbols: dict[NativeFn, mir.ExternAnonSymbol]
     newly_compiled: set[FunctionInstance]
+    # the MIR-mirror interning table of the analysis (see ``Analyser``): the
+    # thunks are built from the layout a mirror carries
+    mir_lower_cache: MirLowerCache
 
     def collect_symbols(self, extra: Iterable[mir.Function] = ()) -> set[mir.GlobalValue | mir.StructType]:
         entry: list[mir.GlobalValue] = list(self.extern_anon_symbols.values())
@@ -916,10 +994,15 @@ class CompileBatch:
 
     def compile(self, symbol_table: SymbolTable, backend: Backend, target: TargetInfo):
         thunks: dict[mir.Function, mir.Function] = {}
+        cache = self.mir_lower_cache
         for instance in self.newly_compiled:
-            if _needs_thunk(instance.mir):
-                thunk = _make_thunk(instance.mir)
-                thunks[instance.mir] = thunk
+            ret_sig = instance.ret_sig
+            assert ret_sig is not None
+            ret_spec = ret_sig.ret_spec(cache)
+            thunks[instance.mir] = _make_thunk(instance.mir, ret_spec, cache)
+            instance.thunk_ret = _thunk_ret(ret_spec)
+            assert instance.call_sig is not None
+            instance.thunk_call_sig = _thunk_call_sig(instance.call_sig, instance.mir)
 
         # a Python-entry thunk is a function of the module like any other
         # (the host calls it through the symbol table), so it is collected
@@ -946,8 +1029,7 @@ class CompileBatch:
             native_fn = native_fns[instance.mir]
             instance.native_fn = native_fn
             symbol_table._add(names[instance.mir], native_fn)
-            thunk = thunks.get(instance.mir)
-            instance.wrapper_fn = native_fns[thunk] if thunk is not None else None
+            instance.wrapper_fn = native_fns[thunks[instance.mir]]
 
 
 class Backend:

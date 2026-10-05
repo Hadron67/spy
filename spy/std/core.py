@@ -84,8 +84,11 @@ class ConstSlicePtr[T]:
             self._out_of_bounds()
         return self.ptr + index
 
+    def __bool__(self) -> bool:
+        return self.length != 0
+
     @func()
-    def slice(self, begin: Option[usize], end: Option[usize]) -> ConstSlicePtr[T]:
+    def slice(self, begin: Option[usize], end: Option[usize] = None) -> ConstSlicePtr[T]:
         start: usize = 0
         if (b := begin) is not None:
             start = b
@@ -117,6 +120,9 @@ class SlicePtr[T]:
 
     def __iter__(self) -> _SliceValueIterator[T]:
         return _SliceValueIterator(self.ptr, self.length)
+
+    def __bool__(self) -> bool:
+        return self.length != 0
 
     def refs(self) -> _SliceRefIterator[T]:
         return _SliceRefIterator(self.ptr, self.length)
