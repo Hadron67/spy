@@ -3,7 +3,7 @@ from typing import Any
 from ..compiler import Option, builtin_func, struct
 from .core import ConstSlicePtr
 
-type TypeInfo = IntType | PointerType | ArrayType | StructType | UnionType | TaggedUnionType | OptionType
+type TypeInfo = IntType | PointerType | ArrayType | StructType | UnionType | TaggedUnionType | OptionType | ComplexType
 
 @struct()
 class IntType:
@@ -44,6 +44,10 @@ class TaggedUnionType:
 @struct()
 class OptionType:
     child: type
+
+@struct()
+class ComplexType:
+    elem: type
 
 @builtin_func
 def type_info(ty: Any) -> TypeInfo: ...

@@ -44,18 +44,21 @@ Python 值在调用边界按以下规则映射：
 | `bool` | `spy.bool` |
 | `int` | `spy.i64`（见 `dsl._INT_LITERAL_BITS`） |
 | `float` | `spy.f64` |
+| `complex` | `spy.c128`（`ComplexType[FloatType(64)]`） |
 | `bytes` | 编译期字节串（`sval.BytesType`，只在编译期存在；用 `std.core.gstr`/`sstr` 转成运行时指针/切片。`str` 字面量在解析时被编码为 `bytes`，spy 函数内不允许 `str`） |
 | `None` | `Null`（`sval.Null()`，类型 `NullType`；是 `Option[T]` 的“缺席”值，也可以当 void 值用） |
 | `syntax.Ptr[T]` | `sval.PointerType`（见下） |
 | `syntax.Option[T]` | `sval.OptionType`（见下） |
 
-可用的类型注解值：`spy.bool`、`spy.u8/u16/u32/u64`、`spy.i8/i16/i32/i64`、`spy.f32/f64`、`spy.void`。C 整数类型 `spy.c_char/c_uchar`、`spy.c_short/c_ushort`、`spy.c_int/c_uint`、`spy.c_long/c_ulong`、`spy.c_longlong/c_ulonglong` 也可用作注解，它们的宽度（以及 `c_char` 的符号）由目标平台的 `TargetInfo` 决定（`c_long` 在 Windows 为 32 位、在常见 64 位 Unix 上为 64 位）。想以非默认类型传参时用 `spy.as_(value, T)`：
+可用的类型注解值：`spy.bool`、`spy.u8/u16/u32/u64`、`spy.i8/i16/i32/i64`、`spy.f32/f64`、`spy.c64/c128`、`spy.void`。C 整数类型 `spy.c_char/c_uchar`、`spy.c_short/c_ushort`、`spy.c_int/c_uint`、`spy.c_long/c_ulong`、`spy.c_longlong/c_ulonglong` 也可用作注解，它们的宽度（以及 `c_char` 的符号）由目标平台的 `TargetInfo` 决定（`c_long` 在 Windows 为 32 位、在常见 64 位 Unix 上为 64 位）。想以非默认类型传参时用 `spy.as_(value, T)`：
 
 ```python
 add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 ```
 
 **形参类型**按以下顺序确定：注解（替换掉已求解的泛型参数后）、实参 marshaled 出的类型、默认值的 spy 类型；形参写了注解时注解生效，实参在调用点转换到该类型。类型注解同时也是**编译期值**：`spy.typeof(x)` 返回 `x` 的静态类型，可以与类型值比较做编译期分发。
+
+**复数**：`sval.ComplexType`（`spy.c64 = ComplexType(f32)`、`spy.c128 = ComplexType(f64)`）是实部与虚部各为元素浮点类型的复数，运行时落成 `{real, imag}` 结构体。Python `complex` 映射到 `spy.c128`；实数（浮点或整数）到复数有一条隐式转换 `T -> Complex[T]`（虚部为 0，`Complex[f32]` 可扩宽到 `Complex[f64]`）。支持四则运算 `+ - * /`（逐分量内联计算：编译期常量在编译期折叠，运行期发浮点指令），以及字段访问 `z.real` / `z.imag`。编译期反射中 `std.reflect.type_info` 会给出带 `elem`（元素浮点类型）的 `ComplexType` 变体。
 
 **空类型**：`sval.EmptyType`（`empty`）是**空类型**——它一个值都没有；注解里的 `typing.Never`（及其已弃用的别名 `NoReturn`）映射到它，因此可以显式声明一个永远不返回值的函数（`-> Never`，见异常一节）。它是“函数体从不交付值”时那个结果的值部分类型（推理得出的情形亦然），因此没有任何 `return` 路径：这样的函数体里不能出现 `return`，也不能落穿到函数体末尾（都报编译错）。对编译器它表现得像个 ZST：`to_mir_type` 返回 `None`，slot 里存的是“无值”标记 `Void()`。
 

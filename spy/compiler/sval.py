@@ -45,7 +45,7 @@ class Value:
     def get_type(self) -> Type:
         ...
 
-type AnyValue = Value | int | float | bytes | bool
+type AnyValue = Value | int | float | complex | bytes | bool
 
 class SpecialTypeKind(IntEnum):
     """How a spy type maps onto runtime code (see ``Type.classify``).
@@ -78,6 +78,7 @@ class MirLowerCache:
         self._union_mirs: dict[UnionType, mir.UnionType] = {}
         self._option_struct_mirs: dict[Type, mir.StructType] = {}
         self._tagged_union_mirs: dict[TaggedUnionType, mir.StructType] = {}
+        self._complex_mirs: dict[ComplexType, mir.StructType] = {}
 
     def union_mir(self, type: UnionType, payload: mir.Type) -> mir.UnionType:
         """The (interned) MIR mirror of the payload union ``type``."""
@@ -123,6 +124,19 @@ class MirLowerCache:
                 mir.FormalArg('payload', payload),
             ))
             self._tagged_union_mirs[type] = ret
+        return ret
+
+    def complex_mir(self, type: ComplexType) -> mir.StructType:
+        """The (interned) MIR mirror of the complex type ``type``: a struct of
+        its real and imaginary parts (both of the element float)."""
+        ret = self._complex_mirs.get(type)
+        if ret is None:
+            elem = mir.FloatType(type.elem.bits)
+            ret = mir.StructType('complex', (
+                mir.FormalArg('real', elem),
+                mir.FormalArg('imag', elem),
+            ))
+            self._complex_mirs[type] = ret
         return ret
 
 
@@ -1191,6 +1205,9 @@ def aggregate_type_length(type: Type) -> int:
         if length is None:
             raise CompileError(f'cannot tell how many elements {type} holds')
         return length
+    if isinstance(type, ComplexType):
+        # the real and the imaginary part
+        return 2
     raise CompileError(f'{type} is not an aggregate')
 
 @dataclass
@@ -1358,6 +1375,74 @@ class Float(Value):
 
     def __str__(self) -> str:
         return f"{self.value}{self.type}"
+
+@dataclass(frozen=True, slots=True)
+class ComplexType(Type):
+    """A complex number type ``Complex[T]``: a value of a real part and an
+    imaginary part, each of the float type ``elem``.  A real (float or integer)
+    value converts to it implicitly with a zero imaginary part (the ``T ->
+    Complex[T]`` conversion), and ``Complex[T]`` widens to ``Complex[T']``
+    when ``T`` widens to ``T'``."""
+
+    elem: FloatType
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        return (self.elem,)
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        # a complex number always has storage: its element type is a float and
+        # never zero-sized, so it is an ordinary type with a mirror of its own
+        return SpecialTypeKind.NONE
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return cache.complex_mir(self)
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        """A complex type is a subtype of a complex one whose element type its
+        own element converts to (the wider float)."""
+        return isinstance(other, ComplexType) and self.elem.is_subtype_of(other.elem)
+
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, UndefinedType):
+            return self
+        if isinstance(other, NullType):
+            return OptionType(self)
+        if isinstance(other, OptionType):
+            return _resolve_option_peer(self, other)
+        if isinstance(other, (IntType, AnyIntType)):
+            # a real integer operand is taken as a complex one of the element
+            # float, with a zero imaginary part (like a float does)
+            return self
+        if isinstance(other, ComplexType):
+            elem = self.elem.resolve_peer_type(other.elem)
+            return ComplexType(elem) if isinstance(elem, FloatType) else None
+        if isinstance(other, FloatType):
+            # a real float operand widens the element type, and the value
+            # converts to the complex one with a zero imaginary part
+            return ComplexType(FloatType(max(self.elem.bits, other.bits)))
+        return other if self.is_subtype_of(other) else None
+
+    def field_index(self, name: str) -> int | None:
+        """The index of the component the field name ``name`` names: the real
+        part (``real``) or the imaginary one (``imag``), or ``None`` for any
+        other name."""
+        if name == 'real':
+            return 0
+        if name == 'imag':
+            return 1
+        return None
+
+    def __str__(self) -> str:
+        return f'c{self.elem.bits * 2}'
 
 class PointerVariant(IntEnum):
     SINGLE = auto()
@@ -2395,7 +2480,7 @@ def returns_via_result_ptr(type: Type, cache: MirLowerCache) -> bool:
         # ``HirRunner._ret_leaf_ptr``)
         return True
     match type:
-        case StructType() | ArrayType() | OptionType() | UnionType() | TaggedUnionType():
+        case StructType() | ArrayType() | OptionType() | UnionType() | TaggedUnionType() | ComplexType():
             if _mentions_type_var(type):
                 # the layout is not known until the call substitutes the
                 # type parameter: assumed small now, re-decided on substitution
@@ -2643,6 +2728,8 @@ def type_of(value: AnyValue, int_literal_bits: int | None = None) -> Type:
             return AnyIntType() if int_literal_bits is None else IntType(int_literal_bits, True)
         case float():
             return FloatType(64)
+        case complex():
+            return ComplexType(FloatType(64))
         case bytes():
             return BytesType()
         case str():
@@ -2708,7 +2795,7 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
     ``dsl._Context.resolve_global``).  The resolver is required: an object
     only the host knows cannot be converted without one, and converting it in
     the wrong context would break the isolation between contexts."""
-    if isinstance(value, (Value, int, float, bytes, bool)):
+    if isinstance(value, (Value, int, float, bytes, bool, complex)):
         return value
     if isinstance(value, str) or value is str:
         # spy has no ``str`` type: a string is a byte string (``bytes``), and a
@@ -2724,6 +2811,10 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         return AnyIntType()
     if value is float:
         return FloatType(64)
+    if value is complex:
+        # the ``complex`` type maps to a complex of the default float width, like
+        # a plain Python ``float`` maps to ``f64``
+        return ComplexType(FloatType(64))
     if value is bytes:
         return BytesType()
     if value is type:
@@ -3117,6 +3208,10 @@ def replace_type_var(value: AnyValue, reps: Mapping[TypeVar, AnyValue]) -> AnyVa
             )
         case OptionType():
             return OptionType(replace_type_vars_type(value.child, reps))
+        case ComplexType():
+            elem = replace_type_vars_type(value.elem, reps)
+            assert isinstance(elem, FloatType)
+            return ComplexType(elem)
         case TupleType():
             return TupleType(
                 tuple(replace_type_vars_type(t, reps) for t in value.types),
@@ -3247,6 +3342,29 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise CompileError(f"cannot use {value} as a float constant")
             return Float(float(value), type)
+        case ComplexType():
+            # a complex constant: a Python ``complex`` (or a real value, whose
+            # imaginary part is zero) as an aggregate of its two parts.  A
+            # complex aggregate of another element type is re-coerced part by
+            # part (the element widens or narrows)
+            if isinstance(value, AggregateValue) and isinstance(value.type, ComplexType):
+                return AggregateValue(
+                    (
+                        coerce_const(value.values[0], type.elem),
+                        coerce_const(value.values[1], type.elem),
+                    ),
+                    type,
+                )
+            if isinstance(value, complex):
+                re, im = value.real, value.imag
+            elif isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise CompileError(f"cannot use {value!r} as a complex constant")
+            else:
+                re, im = value, 0.0
+            return AggregateValue(
+                (Float(float(re), type.elem), Float(float(im), type.elem)),
+                type,
+            )
         case TypeType():
             if not isinstance(value, Type):
                 raise CompileError(f"cannot use {value} as a type constant")

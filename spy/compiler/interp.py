@@ -591,7 +591,7 @@ def _is_aggregate(type: sval.Type) -> bool:
 
     A union is not one: its storage is a single variant, not a field per
     place."""
-    return isinstance(type, (sval.StructType, sval.ArrayType))
+    return isinstance(type, (sval.StructType, sval.ArrayType, sval.ComplexType))
 
 def _is_union_unit(val: InterpVal) -> bool:
     """Whether ``val`` is a union value that carries no storage
@@ -610,7 +610,8 @@ def _is_undefined_val(val: InterpVal) -> bool:
 
 def _aggregate_place_types(type: sval.Type) -> tuple[sval.Type, ...]:
     """The type of every place of the aggregate ``type``, in place order: the
-    fields of a struct in declaration order, the elements of an array."""
+    fields of a struct in declaration order, the elements of an array, the real
+    and imaginary parts of a complex number."""
     if isinstance(type, sval.StructType):
         return tuple(field0.type for field0 in type.fields().values())
     if isinstance(type, sval.ArrayType):
@@ -618,6 +619,8 @@ def _aggregate_place_types(type: sval.Type) -> tuple[sval.Type, ...]:
         if length is None:
             raise CompileError(f'cannot tell how many elements {type} holds')
         return (type.elem,) * length
+    if isinstance(type, sval.ComplexType):
+        return (type.elem, type.elem)
     raise CompileError(f'{type} is not an aggregate')
 
 def _as_aggregate(ev: InterpVal) -> ComptimeAggregate | None:
@@ -3453,7 +3456,7 @@ class HirRunner:
         if isinstance(value, ComptimeAggregate):
             return value.values[index]
         type = _type_of(value)
-        if not isinstance(type, (sval.StructType, sval.ArrayType)):
+        if not isinstance(type, (sval.StructType, sval.ArrayType, sval.ComplexType)):
             raise CompileError(f'{value!r} is not an aggregate')
         field_type = _aggregate_place_types(type)[index]
         if field_type.classify() == sval.SpecialTypeKind.DST:
@@ -3467,7 +3470,10 @@ class HirRunner:
             return ComptimeVal(unit)
         if not isinstance(value, RuntimeVal):
             raise CompileError(f'cannot read a field of {value!r}')
-        if isinstance(type, sval.ArrayType):
+        if isinstance(type, (sval.ArrayType, sval.ComplexType)):
+            # an array's elements and a complex number's parts sit in element
+            # order in the mirror (a complex number mirrors to a struct of its
+            # real and imaginary parts, with no reordering)
             mir_index = index
         elif type.mirror_is_a_field(self._mir_cache):
             return RuntimeVal(value.value, field_type)
@@ -3488,7 +3494,7 @@ class HirRunner:
         if aggregate is not None:
             return aggregate
         type = _type_of(ev)
-        if not isinstance(type, (sval.StructType, sval.ArrayType)):
+        if not isinstance(type, (sval.StructType, sval.ArrayType, sval.ComplexType)):
             raise CompileError(f'{ev!r} is not an aggregate')
         return ComptimeAggregate(
             type,
@@ -3947,6 +3953,12 @@ class HirRunner:
                 type = _type_of(ptr)
                 assert isinstance(type, sval.PointerType)
                 container_type = type.elem
+        if isinstance(container_type, sval.ComplexType):
+            # a complex number's parts are its fields (``real`` and ``imag``)
+            index = container_type.field_index(name)
+            if index is None:
+                raise CompileError(f"type {container_type} has no field named '{name}'")
+            return self.field_index_addr(ptr, _index_value(index))
         if not isinstance(container_type, sval.StructType):
             raise CompileError(f"cannot take field address of {ptr}")
         index = container_type.field_index(name)
@@ -4056,6 +4068,23 @@ class HirRunner:
                     # (see ``sval.StructType.mirror_is_a_field``): the field is
                     # the value itself, so it takes no address arithmetic
                     return RuntimeVal(ptr.value, field_ptr_type)
+                case _:
+                    raise CompileError(f'cannot take field address of {ptr}')
+
+        if isinstance(container_type, sval.ComplexType):
+            index_int = _comptime_index(index)
+            if index_int < 0 or index_int > 1:
+                raise CompileError(f'type {container_type} has no field at index {index_int}')
+            field_ptr_type = sval.PointerType(container_type.elem, is_const)
+            match ptr:
+                case ComptimeAggregatePtr(_, ptrs):
+                    # the parts of a compile-time complex are their own places,
+                    # real first then imaginary (see ``ComptimeAggregatePtr``)
+                    return ptrs[index_int]
+                case RuntimeVal():
+                    return RuntimeVal(
+                        self._emit(mir.Gep(ptr.value, index_int), at), field_ptr_type
+                    )
                 case _:
                     raise CompileError(f'cannot take field address of {ptr}')
 
@@ -4196,6 +4225,11 @@ class HirRunner:
             if not isinstance(ev, ComptimeTuple):
                 raise CoerceError(f'cannot materialize a {target} from {ev!r}')
             return ev
+        if isinstance(target, sval.ComplexType):
+            # a complex number is an aggregate: a real value converts to one with
+            # a zero imaginary part and a complex one to a wider element type
+            # (see ``_coerce_complex``)
+            return self._coerce_complex(ev, target)
         match ev:
             case ComptimeVal(obj) if isinstance(obj, sval.AggregateValue):
                 # an aggregate held as one compile-time object (see
@@ -4250,6 +4284,57 @@ class HirRunner:
         if not _is_aggregate(target) or (aggregate.type != target and not target.is_zst()):
             raise CoerceError(f'cannot convert a {aggregate.type} value to {target}')
         return aggregate
+
+    def _coerce_complex(self, ev: InterpVal, target: sval.ComplexType) -> InterpVal:
+        """A value of the complex type ``target``: a compile-time value is
+        converted with ``sval.coerce_const`` (the ``AggregateValue`` the
+        interpreter reads back as a ``ComptimeAggregate``); a runtime value is
+        rebuilt part by part - a real (float or integer) value becomes a complex
+        one with a zero imaginary part, and a complex one of a narrower element
+        type is widened.  This is the implicit ``T -> Complex[T]`` conversion.
+
+        Raises :class:`~spy.errors.CoerceError` when the value has no
+        materialization as ``target``."""
+        ev = _shallow_normalize(ev)
+        match ev:
+            case ComptimeVal(obj):
+                return ComptimeVal(sval.coerce_const(obj, target))
+            case ComptimeAggregate(aggregate_type) if aggregate_type == target:
+                # an aggregate already of the target type passes through
+                return ev
+            case ComptimeAggregate():
+                # a complex number of another element type: re-coerce its parts
+                # (the element widens or narrows)
+                return ComptimeAggregate(
+                    target,
+                    (
+                        self._coerce(ev.values[0], target.elem),
+                        self._coerce(ev.values[1], target.elem),
+                    ),
+                )
+            case RuntimeVal(_, from_type):
+                if from_type == target:
+                    return ev
+                re: InterpVal
+                im: InterpVal
+                if isinstance(from_type, sval.ComplexType):
+                    aggregate = self.as_comptime_aggregate(ev)
+                    re = self._coerce(aggregate.values[0], target.elem)
+                    im = self._coerce(aggregate.values[1], target.elem)
+                elif sval.is_numeric_type(from_type):
+                    # a real value: the real part is the value, the imaginary one
+                    # is zero
+                    re = self._coerce(ev, target.elem)
+                    im = ComptimeVal(sval.coerce_const(0.0, target.elem))
+                else:
+                    raise CoerceError(f'cannot convert a {from_type} value to {target}')
+                mir_type = target.to_mir_type(self._mir_cache)
+                assert isinstance(mir_type, mir.StructType)
+                result = self._emit(mir.InsertValue(mir.UndefValue(mir_type), self._to_runtime(re), 0))
+                result = self._emit(mir.InsertValue(result, self._to_runtime(im), 1))
+                return RuntimeVal(result, target)
+            case _:
+                raise CoerceError(f'cannot materialize a {target} from {ev!r}')
 
     def _materialize_aggregate(
         self, value: ComptimeAggregate, aggregate_type: sval.Type
@@ -4666,6 +4751,9 @@ class HirRunner:
         if isinstance(lhs_type, sval.StructType) or isinstance(rhs_type, sval.StructType):
             return self._binary_overload(op, lhs, rhs, lhs_type, rhs_type, ret)
 
+        if isinstance(lhs_type, sval.ComplexType) or isinstance(rhs_type, sval.ComplexType):
+            return self._eval_complex(op, lhs, rhs, lhs_type, rhs_type, ret)
+
         # the operators whose operands do not simply share one peer type are
         # handled on their own: a division promotes to float, an exponent's
         # type follows the base, and a shift's result is the left operand's
@@ -4736,6 +4824,11 @@ class HirRunner:
         return mir.Int(1, mir_type)
 
     def _fold_or_emit_arith(self, op: BinaryOp, lv: InterpVal, rv: InterpVal, target: sval.Type, ret: InterpVal) -> None:
+        """Compute ``lv op rv`` as ``target`` and store it into ``ret`` (see
+        ``_fold_or_emit_arith_value``)."""
+        self.store(ret, self._fold_or_emit_arith_value(op, lv, rv, target))
+
+    def _fold_or_emit_arith_value(self, op: BinaryOp, lv: InterpVal, rv: InterpVal, target: sval.Type) -> InterpVal:
         """Compute ``lv op rv`` as ``target``: a compile-time pair folds in
         Python (and the result is re-tagged as ``target``), a runtime one is a
         ``mir.Arith`` over operands coerced to ``target``."""
@@ -4744,14 +4837,68 @@ class HirRunner:
             robj = _to_comptime(rv)
             assert lobj is not None and robj is not None
             obj = _comptime_py_op(op, lobj, robj)
-            self.store(ret, ComptimeVal(sval.coerce_const(obj, target)))
-            return
+            return ComptimeVal(sval.coerce_const(obj, target))
         lc = self._coerce(lv, target)
         rc = self._coerce(rv, target)
         mir_type = target.to_mir_type(self._mir_cache)
         assert mir_type is not None and not target.is_zst()
         value = self._emit(mir.Arith(op, self._to_runtime(lc), self._to_runtime(rc), mir_type))
-        self.store(ret, RuntimeVal(value, target))
+        return RuntimeVal(value, target)
+
+    def _eval_complex(self, op: BinaryOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret: InterpVal) -> PollResult:
+        """``a op b`` with a complex operand: one of the four arithmetic
+        operations on complex numbers, computed part by part (inline
+        ``mir.Arith`` on the real and the imaginary part).  A real (float or
+        integer) operand is taken as a complex one with a zero imaginary part,
+        widened to the other operand's element type (the implicit ``T ->
+        Complex[T]`` conversion).
+
+        Both operands are first turned into their complex value form (a
+        ``ComptimeAggregate``, see ``as_comptime_aggregate``), so a
+        compile-time pair folds and a runtime one emits the arithmetic."""
+        if lhs_type is None or rhs_type is None:
+            raise CompileError(f"cannot apply '{op}' to untyped objects")
+        if op not in ('+', '-', '*', '/'):
+            raise CompileError(f"unsupported operator '{op}' for complex numbers")
+        complex_type = lhs_type if isinstance(lhs_type, sval.ComplexType) else rhs_type
+        other = rhs_type if isinstance(lhs_type, sval.ComplexType) else lhs_type
+        assert isinstance(complex_type, sval.ComplexType)
+        target = complex_type.resolve_peer_type(other)
+        if not isinstance(target, sval.ComplexType):
+            raise CompileError(f"cannot apply '{op}' to {lhs_type} and {rhs_type}")
+        elem = target.elem
+
+        # the values are turned into their complex value form first: the real
+        # and imaginary parts of a compile-time value are compile-time, those of
+        # a runtime one are read out of the value itself (see
+        # ``as_comptime_aggregate``)
+        a = self.as_comptime_aggregate(self._coerce(self._arg_value(lhs), target))
+        b = self.as_comptime_aggregate(self._coerce(self._arg_value(rhs), target))
+        ar, ai = a.values[0], a.values[1]
+        br, bi = b.values[0], b.values[1]
+
+        def arith(op: BinaryOp, x: InterpVal, y: InterpVal) -> InterpVal:
+            return self._fold_or_emit_arith_value(op, x, y, elem)
+
+        re: InterpVal
+        im: InterpVal
+        if op == '+':
+            re = arith('+', ar, br)
+            im = arith('+', ai, bi)
+        elif op == '-':
+            re = arith('-', ar, br)
+            im = arith('-', ai, bi)
+        elif op == '*':
+            # (ar + ai i)(br + bi i) = (ar br - ai bi) + (ar bi + ai br) i
+            re = arith('-', arith('*', ar, br), arith('*', ai, bi))
+            im = arith('+', arith('*', ar, bi), arith('*', ai, br))
+        else:
+            # a / b = a * conj(b) / |b|^2
+            denom = arith('+', arith('*', br, br), arith('*', bi, bi))
+            re = arith('/', arith('+', arith('*', ar, br), arith('*', ai, bi)), denom)
+            im = arith('/', arith('-', arith('*', ai, br), arith('*', ar, bi)), denom)
+        self.store(ret, ComptimeAggregate(target, (re, im)))
+        return PollResult.AGAIN
 
     def _eval_divide(self, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret: InterpVal) -> PollResult:
         """``a / b``: true division.  A float operand picks the wider float
@@ -5785,6 +5932,9 @@ class HirRunner:
         elif isinstance(ty, sval.OptionType):
             variant = 'OptionType'
             fields = (ComptimeVal(ty.child),)
+        elif isinstance(ty, sval.ComplexType):
+            variant = 'ComplexType'
+            fields = (ComptimeVal(ty.elem),)
         elif isinstance(ty, sval.StructType):
             variant = 'StructType'
             fields = (

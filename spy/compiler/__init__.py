@@ -26,7 +26,7 @@ from . import builtins as _builtins
 from . import syntax
 from .dsl import builtin_func, decl_func, func, func_type, struct
 from .errors import CompileError, SpyError, TypeMismatchError
-from .sval import BoolType, FloatType, IntType, VoidType
+from .sval import BoolType, ComplexType, FloatType, IntType, VoidType
 from .syntax import ConstMultiPtr, ConstPtr, ISize, MultiPtr, Option, Ptr, USize, typeof
 
 # ``spy.typeof`` is a ``syntax`` marker: ``astgen`` recognizes it by identity and
@@ -49,6 +49,8 @@ if TYPE_CHECKING:
     i64 = int
     f32 = float
     f64 = float
+    c64 = complex
+    c128 = complex
     usize = int
     isize = int
     c_char = int
@@ -87,6 +89,8 @@ else:
     c_ulonglong = syntax.c_ulonglong
     f32 = FloatType(32)
     f64 = FloatType(64)
+    c64 = ComplexType(FloatType(32))
+    c128 = ComplexType(FloatType(64))
     bool = BoolType()
     void = VoidType()
 
@@ -102,6 +106,8 @@ __all__ = [
     'as_',
     'bool',
     'builtin_func',
+    'c64',
+    'c128',
     'c_char',
     'c_int',
     'c_long',

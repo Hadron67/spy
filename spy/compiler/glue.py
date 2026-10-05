@@ -237,6 +237,12 @@ def _child_offset(type: Type, index: int, cache: MirLowerCache) -> int:
             elem = type.elem.to_mir_type(cache)
             assert elem is not None
             return ctypes.sizeof(to_ctype(elem)) * index
+        case sval.ComplexType():
+            mir_type = type.to_mir_type(cache)
+            assert isinstance(mir_type, mir.StructType)
+            ctype = to_ctype(mir_type)
+            name, _ = ctype._fields_[index]
+            return cast(int, getattr(ctype, name).offset)
         case sval.OptionType():
             return 0
         case _:
@@ -285,6 +291,12 @@ def _read(type: Type, owner: Any, offset: int, cache: MirLowerCache) -> Any:
             return _StructInstance(type, owner, offset, cache)
         case sval.ArrayType():
             raise SpyError('an array cannot cross the Python boundary yet')
+        case sval.ComplexType():
+            # a complex number crosses as a Python ``complex``: read its real and
+            # imaginary parts out of the two float fields of its mirror
+            re = _read(type.elem, owner, offset + _child_offset(type, 0, cache), cache)
+            im = _read(type.elem, owner, offset + _child_offset(type, 1, cache), cache)
+            return complex(re, im)
         case _:
             value = _scalar_ctype(type, cache).from_address(_address(owner, offset)).value
             if isinstance(type, (sval.PointerType,)) or type.classify() == SpecialTypeKind.DST:
@@ -310,6 +322,18 @@ def _write(type: Type, value: Any, owner: Any, offset: int, cache: MirLowerCache
             ctypes.memmove(address, source._base(), ctypes.sizeof(to_ctype(mir_type)))
         case sval.ArrayType():
             raise SpyError('an array cannot cross the Python boundary yet')
+        case sval.ComplexType():
+            # a complex number crosses as a Python ``complex``; a real value
+            # (float or integer) has a zero imaginary part
+            value = _py(value)
+            if isinstance(value, complex):
+                re, im = value.real, value.imag
+            elif isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise SpyError(f'cannot use {value!r} as a complex value')
+            else:
+                re, im = value, 0.0
+            _write(type.elem, re, owner, offset + _child_offset(type, 0, cache), cache)
+            _write(type.elem, im, owner, offset + _child_offset(type, 1, cache), cache)
         case _:
             pointer = isinstance(type, sval.PointerType) or type.classify() == SpecialTypeKind.DST
             if pointer:

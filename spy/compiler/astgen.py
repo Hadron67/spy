@@ -1186,7 +1186,7 @@ class _Builder:
                     # spy has no ``str`` type: a string literal is a byte string,
                     # encoded at parse time (``b'...'`` is already ``bytes``)
                     value = value.encode()
-                if isinstance(value, (int, float, bytes, bool)) or value is None:
+                if isinstance(value, (int, float, complex, bytes, bool)) or value is None:
                     return ArgEntry(hir.Const(value), False), False
                 raise CompileError(f"unsupported constant {node.value!r}")
             case ast.UnaryOp(op=ast.Not()):
