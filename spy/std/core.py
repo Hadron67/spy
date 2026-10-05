@@ -1,14 +1,15 @@
 # This file is imported by the compiler, make sure to avoid circular imports.
 
-from typing import TYPE_CHECKING, Any, Protocol, Self, cast
+from typing import TYPE_CHECKING, Any, Never, Protocol, Self, cast
 
-from ..compiler import builtin_func, usize
-from ..compiler.dsl import func, struct
+from ..compiler import builtin_func, i32, i64, u32, u64, usize
+from ..compiler.dsl import Callable, func, func_type, struct
 from ..compiler.syntax import (
     Array,
     ConstMultiPtr,
     ConstPtr,
     MultiPtr,
+    Opaque,
     Option,
     Ptr,
     comptime,
@@ -222,3 +223,23 @@ def undefined() -> Any: ...
 
 @builtin_func
 def as_static_ptr[T](value: T) -> ConstPtr[T]: ...
+
+@func_type()
+class DestructorFn:
+    def __call__(self, ptr: Ptr[Opaque]): ...
+
+class OpaqueWithDestructor:
+    ptr: Ptr[Opaque]
+    destructotr: ConstPtr[DestructorFn]
+
+type PanicData = i32 | u32 | i64 | u64 | Ptr[Opaque] | OpaqueWithDestructor
+
+@struct()
+class UnwindException(Exception):
+    data: PanicData
+
+@builtin_func
+def panic(data: PanicData) -> Never: ...
+
+@builtin_func
+def catch_unwind[T](fn: Callable[[], T]) -> T: ...

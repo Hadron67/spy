@@ -3,17 +3,19 @@
 The MIR is mapped instruction by instruction onto the textual LLVM IR
 builder of ``llvm`` (the same representation the rest of the package
 uses); the generated module text is then JIT-compiled with
-``llvmlite.binding`` (MCJIT).
+``llvmlite.binding`` (LLJIT, the ORC JIT).
 
 Compilation is module-at-a-time: :class:`LLVMBackend` lowers a whole group
-of MIR functions into *one* LLVM module and adds it to a single,
-process-wide engine, so calls between them become in-module ``define``
-references.  Calls to functions compiled in earlier modules become
-``declare``d symbols carrying the exporter's link name; the engine
-resolves a module's imports by name from the modules it already holds
-(it is kept alive, so everything it compiled stays callable).  The
-unique link names live in the host's symbol table (``fn.SymbolTable``),
-not in this backend.
+of MIR functions into *one* LLVM module and links it as a named JIT
+library of a single, process-wide ORC JIT, so calls between them become
+in-module ``define`` references.  Calls to functions compiled in earlier
+modules become ``declare``d symbols carrying the exporter's link name;
+every library linked so far is a prerequisite of the new one (the JIT's
+link order is not transitive), so a module's imports resolve by name from
+the libraries it already holds.  An ``ExternSymbol`` falls back to the
+process.  The resource trackers of the linked libraries are kept alive,
+so everything compiled stays callable.  The unique link names live in the
+host's symbol table (``fn.SymbolTable``), not in this backend.
 
 The Python-facing entry of a native function is the value-form function
 itself, except when the machine ABI cannot carry its arguments or result
@@ -745,24 +747,32 @@ class _NativeFn(NativeFn):
 
 
 class LLVMBackend(Backend):
-    """The MCJIT backend of the spy compiler: lowers one MIR module at a
-    time into one LLVM module and adds it to a single, reused engine.
+    """The LLJIT backend of the spy compiler: lowers one MIR module at a
+    time into one LLVM module and links it as a named JIT library of a
+    single, reused ORC JIT.
 
     The MIR symbol table (``fn.SymbolTable``) has already given every
-    global the unique link name it keeps across modules, so the engine
+    global the unique link name it keeps across modules, so the JIT
     resolves a module's external references by name: an import of an
-    earlier-compiled function carries the exporter's name, and an
-    ``ExternSymbol`` falls back to the process.  The engine is kept alive
-    so the addresses of everything it has compiled stay valid."""
+    earlier-compiled function carries the exporter's name and resolves
+    from the library that module was linked into (every earlier library
+    is a prerequisite of the new one), and an ``ExternSymbol`` falls back
+    to the process.  The resource trackers of the linked libraries are
+    kept alive so the addresses of everything compiled stay valid."""
 
     def __init__(self) -> None:
         super().__init__()
         target = llvm.Target.from_default_triple()
         tm = target.create_target_machine()
-        backing_mod = llvm.parse_assembly('')
-        # one engine for the whole process: modules added to it resolve
-        # each other's symbols by name
-        self._engine = llvm.create_mcjit_compiler(backing_mod, tm)
+        # one JIT for the whole process: every module becomes a named JIT
+        # library, and a later library lists the earlier ones as prerequisites
+        # so that cross-module references resolve by name
+        self._jit = llvm.create_lljit_compiler(tm)
+        self._libraries: list[str] = []
+        # the trackers keep the linked libraries (and their code) alive; the
+        # backend lives as long as the process, so the addresses stay valid
+        self._trackers: list[llvm.ResourceTracker] = []
+        self._module_id = 0
 
     def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue], target: TargetInfo) -> dict[mir.GlobalValue, NativeFn]:
         types = _ModuleTypes()
@@ -787,17 +797,32 @@ class LLVMBackend(Backend):
         lmod.finish()
         lines = lmod.write()
 
-        llvm_mod = llvm.parse_assembly('\n'.join(lines))
+        # parse + verify before handing the module to the JIT, so bad IR
+        # reports a clear error
+        text = '\n'.join(lines)
+        llvm_mod = llvm.parse_assembly(text)
         llvm_mod.verify()
-        self._engine.add_module(llvm_mod)
-        self._engine.finalize_object()
-        self._engine.run_static_constructors()
+
+        # link the module as a fresh named library; it may reference any
+        # earlier module, so every library linked so far is a prerequisite of
+        # the new one (the JIT's link order is not transitive), while
+        # unresolved externals fall back to the process
+        builder = llvm.JITLibraryBuilder().add_ir(text).add_current_process()
+        for lib in self._libraries:
+            builder.add_jit_library(lib)
+        for fn in fns:
+            builder.export_symbol(lmod.get_global_name(llvm_fns[fn]))
+        lib_name = f'spy_module_{self._module_id}'
+        self._module_id += 1
+        tracker = builder.link(self._jit, lib_name)
+        self._libraries.append(lib_name)
+        self._trackers.append(tracker)
 
         rets: dict[mir.GlobalValue, NativeFn] = {}
         for fn in fns:
             # the link name the LLVM module actually emitted
             name = lmod.get_global_name(llvm_fns[fn])
-            addr = self._engine.get_function_address(name)
+            addr = tracker[name]
             arg_ctypes: list[Any] = [py_entry_arg_ctype(a) for a in fn.args]
             restype = to_ctype(fn.ret_type)
             proto = ctypes.CFUNCTYPE(restype, *arg_ctypes)  # type: ignore[arg-type]

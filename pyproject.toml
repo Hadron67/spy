@@ -1,2 +1,6 @@
 [project]
 requires-python = ">=3.14"
+dependencies = [
+    # the OrcJIT (LLJIT) bindings this backend uses were added in 0.36
+    "llvmlite>=0.36",
+]

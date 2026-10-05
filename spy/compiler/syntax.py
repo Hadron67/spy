@@ -108,8 +108,14 @@ class Opaque:
     As the last field of a ``@struct()`` it is an opaque tail, the flexible
     member of a C struct."""
 
+OK = 1
+RAISE = 2
+UNWIND = 4
+ERR = RAISE | UNWIND
+ALL = OK | ERR
+
 @contextmanager
-def defer():
+def defer(flags: int = ALL):
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
 @contextmanager

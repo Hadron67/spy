@@ -10,7 +10,7 @@ Python 源码 ──astgen──▶ 无类型 HIR ──interp──▶ 有类�
 
 - `astgen`：用 `inspect.getsource` 取得函数源码，翻译成线性的无类型指令流（HIR），并把函数签名（形参/默认值/泛型参数/返回注解）转成 spy 域的 `fn.Signature`；
 - `interp`：在**编译期**以具体的参数类型逐条“运行”HIR——纯编译期操作直接在 Python 中求值，需要落到运行时的操作才发出带类型的 MIR 指令（此时控制流是一张以入口块为根的基本块图，每个块以 `jmp`/`br`/`ret` 结束，见下文）；
-- `lower`：把 MIR 机械地映射到 LLVM IR（用 `llvm` 的文本 IR 构造器），再用 llvmlite 的 MCJIT 编译成原生代码。
+- `lower`：把 MIR 机械地映射到 LLVM IR（用 `llvm` 的文本 IR 构造器），再用 llvmlite 的 LLJIT（ORC JIT）编译成原生代码。
 
 > 函数必须定义在真实源码文件中（`inspect.getsource` 需要源码，交互式环境里无法使用）。
 
@@ -105,7 +105,7 @@ add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))
 
 ### 函数与调用
 
-- **模块化编译**：编译一个函数时，把"它 + 它依赖的所有尚未编译的函数"放进同一个 LLVM module 一起 `define`；之前模块已编译过的函数在调用处作为外部符号（按链接名）引用，由进程内唯一的 MCJIT engine 解析。每个特化的原生符号名唯一（重名的函数会被分配不同的名字）。
+- **模块化编译**：编译一个函数时，把"它 + 它依赖的所有尚未编译的函数"放进同一个 LLVM module 一起 `define`；之后该 module 作为一个新命名的 JIT library 链接进进程内唯一的 LLJIT，并把此前链接过的所有 library 都列为自己的前置依赖（LLJIT 的链接顺序不传递，必须逐个列出），于是调用处引用的外部符号按链接名解析到对应 library；未能解析到的外部符号回退到宿主进程。每个特化的原生符号名唯一（重名的函数会被分配不同的名字）。
 - **递归**：直接递归、互递归、泛型函数的多类型递归都能工作（调用进行中即可解析到正在编译的函数本身）。递归要求函数返回类型能由注解确定：具体类型，或由参数绑定出的类型参数 `T`；否则报 `requires a return type annotation`。
 - 普通（未注册进任何 context 的）Python 函数在体内调用时会被**内联**；未装饰的结构体方法同理。内联函数也可以递归调用自己，但内联体的参数绑定为运行期值，递归驱动参数是运行期值时编译期不会收敛（形同编译期死循环），会在内联嵌套上限（64 层）处报错——需要真正运行期递归的函数请声明为 spy 函数。
 - Python 调用侧与函数体**内部**的调用都支持位置参数、关键字参数与默认参数（`*args`/`**kwargs` 尚不支持）。
@@ -291,7 +291,7 @@ def min_max(a: spy.i32, b: spy.i32) -> tuple[spy.i32, spy.i32]:
 | `compiler/mir.py` | MIR 类型、指令与基本块定义 |
 | `compiler/opt.py` | MIR 清理：把单次存取的 slot 折回寄存器（按基本块支配关系判定）、删除无用 slot |
 | `compiler/llvm.py` | LLVM IR 的文本构造器 |
-| `compiler/lower.py` | MIR → LLVM IR → 机器码（llvmlite MCJIT） |
+| `compiler/lower.py` | MIR → LLVM IR → 机器码（llvmlite LLJIT） |
 | `compiler/fn.py` | 函数签名（`Signature`：形参绑定、类型参数求解、返回类型推导）、函数值与编译产物、链接名表（`SymbolTable`）与函数入口 thunk |
 | `compiler/sval.py` | spy 类型系统（含结构体类型）、编译期值、Python 值 → spy 域的映射（`as_value`）与类型参数约束求解（`TypeVarSolver`） |
 | `compiler/syntax.py` | 函数体内使用的语法标记：指针类型 `Ptr`/`ConstPtr`/`MultiPtr`/`ConstMultiPtr`、取地址 `ref`、指针强转 `ptr_cast`、数组类型 `Array` 与构造 `array`、`Option`、编译期变量标注 `Comptime`、类型探针 `typeof` |
