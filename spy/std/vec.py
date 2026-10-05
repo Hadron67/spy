@@ -1,7 +1,7 @@
 from ..compiler import struct, usize
 from ..compiler.dsl import func
-from .core import SlicePtr
-from .mem import Allocator, AllocError
+from .core import SlicePtr, undefined
+from .mem import Allocator, AllocError, CAllocator
 
 
 @struct()
@@ -9,6 +9,10 @@ class Vec[T, A: Allocator]:
     ptr: SlicePtr[T]
     size: usize
     allocator: A
+
+    @staticmethod
+    def new[T2](t: type[T2]) -> Vec[T2, CAllocator]:
+        return Vec(SlicePtr(undefined(), 0), 0, CAllocator())
 
     def deinit(self):
         self.allocator.free_array(self.ptr)

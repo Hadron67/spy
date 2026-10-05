@@ -12,9 +12,9 @@ Calls follow *result location semantics* (RLS): a call writes its
 result into the slot of its ``ret`` operand (:class:`CallInplace`) and
 produces no register of its own.  A caller that needs the value
 allocates a slot and loads it back.  The slot only becomes real memory
-when it is committed (``CommitSlot``): a slot all of whose stores are
-compile-time - an inline temporary, an ``Alloca`` whose
-:class:`InlineMode` allows it - stays a compile-time value, a
+when it is committed (``CommitSlot``): a slot whose stores may all be kept
+inline - an ``Alloca`` whose :class:`InlineMode` allows it and no store
+that crossed a runtime block - stays a compile-time value, a
 zero-sized slot only records its unit value, and
 anything else is materialized as memory.  The store/load round trip a
 runtime call result leaves behind is folded back into registers
@@ -98,10 +98,12 @@ class InlineMode(IntEnum):
     of its own here (see ``ComptimeAggregatePtr``).  ``FULL`` may keep
     anything inline - it is what a ``Comptime`` variable declares, and an
     aggregate in one is always held by its fields' places, whatever the
-    values of those fields are; only a delivery that needs the slot's own
-    single address forces it into memory (see ``interp``).  A zero-sized
-    value has no runtime representation at all, so its slot only records its
-    unit value whatever the mode is."""
+    values of those fields are.  A delivery that needs the slot's own single
+    address (a result pointer a callee writes through), or a store that
+    crossed a runtime block boundary since the slot was created, forces it
+    into memory (see ``interp``).  A zero-sized value has no runtime
+    representation at all, so its slot only records its unit value whatever
+    the mode is."""
 
     NONE = auto()
     NON_AGGREGATE = auto()

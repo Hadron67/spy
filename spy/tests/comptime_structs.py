@@ -1,11 +1,12 @@
 from unittest import TestCase
 
-from ..compiler import bool as spy_bool
 from ..compiler import (
+    CompileError,
     i32,
     i64,
     syntax,
 )
+from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
@@ -121,8 +122,9 @@ def comptime_struct_argument() -> i32:
 
 @func()
 def comptime_struct_choose(c: spy_bool) -> i32:
-    # both branches build into one storage: the second reuses the field places
-    # the first recorded (see ``finish_struct``)
+    # both branches build into one storage, but they are two runtime regions, so
+    # the field places cross a runtime block and land in memory: each branch
+    # keeps its own value
     s: Comptime = Small(1, 1) if c else Small(2, 2)
     return s.b
 
@@ -203,9 +205,9 @@ def comptime_struct_of_one_field_from_a_runtime_value(x: i64) -> i64:
 
 @func()
 def comptime_struct_runtime_field_by_ref(x: i32) -> i32:
-    # the runtime field of a compile-time aggregate is a runtime place of its
-    # own, so its address can be handed to a native function (which writes
-    # through it)
+    # the runtime field of a compile-time aggregate is kept inline (a box holding
+    # the runtime value), so it has no address of its own to hand to a native
+    # function: taking one is rejected
     s: Comptime = Small(x, 2)
     incr_ptr(ref(s.a))
     return s.a
@@ -213,9 +215,10 @@ def comptime_struct_runtime_field_by_ref(x: i32) -> i32:
 
 @func()
 def comptime_struct_field_written_in_branches(c: spy_bool, x: i32) -> i32:
-    # the runtime field of a compile-time aggregate written in both branches of a
-    # runtime ``if``: both runtime paths have to write the same place, so it is
-    # memory - a compile-time box would keep only the value the walk wrote last
+    # the field holds the runtime value ``x``, so it is an inline compile-time
+    # place (a box); writing it in both branches of a runtime ``if`` happens
+    # after the storage was committed, so the last write the walk performs wins -
+    # like a scalar compile-time local
     s: Comptime = Small(x, 1)
     if c:
         s.a = 5
@@ -313,12 +316,10 @@ class SpyComptimeStructTest(TestCase):
         self.assertEqual(comptime_struct_unroll(), 1)
 
     def test_a_runtime_branch_writes_the_aggregate(self) -> None:
-        # both branches of a runtime ``if`` are typed, so the construction
-        # writes the same places twice and the last write wins - exactly like a
-        # scalar compile-time local (``x: Comptime = 1 if c else 2`` is always
-        # 2): a compile-time location holds one value, and no store knows the
-        # runtime condition
-        self.assertEqual(comptime_struct_choose(True), 2)
+        # the two branches of the runtime ``if`` are two runtime regions, so the
+        # field places cross a runtime block and land in memory: each branch
+        # keeps its own value
+        self.assertEqual(comptime_struct_choose(True), 1)
         self.assertEqual(comptime_struct_choose(False), 2)
 
     def test_nested_aggregate_copy(self) -> None:
@@ -335,14 +336,16 @@ class SpyComptimeStructTest(TestCase):
     def test_a_whole_runtime_value_after_a_construction(self) -> None:
         self.assertEqual(comptime_struct_reassigned_from_a_runtime_value(5), 8)
 
-    def test_a_runtime_field_of_such_a_variable_is_addressable(self) -> None:
-        # the runtime field is memory, not a box: a native callee writes it
-        self.assertEqual(comptime_struct_runtime_field_by_ref(5), 6)
+    def test_a_runtime_field_of_such_a_variable_is_not_addressable(self) -> None:
+        # the runtime field is a compile-time box, not memory: taking its address
+        # is rejected
+        with self.assertRaises(CompileError):
+            comptime_struct_runtime_field_by_ref(5)
 
     def test_a_runtime_field_written_in_branches(self) -> None:
-        # both runtime paths write the same memory place, so each keeps its own
-        # value (a box would have kept the one the walk wrote last)
-        self.assertEqual(comptime_struct_field_written_in_branches(True, 3), 6)
+        # both branches write the same compile-time box, so the last write of the
+        # walk wins whatever the runtime condition is
+        self.assertEqual(comptime_struct_field_written_in_branches(True, 3), 10)
         self.assertEqual(comptime_struct_field_written_in_branches(False, 3), 10)
 
     def test_a_nested_runtime_aggregate_field(self) -> None:

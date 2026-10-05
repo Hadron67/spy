@@ -104,7 +104,7 @@ class DynamicAllocator(Allocator):
             return ptr_cast(data, Ptr[t])[...].resize(ptr, layout, new_layout)
 
         comptime()
-        vtable: AllocatorVtable = AllocatorVtable(
+        vtable = AllocatorVtable(
             as_func_ptr(AllocFn, alloc),
             as_func_ptr(ResizeFn, resize),
         )

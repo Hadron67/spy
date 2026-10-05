@@ -246,7 +246,7 @@ class _PendingActionData:
 
     @abstractmethod
     def info(self) -> tuple[sval.Type, bool]:
-        """Returns (type, is_inline) of the value the action delivers."""
+        """Returns (type, may_be_inlined) of the value the action delivers."""
         ...
 
 @dataclass
@@ -261,9 +261,10 @@ class _PendingAction:
 @dataclass
 class _PendingStore(_PendingActionData):
     """One store point recorded by a :class:`PendingSlot`: the spy type of
-    the stored value and whether it may be inlined.  The store itself is
-    delivered once the slot's final type is known (the stored value is
-    coerced to it then)."""
+    the stored value and whether it may be kept inline - a store that crossed a
+    runtime block boundary since the slot's own position may not (see
+    ``HirRunner._record_pending_store``).  The store itself is delivered once
+    the slot's final type is known (the stored value is coerced to it then)."""
 
     type: sval.Type
     is_inline: bool
@@ -330,6 +331,11 @@ class PendingSlot(InterpVal):
     plain slot), anything but an aggregate (an expression temporary), or
     anything (a ``Comptime`` variable) - see ``InlineMode``.
 
+    ``runtime_pos`` is the *runtime* block the ``Alloca`` ran in - the MIR block
+    the walk was building, recorded so that a store into the slot knows whether
+    the walk has since crossed a runtime block boundary (see
+    ``_record_pending_store``).
+
     ``insertion`` is the position the slot's storage is produced at: a
     :class:`mir.Insertion` emitted where the ``Alloca`` ran, whose
     instructions the slot's commit fills with the :class:`mir.Alloca` (or,
@@ -338,6 +344,7 @@ class PendingSlot(InterpVal):
 
     insertion: mir.Insertion
     inline_mode: InlineMode
+    runtime_pos: mir.BasicBlock | None = None
     stores: list[_PendingAction] = field(default_factory=list)
     committed: InterpVal | None = None
 
@@ -361,26 +368,17 @@ class PendingSlot(InterpVal):
     def is_inline(self, type: sval.Type) -> bool:
         """Whether the slot may hold the value of type ``type`` inline (in a
         :class:`ComptimeBox`, or as a :class:`ComptimeAggregatePtr` for an
-        aggregate) rather than in memory.  A ``FULL`` slot holds *any* aggregate
-        that way, whatever the values of its fields are - a compile-time
-        aggregate is its fields' own places (see ``ComptimeAggregatePtr``) -
-        unless a delivery into the slot needs an address of its own: a result
-        pointer a callee writes through (see ``_defer_ptr_convertion``), which a
-        place held by its fields has no single address to hand over.  Otherwise
-        the mode has to allow it (see ``InlineMode``) and every store into the
-        slot has to be of an inline value (see ``_is_inline_val``) - a runtime
-        value written into a ``NON_AGGREGATE`` slot or into the field of a
-        compile-time aggregate has to land in memory, since the runtime paths
-        that write it (the two branches of a runtime ``if``, e.g.) only join
-        there - and a ``NON_AGGREGATE`` slot holds no aggregate at all.  A
-        zero-sized value has no runtime representation, so any mode keeps its
-        unit value."""
+        aggregate) rather than in memory.  The mode has to allow it (see
+        ``InlineMode``), every store into the slot has to be an inline one - a
+        store that crossed a runtime block boundary since the slot's own
+        position cannot be inlined (see ``_record_pending_store``), and a
+        delivery that needs the slot's own single address (a result pointer a
+        callee writes through, see ``_defer_ptr_convertion``) forces it into
+        memory too - and a ``NON_AGGREGATE`` slot holds no aggregate at all.
+        A zero-sized value has no runtime representation, so any mode keeps
+        its unit value."""
         if self.inline_mode == InlineMode.NONE:
             return False
-        if self.inline_mode == InlineMode.FULL and _is_aggregate(type):
-            return not any(
-                isinstance(store.data, _PendingPtrConvertion) for store in self.stores
-            )
         if not all(store.data.info()[1] for store in self.stores):
             return False
         return not (self.inline_mode == InlineMode.NON_AGGREGATE and _is_aggregate(type))
@@ -517,10 +515,7 @@ def _is_comptime_val(val: InterpVal) -> bool:
     the HIR runs, so a computation over it can be folded in Python (see
     ``_eval_binary`` and friends) and a call may take it for a compile-time
     parameter.  A container is deeply compile-time when everything it holds
-    is, so a box or a tuple holding a runtime value is not.
-
-    Not to be confused with ``_is_inline_val``, the *shallow* property that
-    decides whether a value may live in a :class:`ComptimeBox`."""
+    is, so a box or a tuple holding a runtime value is not."""
     todo = [val]
     while todo:
         val = todo.pop()
@@ -587,24 +582,6 @@ def _references_register(value: mir.Value) -> bool:
         if children is not None:
             todo.extend(children)
     return False
-
-def _is_inline_val(val: InterpVal) -> bool:
-    """Whether the value may be *inlined* - kept as a compile-time value (in a
-    :class:`ComptimeBox`, or as a :class:`ComptimeAggregatePtr` for an
-    aggregate) rather than written into memory.  This is the *shallow* property
-    of the value itself: it is not a runtime value.  A container counts as
-    inline even when what it holds is a runtime value - a tuple, a box, ... has
-    no runtime representation of its own, so it only exists while the HIR runs
-    (a ``Comptime`` variable may hold one, see ``_is_comptime_val`` for the
-    deep property).  A runtime value that refers to no register - a constant leaf
-    or a reference to a global (a static constant, a function) - may also be
-    inlined: it is the same on every path, so a compile-time box can hold it
-    (see ``_references_register``)."""
-    return not isinstance(_shallow_normalize(val), RuntimeVal)
-    # ev = _shallow_normalize(val)
-    # if isinstance(ev, RuntimeVal):
-    #     return not _references_register(ev.value)
-    # return True
 
 def _is_aggregate(type: sval.Type) -> bool:
     """Whether ``type`` is an *aggregate*: a struct or an array.  An aggregate
@@ -3221,9 +3198,14 @@ class HirRunner:
             value_type = _type_of(value)
             if value_type is None:
                 raise CompileError('cannot store a value that has no spy type')
-            if ptr.inline_mode == InlineMode.FULL and _is_aggregate(value_type) and not _is_inline_val(value):
-                # a *runtime* aggregate value into a compile-time variable: such a
-                # variable holds its fields as places of their own (see
+            if (
+                ptr.inline_mode == InlineMode.FULL
+                and _is_aggregate(value_type)
+                and self._runtime_position() == ptr.runtime_pos
+            ):
+                # an aggregate value into an inline compile-time variable that
+                # has not crossed a runtime block since the variable was created:
+                # such a variable holds its fields as places of their own (see
                 # ``ComptimeAggregatePtr``), so the value is split into one place
                 # (and one store) per field - each of which then lands where its
                 # own kind says, in memory for a runtime field and in a box
@@ -3245,14 +3227,7 @@ class HirRunner:
                     ):
                         self.store(recorded.places[index], field_value)
                 return
-            self._record_pending_action(
-                ptr,
-                _PendingStore(
-                    type=value_type,
-                    is_inline=_is_inline_val(value),
-                    value=value,
-                ),
-            )
+            self._record_pending_store(ptr, value_type, value)
             return
 
         ptr_type = _type_of(ptr)
@@ -3440,13 +3415,15 @@ class HirRunner:
 
     def as_comptime_aggregate(self, ev: InterpVal) -> ComptimeAggregate:
         """The ``ComptimeAggregate`` form of the aggregate value ``ev`` (whose
-        type it is read off): a compile-time aggregate is returned as it is, and
-        a runtime one has every field (or element) read out of the value itself
-        with ``_extract_aggregate_value`` (a struct and an array alike).  A
-        value that is not an aggregate (an ``Option``, say) is rejected."""
+        type it is read off): a compile-time aggregate - held as one object, or
+        as an ``sval.AggregateValue`` - is returned as it is, and a runtime one
+        has every field (or element) read out of the value itself with
+        ``_extract_aggregate_value`` (a struct and an array alike).  A value
+        that is not an aggregate (an ``Option``, say) is rejected."""
         ev = _shallow_normalize(ev)
-        if isinstance(ev, ComptimeAggregate):
-            return ev
+        aggregate = _as_aggregate(ev)
+        if aggregate is not None:
+            return aggregate
         type = _type_of(ev)
         if not isinstance(type, (sval.StructType, sval.ArrayType)):
             raise CompileError(f'{ev!r} is not an aggregate')
@@ -3459,17 +3436,16 @@ class HirRunner:
         )
 
     def _runtime_aggregate_field_values(self, value: InterpVal) -> list[InterpVal]:
-        """The value of every field (or element) of the *runtime* aggregate
-        ``value``, read out of the value itself (see
-        ``as_comptime_aggregate``)."""
+        """The value of every field (or element) of the aggregate ``value``, read
+        out of the value itself (see ``as_comptime_aggregate``)."""
         return list(self.as_comptime_aggregate(value).values)
 
     def _split_runtime_aggregate(self, value: InterpVal) -> tuple[InterpVal, ...]:
-        """One fresh place per field (or element) of the *runtime* aggregate
-        ``value``, written with the field read out of it - the places a
-        compile-time aggregate holds (see ``ComptimeAggregatePtr``).  A nested
-        aggregate field is split the same way, recursively (its own place is a
-        ``FULL`` slot holding a runtime aggregate, see ``store``)."""
+        """One fresh place per field (or element) of the aggregate ``value``,
+        written with the field read out of it - the places a compile-time
+        aggregate holds (see ``ComptimeAggregatePtr``).  A nested aggregate
+        field is split the same way, recursively (its own place is a ``FULL``
+        slot holding the nested value, see ``store``)."""
         places: list[InterpVal] = []
         for field_value in self._runtime_aggregate_field_values(value):
             place = self.alloca(InlineMode.FULL)
@@ -4076,7 +4052,7 @@ class HirRunner:
         memory (a :class:`RuntimeVal`) for anything else (see ``hir.Alloca``)."""
         insertion = mir.Insertion([], None)
         self._emit(insertion)
-        slot = PendingSlot(insertion, inline)
+        slot = PendingSlot(insertion, inline, self._runtime_position())
         if declared is not None:
             if inline != InlineMode.NONE and declared.get_unit_value() is None:
                 if _is_aggregate(declared):
@@ -5753,12 +5729,40 @@ class HirRunner:
             on_return()
         return res
 
+    def _runtime_position(self) -> mir.BasicBlock:
+        """The *runtime* block the walk currently sits in: the MIR block being
+        built.  A store into a slot may be kept inline only while this is the
+        block the slot recorded when its ``Alloca`` ran (see
+        ``_record_pending_store``): a runtime value is a MIR register that only
+        dominates the paths *after* it inside the block it is defined in, so a
+        store that crossed a runtime block boundary has to land in memory.  The
+        block changes exactly when the walk emits runtime control flow (a
+        runtime ``if`` branch or loop header, the taken edge of a runtime
+        ``break_if``, the join an ended path continues in); a compile-time
+        ``if``/``loop`` and a ``hir.Block`` entry emit none and keep it."""
+        return self._cur_block
+
     def _record_pending_action(self, slot: PendingSlot, data: _PendingActionData) -> None:
         """Record one action on a still uncommitted slot, reserving the
         insertion block that will hold the instructions delivering it."""
         insertion = mir.Insertion([], None)
         self._emit(insertion)
         slot.stores.append(_PendingAction(insertion, data))
+
+    def _record_pending_store(self, slot: PendingSlot, value_type: sval.Type, value: InterpVal) -> None:
+        """Record a store into a still uncommitted slot.  The value may be kept
+        inline only while the walk has not crossed a runtime block boundary
+        since the slot was created: a runtime value is a MIR register that only
+        dominates the paths after it inside its own block, so a store from
+        another runtime block cannot be held as a compile-time value."""
+        self._record_pending_action(
+            slot,
+            _PendingStore(
+                type=value_type,
+                is_inline=self._runtime_position() == slot.runtime_pos,
+                value=value,
+            ),
+        )
 
     def _commit_pending_slot(
         self, val: InterpVal, type: sval.Type | None = None, ptr: mir.Value | None = None
