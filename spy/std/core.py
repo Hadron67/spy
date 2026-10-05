@@ -77,7 +77,7 @@ class ConstSlicePtr[T]:
         return _ConstSliceRefIterator(self.ptr, self.length)
 
     def _out_of_bounds(self):
-        pass
+        panic(sstr(b'index out of bounds'))
 
     def __spy_getitemptr__(self, index: usize) -> ConstPtr[T]:
         if index >= self.length:
@@ -122,7 +122,7 @@ class SlicePtr[T]:
         return _SliceRefIterator(self.ptr, self.length)
 
     def _out_of_bounds(self):
-        pass
+        panic(sstr(b'index out of bounds'))
 
     def __spy_getitemptr__(self, index: usize) -> Ptr[T]:
         if index >= self.length:
@@ -246,7 +246,7 @@ class OpaqueWithDestructor:
     def deinit(self):
         self.destructor[...](self.ptr)
 
-type PanicData = i32 | u32 | i64 | u64 | Ptr[Opaque] | OpaqueWithDestructor
+type PanicData = i32 | u32 | i64 | u64 | ConstSlicePtr[u8] | Ptr[Opaque] | OpaqueWithDestructor
 
 def deinit_panic_data(data: PanicData) -> None:
     if isinstance(v := data, OpaqueWithDestructor):

@@ -16,7 +16,7 @@ from ..compiler import (
 )
 from ..compiler.syntax import Comptime, Opaque, as_func_ptr, closure, comptime, ptr_cast
 from .c import free, malloc, realloc
-from .core import SlicePtr, as_static_ptr, undefined
+from .core import SlicePtr, as_static_ptr, panic, sstr, undefined
 
 
 @struct()
@@ -45,7 +45,7 @@ class Allocator(Protocol):
     def resize(self, ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]: ...
 
     def _free_failed(self):
-        pass
+        panic(sstr(b'failed to free memory'))
 
     def new[T](self, typ: type[T]) -> Ptr[T]:
         layout = layout_of(typ)

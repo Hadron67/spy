@@ -6,6 +6,7 @@ from ..compiler import (
     i32,
     i64,
     syntax,
+    u8,
     u64,
 )
 from ..compiler import typeof as spy_typeof
@@ -19,6 +20,8 @@ from ..compiler.syntax import (
     Option,
     Ptr,
     array,
+    closure,
+    defer,
     ref,
 )
 from ..std import (
@@ -26,6 +29,12 @@ from ..std import (
     SlicePtr,
     arr_slice,
     const_arr_slice,
+)
+from ..std.core import (
+    PanicData,
+    UnwindException,
+    catch_unwind,
+    deinit_panic_data,
 )
 from .generics import TwoI64
 from .structs import Small
@@ -313,22 +322,102 @@ def const_slice_method_slice(x: i32) -> i32:
     return t[0] + t[1] + t[2]
 
 
-@func()
-def slice_out_of_bounds_calls_the_stub(x: i32) -> i32:
-    # an out-of-bounds slice calls ``_out_of_bounds`` (a no-op stub for now) and
-    # carries on - the result is never read
-    a = array(x, x + 1, x + 2, x + 3)
-    s = arr_slice(ref(a))
-    s.slice(0, 5)
-    return 7
+# ---------------------------------------------------------------------------
+# a slice's bounds checks call ``std.core.panic`` (the panic payload is the
+# ``ConstSlicePtr[u8]`` message ``b'index out of bounds'``, see ``std.core``):
+# a failing access is caught with ``catch_unwind``, which delivers the panic as
+# an ``UnwindException`` to the ordinary error path
+# ---------------------------------------------------------------------------
 
 
 @func()
-def slice_subscript_out_of_bounds_calls_the_stub(x: i32) -> i32:
+def slice_index_out_of_bounds(x: i32) -> i32:
     a = array(x, x + 1, x + 2, x + 3)
     s = arr_slice(ref(a))
-    s[s.length]
-    return 7
+    return s[4]
+
+
+@func()
+def const_slice_index_out_of_bounds(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a)).as_const()
+    return s[4]
+
+
+@func()
+def slice_method_out_of_bounds(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a))
+    t = s.slice(2, 9)
+    return t[0]
+
+
+@func()
+def const_slice_method_out_of_bounds(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, x + 3)
+    s = arr_slice(ref(a)).as_const()
+    t = s.slice(2, 9)
+    return t[0]
+
+
+@func()
+def panic_message(data: PanicData) -> i32:
+    # the first byte of the ``ConstSlicePtr[u8]`` message a slice panic carries
+    if isinstance(v := data, ConstSlicePtr[u8]):  # pyright: ignore
+        return v[0]
+    return -1
+
+
+@func()
+def catch_slice_index_out_of_bounds(x: i32) -> i32:
+    @closure(inline=False)
+    def body() -> i32:
+        return slice_index_out_of_bounds(x)
+
+    try:
+        return catch_unwind(body)
+    except UnwindException as e:
+        with defer(): deinit_panic_data(e.data)
+        return panic_message(e.data)
+
+
+@func()
+def catch_const_slice_index_out_of_bounds(x: i32) -> i32:
+    @closure(inline=False)
+    def body() -> i32:
+        return const_slice_index_out_of_bounds(x)
+
+    try:
+        return catch_unwind(body)
+    except UnwindException as e:
+        with defer(): deinit_panic_data(e.data)
+        return panic_message(e.data)
+
+
+@func()
+def catch_slice_method_out_of_bounds(x: i32) -> i32:
+    @closure(inline=False)
+    def body() -> i32:
+        return slice_method_out_of_bounds(x)
+
+    try:
+        return catch_unwind(body)
+    except UnwindException as e:
+        with defer(): deinit_panic_data(e.data)
+        return panic_message(e.data)
+
+
+@func()
+def catch_const_slice_method_out_of_bounds(x: i32) -> i32:
+    @closure(inline=False)
+    def body() -> i32:
+        return const_slice_method_out_of_bounds(x)
+
+    try:
+        return catch_unwind(body)
+    except UnwindException as e:
+        with defer(): deinit_panic_data(e.data)
+        return panic_message(e.data)
 
 
 # ---------------------------------------------------------------------------
@@ -809,10 +898,14 @@ class SpySlicePtrTest(TestCase):
     def test_an_absent_slice_bound_is_open(self) -> None:
         self.assertEqual(slice_method_open_bounds(10), 10 + 13)
 
-    def test_an_out_of_bounds_call_reaches_the_stub(self) -> None:
-        # the bounds check calls ``_out_of_bounds``, a no-op stub for now
-        self.assertEqual(slice_out_of_bounds_calls_the_stub(10), 7)
-        self.assertEqual(slice_subscript_out_of_bounds_calls_the_stub(10), 7)
+    def test_an_out_of_bounds_call_panics(self) -> None:
+        # the bounds check calls ``std.core.panic``; the panic is caught with
+        # ``catch_unwind`` and delivered as an ``UnwindException`` whose payload
+        # is the ``ConstSlicePtr[u8]`` message (its first byte is ``'i'``)
+        self.assertEqual(catch_slice_index_out_of_bounds(10), ord('i'))
+        self.assertEqual(catch_const_slice_index_out_of_bounds(10), ord('i'))
+        self.assertEqual(catch_slice_method_out_of_bounds(10), ord('i'))
+        self.assertEqual(catch_const_slice_method_out_of_bounds(10), ord('i'))
 
 
 class SpySubscriptOverloadTest(TestCase):
