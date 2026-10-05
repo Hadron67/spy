@@ -39,10 +39,12 @@ globals()['as'] = _builtins.spy_as
 
 if TYPE_CHECKING:
     u0 = int
+    u1 = int
     u8 = int
     u16 = int
     u32 = int
     u64 = int
+    i1 = int
     i8 = int
     i16 = int
     i32 = int
@@ -67,10 +69,12 @@ if TYPE_CHECKING:
     void = NoneType
 else:
     u0 = IntType(0, False)
+    u1 = IntType(1, False)
     u8 = IntType(8, False)
     u16 = IntType(16, False)
     u32 = IntType(32, False)
     u64 = IntType(64, False)
+    i1 = IntType(1, True)
     i8 = IntType(8, True)
     i16 = IntType(16, True)
     i32 = IntType(32, True)
@@ -124,6 +128,7 @@ __all__ = [
     'f64',
     'func',
     'func_type',
+    'i1',
     'i8',
     'i16',
     'i32',
@@ -131,6 +136,7 @@ __all__ = [
     'isize',
     'struct',
     'typeof',
+    'u1',
     'u8',
     'u16',
     'u32',

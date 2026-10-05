@@ -19,6 +19,7 @@ from unittest import TestCase, TestSuite
 from .annotations import all_tests as annotations_tests
 from .arrays import all_tests as arrays_tests
 from .basics import all_tests as basics_tests
+from .bitcast import all_tests as bitcast_tests
 from .classname import all_tests as classname_tests
 from .closures import all_tests as closures_tests
 from .complex import all_tests as complex_tests
@@ -49,6 +50,7 @@ from .undefined import all_tests as undefined_tests
 
 all_tests: list[type[TestCase]] = [
     *basics_tests,
+    *bitcast_tests,
     *loops_tests,
     *inline_loops_tests,
     *structs_tests,

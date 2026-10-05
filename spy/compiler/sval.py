@@ -84,7 +84,7 @@ class MirLowerCache:
         """The (interned) MIR mirror of the payload union ``type``."""
         ret = self._union_mirs.get(type)
         if ret is None:
-            ret = mir.UnionType('union', payload)
+            ret = mir.UnionType(f'union[{payload}]', payload)
             self._union_mirs[type] = ret
         return ret
 
@@ -98,14 +98,14 @@ class MirLowerCache:
         if ret is None:
             if child.classify() == SpecialTypeKind.DST:
                 ret = mir.StructType(
-                    'option',
+                    f'option[{child}]',
                     (mir.FormalArg('tag', mir.BoolType()),),
                     child.fam_mir_type(self),
                 )
             else:
                 assert child_mir is not None
                 ret = mir.StructType(
-                    'option',
+                    f'option[{child_mir}]',
                     (
                         mir.FormalArg('tag', mir.BoolType()),
                         mir.FormalArg('value', child_mir),
@@ -119,7 +119,7 @@ class MirLowerCache:
         holds storage: a tag and the (untagged) payload union."""
         ret = self._tagged_union_mirs.get(type)
         if ret is None:
-            ret = mir.StructType('tagged_union', (
+            ret = mir.StructType(f'tagged_union[{payload}]', (
                 mir.FormalArg('tag', tag),
                 mir.FormalArg('payload', payload),
             ))
@@ -132,7 +132,7 @@ class MirLowerCache:
         ret = self._complex_mirs.get(type)
         if ret is None:
             elem = mir.FloatType(type.elem.bits)
-            ret = mir.StructType('complex', (
+            ret = mir.StructType(f'complex[{elem}]', (
                 mir.FormalArg('real', elem),
                 mir.FormalArg('imag', elem),
             ))

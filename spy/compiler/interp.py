@@ -82,6 +82,8 @@ type information of its own.
 
 import math
 import operator
+import struct
+import sys
 import types as pytypes
 from abc import abstractmethod
 from annotationlib import Format
@@ -1339,6 +1341,55 @@ def _convert_inst(
     raise CoerceError(
         f"cannot convert a {from_type} value to {to_type}"
     )
+
+_FLOAT_STRUCT_FMT = {32: '=f', 64: '=d'}
+
+def _scalar_bit_width(t: sval.Type) -> int | None:
+    """The storage width in bits of a scalar type ``std.core.bitcast`` accepts
+    (a boolean is a one-bit integer), or None for every other type."""
+    match t:
+        case sval.BoolType():
+            return 1
+        case sval.IntType():
+            return t.bits
+        case sval.FloatType():
+            return t.bits
+        case _:
+            return None
+
+def _scalar_to_bits(obj: sval.AnyValue, t: sval.Type) -> int:
+    """The integer bit pattern of the scalar compile-time constant ``obj`` of
+    the scalar type ``t`` (see ``HirRunner._builtin_bitcast``)."""
+    match t:
+        case sval.BoolType():
+            assert isinstance(obj, bool), f'expected a bool constant, got {obj!r}'
+            return 1 if obj else 0
+        case sval.IntType():
+            assert isinstance(obj, sval.Int), f'expected an integer constant, got {obj!r}'
+            return obj.value & ((1 << t.bits) - 1) if t.bits > 0 else 0
+        case sval.FloatType():
+            assert isinstance(obj, sval.Float), f'expected a float constant, got {obj!r}'
+            return int.from_bytes(struct.pack(_FLOAT_STRUCT_FMT[t.bits], obj.value), sys.byteorder)
+        case _:
+            raise AssertionError(f'{t} is not a scalar type')
+
+def _scalar_of_bits(bits: int, t: sval.Type) -> sval.AnyValue:
+    """The scalar compile-time constant of the scalar type ``t`` whose bit
+    pattern is ``bits`` (the inverse of ``_scalar_to_bits``)."""
+    match t:
+        case sval.BoolType():
+            return bool(bits & 1)
+        case sval.IntType():
+            if t.bits == 0:
+                return sval.Int(0, t)
+            if t.signed and (bits >> (t.bits - 1)) & 1:
+                bits -= 1 << t.bits
+            return sval.Int(bits, t)
+        case sval.FloatType():
+            data = bits.to_bytes(t.bits // 8, sys.byteorder)
+            return sval.Float(struct.unpack(_FLOAT_STRUCT_FMT[t.bits], data)[0], t)
+        case _:
+            raise AssertionError(f'{t} is not a scalar type')
 
 def _check_comptime_args(
     sig: Signature, args: ArgList[ArgEntry[InterpVal]]
@@ -5466,6 +5517,8 @@ class HirRunner:
             return self._builtin_gstr(args, ret)
         if fn.name == 'sstr':
             return self._builtin_sstr(args, ret)
+        if fn.name == 'bitcast':
+            return self._builtin_bitcast(args, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 
     # -- ``std.core.gstr`` / ``std.core.sstr`` -------------------------------
@@ -5514,6 +5567,60 @@ class HirRunner:
             RuntimeVal(self._string_global(data), self._string_ptr_type()),
             ComptimeVal(sval.Int(len(data), self._usize_type())),
         )))
+        return PollResult.AGAIN
+
+    # -- ``std.core.bitcast`` ------------------------------------------------
+
+    def _builtin_bitcast(
+        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.bitcast(value, T)``: reinterpret the bits of the scalar
+        ``value`` as the scalar type ``T``.  Only booleans, integers and floats
+        are accepted, and the two types must have the same width (a boolean is a
+        one-bit integer, so ``bool <-> i1/u1`` works).
+
+        A compile-time scalar is reinterpreted in Python and stays
+        compile-time; a runtime value is ``mir.BitCast`` - which lowers to a
+        real ``llvm.bitcast`` between an integer and a float, and to a no-op
+        when the two share the LLVM type (a signedness change, or ``bool`` and
+        its ``i1``/``u1`` counterpart, whose MIR types differ but whose LLVM
+        type is the same ``i1``)."""
+        if len(args.positional) != 2 or len(args.kwargs) > 0:
+            raise CompileError('std.core.bitcast takes exactly two arguments')
+        target = self._type_value_arg(
+            args.positional[1], 'the type argument of std.core.bitcast'
+        )
+        ev = self._arg_value(args.positional[0])
+        source = _type_of(ev)
+        if source is None:
+            raise CompileError(
+                'cannot determine the type of the value passed to std.core.bitcast'
+            )
+        source_bits = _scalar_bit_width(source)
+        target_bits = _scalar_bit_width(target)
+        if source_bits is None or target_bits is None:
+            raise CompileError(
+                f'std.core.bitcast supports only integers, floats and booleans, '
+                f'got {source} and {target}'
+            )
+        if source_bits != target_bits:
+            raise CompileError(
+                f'cannot bitcast a {source} ({source_bits} bits) to a {target} '
+                f'({target_bits} bits)'
+            )
+        if source == target:
+            self.store(ret, ev)
+            return PollResult.AGAIN
+        obj = ev.obj if isinstance(ev, ComptimeVal) else None
+        if isinstance(obj, (sval.Int, sval.Float, bool)):
+            # a compile-time scalar: reinterpret it here and keep it compile-time
+            self.store(ret, ComptimeVal(_scalar_of_bits(_scalar_to_bits(obj, source), target)))
+            return PollResult.AGAIN
+        target_mir = target.to_mir_type(self._mir_cache)
+        assert target_mir is not None
+        self.store(ret, RuntimeVal(
+            self._emit(mir.BitCast(self._to_runtime(ev), target_mir)), target
+        ))
         return PollResult.AGAIN
 
     # -- ``std.core.panic`` / ``std.core.catch_unwind`` ----------------------

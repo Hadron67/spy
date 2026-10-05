@@ -670,10 +670,18 @@ class _Lowerer:
                         raise CompileError(f"unsupported conversion '{inst.kind}'")
             case mir.BitCast():
                 value = self._value(inst.value, arg_values)
-                if isinstance(inst.value.get_type(), mir.PointerType) and isinstance(inst.type, mir.PointerType):
-                    # the LLVM IR pointers are untyped (``ptr``): reinterpreting
-                    # one pointer type as another is a no-op, the address is
-                    # used as it is
+                source_type = inst.value.get_type()
+                if (
+                    (isinstance(source_type, mir.PointerType) and isinstance(inst.type, mir.PointerType))
+                    or self._to_llvm(source_type) == self._to_llvm(inst.type)
+                ):
+                    # the reinterpretation has no representation of its own when
+                    # the two types lower to the same LLVM type: every pointer is
+                    # the same opaque ``ptr``, and an integer's signedness (or
+                    # ``bool`` against its ``i1``/``u1`` counterpart) is a
+                    # compile-time notion - the LLVM type is the same, so the
+                    # value is used as it is.  Its MIR type is the target, so the
+                    # signedness a later instruction reads is the new one.
                     result = value
                 else:
                     result = block.bitcast(value, self._to_llvm(inst.type))
