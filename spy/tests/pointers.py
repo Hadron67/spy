@@ -3,6 +3,7 @@ from unittest import TestCase
 from ..compiler import (
     i32,
     syntax,
+    void,
 )
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
@@ -123,6 +124,19 @@ def field_through_ptr(a: i32, b: i32) -> i32:
     return p[...].total()
 
 
+@struct()
+class HasVoid:
+    v: void
+    n: i32
+
+
+@func()
+def ptr_to_void_field(h: HasVoid) -> Ptr[void]:
+    # the address of a zero-sized field has no storage: it is a dangling,
+    # non-null pointer, so it never comes back as the null pointer (``None``)
+    return ref(h.v)
+
+
 class SpyPointerTest(TestCase):
     """Pointers: ``syntax.Ptr`` annotates a pointer type, ``ref`` takes the
     address of a value and ``p[...]`` dereferences a pointer value."""
@@ -158,6 +172,11 @@ class SpyPointerTest(TestCase):
 
     def test_field_through_a_pointer(self) -> None:
         self.assertEqual(field_through_ptr(1, 2), 4)
+
+    def test_a_pointer_to_a_zero_sized_field_is_not_null(self) -> None:
+        # a pointer to a zero-sized place is a dangling, non-null address (a
+        # null one would violate the non-null convention of ``Ptr[T]``)
+        self.assertIsNotNone(ptr_to_void_field(HasVoid(None, 5)))
 
 
 all_tests = [

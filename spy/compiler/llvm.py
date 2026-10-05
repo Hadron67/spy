@@ -374,6 +374,23 @@ class NullValue(Value):
     def get_type(self) -> Type:
         return self.type
 
+@dataclass(frozen=True, slots=True)
+class IntToPtr(Value):
+    """A constant pointer reinterpreted from an integer address (LLVM's
+    constant ``inttoptr``): the non-null, aligned dangling pointer a
+    ``mir.Dangling`` lowers to."""
+
+    value: IntValue
+    type: PointerType
+
+    @override
+    def stringify_value(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue] | None = None) -> str:
+        return f'inttoptr ({self.value.stringify(name_context, local_counter)} to {self.type.stringify(name_context)})'
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
 _CHAR_CODES = [
 
 ]

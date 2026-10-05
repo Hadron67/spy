@@ -8,10 +8,11 @@ through ctypes, and turning the results back into Python values.
 
 A spy value that lives on the Python side is one of:
 
-* :class:`_StructInstance` - a spy struct value: the struct type, the
-  allocation that holds its bytes (``_owner``, kept alive by the instance) and
-  the offset of this value inside it (a nested field view shares its parent's
-  allocation, so it writes through to the parent);
+* :class:`_StructInstance` - a spy struct value: a handle over its
+  :class:`_StructInstanceData` (the struct type, the allocation that holds its
+  bytes, kept alive by the value, and the offset of this value inside it - a
+  nested field view shares its parent's allocation, so it writes through to the
+  parent);
 * :class:`_PtrInstance` - a non-null spy pointer (or a dynamically-sized
   function value, which is a pointer too);
 * :class:`_ExceptionInstance` - the struct instance of a raised spy exception,
@@ -84,58 +85,82 @@ def _address(owner: Any, offset: int) -> int:
     return base + offset
 
 
-class _StructInstance:
-    """A spy struct value held on the Python side.
-the Python side.
+class _StructInstanceData:
+    """The data of a spy struct value on the Python side: the struct's spy type,
+    the allocation the bytes of the value live in (``_owner``, kept alive by the
+    value) and the offset of the value inside it (a nested field view shares its
+    parent's allocation, so it writes through to the parent).  ``_cache`` is the
+    MIR-mirror interning table the layout is computed from.
 
-    ``type`` is the struct's spy type; the bytes of the value live in the
-    ``_owner`` allocation at ``_offset``.  A nested field view shares its
-    parent's owner and adds the field's offset, so it keeps the allocation
-    alive and writes through to the parent.  ``_cache`` is the MIR-mirror
-    interning table the layout is computed from.
+    The fields and methods of the value are reached through :meth:`get_attr` /
+    :meth:`set_attr` rather than ``__getattr__``/``__setattr__``, so that the
+    :class:`_StructInstance` wrapping it can implement attribute access without
+    re-entering itself.  It is held by exactly one :class:`_StructInstance`."""
+
+    __slots__ = ('_cache', '_offset', '_owner', 'type')
+
+    def __init__(self, type: StructType, owner: Any, offset: int, cache: MirLowerCache) -> None:
+        self.type = type
+        self._owner = owner
+        self._offset = offset
+        self._cache = cache
+
+    def _base(self) -> int:
+        return _address(self._owner, self._offset)
+
+    def get_attr(self, name: str, instance: _StructInstance) -> Any:
+        """The value of the field ``name``, or the method ``name`` bound to
+        ``instance``."""
+        index = self.type.field_index(name)
+        if index is not None:
+            return _read_field(self, self.type, index, self._cache)
+        method = self.type.get_method(name)
+        if method is not None:
+            return _BoundMethod(instance, method)
+        raise AttributeError(f'{self.type} has no field or method {name!r}')
+
+    def set_attr(self, name: str, value: Any) -> None:
+        """Write ``value`` into the field ``name``."""
+        index = self.type.field_index(name)
+        if index is None:
+            raise AttributeError(f'{self.type} has no field {name!r}')
+        _write_field(self, self.type, index, value, self._cache)
+
+    def __repr__(self) -> str:
+        return f'{self.type}(...)'
+
+
+class _StructInstance:
+    """A spy struct value held on the Python side: a handle over its
+    :class:`_StructInstanceData`.  ``p.x`` reads the field, ``p.x = v`` writes
+    it, and ``p.m`` is the method ``m`` bound to this value.  Assigning a name
+    that is not a field falls back to an ordinary attribute, which is what
+    ``Exception``'s own attributes (:class:`_ExceptionInstance`) and ``_data``
+    itself need.
 
     It deliberately has no ``__slots__``: :class:`_ExceptionInstance` derives
     from it *and* from ``Exception``, whose layout does not combine with a
     class that has slots of its own."""
 
-    _INTERNAL = ('type', '_owner', '_offset', '_cache')
-
     def __init__(self, type: StructType, owner: Any, offset: int, cache: MirLowerCache) -> None:
-        object.__setattr__(self, 'type', type)
-        object.__setattr__(self, '_owner', owner)
-        object.__setattr__(self, '_offset', offset)
-        object.__setattr__(self, '_cache', cache)
-
-    def _base(self) -> int:
-        return _address(object.__getattribute__(self, '_owner'), object.__getattribute__(self, '_offset'))
+        object.__setattr__(self, '_data', _StructInstanceData(type, owner, offset, cache))
 
     def __getattr__(self, name: str) -> Any:
-        if name in _StructInstance._INTERNAL or name.startswith('_'):
-            raise AttributeError(name)
-        type = object.__getattribute__(self, 'type')
-        cache = object.__getattribute__(self, '_cache')
-        index = type.field_index(name)
-        if index is not None:
-            return _read_field(self, type, index, cache)
-        method = type.get_method(name)
-        if method is not None:
-            return _BoundMethod(self, method)
-        raise AttributeError(f'{type} has no field or method {name!r}')
+        # the data is read with ``object.__getattribute__``, so that a missing
+        # ``_data`` cannot re-enter ``__getattr__``
+        return object.__getattribute__(self, '_data').get_attr(name, self)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in _StructInstance._INTERNAL or name.startswith('_'):
+        data = object.__getattribute__(self, '_data')
+        if data.type.field_index(name) is None:
+            # not a spy field: an ordinary attribute of the wrapper (the
+            # ``Exception`` attributes of ``_ExceptionInstance``, ``_data``...)
             object.__setattr__(self, name, value)
             return
-        type = object.__getattribute__(self, 'type')
-        cache = object.__getattribute__(self, '_cache')
-        index = type.field_index(name)
-        if index is None:
-            raise AttributeError(f'{type} has no field {name!r}')
-        _write_field(self, type, index, value, cache)
+        data.set_attr(name, value)
 
     def __repr__(self) -> str:
-        type = object.__getattribute__(self, 'type')
-        return f'{type}(...)'
+        return repr(object.__getattribute__(self, '_data'))
 
 
 class _PtrInstance:
@@ -319,7 +344,7 @@ def _write(type: Type, value: Any, owner: Any, offset: int, cache: MirLowerCache
             source = _as_instance(value, type)
             mir_type = type.get_mir_type(cache)
             assert mir_type is not None
-            ctypes.memmove(address, source._base(), ctypes.sizeof(to_ctype(mir_type)))
+            ctypes.memmove(address, source._data._base(), ctypes.sizeof(to_ctype(mir_type)))
         case sval.ArrayType():
             raise SpyError('an array cannot cross the Python boundary yet')
         case sval.ComplexType():
@@ -349,7 +374,7 @@ def _as_address(value: Any) -> int | None:
         case _PtrInstance():
             return value._base()
         case _StructInstance():
-            return value._base()
+            return value._data._base()
         case ctypes.c_void_p():
             return value.value
         case None:
@@ -369,8 +394,9 @@ def pointer_value(value: Any, type: Type) -> _PtrInstance:
 
 def _as_instance(value: Any, type: StructType) -> _StructInstance:
     if isinstance(value, _StructInstance):
-        if value.type is not type:
-            raise SpyError(f'cannot use a {value.type} value as a {type} value')
+        data = value._data
+        if data.type is not type:
+            raise SpyError(f'cannot use a {data.type} value as a {type} value')
         return value
     raise SpyError(f'cannot use {value!r} as a {type} value')
 
@@ -405,14 +431,14 @@ def _write_pointer_at(type: Type, position: tuple[int, ...], owner: Any, offset:
     ctypes.c_void_p.from_address(_address(owner, offset)).value = value
 
 
-def _read_field(instance: _StructInstance, type: StructType, index: int, cache: MirLowerCache) -> Any:
+def _read_field(instance: _StructInstanceData, type: StructType, index: int, cache: MirLowerCache) -> Any:
     field = type.fields().get_by_id(index)
     if field.type.is_zst():
         return None
     return _read(field.type, instance._owner, instance._offset + _field_offset(type, index, cache), cache)
 
 
-def _write_field(instance: _StructInstance, type: StructType, index: int, value: Any, cache: MirLowerCache) -> None:
+def _write_field(instance: _StructInstanceData, type: StructType, index: int, value: Any, cache: MirLowerCache) -> None:
     field = type.fields().get_by_id(index)
     if field.type.is_zst():
         return
@@ -463,7 +489,7 @@ def _write_tagged_union(type: sval.TaggedUnionType, value: Any, owner: Any, offs
         _write(type.types[0], value, owner, offset, cache)
         return
     if isinstance(value, _StructInstance):
-        variant_type: Type = value.type
+        variant_type: Type = value._data.type
     else:
         variant_type = type_of(_py(value))
     index = type.variant_index_for(variant_type)
@@ -484,7 +510,9 @@ def _write_tagged_union(type: sval.TaggedUnionType, value: Any, owner: Any, offs
 def arg_spy_type(value: Any) -> Type | None:
     """The spy type of one Python argument (``None`` for a value with no spy
     type)."""
-    if isinstance(value, (_StructInstance, _PtrInstance)):
+    if isinstance(value, _StructInstance):
+        return value._data.type
+    if isinstance(value, _PtrInstance):
         return value.type
     return type_of(value, _INT_LITERAL_BITS)
 

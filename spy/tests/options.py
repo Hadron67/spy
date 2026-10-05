@@ -1,3 +1,4 @@
+from typing import Literal
 from unittest import TestCase
 
 from ..compiler import (
@@ -9,11 +10,13 @@ from ..compiler import (
     mir,
     sval,
     u0,
+    void,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
+    Array,
     Comptime,
     Option,
     Ptr,
@@ -316,6 +319,57 @@ def use_maybe_two(x: i32, c: spy_bool) -> i32:
     return x + take_two(o)
 
 
+@struct()
+class ZstArrayMixed:
+    """A zero-sized field that still *reports* a pointer child: a zero-length
+    array whose element is a pointer.  It holds no storage, so an option
+    looking for its tag must not descend into it (see
+    ``find_first_pointer_type_pos``)."""
+
+    z: Array[Ptr[i32], Literal[0]]
+    a: i32
+    p: Ptr[i32]
+
+
+@func()
+def maybe_zst_array(p: Ptr[i32], a: i32, c: spy_bool) -> Option[ZstArrayMixed]:
+    # the zero-length array field is not a tag: the option tags on ``p``
+    if c:
+        return ZstArrayMixed(None, a, p)  # pyright: ignore
+    return None
+
+
+@func()
+def take_zst_array(o: Option[ZstArrayMixed]) -> i32:
+    return 8
+
+
+@func()
+def use_maybe_zst_array(x: i32, c: spy_bool) -> i32:
+    y = x
+    o = maybe_zst_array(ref(y), x, c)
+    return x + take_zst_array(o)
+
+
+@struct()
+class ZstField:
+    """A struct with a zero-sized field: the address of that field has no
+    storage, so it is a dangling (non-null) pointer."""
+
+    v: void
+    n: i32
+
+
+@func()
+def maybe_void_ptr(b: spy_bool) -> Option[Ptr[void]]:
+    # the option *is* the pointer: a present one has to be non-null, which the
+    # address of the zero-sized field is by being dangling (see ``mir.Dangling``)
+    x = ZstField(None, 1)
+    if b:
+        return ref(x.v)
+    return None
+
+
 class SpyOptionNestingTest(TestCase):
     """The tag of a nested option: an ``Option`` uses one pointer of its child
     as its tag, so it has one fewer than the child and ``Option[Option[T]]``
@@ -360,6 +414,17 @@ class SpyOptionNestingTest(TestCase):
     def test_nested_option_of_a_two_pointer_struct(self) -> None:
         self.assertEqual(use_maybe_two(10, True), 16)
         self.assertEqual(use_maybe_two(10, False), 16)
+
+    def test_a_zero_sized_field_is_not_descended_into(self) -> None:
+        # a zero-length array of pointers is zero-sized: it holds no storage,
+        # so its element pointer is not a usable tag - the search skips that
+        # field and finds the struct's real pointer instead
+        mixed = struct_type(ZstArrayMixed)
+        self.assertEqual(sval.find_first_pointer_type_pos(mixed), (2,))
+
+    def test_nested_option_of_a_struct_with_a_zero_sized_pointer_field(self) -> None:
+        self.assertEqual(use_maybe_zst_array(10, True), 18)
+        self.assertEqual(use_maybe_zst_array(10, False), 18)
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +1009,12 @@ class SpyPythonSideOptionTest(TestCase):
         self.assertEqual((h.o, h.n), (5, 1))
         h2 = OptHolder(None, 1)
         self.assertIsNone(h2.o)
+
+    def test_a_present_option_of_a_zero_sized_pointer(self) -> None:
+        # a pointer to a zero-sized place is a dangling, non-null address, so a
+        # present option does not read as absent
+        self.assertIsNotNone(maybe_void_ptr(True))
+        self.assertIsNone(maybe_void_ptr(False))
 
 
 all_tests = [

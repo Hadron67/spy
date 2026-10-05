@@ -335,6 +335,24 @@ class NullValue(Value):
         return (self.type,)
 
 
+@dataclass(frozen=True, slots=True)
+class Dangling(Value):
+    """A non-null, *dangling* pointer constant: its address is the pointee's
+    alignment (rust's ``NonNull::dangling``).  It is what
+    ``sval.Undefined(Ptr[T])`` lowers to, because null is not a legal value of
+    a non-null pointer, so an undefined pointer may not be null either
+    (see ``lower``)."""
+
+    type: PointerType
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.type,)
+
+
 @dataclass(frozen=True)
 class UndefValue(Value):
     """The undefined value of the aggregate type ``type``: the base an

@@ -395,6 +395,18 @@ class _Lowerer:
             return sllvm.NullValue(ptr_type)
         if isinstance(value, mir.UndefValue):
             return sllvm.Undef(self._to_llvm(value.type))
+        if isinstance(value, mir.Dangling):
+            # a dangling pointer: the pointee's *actual* alignment as the
+            # address, so it is non-null (see ``mir.Dangling``).  A pointer to a
+            # zero-sized type has ``void`` as its pointee, whose alignment the
+            # layout has (1).
+            ptr_type = self._to_llvm(value.type)
+            assert isinstance(ptr_type, sllvm.PointerType)
+            align = self._layout.align_of(self._to_llvm(value.type.elem))
+            return sllvm.IntToPtr(
+                sllvm.IntValue(align, sllvm.IntType(self._layout.pointer_size * 8)),
+                ptr_type,
+            )
         if isinstance(value, mir.GlobalValue):
             return self.lower_global(value)
         raise CompileError(f'cannot lower value {value!r}')

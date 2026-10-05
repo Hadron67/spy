@@ -606,9 +606,16 @@ def _is_undefined_val(val: InterpVal) -> bool:
     """Whether the value is the undefined literal - the untyped
     ``sval.UntypedUndefined`` ``std.core.undefined`` evaluates to, or the typed
     ``sval.Undefined`` it becomes once it is coerced to a type: a store of one
-    leaves its destination undefined (see ``HirRunner.store``)."""
+    leaves its destination undefined (see ``HirRunner.store``).
+
+    A typed ``sval.Undefined`` of a *pointer* type is not one: null is not a
+    legal value of a non-null pointer, so it stands for a dangling - but
+    defined - pointer, and a store of it writes that pointer (see
+    ``mir.Dangling``)."""
     obj = _to_comptime(_shallow_normalize(val))
-    return isinstance(obj, (sval.UntypedUndefined, sval.Undefined))
+    if isinstance(obj, sval.Undefined):
+        return not isinstance(obj.type, sval.PointerType)
+    return isinstance(obj, sval.UntypedUndefined)
 
 def _aggregate_place_types(type: sval.Type) -> tuple[sval.Type, ...]:
     """The type of every place of the aggregate ``type``, in place order: the
@@ -891,11 +898,16 @@ def _sval_to_runtime(value: sval.AnyValue, cache: sval.MirLowerCache) -> mir.Val
             assert isinstance(mir_type, mir.PointerType)
             return mir.ExternSymbol(value.linkname, mir_type)
         case sval.Undefined():
-            # an undefined value has no defined content: it materializes as
-            # LLVM's ``undef`` of its type
+            # an undefined value has no defined content.  For a pointer it may
+            # not be LLVM's ``undef``: null is not a legal value of a non-null
+            # ``Ptr[T]``, so an undefined pointer is a dangling (non-null,
+            # aligned) address instead (see ``mir.Dangling``)
             mir_type = value.type.to_mir_type(cache)
             if mir_type is None:
                 raise _no_runtime_type(value.type)
+            if isinstance(value.type, sval.PointerType):
+                assert isinstance(mir_type, mir.PointerType)
+                return mir.Dangling(mir_type)
             return mir.UndefValue(mir_type)
         case _:
             raise CompileError(f"cannot return the compile-time value {value!r}")

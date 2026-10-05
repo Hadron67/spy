@@ -1117,12 +1117,21 @@ def find_first_pointer_type_pos(type: Type, shift: int = 0) -> tuple[int, ...] |
     entering an option while searching skips one (that is what ``shift``
     starts the count with - the outer ``Option[Option[T]]`` claims ``T``'s
     second pointer, not its first).  Iterative (an explicit stack and two
-    counters), so nesting costs no Python stack."""
+    counters), so nesting costs no Python stack.
+
+    A zero-sized node holds no storage and so holds no usable pointer: it is
+    not descended into.  (A zero-length array still reports its element as a
+    child even though it has no elements, so descending would otherwise treat
+    a pointer that has no storage as a tag.)"""
     pointers = 0
     claimed = shift
     todo: list[tuple[Type, tuple[int, ...]]] = [(type, ())]
     while todo:
         current, pos = todo.pop()
+        if current.is_zst():
+            # a zero-sized value has no storage, so it cannot hold a pointer an
+            # option may use as its tag: do not descend into it
+            continue
         if isinstance(current, PointerType):
             if claimed == pointers:
                 return pos
