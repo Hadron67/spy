@@ -2,6 +2,13 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    c_char,
+    c_int,
+    c_long,
+    c_short,
+    c_uchar,
+    c_uint,
+    c_ulonglong,
     i32,
     i64,
     mir,
@@ -508,9 +515,58 @@ class SpyLayoutOfTest(TestCase):
             layout_align_unsized_opaque()
 
 
+@func()
+def c_int_roundtrip(n: c_int) -> c_int:
+    return n + 1
+
+
+@func()
+def c_ulonglong_echo(n: c_ulonglong) -> c_ulonglong:
+    return n
+
+
+@struct()
+class CInts:
+    a: c_int
+    b: c_short
+    c: c_char
+
+
+@func()
+def c_struct_sum(x: c_int) -> c_int:
+    s = CInts(x, 2, 3)
+    return s.a + s.b + s.c
+
+
+class SpyCTypeTest(TestCase):
+    """The C integer types: markers (like ``usize``/``isize``) whose width - and,
+    for ``c_char``, signedness - is read off the compile target (``TargetInfo``)."""
+
+    def test_c_types_resolve_to_target_ints(self) -> None:
+        target = _GLOBAL_CONTEXT.target_info()
+        self.assertEqual(sval.as_value(c_char, _GLOBAL_CONTEXT), sval.IntType(target.c_char_bits, True))
+        self.assertEqual(sval.as_value(c_uchar, _GLOBAL_CONTEXT), sval.IntType(target.c_char_bits, False))
+        self.assertEqual(sval.as_value(c_short, _GLOBAL_CONTEXT), sval.IntType(target.c_short_bits, True))
+        self.assertEqual(sval.as_value(c_int, _GLOBAL_CONTEXT), sval.IntType(target.c_int_bits, True))
+        self.assertEqual(sval.as_value(c_uint, _GLOBAL_CONTEXT), sval.IntType(target.c_int_bits, False))
+        self.assertEqual(sval.as_value(c_long, _GLOBAL_CONTEXT), sval.IntType(target.c_long_bits, True))
+        self.assertEqual(
+            sval.as_value(c_ulonglong, _GLOBAL_CONTEXT),
+            sval.IntType(target.c_longlong_bits, False),
+        )
+
+    def test_a_c_typed_function_round_trips(self) -> None:
+        self.assertEqual(c_int_roundtrip(41), 42)
+        self.assertEqual(c_ulonglong_echo(7), 7)
+
+    def test_c_typed_struct_fields(self) -> None:
+        self.assertEqual(c_struct_sum(5), 10)
+
+
 all_tests = [
     SpyTypeClassifyTest,
     SpyDstTest,
     SpyOpaqueAndUnsizedTest,
     SpyLayoutOfTest,
+    SpyCTypeTest,
 ]

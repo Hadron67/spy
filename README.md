@@ -49,7 +49,7 @@ Python 值在调用边界按以下规则映射：
 | `syntax.Ptr[T]` | `sval.PointerType`（见下） |
 | `syntax.Option[T]` | `sval.OptionType`（见下） |
 
-可用的类型注解值：`spy.bool`、`spy.u8/u16/u32/u64`、`spy.i8/i16/i32/i64`、`spy.f32/f64`、`spy.void`。想以非默认类型传参时用 `spy.as_(value, T)`：
+可用的类型注解值：`spy.bool`、`spy.u8/u16/u32/u64`、`spy.i8/i16/i32/i64`、`spy.f32/f64`、`spy.void`。C 整数类型 `spy.c_char/c_uchar`、`spy.c_short/c_ushort`、`spy.c_int/c_uint`、`spy.c_long/c_ulong`、`spy.c_longlong/c_ulonglong` 也可用作注解，它们的宽度（以及 `c_char` 的符号）由目标平台的 `TargetInfo` 决定（`c_long` 在 Windows 为 32 位、在常见 64 位 Unix 上为 64 位）。想以非默认类型传参时用 `spy.as_(value, T)`：
 
 ```python
 add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64))

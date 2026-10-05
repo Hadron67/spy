@@ -2741,6 +2741,26 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         return IntType(ctx.target_info().usize_bits, False)
     if value is syntax.ISize:
         return IntType(ctx.target_info().usize_bits, True)
+    if value is syntax.c_char:
+        return IntType(ctx.target_info().c_char_bits, True)
+    if value is syntax.c_uchar:
+        return IntType(ctx.target_info().c_char_bits, False)
+    if value is syntax.c_short:
+        return IntType(ctx.target_info().c_short_bits, True)
+    if value is syntax.c_ushort:
+        return IntType(ctx.target_info().c_short_bits, False)
+    if value is syntax.c_int:
+        return IntType(ctx.target_info().c_int_bits, True)
+    if value is syntax.c_uint:
+        return IntType(ctx.target_info().c_int_bits, False)
+    if value is syntax.c_long:
+        return IntType(ctx.target_info().c_long_bits, True)
+    if value is syntax.c_ulong:
+        return IntType(ctx.target_info().c_long_bits, False)
+    if value is syntax.c_longlong:
+        return IntType(ctx.target_info().c_longlong_bits, True)
+    if value is syntax.c_ulonglong:
+        return IntType(ctx.target_info().c_longlong_bits, False)
     if value is syntax.Opaque:
         # an opaque type: a dynamically-sized type of unknown layout, of which
         # only a pointer (a void pointer) is a value

@@ -101,6 +101,41 @@ class USize:
 class ISize:
     pass
 
+# The C integer types: like ``USize``/``ISize``, each is a *marker* whose width
+# (and, for ``c_char``, signedness) is decided by the compile target - see
+# ``TargetInfo`` and ``sval.as_value``.  ``c_char``/``c_short``/... are the
+# signed spellings, ``c_uchar``/``c_ushort``/... the unsigned ones.
+
+class c_char:
+    pass
+
+class c_uchar:
+    pass
+
+class c_short:
+    pass
+
+class c_ushort:
+    pass
+
+class c_int:
+    pass
+
+class c_uint:
+    pass
+
+class c_long:
+    pass
+
+class c_ulong:
+    pass
+
+class c_longlong:
+    pass
+
+class c_ulonglong:
+    pass
+
 class Opaque:
     """An opaque type: a dynamically-sized type of unknown layout.  It is
     converted to ``sval.OpaqueType`` and, as a bare name, is only usable behind

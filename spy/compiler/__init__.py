@@ -23,6 +23,7 @@ from types import NoneType
 from typing import TYPE_CHECKING
 
 from . import builtins as _builtins
+from . import syntax
 from .dsl import builtin_func, decl_func, func, func_type, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, FloatType, IntType, VoidType
@@ -50,6 +51,16 @@ if TYPE_CHECKING:
     f64 = float
     usize = int
     isize = int
+    c_char = int
+    c_uchar = int
+    c_short = int
+    c_ushort = int
+    c_int = int
+    c_uint = int
+    c_long = int
+    c_ulong = int
+    c_longlong = int
+    c_ulonglong = int
     bool = pybuiltins.bool
     void = NoneType
 else:
@@ -64,6 +75,16 @@ else:
     i64 = IntType(64, True)
     usize = USize
     isize = ISize
+    c_char = syntax.c_char
+    c_uchar = syntax.c_uchar
+    c_short = syntax.c_short
+    c_ushort = syntax.c_ushort
+    c_int = syntax.c_int
+    c_uint = syntax.c_uint
+    c_long = syntax.c_long
+    c_ulong = syntax.c_ulong
+    c_longlong = syntax.c_longlong
+    c_ulonglong = syntax.c_ulonglong
     f32 = FloatType(32)
     f64 = FloatType(64)
     bool = BoolType()
@@ -81,6 +102,16 @@ __all__ = [
     'as_',
     'bool',
     'builtin_func',
+    'c_char',
+    'c_int',
+    'c_long',
+    'c_longlong',
+    'c_short',
+    'c_uchar',
+    'c_uint',
+    'c_ulong',
+    'c_ulonglong',
+    'c_ushort',
     'compile_log',
     'decl_func',
     'f32',
