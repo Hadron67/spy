@@ -201,6 +201,43 @@ def compiled_closure_mutates_its_captured_copy() -> i32:
     return f() * 1000 + s.a
 
 
+@func()
+def compiled_closure_captures_a_comptime_tuple() -> i32:
+    # a captured tuple is a compile-time pointer of its own: the capture is
+    # rebuilt as a place tree (see ``ComptimeTuplePtr``)
+    t: Comptime = (3, 4)
+
+    @syntax.closure(inline=False)
+    def f() -> i32:
+        return t[0] + t[1]
+
+    return f()
+
+
+@func()
+def compiled_closure_captures_a_tuple_with_a_runtime_element(x: i32) -> i32:
+    # the tuple's runtime element is copied in as a MIR argument, its compile-time
+    # element rides along as compile-time content (see ``ComptimePtrArg``)
+    t: Comptime = (x, 5)
+
+    @syntax.closure(inline=False)
+    def f() -> i32:
+        return t[0] + t[1]
+
+    return f()
+
+
+@func()
+def compiled_closure_captures_an_aggregate_with_a_runtime_element(x: i32) -> i32:
+    s: Comptime = Little(x, 2)
+
+    @syntax.closure(inline=False)
+    def f() -> i32:
+        return s.a + s.b
+
+    return f()
+
+
 # -- a compile-time capture baked into a function pointer -------------------
 
 
@@ -266,6 +303,17 @@ class SpyComptimePtrTest(TestCase):
 
     def test_a_compiled_closure_mutates_its_captured_copy(self) -> None:
         self.assertEqual(compiled_closure_mutates_its_captured_copy(), 102001)
+
+    def test_a_compiled_closure_captures_a_comptime_tuple(self) -> None:
+        self.assertEqual(compiled_closure_captures_a_comptime_tuple(), 7)
+
+    def test_a_compiled_closure_captures_a_tuple_with_a_runtime_element(self) -> None:
+        self.assertEqual(compiled_closure_captures_a_tuple_with_a_runtime_element(10), 15)
+
+    def test_a_compiled_closure_captures_an_aggregate_with_a_runtime_element(self) -> None:
+        self.assertEqual(
+            compiled_closure_captures_an_aggregate_with_a_runtime_element(10), 12,
+        )
 
     def test_a_comptime_capture_baked_into_a_function_pointer(self) -> None:
         self.assertEqual(comptime_capture_as_func_ptr(), 6)
