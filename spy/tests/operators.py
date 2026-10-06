@@ -121,6 +121,9 @@ class OpVec:
     def __bool__(self) -> spy_bool:
         return self.v != 0
 
+    def __len__(self) -> i32:
+        return self.v * 2
+
     def __and__(self, other: OpVec) -> OpVec:
         return OpVec(self.v & other.v)
 
@@ -164,6 +167,13 @@ def overload_bool(a: i32) -> spy_bool:
     if OpVec(a):  # noqa: SIM103
         return True
     return False
+
+
+@func()
+def overload_len(a: i32) -> i32:
+    # ``len`` of a struct answers through its own ``__len__`` (undecorated, so
+    # the method is inlined)
+    return len(OpVec(a))
 
 
 @func()
@@ -242,6 +252,9 @@ class SpyOperatorTest(TestCase):
     def test_struct_bool(self) -> None:
         self.assertFalse(overload_bool(0))
         self.assertTrue(overload_bool(1))
+
+    def test_struct_len(self) -> None:
+        self.assertEqual(overload_len(3), 6)
 
     def test_struct_bitand(self) -> None:
         self.assertEqual(overload_bitand(0b1100, 0b1010), 8)

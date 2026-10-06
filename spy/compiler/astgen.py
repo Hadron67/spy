@@ -977,15 +977,15 @@ class _Builder:
         return False, node
 
     def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], inline_mode: hir.InlineMode = hir.InlineMode.NONE) -> hir.Value:
-        """The tuple of addresses a destructuring target denotes: a plain
-        target contributes the address of its slot (or field), a nested
+        """The tuple of addresses a destructuring target denotes (``hir.TuplePtr``):
+        a plain target contributes the address of its slot (or field), a nested
         tuple target contributes its own tuple of addresses.  Only a name
         that is bound nowhere is declared (see ``_gen_assign``); its fresh slot
         keeps values inline as ``inline_mode`` says (see ``_gen_lhs``)."""
-        elems: list[ArgEntry[hir.Value]] = []
+        elems: list[hir.Value] = []
         for elt in target.elts:
             if isinstance(elt, ast.Tuple):
-                elems.append(ArgEntry(self._gen_target_tuple(elt, new_slots, inline_mode), False))
+                elems.append(self._gen_target_tuple(elt, new_slots, inline_mode))
                 continue
             if isinstance(elt, ast.Name):
                 slot = self._lookup_within_function(elt.id)
@@ -1000,8 +1000,8 @@ class _Builder:
                 raise CompileError(
                     f"target of a destructuring assignment must be addressable, got {elt}"
                 )
-            elems.append(ref)
-        return self.add(hir.Tuple(tuple(elems)))
+            elems.append(ref.value)
+        return self.add(hir.TuplePtr(tuple(elems)))
 
     def _gen_augassign(self, node: ast.AugAssign) -> None:
         """One ``name += expr`` statement: read the value, add ``expr``
@@ -1088,6 +1088,10 @@ class _Builder:
             )
         if builtin is ord:
             # ``ord(x)`` is lowered to ``hir.Ord`` by the call parser (see
+            # ``_gen_call``)
+            return builtin
+        if builtin is len:
+            # ``len(x)`` is lowered to ``hir.Len`` by the call parser (see
             # ``_gen_call``)
             return builtin
         if builtin is isinstance:
@@ -1688,6 +1692,14 @@ class _Builder:
                     raise CompileError('ord takes exactly one argument')
                 operand = self._as_value(self._gen_expr(node.args[0])[0])
                 self.add(hir.Ord(operand, result_loc))
+                return
+            if fn_global is len:
+                # ``len(x)``: the number of elements of a tuple, or a struct's
+                # own ``__len__`` (see ``hir.Len``)
+                if len(node.args) != 1 or len(node.keywords) > 0:
+                    raise CompileError('len takes exactly one argument')
+                operand = self._gen_expr(node.args[0])[0]
+                self.add(hir.Store(result_loc, self.add(hir.Len(operand))))
                 return
         if isinstance(node.func, ast.Attribute):
             # a method of the struct ``base``: the method and its self

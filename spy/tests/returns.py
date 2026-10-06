@@ -200,6 +200,62 @@ def bad_ellipsis_return(x: i32) -> tuple[i32, ...]:
     return x  # pyright: ignore[reportReturnType]
 
 
+# ---------------------------------------------------------------------------
+# a packed tuple is a compile-time place tree: its element count is known with
+# ``len`` (a compile-time integer), and its i-th element is a *place* read and
+# written with ``t[i]`` (a compile-time integer index, bounds-checked).
+# ---------------------------------------------------------------------------
+
+
+@func()
+def packed_len(x: i32) -> i32:
+    packed: Comptime = min_max(x, x + 1)
+    return len(packed)  # pyright: ignore
+
+
+@func()
+def nested_packed_len(x: i32) -> i32:
+    packed: Comptime = nested_multi(x)
+    return len(packed)  # pyright: ignore
+
+
+@func()
+def packed_index(x: i32) -> i32:
+    packed: Comptime = min_max(x, x + 100)
+    return packed[0] * 1000 + packed[1]  # pyright: ignore
+
+
+@func()
+def packed_nested_index(x: i32) -> i32:
+    packed: Comptime = nested_multi(x)
+    return packed[0] * 100 + packed[1][0]  # pyright: ignore
+
+
+@func()
+def packed_index_write(x: i32) -> i32:
+    packed: Comptime = min_max(x, x + 1)
+    packed[0] = 100  # pyright: ignore
+    return packed[0] + packed[1]  # pyright: ignore
+
+
+@func()
+def bad_packed_index_oob(x: i32) -> i32:
+    packed: Comptime = min_max(x, x + 1)
+    return packed[5]  # pyright: ignore
+
+
+@func()
+def bad_packed_index_runtime(x: i32) -> i32:
+    packed: Comptime = min_max(x, x + 1)
+    return packed[x]  # pyright: ignore
+
+
+@func()
+def bad_packed_index_negative(x: i32) -> i32:
+    packed: Comptime = min_max(x, x + 1)
+    return packed[-1]  # pyright: ignore
+
+
 class SpyMultiReturnTest(TestCase):
     """A function annotated ``-> tuple[T1, T2, ...]`` returns several values:
     the lowered function returns one of them by value and delivers every other
@@ -338,6 +394,33 @@ class SpyMultiReturnTest(TestCase):
     def test_a_varying_number_of_results_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
             bad_ellipsis_return(3)
+
+    def test_len_of_a_packed_tuple(self) -> None:
+        self.assertEqual(packed_len(3), 2)
+
+    def test_len_of_a_nested_packed_tuple(self) -> None:
+        self.assertEqual(nested_packed_len(3), 3)
+
+    def test_indexing_a_packed_tuple(self) -> None:
+        self.assertEqual(packed_index(3), 3103)
+
+    def test_indexing_a_nested_packed_tuple(self) -> None:
+        self.assertEqual(packed_nested_index(3), 304)
+
+    def test_writing_a_packed_tuple_element(self) -> None:
+        self.assertEqual(packed_index_write(3), 104)
+
+    def test_a_packed_tuple_index_out_of_bounds_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_packed_index_oob(3)
+
+    def test_a_packed_tuple_index_must_be_a_compile_time_integer(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_packed_index_runtime(3)
+
+    def test_a_negative_packed_tuple_index_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_packed_index_negative(3)
 
 
 all_tests = [

@@ -19,7 +19,10 @@ Values in the register table are either
   Python ``None``, and the ``None`` the source writes is the absent value
   of an option, ``sval.Null()``,
 * :class:`ComptimeTuple`/:class:`ComptimeDict` - a compile-time
-  aggregate whose elements are themselves interpreter values,
+  aggregate whose elements are themselves interpreter values, and
+  :class:`ComptimeTuplePtr`/:class:`ComptimeDictPtr` - their pointer
+  forms, one place per element (a tuple/dict variable or a destructuring
+  target),
 * :class:`RuntimeVal` - the object of an already emitted MIR
   instruction (a typed runtime value),
 * :class:`PendingSlot` - an executed ``Alloca`` that is only committed
@@ -29,9 +32,11 @@ Values in the register table are either
 * :class:`ComptimeBox` - the compile-time memory a committed
   compile-time slot materializes into (a pointer to a compile-time
   value), or
-* :class:`ComptimeResult` - the result location of a function: the places
-  its normal value, its error code and its payload union are delivered into
-  (the interpreter's form of a :class:`sval.ResultType`).
+* :class:`ComptimeResultPtr` - the result location of a function: the
+  places its normal value, its error code and its payload union are
+  delivered into (the interpreter's form of a :class:`sval.ResultType`).
+  It is the one interpreter place that is not an :class:`InterpVal` (it
+  never flows as a value; see :class:`ComptimeResultPtr`).
 
 Instructions whose operands are all compile-time values are evaluated
 eagerly in Python (the comptime semantics of the DSL); instructions
@@ -185,6 +190,7 @@ _COMPARE_METHODS: dict[str, tuple[str, str]] = {
 # the magic method of every unary operator, and the one ``bool(x)`` uses
 _UNARY_METHODS: dict[str, str] = {'-': '__neg__', '~': '__invert__'}
 _BOOL_METHOD = '__bool__'
+_LEN_METHOD = '__len__'
 
 
 @dataclass(slots=True)
@@ -295,7 +301,7 @@ class _PendingTuple(_PendingActionData):
     # written.  Recording it as an action (rather than committing the slot
     # right away) keeps the slot's type resolution - and the conflict it
     # reports against any other store into the slot - intact.
-    places: tuple[ArgEntry[InterpVal], ...]
+    places: tuple[InterpVal, ...]
 
     @override
     def info(self) -> tuple[sval.Type, bool]:
@@ -386,14 +392,21 @@ class PendingSlot(InterpVal):
         return not (self.inline_mode == InlineMode.NON_AGGREGATE and _is_aggregate(type))
 
 @dataclass(frozen=True, slots=True)
-class ComptimeResult(InterpVal):
-    """The value form of a :class:`sval.ResultType`: the result location of a
-    function - the place its normal result is delivered into, the place of its
+class ComptimeResultPtr:
+    """The *pointer* form of a :class:`sval.ResultType`: the result location of
+    a function - the place its normal result is delivered into, the place of its
     error code and the place of its payload union, in that order.  The places
     are :class:`PendingSlot`s while the location is not committed yet (the code
     and payload widths follow from the exception set at the commit, see
     ``_commit_error_space``), and the materialized places afterwards (a
-    ``ComptimeBox`` for a zero-sized one)."""
+    ``ComptimeBox`` for a zero-sized one).
+
+    Unlike every other interpreter value, a result location is *not* an
+    :class:`InterpVal`: it is a composite place that only ever occurs as the
+    frame's own result location (see ``InlineFrame.ret_loc``), never as a value
+    an expression produces or consumes, so it has no place in ``_type_of``'s
+    world.  A call hands its own result location over as the separate
+    ``ret_loc``/``err_loc`` places (see ``_deliver_result``)."""
 
     value: InterpVal
     code: InterpVal
@@ -401,11 +414,38 @@ class ComptimeResult(InterpVal):
 
 @dataclass(frozen=True, slots=True)
 class ComptimeTuple(InterpVal):
+    """The value form of a tuple: a tuple of *operands* (a value or a
+    reference to one, see :class:`ArgEntry`), the shape a ``tuple`` expression
+    or a multi-value result has.  A tuple has no runtime representation of its
+    own; its pointer form is :class:`ComptimeTuplePtr`."""
+
     values: tuple[ArgEntry[InterpVal], ...]
 
 @dataclass
 class ComptimeDict(InterpVal):
+    """The value form of a ``**kwargs`` dictionary: one operand per name (see
+    :class:`ComptimeDictPtr` for its pointer form)."""
+
     values: dict[str, ArgEntry[InterpVal]]
+
+@dataclass(frozen=True, slots=True)
+class ComptimeTuplePtr(InterpVal):
+    """The pointer form of a tuple: one *place* per element, in order - the
+    storage a tuple variable or a multi-value result location is held as (a
+    tuple has no representation of its own, so the tuple of places is the
+    storage).  It is the tuple counterpart of :class:`ComptimeAggregatePtr`:
+    ``HirRunner.load`` reads the tuple value out of it, ``HirRunner.store``
+    distributes a value into the element places, and a destructuring target is
+    one of these (see ``_gen_target_tuple``/``hir.TuplePtr``)."""
+
+    values: tuple[InterpVal, ...]
+
+@dataclass
+class ComptimeDictPtr(InterpVal):
+    """The pointer form of a ``**kwargs`` dictionary: one place per name (the
+    storage a ``**kwargs`` parameter is bound to; see :class:`ComptimeDict`)."""
+
+    values: dict[str, InterpVal]
 
 @dataclass(frozen=True, slots=True)
 class ComptimeAggregate(InterpVal):
@@ -552,8 +592,15 @@ def _is_comptime_val(val: InterpVal) -> bool:
                 todo.append(val.payload_ptr)
             case ComptimeTuple():
                 todo.extend(a.value for a in val.values)
+            case ComptimeTuplePtr():
+                # a tuple place tree is comptime when every element place is (see
+                # ``ComptimeTuplePtr``)
+                todo.extend(val.values)
             case ComptimeDict():
                 todo.extend(a.value for a in val.values.values())
+            case ComptimeDictPtr():
+                # and its dict place form (see ``ComptimeDictPtr``)
+                todo.extend(val.values.values())
             case ComptimeAggregate():
                 # a compile-time aggregate is comptime when everything it holds
                 # is, like a tuple or a box (see ``ComptimeAggregate``)
@@ -806,7 +853,7 @@ class BlockFrame:
     data: BlockFrameData
 
 class InlineFrame:
-    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResult, insts: tuple[hir.Inst, ...], fn_name: str, value_is_empty: bool = False, on_done: Callable[[], None] | None = None, compile_vars: CompileVars | None = None, closure_values: tuple[InterpVal, ...] = ()) -> None:
+    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResultPtr, insts: tuple[hir.Inst, ...], fn_name: str, value_is_empty: bool = False, on_done: Callable[[], None] | None = None, compile_vars: CompileVars | None = None, closure_values: tuple[InterpVal, ...] = ()) -> None:
         self.generic_var_values = generic_var_values
         self.arg_values = arg_values
         # the name of the function this frame executes (the specialization's
@@ -825,7 +872,7 @@ class InlineFrame:
         # the frame's result location: the place its result is delivered into and
         # the function proper's error places (an inlined plain body raises into
         # the enclosing function's error location, so it shares them)
-        self.ret_loc: ComptimeResult = ret_loc
+        self.ret_loc: ComptimeResultPtr = ret_loc
         # whether the body of this frame has no value to return (the *declared*
         # one of an inlined plain-Python body; the function proper's own type is
         # asked for when it runs, see ``HirRunner._current_value_is_empty``)
@@ -989,6 +1036,36 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
                     return None
                 types.append(entry_type)
             return sval.TupleType(tuple(types), False)
+        case ComptimeTuplePtr():
+            # the storage of a tuple: a pointer to the tuple of the types of the
+            # element places (see ``ComptimeTuplePtr``)
+            element_types: list[sval.Type] = []
+            for place in ev.values:
+                place_type = _place_type(place)
+                if place_type is None:
+                    return None
+                element_types.append(place_type)
+            return sval.PointerType(sval.TupleType(tuple(element_types), False), is_const=False)
+        case ComptimeDict():
+            # a dictionary of values: its type is the ``{name: type}`` of the
+            # types of the values its entries denote (see ``sval.StrDictType``)
+            values: dict[str, sval.Type] = {}
+            for name, entry in ev.values.items():
+                entry_type = _arg_type_of(entry)
+                if entry_type is None:
+                    return None
+                values[name] = entry_type
+            return sval.StrDictType(frozendict(values))
+        case ComptimeDictPtr():
+            # the storage of a dictionary: a pointer to the ``{name: type}`` of
+            # the types of the element places (see ``ComptimeDictPtr``)
+            name_types: dict[str, sval.Type] = {}
+            for name, place in ev.values.items():
+                place_type = _place_type(place)
+                if place_type is None:
+                    return None
+                name_types[name] = place_type
+            return sval.PointerType(sval.StrDictType(frozendict(name_types)), is_const=False)
         case _:
             return None
 
@@ -1098,13 +1175,13 @@ def _place_type(place: InterpVal) -> sval.Type | None:
         return type.elem
     return None
 
-def _tuple_places_type(places: tuple[ArgEntry[InterpVal], ...]) -> sval.Type:
+def _tuple_places_type(places: tuple[InterpVal, ...]) -> sval.Type:
     # the type of a tuple of element places (see ``init_tuple``): a tuple has
     # no representation of its own, so this is the tuple of the types of the
     # places themselves
     types: list[sval.Type] = []
     for place in places:
-        type = _place_type(place.value)
+        type = _place_type(place)
         if type is None:
             raise CompileError('a tuple element has no type yet')
         types.append(type)
@@ -1119,23 +1196,19 @@ def _union_contains(superset: sval.UnionType, subset: sval.UnionType) -> bool:
     return all(exception in superset.types for exception in subset.types)
 
 
-def _result_places(location: InterpVal) -> tuple[InterpVal, ...]:
+def _result_places(location: ComptimeResultPtr) -> tuple[InterpVal, ...]:
     """The leaf places one result value each is delivered into, in depth-first
-    declaration order: the result location of a function whose annotation
-    declares several results is a tuple of slots (nested exactly like the
-    results), every other function has a single result slot."""
+    declaration order: the result location's value may itself be a tuple of
+    slots (nested exactly like the results, followed by the error code and the
+    payload union, see ``sval.make_ret_spec``)."""
     places: list[InterpVal] = []
-    work: list[InterpVal] = [location]
+    # the result spreads into its value, its error code and its payload, in that
+    # order (the stack is popped last-in-first-out, so it is pushed in reverse)
+    work: list[InterpVal] = [location.payload, location.code, location.value]
     while work:
         place = _shallow_normalize(work.pop())
-        if isinstance(place, ComptimeTuple):
-            work.extend(reversed([entry.value for entry in place.values]))
-        elif isinstance(place, ComptimeResult):
-            # the result spreads into its value, its error code and its payload,
-            # in that order (see ``sval.make_ret_spec``)
-            work.append(place.payload)
-            work.append(place.code)
-            work.append(place.value)
+        if isinstance(place, ComptimeTuplePtr):
+            work.extend(reversed(list(place.values)))
         else:
             places.append(place)
     return tuple(places)
@@ -1572,8 +1645,8 @@ class HirRunner:
             # the whole return convention is declared: fix it before the body
             self._materialize_ret_sig(ret_sig.complete())
 
-    def _reserve_result_loc(self, ret_sig: PartialReturnSignature | None) -> ComptimeResult:
-        """The result location of the function proper (see ``ComptimeResult``):
+    def _reserve_result_loc(self, ret_sig: PartialReturnSignature | None) -> ComptimeResultPtr:
+        """The result location of the function proper (see ``ComptimeResultPtr``):
         the place its declared result is delivered into and its error places.
         The places are the ones the effective spec names when the signature
         declares the whole return convention, and fresh slots otherwise - an
@@ -1582,15 +1655,19 @@ class HirRunner:
         declared_value = ret_sig.ret_type_spec if ret_sig is not None else None
         if ret_sig is not None and ret_sig.is_complete():
             # the value and the error part are both declared: the result
-            # location is the one the effective spec names
-            loc = self._ret_spec_place(ret_sig.complete().ret_spec(self._mir_cache))
-            assert isinstance(loc, ComptimeResult)
-            return loc
+            # location's value is the one the effective spec names (the error
+            # places are committed later, see ``_commit_error_space``)
+            spec = ret_sig.complete().ret_spec(self._mir_cache)
+            assert isinstance(spec, RetTuple) and isinstance(spec.type, sval.ResultType)
+            value_loc = self._ret_spec_place(spec.values[0])
+            return ComptimeResultPtr(
+                value_loc, self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE),
+            )
         if declared_value is not None:
             value_loc = self._ret_spec_place(declared_value)
         else:
             value_loc = self.alloca(InlineMode.NONE)
-        return ComptimeResult(
+        return ComptimeResultPtr(
             value_loc, self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE),
         )
 
@@ -1644,9 +1721,9 @@ class HirRunner:
             arg_values.append(self._init_one_arg(arg, mir_args, is_ref))
 
         if signature.varargs:
-            arg_values.append(ComptimeTuple(tuple(ArgEntry(self._init_one_arg(a, mir_args, False), True) for a in signature.varargs)))
+            arg_values.append(ComptimeTuplePtr(tuple(self._init_one_arg(a, mir_args, False) for a in signature.varargs)))
         if signature.kwargs:
-            arg_values.append(ComptimeDict({k: ArgEntry(self._init_one_arg(v, mir_args, False), True) for k, v in signature.kwargs.items()}))
+            arg_values.append(ComptimeDictPtr({k: self._init_one_arg(v, mir_args, False) for k, v in signature.kwargs.items()}))
 
         return tuple(arg_values)
 
@@ -1675,28 +1752,19 @@ class HirRunner:
         return tuple(out)
 
     def _ret_spec_place(self, node: RetSpec) -> InterpVal:
-        """The result place one declared result is delivered into: a fresh slot
-        for a value, a tuple of the places of its elements for a group, and the
-        function's result location for a result-type group (its exception set and
-        storage are fixed when it is committed, see ``_commit_error_space``)."""
+        """The result place the *value* part ``node`` of a declared result is
+        delivered into: a fresh slot for a value, a tuple of the places of its
+        elements for a group.  A result-type group is not a value part - the
+        function's result location is built around it (see
+        ``_reserve_result_loc``/``ComptimeResultPtr``)."""
         match node:
             case RetValue():
                 return self.alloca(InlineMode.NONE)
             case RetTuple(type=type, values=values):
-                if isinstance(type, sval.ResultType):
-                    # the function's own result location: its value, its error
-                    # code and its payload union (the set and the storage are
-                    # fixed when the group is committed, see ``_commit_error_space``)
-                    return ComptimeResult(
-                        self._ret_spec_place(values[0]),
-                        self.alloca(InlineMode.NONE),
-                        self.alloca(InlineMode.NONE),
-                    )
-                entries: list[ArgEntry[InterpVal]] = []
-                for child in values:
-                    place = self._ret_spec_place(child)
-                    entries.append(ArgEntry(place, isinstance(child, RetValue)))
-                return ComptimeTuple(tuple(entries))
+                assert not isinstance(type, sval.ResultType)
+                return ComptimeTuplePtr(
+                    tuple(self._ret_spec_place(child) for child in values)
+                )
 
     def _materialize_ret_sig(
         self, sig: ReturnSignature
@@ -1735,47 +1803,36 @@ class HirRunner:
             return
         self.ret_sig = sig
         self._fn_instance.mir.ret_type = mir.VOID
-        self._commit_ret_places(spec, self._current_result_loc())
+        ret_loc = self._current_result_loc()
+        # the effective spec's root is always the result-type group: its value is
+        # committed through the places ``_ret_spec_place`` reserved, its error
+        # code and payload union are the result location's own (see
+        # ``_commit_error_space``)
+        assert isinstance(spec, RetTuple) and isinstance(spec.type, sval.ResultType)
+        value_spec, code_spec, payload_spec = spec.values
+        self._commit_ret_places(value_spec, ret_loc.value)
+        code_ptr = self._ret_leaf_ptr(code_spec)
+        payload_ptr = self._ret_leaf_ptr(payload_spec)
+        self._commit_error_space(ret_loc, spec.type, code_ptr, payload_ptr)
         if sig.is_noreturn():
             # the function has no value to return and raises nothing: no path
             # of it can ever come back, which its lowered form says outright
             self._fn_instance.mir.ret_type = mir.NORETURN
 
     def _commit_ret_places(self, node: RetSpec, place: InterpVal) -> None:
-        """Commit the result place(s) mirroring the spec node ``node``: a leaf
+        """Commit the value place(s) mirroring the spec node ``node``: a leaf
         place is committed (through a hidden result pointer when the leaf says
-        so), and a result-type group - whose place is the result location - is
-        committed as a whole, its places being the value, the error code and the
-        payload union of the result."""
-        match node:
-            case RetValue():
-                self._commit_pending_slot(place, node.type, ptr=self._ret_leaf_ptr(node))
-            case RetTuple(type=type, values=values):
-                if isinstance(type, sval.ResultType):
-                    assert isinstance(place, ComptimeResult)
-                    value, code, payload = values
-                    self._commit_result_place(value, place.value)
-                    code_ptr = self._ret_leaf_ptr(code)
-                    payload_ptr = self._ret_leaf_ptr(payload)
-                    self._commit_error_space(place, type, code_ptr, payload_ptr)
-                    return
-                assert isinstance(place, ComptimeTuple)
-                for child, entry in zip(values, place.values):
-                    self._commit_ret_places(child, entry.value)
-
-    def _commit_result_place(self, node: RetSpec, place: InterpVal) -> None:
-        """Commit the place(s) of the value part of a result (the first element
-        of a result-type group): a leaf is committed - through the hidden result
-        pointer it is delivered through when it says so - and a nested group of
-        values by pairing it with the place tree the caller reserved for it."""
+        so), a group by pairing it with the place tree the caller reserved for
+        it.  The root result-type group is handled by ``_materialize_ret_sig``,
+        so ``node`` is never one here."""
         match node:
             case RetValue():
                 self._commit_pending_slot(place, node.type, ptr=self._ret_leaf_ptr(node))
             case RetTuple(type=type, values=values):
                 assert not isinstance(type, sval.ResultType)
-                assert isinstance(place, ComptimeTuple)
-                for child, entry in zip(values, place.values):
-                    self._commit_result_place(child, entry.value)
+                assert isinstance(place, ComptimeTuplePtr)
+                for child, sub in zip(values, place.values):
+                    self._commit_ret_places(child, sub)
 
     def _ret_leaf_ptr(self, leaf: RetSpec) -> mir.Value | None:
         """The hidden result pointer a leaf is delivered through (appending the
@@ -1815,10 +1872,10 @@ class HirRunner:
 
     # -- return statements ------------------------------------------------
 
-    def _current_result_loc(self) -> ComptimeResult:
+    def _current_result_loc(self) -> ComptimeResultPtr:
         assert len(self._frames) > 0, 'no function result location'
         ret = self._frames[-1].ret_loc
-        assert isinstance(ret, ComptimeResult)
+        assert isinstance(ret, ComptimeResultPtr)
         return ret
 
     def _result_loc(self) -> InterpVal:
@@ -1826,11 +1883,11 @@ class HirRunner:
         part of the frame's result location (its error places are separate)."""
         return self._current_result_loc().value
 
-    def _function_result(self) -> ComptimeResult:
+    def _function_result(self) -> ComptimeResultPtr:
         """The function proper's own result location (the frame at the bottom of
         the stack: an inlined body's result location shares its error places)."""
         ret = self._frames[0].ret_loc
-        assert isinstance(ret, ComptimeResult)
+        assert isinstance(ret, ComptimeResultPtr)
         return ret
 
     def _current_value_is_empty(self) -> bool:
@@ -1973,7 +2030,7 @@ class HirRunner:
 
     # -- error locations ---------------------------------------------------
 
-    def _commit_error_space(self, result: ComptimeResult, type: sval.ResultType, code_ptr: mir.Value | None = None, payload_ptr: mir.Value | None = None) -> None:
+    def _commit_error_space(self, result: ComptimeResultPtr, type: sval.ResultType, code_ptr: mir.Value | None = None, payload_ptr: mir.Value | None = None) -> None:
         """Commit an error location: its code and payload slots are materialized
         (through a hidden result pointer when given, freshly allocated
         otherwise), their widths following from the result type, and the
@@ -2031,11 +2088,6 @@ class HirRunner:
         assert mir_struct is not None and not struct_type.is_zst()
         bitcast = self._emit(mir.BitCast(self._to_runtime(place), mir.PointerType(mir_struct)))
         return RuntimeVal(bitcast, sval.PointerType(struct_type, is_const=False))
-
-    def _error_payload_ptr(self, error: ComptimeResult, struct_type: sval.StructType) -> InterpVal:
-        """The address the variant ``struct_type`` is written to inside the
-        error location ``error``."""
-        return self._union_variant_ptr(error.payload, struct_type)
 
 
     def _payload_variant_ptr(self, exception: sval.StructType) -> InterpVal:
@@ -2411,6 +2463,8 @@ class HirRunner:
                     regs[inst] = RuntimeVal(phi, sval.PointerType(exception, is_const=False))
             case hir.AsBool():
                 return self.as_bool(self.operand_arg(inst.value), inst)
+            case hir.Len():
+                return self.exec_len(inst)
             case hir.IsNull():
                 value = self._arg_value(self.operand_arg(inst.opt))
                 value_type = _type_of(value)
@@ -2482,6 +2536,8 @@ class HirRunner:
                 self.store_void_retloc()
             case hir.Tuple():
                 regs[inst] = ComptimeTuple(tuple(self.operand_arg(v) for v in inst.values))
+            case hir.TuplePtr():
+                regs[inst] = ComptimeTuplePtr(tuple(self.operand(v) for v in inst.values))
             case hir.InitTuple():
                 self.init_tuple(self.operand(inst.tuple_ptr), inst.length)
             case hir.TuplePtrElement():
@@ -3242,6 +3298,17 @@ class HirRunner:
                 # an aggregate is held by its fields: loading one loads every
                 # field out of its own place (see ``ComptimeAggregatePtr``)
                 return ComptimeAggregate(aggregate_type, tuple(self.load(p) for p in ptrs))
+            case ComptimeTuplePtr(values):
+                # a tuple is held by its element places: loading one is the value
+                # form of them (see ``ComptimeTuplePtr``)
+                return ComptimeTuple(
+                    tuple(ArgEntry(self.load(p), False) for p in values)
+                )
+            case ComptimeDictPtr(values):
+                # likewise for a ``**kwargs`` dictionary (see ``ComptimeDictPtr``)
+                return ComptimeDict(
+                    {k: ArgEntry(self.load(p), False) for k, p in values.items()}
+                )
             case ComptimeOptionPtr(is_null, payload_ptr):
                 # an option is held by its tag and its payload place: loading
                 # one is the value form of the two (see ``ComptimeOptionPtr``)
@@ -3280,26 +3347,26 @@ class HirRunner:
         aggregate) still records the value, since the type of such a place may
         have no runtime representation at all."""
         value = _shallow_normalize(value)
-        if isinstance(ptr, ComptimeTuple):
-            # a destructuring target: a tuple of element *addresses*, one
-            # per element of the value it is stored with (a nested tuple
-            # target pairs with a nested tuple value)
+        if isinstance(ptr, ComptimeTuplePtr):
+            # a destructuring target: a tuple of element *places*, one per
+            # element of the value it is stored with (a nested tuple target
+            # pairs with a nested tuple value)
             todo: list[tuple[InterpVal, InterpVal]] = [(ptr, value)]
             stores: list[tuple[InterpVal, InterpVal]] = []
             while todo:
                 target, source = todo.pop()
-                if isinstance(target, ComptimeTuple):
-                    if not isinstance(source, ComptimeTuple):
+                if isinstance(target, ComptimeTuplePtr):
+                    children = self._tuple_source_values(source)
+                    if children is None:
                         raise CompileError(
                             f'cannot unpack a value into {len(target.values)} targets'
                         )
-                    if len(source.values) != len(target.values):
+                    if len(children) != len(target.values):
                         raise CompileError(
-                            f'cannot unpack {len(source.values)} values into '
+                            f'cannot unpack {len(children)} values into '
                             f'{len(target.values)} targets'
                         )
-                    assert all(a.is_ref or isinstance(a.value, ComptimeTuple) for a in target.values)
-                    todo.extend(reversed([(t.value, self._arg_value(s)) for t, s in zip(target.values, source.values)]))
+                    todo.extend(reversed(list(zip(target.values, children))))
                     continue
                 stores.append((target, source))
             for target, source in stores:
@@ -3307,21 +3374,6 @@ class HirRunner:
             return
 
         ptr = _shallow_normalize(ptr)
-        if isinstance(ptr, ComptimeResult):
-            # a delivery into the function's result location: the value is either
-            # the "no error" tag (``Success``) or an exception value, tagged and
-            # written into the payload
-            obj = value.obj if isinstance(value, ComptimeVal) else None
-            if isinstance(obj, sval.Success):
-                self.store(ptr.code, ComptimeVal(0))
-                return
-            type = _type_of(value)
-            if not isinstance(type, sval.StructType):
-                raise CompileError(f'cannot raise {type}: an exception must be a struct')
-            self._add_function_exception(type)
-            self._defer_error_code_write(type)
-            self.store(self._error_payload_ptr(ptr, type), value)
-            return
 
         if isinstance(ptr, PendingSlot) and ptr.committed is None:
             value_type = _type_of(value)
@@ -3598,7 +3650,7 @@ class HirRunner:
                 'value to return'
             )
         location = self._result_loc()
-        if isinstance(location, ComptimeTuple):
+        if isinstance(location, ComptimeTuplePtr):
             raise CompileError('a function that returns several values must return them')
         self.store(location, ComptimeVal(sval.Void()))
 
@@ -3973,6 +4025,14 @@ class HirRunner:
             return self.load(arg.value)
         return arg.value
 
+    def _tuple_source_values(self, source: InterpVal) -> tuple[InterpVal, ...] | None:
+        """The element *values* a destructuring store reads out of ``source``
+        (see ``store``): a tuple value takes every operand's value (see
+        ``_arg_value``).  None when ``source`` is not a tuple at all."""
+        if isinstance(source, ComptimeTuple):
+            return tuple(self._arg_value(entry) for entry in source.values)
+        return None
+
     def _auto_deref(self, ev: InterpVal) -> InterpVal:
         t = _type_of(ev)
         if isinstance(t, sval.PointerType) and isinstance(t.elem, sval.PointerType):
@@ -3986,11 +4046,6 @@ class HirRunner:
         Auto-dereferences a base that points at a pointer, unlike
         ``field_index_addr``."""
         ptr = _shallow_normalize(ptr)
-        if is_aggregate_init and isinstance(ptr, ComptimeResult):
-            # a field of the exception being raised: its address is decided by
-            # the ``FinishStruct`` that closes the construction, in the error
-            # location's payload (see ``finish_struct``)
-            return self.alloca(InlineMode.NONE)
         if is_aggregate_init and isinstance(ptr, PendingSlot) and ptr.committed is None:
             # the storage of the aggregate being built has no address yet: the
             # field gets a pending place of its own (see ``finish_struct``) -
@@ -4053,10 +4108,6 @@ class HirRunner:
         instruction into an insertion block instead of the current position.
         A zero-sized field/element occupies no storage and has no address."""
         ptr = _shallow_normalize(ptr)
-        if is_aggregate_init and isinstance(ptr, ComptimeResult):
-            # a keyword field of the exception being raised (see
-            # ``field_index_addr``)
-            return self.alloca(InlineMode.NONE)
         if is_aggregate_init and isinstance(ptr, PendingSlot) and ptr.committed is None:
             # the aggregate's storage has no address yet: the field gets a
             # pending place of its own - the one a previous construction of the
@@ -4284,8 +4335,14 @@ class HirRunner:
             return self._coerce_tagged_union_value(ev, target)
         if isinstance(target, sval.TupleType):
             # a tuple has no runtime representation to convert to: the
-            # compile-time tuple itself is what a location of the type holds
-            if not isinstance(ev, ComptimeTuple):
+            # compile-time tuple (its value form or its place tree) itself is
+            # what a location of the type holds
+            if not isinstance(ev, (ComptimeTuple, ComptimeTuplePtr)):
+                raise CoerceError(f'cannot materialize a {target} from {ev!r}')
+            return ev
+        if isinstance(target, sval.StrDictType):
+            # likewise for a ``**kwargs`` dictionary (see ``sval.StrDictType``)
+            if not isinstance(ev, (ComptimeDict, ComptimeDictPtr)):
                 raise CoerceError(f'cannot materialize a {target} from {ev!r}')
             return ev
         if isinstance(target, sval.ComplexType):
@@ -6207,14 +6264,16 @@ class HirRunner:
     ) -> None:
         """Materialize a pending slot.  It becomes a :class:`ComptimeBox` when
         it may inline values and every action may be inlined, a
-        :class:`ComptimeAggregatePtr` when the value is an aggregate (which a box
-        never holds), or - when its type is zero-sized - the unit value it only
-        records; with an explicit result pointer (``ptr``), or otherwise, it
-        becomes a :class:`RuntimeVal` pointer to freshly allocated memory.  The
-        type is the pairwise ``resolve_peer_type`` of the action types (or the
-        given one).  The recorded actions are delivered through
-        ``_exec_pending_actions``, which fills in the instructions that must be
-        spliced at their original positions."""
+        :class:`ComptimeAggregatePtr`/:class:`ComptimeTuplePtr`/
+        :class:`ComptimeDictPtr` when the value is an aggregate, a tuple or a
+        ``**kwargs`` dictionary (none of which a box ever holds), or - when its
+        type is zero-sized - the unit value it only records; with an explicit
+        result pointer (``ptr``), or otherwise, it becomes a :class:`RuntimeVal`
+        pointer to freshly allocated memory.  The type is the pairwise
+        ``resolve_peer_type`` of the action types (or the given one).  The
+        recorded actions are delivered through ``_exec_pending_actions``, which
+        fills in the instructions that must be spliced at their original
+        positions."""
         if not isinstance(val, PendingSlot):
             raise CompileError('can only commit a pending slot')
         if val.committed is not None:
@@ -6231,6 +6290,14 @@ class HirRunner:
                 # a compile-time aggregate: its fields (or elements) are their
                 # own places (see ``init_inline_aggregate``)
                 val.committed = self._inline_aggregate_of(val, type)
+            elif isinstance(type, sval.TupleType):
+                # a compile-time tuple: one place per element (a box never holds
+                # one, see ``ComptimeTuplePtr``)
+                val.committed = self._inline_tuple_of(val, type)
+            elif isinstance(type, sval.StrDictType):
+                # and its ``**kwargs`` dictionary counterpart (a box never holds
+                # one either, see ``ComptimeDictPtr``)
+                val.committed = self.init_comptime_dict(type)
             elif isinstance(type, sval.OptionType):
                 # a compile-time option: the tag is a value and the payload a
                 # place of its own (see ``ComptimeOptionPtr``)
@@ -6276,6 +6343,35 @@ class HirRunner:
             return self.init_inline_aggregate(type)
         return ComptimeAggregatePtr(type, recorded.places)
 
+    def _inline_tuple_of(self, slot: PendingSlot, type: sval.TupleType) -> ComptimeTuplePtr:
+        """The tuple storage a slot commits to: the element places its
+        construction recorded (a literal ``(a, b)`` built by ``init_tuple``, or
+        a whole multi-value result packed into the slot, see
+        ``_deliver_packed_tuple``), or fresh element places for a slot that only
+        took tuple *values* (see ``init_comptime_tuple``).  A tuple is never
+        held by a box."""
+        recorded = self._pending_tuple(slot)
+        if recorded is not None:
+            return ComptimeTuplePtr(recorded.places)
+        return self.init_comptime_tuple(type)
+
+    def init_comptime_tuple(self, type: sval.TupleType) -> ComptimeTuplePtr:
+        """Fresh compile-time storage for a tuple: one place per element (see
+        ``_fresh_place``), which is what a tuple a store delivers is written
+        into."""
+        return ComptimeTuplePtr(tuple(
+            self._fresh_place(elem_type, ComptimeVal(sval.Undefined(elem_type)))
+            for elem_type in type.types
+        ))
+
+    def init_comptime_dict(self, type: sval.StrDictType) -> ComptimeDictPtr:
+        """Fresh compile-time storage for a ``**kwargs`` dictionary: one place
+        per name (see ``_fresh_place``)."""
+        return ComptimeDictPtr({
+            name: self._fresh_place(elem_type, ComptimeVal(sval.Undefined(elem_type)))
+            for name, elem_type in type.values.items()
+        })
+
     def _bind_slot(self, slot: PendingSlot, ptr: mir.Value, type: sval.Type) -> None:
         slot.committed = RuntimeVal(ptr, sval.PointerType(type, is_const=False))
         self._exec_pending_actions(slot, type)
@@ -6298,22 +6394,17 @@ class HirRunner:
                 self.store(ptr, action.value)
             case _PendingTuple():
                 # a tuple location: the element places are committed together
-                # with the slot (no ``hir.CommitSlot`` names them), and the slot
-                # holds the tuple of places itself (see ``init_tuple``)
-                self._commit_tuple_places(ComptimeTuple(action.places))
-                if not isinstance(ptr, ComptimeBox):
+                # with the slot (no ``hir.CommitSlot`` names them) - the slot
+                # itself is already the tuple of places (see ``init_tuple`` and
+                # ``_inline_tuple_of``)
+                self._commit_tuple_places(ComptimeTuplePtr(action.places))
+                if not isinstance(ptr, ComptimeTuplePtr):
                     raise CompileError('cannot deliver a tuple into storage')
-                ptr.value = ComptimeTuple(action.places)
             case _PendingPtrConvertion():
                 input_ptr = _shallow_normalize(action.input)
-                if isinstance(input_ptr, ComptimeResult):
-                    # a call returning an aggregate is raised: the payload pointer
-                    # is handed over (and the error code tagged) at the commit
-                    action.output.value = self._to_runtime(self._convert_result_ptr(action.input, action.type))
-                else:
-                    if not (isinstance(input_ptr, RuntimeVal) and isinstance(input_ptr.type, sval.PointerType)):
-                        raise CompileError('cannot convert a compile-time pointer')
-                    action.output.value = self._to_runtime(self._convert_result_ptr(input_ptr, action.type))
+                if not (isinstance(input_ptr, RuntimeVal) and isinstance(input_ptr.type, sval.PointerType)):
+                    raise CompileError('cannot convert a compile-time pointer')
+                action.output.value = self._to_runtime(self._convert_result_ptr(input_ptr, action.type))
             case _PendingAggregate():
                 # a compile-time aggregate: every field (or element) place is
                 # committed with the slot (no ``hir.CommitSlot`` names them) and
@@ -6370,14 +6461,8 @@ class HirRunner:
         present option lives in (``_option_payload_ptr``), which marks the
         option present.  A location that is the function's error location and
         a delivery of an exception ``E`` are the other case: the error is
-        tagged and written into the payload (``_error_payload_ptr``)."""
+        tagged and written into the payload (``_union_variant_ptr``)."""
         ptr = _shallow_normalize(ptr)
-        if isinstance(ptr, ComptimeResult):
-            if not isinstance(to_type, sval.StructType):
-                raise CompileError(f'cannot raise {to_type}: an exception must be a struct')
-            self._add_function_exception(to_type)
-            self._defer_error_code_write(to_type)
-            return self._error_payload_ptr(ptr, to_type)
         ptr_type = _type_of(ptr)
         if not isinstance(ptr_type, sval.PointerType):
             raise CompileError(f'cannot use {ptr!r} as a result location')
@@ -6593,6 +6678,38 @@ class HirRunner:
 
         raise CompileError(f'an if condition must be a bool value, got {type}')
 
+    def exec_len(self, inst: hir.Len) -> PollResult:
+        """``len(x)`` (see ``hir.Len``): the element count of a tuple, or the
+        answer of a struct's own ``__len__``.  The operand is logically a
+        *value*: a tuple yields its length directly (a by-reference one is the
+        ``ComptimeTuplePtr`` place tree at the address it carries), and a struct
+        is handed to its method through its own place - no copy for a
+        by-reference one, and a value is materialized into a fresh place
+        first."""
+        operand = self.operand_arg(inst.value)
+        if operand.is_ref:
+            place = _shallow_normalize(operand.value)
+            if isinstance(place, ComptimeTuplePtr):
+                self._frames[-1].regs[inst] = ComptimeVal(len(place.values))
+                return PollResult.AGAIN
+        else:
+            if isinstance(operand.value, ComptimeTuple):
+                self._frames[-1].regs[inst] = ComptimeVal(len(operand.value.values))
+                return PollResult.AGAIN
+        type = _arg_type_of(operand)
+        if isinstance(type, sval.StructType) and self._resolve_method(type, _LEN_METHOD) is not None:
+            slot = self.alloca(InlineMode.NON_AGGREGATE)
+            regs = self._frames[-1].regs
+
+            def on_return() -> None:
+                self._commit_pending_slot(slot)
+                regs[inst] = self.load(slot)
+
+            return self.call_method(
+                self._operand_place(operand), _LEN_METHOD, RawArgList((), frozendict()), slot, on_return,
+            )
+        raise CompileError(f'cannot take the length of {type}')
+
     def subscript(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
         """``Foo[i32, f64]``: the specialization of the struct template
         ``base`` for the generic arguments ``index`` (one type value, or a
@@ -6622,7 +6739,21 @@ class HirRunner:
 
         ``b[i]`` / ``b[a:c]`` where ``b`` is a compile-time byte string: the
         substring the subscript names, held as a reference (see
-        ``_subscript_bytes``)."""
+        ``_subscript_bytes``).
+
+        ``t[i]`` where ``t`` is a compile-time tuple place tree (a varargs
+        parameter, or a ``Comptime`` variable holding a multi-value result):
+        the place of its i-th element (see ``_subscript_comptime_tuple``).
+
+        ``d[key]`` where ``d`` is a compile-time ``**kwargs`` dictionary place
+        tree: the place of the argument the byte-string key names (see
+        ``_subscript_comptime_dict``)."""
+        base_ev = _shallow_normalize(base)
+        if isinstance(base_ev, ComptimeTuplePtr):
+            return self._subscript_comptime_tuple(base_ev, index, ret)
+        if isinstance(base_ev, ComptimeDictPtr):
+            return self._subscript_comptime_dict(base_ev, index, ret)
+
         array_type = _array_elem_type_of(base)
         if array_type is not None:
             if array_type.length is None:
@@ -6699,6 +6830,42 @@ class HirRunner:
 
         instance = struct.specialize(tuple(arg_values))
         self._frames[-1].regs[ret] = ComptimeVal(instance)
+        return PollResult.AGAIN
+
+    def _subscript_comptime_tuple(self, base: ComptimeTuplePtr, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
+        """``t[i]`` of the compile-time tuple place tree ``base`` (a varargs
+        parameter, or a ``Comptime`` variable holding a multi-value result): the
+        *place* of its i-th element.  A tuple has no runtime storage to index,
+        so the index has to be a compile-time integer, and it is bounds-checked
+        (a negative index is out of bounds like any other)."""
+        element_index = _comptime_int(self._arg_value(index))
+        if element_index is None:
+            raise CompileError(
+                'a tuple element index has to be a compile-time integer'
+            )
+        if not 0 <= element_index < len(base.values):
+            raise CompileError(
+                f'index {element_index} is out of bounds for a tuple of '
+                f'{len(base.values)} element(s)'
+            )
+        self._frames[-1].regs[ret] = base.values[element_index]
+        return PollResult.AGAIN
+
+    def _subscript_comptime_dict(self, base: ComptimeDictPtr, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
+        """``d[key]`` of the compile-time ``**kwargs`` dictionary place tree
+        ``base``: the *place* of the argument the key names.  The key has to be
+        a compile-time byte string (a string literal is encoded to one), and a
+        name the dictionary does not hold is rejected."""
+        key_value = _to_comptime(self._arg_value(index))
+        if not isinstance(key_value, bytes):
+            raise CompileError(
+                'a dict element key has to be a compile-time byte string'
+            )
+        name = key_value.decode()
+        place = base.values.get(name)
+        if place is None:
+            raise CompileError(f'the dict has no element named {name!r}')
+        self._frames[-1].regs[ret] = place
         return PollResult.AGAIN
 
     def _subscript_bytes(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
@@ -6923,6 +7090,14 @@ class HirRunner:
                 return action.data
         return None
 
+    def _pending_tuple(self, slot: PendingSlot) -> _PendingTuple | None:
+        # the tuple initialization a slot recorded, when one did: the element
+        # places an inline tuple construction builds into (see ``init_tuple``)
+        for action in slot.stores:
+            if isinstance(action.data, _PendingTuple):
+                return action.data
+        return None
+
     def init_inline_aggregate(self, type: sval.Type) -> ComptimeAggregatePtr:
         """Fresh compile-time storage for an aggregate: every field (or array
         element) gets a place of its own - a box holding the type's unit value
@@ -6942,12 +7117,17 @@ class HirRunner:
 
     def _fresh_place(self, type: sval.Type, initial: InterpVal) -> InterpVal:
         """A fresh compile-time place for a value of ``type``, used as the
-        field/element/payload of a compile-time aggregate or option: a nested
-        aggregate or option gets a pointer form of its own, anything else a
-        box.  ``initial`` is the value the place holds before it is written
-        (the type's unit value for a zero-sized one, undefined otherwise)."""
+        field/element/payload/element of a compile-time aggregate, tuple, dict
+        or option: a nested aggregate/tuple/dict/option gets a pointer form of
+        its own, anything else a box.  ``initial`` is the value the place holds
+        before it is written (the type's unit value for a zero-sized one,
+        undefined otherwise)."""
         if _is_aggregate(type):
             return self.init_inline_aggregate(type)
+        if isinstance(type, sval.TupleType):
+            return self.init_comptime_tuple(type)
+        if isinstance(type, sval.StrDictType):
+            return self.init_comptime_dict(type)
         if isinstance(type, sval.OptionType):
             return self.init_comptime_option(type)
         if isinstance(type, sval.TaggedUnionType):
@@ -7208,7 +7388,7 @@ class HirRunner:
         # (see ``_PendingTuple``).  That tuple of places is what
         # ``hir.TuplePtrElement`` then takes the element addresses of.
         location = _shallow_normalize(location)
-        if isinstance(location, ComptimeTuple):
+        if isinstance(location, ComptimeTuplePtr):
             if len(location.values) != length:
                 raise CompileError(
                     f'cannot initialize a tuple of {length} element(s) in a '
@@ -7218,7 +7398,7 @@ class HirRunner:
         if isinstance(location, PendingSlot) and location.inline_mode != InlineMode.NONE and location.committed is None:
             self._record_pending_action(
                 location,
-                _PendingTuple(tuple(ArgEntry(self.alloca(InlineMode.FULL), True) for _ in range(length))),
+                _PendingTuple(tuple(self.alloca(InlineMode.FULL) for _ in range(length))),
             )
             return
         raise CompileError(f'cannot initialize a tuple in {location!r}')
@@ -7227,8 +7407,8 @@ class HirRunner:
         # the place the index-th element of the tuple being initialized in
         # ``location`` is written through (see ``init_tuple``)
         location = _shallow_normalize(location)
-        places: tuple[ArgEntry[InterpVal], ...] | None = None
-        if isinstance(location, ComptimeTuple):
+        places: tuple[InterpVal, ...] | None = None
+        if isinstance(location, ComptimeTuplePtr):
             places = location.values
         elif isinstance(location, PendingSlot):
             # a slot InitTuple gave a fresh tuple of element places: the tuple is
@@ -7241,11 +7421,9 @@ class HirRunner:
             raise CompileError(f'cannot take an element of {location!r}')
         if index < 0 or index >= len(places):
             raise CompileError(f'the tuple has no element at index {index}')
-        place = places[index]
-        assert place.is_ref or isinstance(place.value, ComptimeTuple)
-        return place.value
+        return places[index]
 
-    def _commit_tuple_places(self, tuple_value: ComptimeTuple) -> None:
+    def _commit_tuple_places(self, tuple_value: ComptimeTuplePtr) -> None:
         # the element places of a tuple location are committed with the
         # location: no ``hir.CommitSlot`` of its own names them
         # (see ``init_tuple``)
@@ -7253,12 +7431,14 @@ class HirRunner:
         while todo:
             value = todo.pop()
             match value:
-                case ComptimeTuple():
-                    todo.extend(entry.value for entry in value.values)
-                case PendingSlot():
+                case ComptimeTuplePtr():
+                    todo.extend(value.values)
+                case PendingSlot() if value.committed is None:
                     self._commit_pending_slot(value)
                 case _:
-                    raise CompileError(f'unsupported tuple element place {value!r}')
+                    # an already materialized place (a box, a nested pointer
+                    # form): nothing to commit
+                    pass
 
     def _method_of(self, struct: sval.StructType, method_name: str) -> sval.AnyValue | None:
         """The value of the method ``method_name`` of the struct type
@@ -7690,9 +7870,9 @@ class HirRunner:
             payload_place: InterpVal = self._function_result().payload
         else:
             payload_place = self.alloca(InlineMode.NONE)
-        error_tuple: InterpVal = ComptimeResult(ret, code_place, payload_place)
+        error_tuple: tuple[InterpVal, InterpVal] = (code_place, payload_place)
         self._deliver_result(
-            callee, mir_args, error_tuple, spec,
+            callee, mir_args, ret, spec, error_tuple,
             unwind_defers=unwind_defers, catch_unwind=catch_unwind,
         )
         self._check_call_error(
@@ -7784,8 +7964,9 @@ class HirRunner:
         self,
         callee: mir.Value,
         mir_args: list[mir.Value],
-        ret: InterpVal,
+        ret_loc: InterpVal,
         spec: RetSpec,
+        err_loc: tuple[InterpVal, InterpVal] | None = None,
         noreturn: bool = False,
         unwind_defers: tuple[mir.BasicBlock, ...] | None = None,
         catch_unwind: bool = False,
@@ -7793,21 +7974,30 @@ class HirRunner:
         """Emit the native call of a callee returning the value(s) of ``spec``
         and hand every result to its place.
 
-        The results go either into the places the caller reserved - ``ret`` is
-        the place of a single result, or a tuple of places nested exactly like
-        the results (see ``_pair_places``) - or, when a result (or a group of
-        them) is given a single place of its own, into fresh places whose tuple
-        is then stored in that place.  A tuple may be inlined, so such a place
-        has to be able to hold its value inline (a ``Comptime`` variable); a
-        plain slot rejects the tuple when it is committed (see
-        ``_no_runtime_type``).
+        The results go either into the places the caller reserved - ``ret_loc``
+        is the place of the value part (a single place, or a tuple of places
+        nested exactly like the results, see ``_pair_places``), with the error
+        code and payload union of the callee in ``err_loc`` (``None`` for a
+        callee that raises nothing) - or, when a result (or a group of them) is
+        given a single place of its own, into fresh places whose tuple is then
+        stored in that place.  A tuple may be inlined, so such a place has to be
+        able to hold its value inline (a ``Comptime`` variable); a plain slot
+        rejects the tuple when it is committed (see ``_no_runtime_type``).
 
         A zero-sized result occupies no place of its own: its unit value is
         written into its place.  A ``noreturn`` call (``mir.NoReturn``) ends the
         block it is emitted into."""
         places: list[InterpVal] = []
-        packed: list[tuple[InterpVal, ComptimeTuple]] = []
-        self._pair_places(spec, ArgEntry(ret, True), places, packed)
+        packed: list[tuple[InterpVal, ComptimeTuplePtr]] = []
+        if err_loc is None:
+            self._pair_places(spec, ArgEntry(ret_loc, True), places, packed)
+        else:
+            # the spec's root is the result-type group: its value, its error code
+            # and its payload union are the three places the caller reserved
+            code, payload = err_loc
+            assert isinstance(spec, RetTuple) and isinstance(spec.type, sval.ResultType)
+            for child, sub in zip(spec.values, (ret_loc, code, payload)):
+                self._pair_places(child, ArgEntry(sub, True), places, packed)
 
         result_args: list[mir.Value] = []
         ret_type: mir.ReturnType = mir.VOID
@@ -7893,14 +8083,27 @@ class HirRunner:
         for _, tree in packed:
             self._commit_tuple_places(tree)
         for target, tree in packed:
-            self.store(target, tree)
+            self._deliver_packed_tuple(target, tree)
+
+    def _deliver_packed_tuple(self, target: InterpVal, tree: ComptimeTuplePtr) -> None:
+        """Deliver a multi-value result packed into the single place ``target``
+        (a call the caller gave neither a place per result nor a tuple target,
+        see ``_pair_places``).  A still uncommitted slot adopts the tree's
+        element places as its own tuple storage - the storage a tuple variable
+        holds *is* the place tree, never a value, so it is recorded as a
+        ``_PendingTuple`` rather than a store (see ``_inline_tuple_of``); any
+        other place receives the tuple *value* (see ``store``)."""
+        if isinstance(target, PendingSlot) and target.committed is None:
+            self._record_pending_action(target, _PendingTuple(tree.values))
+            return
+        self.store(target, self.load(tree))
 
     def _pair_places(
         self,
         node: RetSpec,
         entry: ArgEntry[InterpVal],
         places: list[InterpVal],
-        packed: list[tuple[InterpVal, ComptimeTuple]],
+        packed: list[tuple[InterpVal, ComptimeTuplePtr]],
     ) -> None:
         """Pair the results of ``node`` with the place tree the caller
         reserved: a single result takes the place ``entry`` denotes, a group
@@ -7909,11 +8112,12 @@ class HirRunner:
         ``places`` in depth-first order.  A group the caller gives a single
         non-tuple place is *packed*: fresh places are reserved and their
         (nested) tuple is stored in that place after the call (see
-        ``_deliver_result``)."""
+        ``_deliver_result``).  The root result-type group is unwrapped by the
+        caller (``_deliver_result``), so ``node`` is never one here."""
         target = entry.value
         match node:
             case RetValue():
-                if isinstance(target, ComptimeTuple):
+                if isinstance(target, ComptimeTuplePtr):
                     raise CompileError('cannot unpack one value into a tuple target')
                 if not entry.is_ref:
                     raise CompileError(
@@ -7921,26 +8125,18 @@ class HirRunner:
                     )
                 places.append(target)
             case RetTuple(type=type, values=values):
-                if isinstance(type, sval.ResultType):
-                    # the result group: its value, its error code and its payload
-                    # union, in the order of the result location
-                    assert isinstance(target, ComptimeResult)
-                    for child, sub in zip(
-                        values, (target.value, target.code, target.payload),
-                    ):
-                        self._pair_places(child, ArgEntry(sub, True), places, packed)
-                    return
-                if isinstance(target, ComptimeTuple):
+                assert not isinstance(type, sval.ResultType)
+                if isinstance(target, ComptimeTuplePtr):
                     if len(target.values) != len(values):
                         raise CompileError(
                             f'cannot unpack {len(values)} value(s) into '
                             f'{len(target.values)} target(s)'
                         )
-                    for child, sub_entry in zip(values, target.values):
-                        self._pair_places(child, sub_entry, places, packed)
+                    for child, sub in zip(values, target.values):
+                        self._pair_places(child, ArgEntry(sub, True), places, packed)
                     return
                 tree = self._fresh_places(node, places)
-                assert isinstance(tree, ComptimeTuple)
+                assert isinstance(tree, ComptimeTuplePtr)
                 packed.append((target, tree))
 
     def _fresh_places(self, node: RetSpec, places: list[InterpVal]) -> InterpVal:
@@ -7953,11 +8149,9 @@ class HirRunner:
                 places.append(place)
                 return place
             case RetTuple(values=values):
-                entries: list[ArgEntry[InterpVal]] = []
-                for child in values:
-                    place = self._fresh_places(child, places)
-                    entries.append(ArgEntry(place, isinstance(child, RetValue)))
-                return ComptimeTuple(tuple(entries))
+                return ComptimeTuplePtr(
+                    tuple(self._fresh_places(child, places) for child in values)
+                )
 
     def _start_inline(
         self,
@@ -8019,7 +8213,7 @@ class HirRunner:
         error = self._function_result()
         frame = InlineFrame(
             frame_values, tuple(arg_values),
-            ComptimeResult(ret, error.code, error.payload),
+            ComptimeResultPtr(ret, error.code, error.payload),
             body, fn_name, value_is_empty=value_is_empty, on_done=on_done,
             compile_vars=self._inherit_compile_vars(),
             closure_values=closure_values,

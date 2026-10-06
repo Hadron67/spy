@@ -1128,9 +1128,9 @@ def find_first_pointer_type_pos(type: Type, shift: int = 0) -> tuple[int, ...] |
     todo: list[tuple[Type, tuple[int, ...]]] = [(type, ())]
     while todo:
         current, pos = todo.pop()
-        if current.is_zst():
-            # a zero-sized value has no storage, so it cannot hold a pointer an
-            # option may use as its tag: do not descend into it
+        if current.classify() != SpecialTypeKind.NONE:
+            # ZST has no storage, DST may not have storage (length of a FAM might be zero), so it cannot hold a pointer and
+            # an option may use as its tag: do not descend into it
             continue
         if isinstance(current, PointerType):
             if claimed == pointers:

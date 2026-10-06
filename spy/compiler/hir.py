@@ -438,7 +438,19 @@ class TuplePtrElement(Inst):
 
 @dataclass(eq=False)
 class Tuple(Inst):
+    """A tuple *value*: the operands (a value or a reference to one) the shape
+    of a ``tuple`` expression is made of (see ``interp.ComptimeTuple``)."""
+
     values: tuple[ArgEntry[Value], ...]
+
+
+@dataclass(eq=False)
+class TuplePtr(Inst):
+    """A tuple *place*: one address per element, the destructuring target
+    ``a, b = ...`` is built as (a nested target nests; see
+    ``interp.ComptimeTuplePtr`` and ``astgen._gen_target_tuple``)."""
+
+    values: tuple[Value, ...]
 
 @dataclass(eq=False)
 class Dict(Inst):
@@ -536,6 +548,17 @@ class ExceptBind(Inst):
 @dataclass(eq=False)
 class AsBool(Inst):
     """Converts a value to a boolean."""
+    value: ArgEntry[Value]
+
+@dataclass(eq=False)
+class Len(Inst):
+    """``len(x)``: the number of elements of ``x``, as a register holding an
+    *untyped* integer (the destination gives it its type, like an integer
+    literal).  The operand is logically a *value*: a tuple (``ComptimeTuple``,
+    or its ``ComptimeTuplePtr`` place form when passed by reference) yields its
+    length directly, and a struct is asked through its ``__len__`` method (see
+    ``interp``)."""
+
     value: ArgEntry[Value]
 
 @dataclass(eq=False)
