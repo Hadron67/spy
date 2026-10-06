@@ -1847,6 +1847,30 @@ class _Builder:
             ret.add(value)
         return ret
 
+    def _gen_closure_vararg(
+        self, arg: ast.arg | None, name: str,
+    ) -> tuple[str | None, bool, hir.Value | None]:
+        """Parse the ``*args``/``**kwargs`` parameter of a closure (``arg`` is
+        None when it is not declared): its name, whether it carries the
+        ``Comptime`` marker, and its *element/value* annotation as an operand
+        evaluated in the enclosing frame (None when unannotated).  A
+        ``type[...]`` annotation is rejected."""
+        if arg is None:
+            return None, False, None
+        is_comptime = False
+        annotation: hir.Value | None = None
+        if arg.annotation is not None:
+            is_comptime, type_node = self._split_comptime(arg.annotation)
+            if type_node is not None:
+                is_type_value, type_node = self._split_type_value(type_node)
+                if is_type_value:
+                    raise CompileError(
+                        f'*args/**kwargs cannot be a type[...] parameter in spy '
+                        f'closure {name}'
+                    )
+                annotation = self._as_value(self._gen_expr(type_node)[0])
+        return arg.arg, is_comptime, annotation
+
     def _gen_closure(
         self,
         name: str,
@@ -1867,8 +1891,6 @@ class _Builder:
         where the closure is created); the body is generated into an instruction
         list of its own, under a :class:`_ClosureScope` that records the captures
         it resolves through the enclosing scopes."""
-        if args.vararg is not None or args.kwarg is not None:
-            raise CompileError(f'*args/**kwargs are not supported in spy closure {name}')
         if len(args.posonlyargs) > 0:
             raise CompileError(f'positional-only arguments are not supported in spy closure {name}')
         if len(args.kwonlyargs) > 0:
@@ -1900,6 +1922,12 @@ class _Builder:
                         tv, type_node = self._split_type_value(type_node)
                         is_type_value[i] = tv
                         annotations[i] = self._as_value(self._gen_expr(type_node)[0])
+            vararg_name, vararg_is_comptime, vararg_annotation = self._gen_closure_vararg(
+                args.vararg, name,
+            )
+            kwarg_name, kwarg_is_comptime, kwarg_annotation = self._gen_closure_vararg(
+                args.kwarg, name,
+            )
             defaults: list[hir.Value | None] = [None] * n
             offset = n - len(args.defaults)
             for i, default in enumerate(args.defaults):
@@ -1919,6 +1947,8 @@ class _Builder:
                 local_name=f'{name}#{self._closure_counter}',
                 body=(), param_names=tuple(param_names), is_comptime=tuple(is_comptime),
                 is_type_value=tuple(is_type_value),
+                vararg_name=vararg_name, kwarg_name=kwarg_name,
+                vararg_is_comptime=vararg_is_comptime, kwarg_is_comptime=kwarg_is_comptime,
                 arg_is_ref=tuple([False] * n),
                 generic_args=tuple(generic_args), force_inline=force_inline,
                 exceptions=exceptions, callconv=callconv, may_panic=may_panic,
@@ -1928,6 +1958,12 @@ class _Builder:
             try:
                 for i, pname in enumerate(param_names):
                     scope.vars[pname] = hir.Arg(i)
+                next_arg = n
+                if vararg_name is not None:
+                    scope.vars[vararg_name] = hir.Arg(next_arg)
+                    next_arg += 1
+                if kwarg_name is not None:
+                    scope.vars[kwarg_name] = hir.Arg(next_arg)
                 saved_insts = self.insts
                 saved_own = self._own_generic_names
                 saved_pragmas = self._pragmas
@@ -1945,7 +1981,7 @@ class _Builder:
                 self._scopes.pop()
             return cast(hir.MakeClosure, self.add(hir.MakeClosure(
                 closure, tuple(annotations), tuple(defaults), ret_operand,
-                tuple(scope.captures),
+                vararg_annotation, kwarg_annotation, tuple(scope.captures),
             )))
         finally:
             self._generic_names = saved_generics
@@ -2027,8 +2063,6 @@ def parse_function(
     if node.name != fn.__name__:
         raise CompileError(f"function name mismatch: expected {node.name}, got {fn.__name__}")
 
-    if node.args.vararg is not None or node.args.kwarg is not None:
-        raise CompileError(f"*args/**kwargs are not supported in spy function {node.name}")
     if len(node.args.posonlyargs) > 0:
         raise CompileError(f"positional-only arguments are not supported in spy function {node.name}")
     if len(node.args.kwonlyargs) > 0:
@@ -2171,12 +2205,27 @@ def parse_function(
         # address); every other parameter is passed as the signature says
         arg_is_ref.append(i == 0 and self_type is not None and not self_by_value)
 
-    # ``*args``/``**kwargs`` are rejected above (a spy function definition
-    # may not declare them yet), so the ``varargs``/``kwargs`` slots of the
-    # signature are always None; the signature model and ``bind_arg_pos``
-    # already support them for the calls the parser will allow later.
+    # ``*args``/``**kwargs``: the excess positional/keyword arguments a call
+    # passes are bound to them (see ``Signature.bind_arg_pos``).  The formal
+    # carries the *element* (varargs) or *value* (kwargs) annotation; an
+    # unannotated one is inferred from the provided arguments (see
+    # ``Signature.specialize``).  ``type[...]`` is rejected: a type-valued
+    # ``*args``/``**kwargs`` element is not supported
+    def vararg_formal(arg: ast.arg | None) -> SignatureFormalArg | None:
+        if arg is None:
+            return None
+        is_comptime, annotated = unwrap_comptime(annotations.get(arg.arg))
+        if get_origin(annotated) is type:
+            raise CompileError(
+                f"*args/**kwargs of function {node.name} cannot be a type[...] parameter"
+            )
+        return SignatureFormalArg(annotation_of(annotated), is_comptime, None, TriState.UNKNOWN, False)
+
+    varargs = vararg_formal(node.args.vararg)
+    kwargs = vararg_formal(node.args.kwarg)
+
     signature = Signature(
-        tuple(generic_args), positional, None, None, annotation_of(ret_annotation), exception_set(),
+        tuple(generic_args), positional, varargs, kwargs, annotation_of(ret_annotation), exception_set(),
         callconv, may_panic,
     )
 
@@ -2188,9 +2237,17 @@ def parse_function(
     # shadow a struct's parameter of the same name, like Python scoping
     builder = _Builder(fn, ir, type_vars, resolver)
     # At HIR level, parameters are passed by ref (pointer); they are the
-    # function body's block, the bottom scope of the builder's stack
+    # function body's block, the bottom scope of the builder's stack.  The
+    # varargs/kwargs parameters come after every positional one, matching the
+    # frame entries ``_init_args_from_signature`` builds
     for i, name in enumerate(positional.keys):
         builder._declare(name, hir.Arg(i))
+    next_arg = len(positional.keys)
+    if node.args.vararg is not None:
+        builder._declare(node.args.vararg.arg, hir.Arg(next_arg))
+        next_arg += 1
+    if node.args.kwarg is not None:
+        builder._declare(node.args.kwarg.arg, hir.Arg(next_arg))
     builder._gen_body(node.body)
     builder.add(hir.StoreVoidRetloc())
     ir.body = tuple(builder.insts)

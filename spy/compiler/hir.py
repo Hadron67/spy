@@ -422,6 +422,11 @@ class MakeClosure(Inst):
     annotations: tuple[Value | None, ...]
     defaults: tuple[Value | None, ...]
     ret_annotation: Value | None
+    # the ``*args``/``**kwargs`` element/value annotations (evaluated here, in
+    # the enclosing frame, like the positional ones); None when that parameter
+    # is not declared or is unannotated
+    vararg_annotation: Value | None
+    kwarg_annotation: Value | None
     captures: tuple[Value, ...]
 
 @dataclass(eq=False)

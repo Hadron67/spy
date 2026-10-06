@@ -761,6 +761,15 @@ class ClosureFunction:
     # whether each declared parameter's annotation is ``type[X]`` (a
     # type-valued parameter, see ``SignatureFormalArg.is_type_value``)
     is_type_value: tuple[bool, ...]
+    # the ``*args``/``**kwargs`` names (None when not declared); their element/
+    # value annotations are the ``vararg_annotation``/``kwarg_annotation``
+    # operands of the ``hir.MakeClosure`` that creates the closure (evaluated in
+    # the enclosing frame, like the positional ones)
+    vararg_name: str | None
+    kwarg_name: str | None
+    # whether ``*args``/``**kwargs`` carry the ``Comptime`` marker
+    vararg_is_comptime: bool
+    kwarg_is_comptime: bool
     # for each declared positional parameter, whether the HIR binds its
     # argument directly as an address (see ``FunctionIR.arg_is_ref``)
     arg_is_ref: tuple[bool, ...]
@@ -965,17 +974,35 @@ def _thunk_call_sig(call_sig: CallSignature, fn: mir.Function) -> CallSignature:
     """The specialized call signature of the Python-entry thunk: ``call_sig``
     with every runtime argument whose aggregate form crosses the boundary as a
     pointer marked ``is_ref`` (its value is then the address)."""
+
+    def convert(arg: SpecializedFormalArg, index: int) -> tuple[SpecializedFormalArg, int]:
+        match arg:
+            case SpecializedComptimeArg():
+                return arg, index
+            case SpecializedRuntimeArg():
+                is_ref = arg.is_ref or _must_pass_by_ref(fn.args[index])
+                return SpecializedRuntimeArg(arg.type, is_ref), index + 1
+        raise AssertionError(f'unsupported specialized argument {arg!r}')
+
     positional: list[tuple[str, SpecializedFormalArg]] = []
     index = 0
     for name, arg in call_sig.positional:
-        match arg:
-            case SpecializedComptimeArg():
-                positional.append((name, arg))
-            case SpecializedRuntimeArg():
-                is_ref = arg.is_ref or _must_pass_by_ref(fn.args[index])
-                positional.append((name, SpecializedRuntimeArg(arg.type, is_ref)))
-                index += 1
-    return replace(call_sig, positional=tuple(positional))
+        arg, index = convert(arg, index)
+        positional.append((name, arg))
+    varargs: tuple[SpecializedFormalArg, ...] | None = None
+    if call_sig.varargs is not None:
+        varargs_values: list[SpecializedFormalArg] = []
+        for arg in call_sig.varargs:
+            arg, index = convert(arg, index)
+            varargs_values.append(arg)
+        varargs = tuple(varargs_values)
+    kwargs: frozendict[str, SpecializedFormalArg] | None = None
+    if call_sig.kwargs is not None:
+        kwargs_values: dict[str, SpecializedFormalArg] = {}
+        for name, arg in call_sig.kwargs.items():
+            kwargs_values[name], index = convert(arg, index)
+        kwargs = frozendict(kwargs_values)
+    return replace(call_sig, positional=tuple(positional), varargs=varargs, kwargs=kwargs)
 
 @dataclass
 class CompileBatch:

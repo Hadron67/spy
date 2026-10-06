@@ -1720,9 +1720,9 @@ class HirRunner:
         for (_, arg), is_ref in zip(signature.positional, arg_is_ref):
             arg_values.append(self._init_one_arg(arg, mir_args, is_ref))
 
-        if signature.varargs:
+        if signature.varargs is not None:
             arg_values.append(ComptimeTuplePtr(tuple(self._init_one_arg(a, mir_args, False) for a in signature.varargs)))
-        if signature.kwargs:
+        if signature.kwargs is not None:
             arg_values.append(ComptimeDictPtr({k: self._init_one_arg(v, mir_args, False) for k, v in signature.kwargs.items()}))
 
         return tuple(arg_values)
@@ -4752,8 +4752,26 @@ class HirRunner:
         ret_type: sval.Type | None = None
         if inst.ret_annotation is not None:
             ret_type = self.type_operand(inst.ret_annotation, 'the closure return type')
+        varargs: SignatureFormalArg | None = None
+        if fn.vararg_name is not None:
+            vararg_type = (
+                None if inst.vararg_annotation is None
+                else self._declared_type(inst.vararg_annotation)
+            )
+            varargs = SignatureFormalArg(
+                vararg_type, fn.vararg_is_comptime, None, TriState.UNKNOWN, False,
+            )
+        kwargs: SignatureFormalArg | None = None
+        if fn.kwarg_name is not None:
+            kwarg_type = (
+                None if inst.kwarg_annotation is None
+                else self._declared_type(inst.kwarg_annotation)
+            )
+            kwargs = SignatureFormalArg(
+                kwarg_type, fn.kwarg_is_comptime, None, TriState.UNKNOWN, False,
+            )
         sig = Signature(
-            fn.generic_args, positional, None, None, ret_type, fn.exceptions,
+            fn.generic_args, positional, varargs, kwargs, ret_type, fn.exceptions,
             fn.callconv, fn.may_panic,
         )
         hir_ir = FunctionIR(fn.name, sig, fn.arg_is_ref, fn.body)
@@ -7658,6 +7676,8 @@ class HirRunner:
                 frozendict(frame_values),
                 value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
                 on_done=on_return,
+                has_varargs=sig.varargs is not None,
+                has_kwargs=sig.kwargs is not None,
             )
         spec_sig = sig.specialize(self._provided_types(sig, binded_args), self._mir_cache)
 
@@ -7698,6 +7718,8 @@ class HirRunner:
                 value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
                 on_done=on_return,
                 closure_values=self._inline_capture_values(closure),
+                has_varargs=sig.varargs is not None,
+                has_kwargs=sig.kwargs is not None,
             )
         capture_specs, capture_args = self._compile_capture_args(closure)
         provided = self._provided_types(sig, binded_args)
@@ -8153,6 +8175,19 @@ class HirRunner:
                     tuple(self._fresh_places(child, places) for child in values)
                 )
 
+    def _inline_arg_place(self, arg: ArgEntry[InterpVal]) -> InterpVal:
+        """The place an inlined callee's argument (a positional by-value
+        argument, or a ``*args``/``**kwargs`` element) is bound to: a reference
+        argument is the address it already carries, any other value is written
+        into a fresh slot first (the copy a value parameter is, see
+        ``_start_inline``)."""
+        if arg.is_ref:
+            return arg.value
+        slot = self.alloca(InlineMode.FULL)
+        self.store(slot, arg.value)
+        self._commit_pending_slot(slot)
+        return slot
+
     def _start_inline(
         self,
         body: tuple[hir.Inst, ...],
@@ -8164,6 +8199,8 @@ class HirRunner:
         value_is_empty: bool = False,
         on_done: Callable[[], None] | None = None,
         closure_values: tuple[InterpVal, ...] = (),
+        has_varargs: bool = False,
+        has_kwargs: bool = False,
     ) -> PollResult:
         """Start the inlined body of a plain Python callee: convert its
         bound arguments into addressable values (the callee's ``hir.Arg``
@@ -8187,8 +8224,6 @@ class HirRunner:
                 f'inline recursion or nesting exceeded '
                 f'{_MAX_INLINE_DEPTH} levels'
             )
-        if len(args.varargs) > 0 or len(args.kwargs) > 0:
-            raise CompileError('*args/**kwargs cannot be inlined yet')
         arg_values: list[InterpVal] = []
         for (arg, by_ref) in zip(args.positional, arg_is_ref):
             # ``by_ref`` is the *callee's* HIR binding: a method's ``self`` is
@@ -8200,10 +8235,19 @@ class HirRunner:
             if by_ref or arg.is_ref:
                 arg_values.append(arg.value)
             else:
-                slot = self.alloca(InlineMode.FULL)
-                self.store(slot, arg.value)
-                self._commit_pending_slot(slot)
-                arg_values.append(slot)
+                arg_values.append(self._inline_arg_place(arg))
+        # the varargs/kwargs the call bound come after every positional
+        # parameter, as one tuple/dict place tree (see ``hir.Arg`` and
+        # ``_init_args_from_signature``, which does the same for a compiled
+        # callee)
+        if has_varargs:
+            arg_values.append(
+                ComptimeTuplePtr(tuple(self._inline_arg_place(a) for a in args.varargs))
+            )
+        if has_kwargs:
+            arg_values.append(
+                ComptimeDictPtr({k: self._inline_arg_place(a) for k, a in args.kwargs.items()})
+            )
         frame_values: dict[sval.TypeVar, InterpVal] = {}
         if generic_var_values is not None:
             frame_values = {tv: ComptimeVal(v) for tv, v in generic_var_values.items()}

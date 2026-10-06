@@ -39,6 +39,7 @@ from .fn import (
     CallSignature,
     FunctionInstance,
     ProvidedArg,
+    SpecializedFormalArg,
     SpecializedRuntimeArg,
     plain_provided_arg,
 )
@@ -569,15 +570,27 @@ def invoke(
 
     temps: list[Any] = []
     py_args: list[Any] = []
-    for (_name, arg), (_tname, targ), value in zip(
-        call_sig.positional, thunk_sig.positional, arglist.positional,
-    ):
+
+    def marshal(targ: SpecializedFormalArg, value: Any) -> None:
         if not isinstance(targ, SpecializedRuntimeArg):
-            continue
+            return
         argument, buffer = _marshal_arg(targ.type, value, targ.is_ref, cache)
         py_args.append(argument)
         if buffer is not None:
             temps.append(buffer)
+
+    for (_name, _arg), (_tname, targ), value in zip(
+        call_sig.positional, thunk_sig.positional, arglist.positional,
+    ):
+        marshal(targ, value)
+    # the varargs/kwargs runtime arguments follow the positional ones, in the
+    # order the lowered function takes them (see ``_init_args_from_signature``)
+    if call_sig.varargs is not None and thunk_sig.varargs is not None:
+        for targ, value in zip(thunk_sig.varargs, arglist.varargs):
+            marshal(targ, value)
+    if call_sig.kwargs is not None and thunk_sig.kwargs is not None:
+        for name, targ in thunk_sig.kwargs.items():
+            marshal(targ, arglist.kwargs[name])
 
     leaves = _storage_leaves(thunk_ret)
     buffers: list[Any] = []

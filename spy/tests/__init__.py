@@ -47,6 +47,8 @@ from .structs import all_tests as structs_tests
 from .tagged_unions import all_tests as tagged_unions_tests
 from .types import all_tests as types_tests
 from .undefined import all_tests as undefined_tests
+from .varargs import all_tests as varargs_tests
+from .varargs_combos import all_tests as varargs_combos_tests
 
 all_tests: list[type[TestCase]] = [
     *basics_tests,
@@ -80,6 +82,8 @@ all_tests: list[type[TestCase]] = [
     *static_tests,
     *strings_tests,
     *mem_tests,
+    *varargs_tests,
+    *varargs_combos_tests,
 ]
 
 
