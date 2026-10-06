@@ -95,7 +95,7 @@ from annotationlib import Format
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from enum import IntEnum, auto
-from typing import Any, Self, cast, override
+from typing import Any, Self, override
 
 from . import hir, mir, sval
 from .binop import BinaryOp, CompareOp, UnaryOp
@@ -108,6 +108,7 @@ from .fn import (
     ClosureValue,
     CompileBatch,
     CompoundArgNode,
+    ComptimePtrArg,
     FunctionInstance,
     FunctionIR,
     FunctionValue,
@@ -549,6 +550,19 @@ class _PendingErrorCodeWrite:
 
     exception: sval.Type
     insertion: mir.Insertion
+
+# The interpreter value forms that *are* a compile-time pointer: the place a
+# compile-time value or aggregate is held in (see ``ComptimeBox`` and the
+# aggregate/tuple/dict/option/union place forms).  Passing one to a non-inline
+# function carries it as a ``ComptimePtrArg`` (see ``HirRunner._node_of``).
+_COMPTIME_PTR_FORMS = (
+    ComptimeBox,
+    ComptimeAggregatePtr,
+    ComptimeOptionPtr,
+    ComptimeTaggedUnionPtr,
+    ComptimeTuplePtr,
+    ComptimeDictPtr,
+)
 
 def _is_comptime_val(val: InterpVal) -> bool:
     """Whether the value is *deeply* compile-time: it is known in full while
@@ -1157,6 +1171,12 @@ def _arg_node_types(node: ArgNode) -> Iterator[sval.Type]:
     a call reads (see ``_call_closure``)."""
     if isinstance(node, RuntimeArgNode):
         yield node.type
+    elif isinstance(node, ComptimePtrArg):
+        # a compile-time pointer: its own pointer type and, recursively, the
+        # types of its pointee (a closure inside a pointer's content is rejected
+        # just like one passed directly)
+        yield node.type
+        yield from _arg_node_types(node.content)
     elif isinstance(node, tuple):
         for child in node:
             yield from _arg_node_types(child)
@@ -1170,6 +1190,34 @@ def _arg_node_types(node: ArgNode) -> Iterator[sval.Type]:
         type = sval.type_of(node)
         if type is not None:
             yield type
+
+
+def _arg_node_needs_mir(node: ArgNode) -> bool:
+    """Whether the argument tree ``node`` consumes a MIR argument: it holds a
+    runtime leaf anywhere (a ``RuntimeArgNode``), including inside the content of
+    a :class:`ComptimePtrArg`.  It is what a caller that can only take a
+    runtime-pointer-free argument reads (see ``exec_as_func_ptr``)."""
+    if isinstance(node, RuntimeArgNode):
+        return True
+    if isinstance(node, ComptimePtrArg):
+        return _arg_node_needs_mir(node.content)
+    if isinstance(node, tuple):
+        return any(_arg_node_needs_mir(child) for child in node)
+    if isinstance(node, frozendict):
+        return any(_arg_node_needs_mir(child) for child in node.values())
+    if isinstance(node, CompoundArgNode):
+        return any(_arg_node_needs_mir(child) for child in node.elems)
+    return False
+
+
+def _union_variant_type(union_type: sval.TaggedUnionType, tag: InterpVal) -> sval.Type:
+    """The variant type the tag value ``tag`` selects in ``union_type`` - or the
+    payload union storage type when the tag is only known at runtime (see
+    ``ComptimeTaggedUnionPtr``)."""
+    obj = _to_comptime(_shallow_normalize(tag))
+    if isinstance(obj, sval.Int):
+        return union_type.types[obj.value]
+    return union_type.payload_type()
 
 
 def _provided_node_of_type(type: sval.Type) -> ArgNode:
@@ -1807,10 +1855,110 @@ class HirRunner:
                     node.container_type,
                     tuple(self._init_arg_node(child, mir_args, False) for child in node.elems),
                 )
+            case ComptimePtrArg(type=type, content=content):
+                # a compile-time pointer: the callee gets a fresh, writable place
+                # holding a copy of the pointee (see ``_init_ptr_target``)
+                assert isinstance(type, sval.PointerType)
+                place = self._init_ptr_target(content, type.elem, mir_args)
+                if arg_is_ref:
+                    # the parameter is a place: the pointer itself is the place
+                    return place
+                # the parameter is a pointer passed by value: its HIR place holds
+                # the pointer value, so wrap the place in a slot of the pointer type
+                return self._inline_arg_place(ArgEntry(place, False))
             case _:
                 # a compile-time leaf (an ``sval.Value``, or a plain Python
                 # scalar): a const reference to it, no MIR argument
                 return ComptimeVal(sval.ConstRef(node))
+
+    def _init_ptr_target(self, node: ArgNode, type: sval.Type, mir_args: list[mir.Type]) -> InterpVal:
+        """A fresh, writable compile-time place of spy type ``type`` holding a
+        copy of the pointee ``node``: what a compile-time pointer argument's
+        pointee is rebuilt as at the callee (see :class:`~spy.compiler.fn.ComptimePtrArg`).
+        A runtime leaf consumes one MIR argument, in depth-first order (the order
+        the caller passed them, see ``_convert_content``)."""
+        match node:
+            case RuntimeArgNode():
+                # a runtime leaf of the pointee: a fresh slot seeded with the
+                # value passed by value
+                return self._init_arg_node(node, mir_args, False)
+            case ComptimePtrArg(inner_type, inner_content):
+                # a pointer inside the pointee: rebuild the place it points at,
+                # then hold the pointer in a fresh place of its own
+                assert isinstance(inner_type, sval.PointerType)
+                inner = self._init_ptr_target(inner_content, inner_type.elem, mir_args)
+                place = self._declared_comptime_place(type)
+                self.store(place, inner)
+                return place
+            case tuple():
+                assert isinstance(type, sval.TupleType)
+                return ComptimeTuplePtr(tuple(
+                    self._init_ptr_target(child, elem_type, mir_args)
+                    for child, elem_type in zip(node, type.types)
+                ))
+            case frozendict():
+                assert isinstance(type, sval.StrDictType)
+                return ComptimeDictPtr({
+                    name: self._init_ptr_target(child, type.values[name], mir_args)
+                    for name, child in node.items()
+                })
+            case CompoundArgNode(container_type, elems):
+                return self._init_container_target(container_type, elems, mir_args)
+            case _:
+                # a compile-time value leaf: a fresh place of the declared type
+                # (a box for a scalar, the type's own place form otherwise)
+                # holding a copy of the value
+                value = self._coerce(ComptimeVal(node), type)
+                place = self._declared_comptime_place(type)
+                self.store(place, value)
+                return place
+
+    def _declared_comptime_place(self, type: sval.Type) -> InterpVal:
+        """Fresh compile-time storage of the declared type ``type`` - a box for a
+        scalar, the type's own place form for an aggregate, tuple, ``dict``,
+        ``Option`` or tagged union (see ``alloca``) - the place a rebuilt
+        compile-time pointer's pointee lives in (see ``_init_ptr_target``)."""
+        return self.alloca(InlineMode.FULL, declared=type)
+
+    def _init_container_target(
+        self, container_type: sval.Type, elems: tuple[ArgNode, ...], mir_args: list[mir.Type]
+    ) -> InterpVal:
+        """A fresh place of the container type ``container_type`` (an aggregate,
+        an ``Option[T]`` or a tagged union) built from the content parts ``elems``
+        (see ``CompoundArgNode`` and ``_init_ptr_target``)."""
+        payload_place: InterpVal
+        if isinstance(container_type, sval.OptionType):
+            tag, payload = elems
+            child = container_type.child
+            if child.is_zst():
+                # a zero-sized child has no payload storage
+                payload_place = ComptimeVal(sval.Undefined(sval.PointerType(child, is_const=False)))
+            else:
+                payload_place = self._init_ptr_target(payload, child, mir_args)
+            return ComptimeOptionPtr(self._init_value(tag, mir_args), payload_place)
+        if isinstance(container_type, sval.TaggedUnionType):
+            tag, payload = elems
+            tag_value = self._init_value(tag, mir_args)
+            variant = container_type.types[self._tagged_union_int(tag_value)]
+            if variant.get_unit_value() is not None:
+                # a zero-sized variant has no payload storage
+                payload_place = ComptimeVal(sval.Undefined(sval.PointerType(variant, is_const=False)))
+            else:
+                payload_place = self._init_ptr_target(payload, variant, mir_args)
+            return ComptimeTaggedUnionPtr(container_type, tag_value, payload_place)
+        if _is_aggregate(container_type):
+            elem_types = _aggregate_place_types(container_type)
+            return ComptimeAggregatePtr(container_type, tuple(
+                self._init_ptr_target(child, elem_type, mir_args)
+                for child, elem_type in zip(elems, elem_types)
+            ))
+        raise CompileError(f'cannot rebuild the content of a {container_type} place')
+
+    def _init_value(self, node: ArgNode, mir_args: list[mir.Type]) -> InterpVal:
+        """The *value* a value leaf ``node`` denotes (see ``_init_container_target``):
+        a compile-time value as itself, a runtime one read back out of the fresh
+        slot it is passed in."""
+        return self.load(self._init_arg_node(node, mir_args, False))
 
     def _init_args_from_signature(
         self,
@@ -4461,16 +4609,19 @@ class HirRunner:
                 return ComptimeVal(sval.coerce_const(obj, target))
             case RuntimeVal(value, type):
                 return RuntimeVal(self._convert(value, type, target), target)
-            case ComptimeAggregatePtr() | ComptimeOptionPtr() | ComptimeBox():
-                # a compile-time aggregate as a value of a pointer type: it *is*
-                # a pointer already (see ``_type_of``) - its fields are their own
-                # places - so nothing is converted here.  Becoming an address of
-                # real memory happens only where a MIR value is actually needed
-                # (see ``_to_runtime``)
+            case (
+                ComptimeAggregatePtr() | ComptimeOptionPtr() | ComptimeTaggedUnionPtr()
+                | ComptimeTuplePtr() | ComptimeDictPtr() | ComptimeBox()
+            ):
+                # a compile-time pointer as a value of a pointer type: it *is* a
+                # pointer already (see ``_type_of``) - its fields/elements are
+                # their own places - so nothing is converted here.  Becoming an
+                # address of real memory happens only where a MIR value is
+                # actually needed (see ``_to_runtime``)
                 # TODO: type check?
                 if not isinstance(target, sval.PointerType):
                     raise CoerceError(
-                        f'cannot materialize a {target} from a compile-time aggregate'
+                        f'cannot materialize a {target} from a compile-time pointer'
                     )
                 return ev
             case ComptimeAggregate():
@@ -4902,14 +5053,18 @@ class HirRunner:
             # its captures refers to a runtime register: a runtime capture would
             # become a hidden pointer parameter (its address), which a function
             # pointer typed ``T`` has no place for, while a compile-time capture
-            # is baked into the specialization (no runtime parameter).
+            # (a compile-time pointer, whose content is baked into the
+            # specialization) needs none.
             if obj.force_inline:
                 raise CompileError(
                     'cannot take the function pointer of an inlined closure'
                 )
-            capture_specs, _ = self._compile_capture_args(obj)
+            capture_specs = tuple(
+                self._provided_node(ArgEntry(capture, False))
+                for capture in obj.captures
+            )
             for spec in capture_specs:
-                if isinstance(spec, RuntimeArgNode):
+                if _arg_node_needs_mir(spec):
                     raise CompileError(
                         'cannot take the function pointer of a closure that captures '
                         'a runtime value'
@@ -7741,30 +7896,124 @@ class HirRunner:
     def _provided_node(self, arg: ArgEntry[InterpVal]) -> ArgNode:
         """The :data:`ArgNode` one argument provides (see
         ``Signature.solve_param_types``): a compile-time value as itself, a
-        runtime value as its spy type, and a tuple/``dict[str, T]`` value as its
-        element tree (whose elements are passed separately)."""
+        compile-time pointer as a :class:`~spy.compiler.fn.ComptimePtrArg` (its
+        pointee carried losslessly), a runtime value as its spy type, and a
+        tuple/``dict[str, T]`` value as its element tree (whose elements are
+        passed separately)."""
         ev = _shallow_normalize(arg.value)
+        if arg.is_ref:
+            # the argument is a *place*: what it provides is the value it holds.
+            # A tuple/``dict`` place keeps its elements as places, in their own
+            # shape; a compile-time place is read (the load is pure); a runtime
+            # one keeps its element type and is loaded by the caller (see
+            # ``_make_runtime_call``)
+            if isinstance(ev, ComptimeTuplePtr):
+                return tuple(self._provided_node(ArgEntry(place, True)) for place in ev.values)
+            if isinstance(ev, ComptimeDictPtr):
+                return frozendict(
+                    (k, self._provided_node(ArgEntry(place, True)))
+                    for k, place in ev.values.items()
+                )
+            if _is_comptime_val(ev):
+                return self._node_of(self.load(ev))
+            type = _arg_type_of(arg)
+            if type is None:
+                raise CompileError(
+                    'cannot determine the type of an argument passed to a spy function'
+                )
+            return RuntimeArgNode(type, False)
+        return self._node_of(ev)
+
+    def _node_of(self, ev: InterpVal) -> ArgNode:
+        """The :data:`ArgNode` a value (or a place used as a value) provides: a
+        compile-time pointer as a :class:`~spy.compiler.fn.ComptimePtrArg`, a
+        plain compile-time value as itself, a runtime value as its spy type, and
+        a tuple/``dict[str, T]`` value as its element tree."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, _COMPTIME_PTR_FORMS):
+            ptr_type = _type_of(ev)
+            assert isinstance(ptr_type, sval.PointerType)
+            if isinstance(ev, (ComptimeOptionPtr, ComptimeTaggedUnionPtr)):
+                tag = ev.is_null if isinstance(ev, ComptimeOptionPtr) else ev.tag
+                if _to_comptime(_shallow_normalize(tag)) is None:
+                    # a tag only known at runtime: the place is not transportable
+                    # losslessly as compile-time content, so the pointer is
+                    # materialized as one runtime argument (still a copy)
+                    return RuntimeArgNode(ptr_type, False)
+            return ComptimePtrArg(ptr_type, self._content_node(ev, ptr_type.elem))
+        if isinstance(ev, ComptimeCastedPtr):
+            # a cast pointer whose underlying place does not convert to the target
+            # type (see ``ComptimeCastedPtr``): reading or writing through it is
+            # not supported, so neither is passing it to a function
+            raise CompileError(f'cannot pass the cast pointer {ev.type} to a function')
+        if isinstance(ev, RuntimeVal):
+            return RuntimeArgNode(ev.type, False)
+        if isinstance(ev, ComptimeVal):
+            obj = ev.obj
+            if isinstance(obj, sval.ConstRef):
+                # a const reference to a compile-time global: a compile-time
+                # pointer to an immutable value (see ``ConstRef``)
+                return ComptimePtrArg(obj.get_type(), self._node_of(ComptimeVal(obj.value)))
+            return obj
         match ev:
             case ComptimeTuple(values=values):
                 return tuple(self._provided_node(child) for child in values)
-            case ComptimeTuplePtr(values=values):
-                return tuple(self._provided_node(ArgEntry(place, True)) for place in values)
             case ComptimeDict(values=values):
-                return frozendict((k, self._provided_node(child)) for k, child in values.items())
-            case ComptimeDictPtr(values=values):
-                return frozendict((k, self._provided_node(ArgEntry(place, True))) for k, place in values.items())
-            case _:
-                if not arg.is_ref and _is_comptime_val(ev):
-                    value = _to_comptime(ev)
-                    if value is not None:
-                        return value
-                type = _arg_type_of(arg)
-                if type is None:
-                    raise CompileError(
-                        'cannot determine the type of an argument passed to a '
-                        'spy function'
-                    )
-                return RuntimeArgNode(type, False)
+                return frozendict(
+                    (k, self._provided_node(child)) for k, child in values.items()
+                )
+        # a value form with no node language of its own (a compile-time
+        # aggregate, option or tagged union): one runtime argument, materialized
+        # where a runtime value is needed
+        type = _type_of(ev)
+        if type is None:
+            raise CompileError(
+                'cannot determine the type of an argument passed to a spy function'
+            )
+        return RuntimeArgNode(type, False)
+
+    def _content_node(self, place: InterpVal, type: sval.Type) -> ArgNode:
+        """The content of the compile-time pointer ``place`` (the pointee of spy
+        type ``type``), as the :data:`ArgNode` the callee rebuilds an equivalent
+        place from (``ComptimePtrArg.content``, see ``_init_ptr_target``).  A
+        runtime leaf is a :class:`RuntimeArgNode` - its value is passed as a MIR
+        argument; anything else is structural."""
+        place = _shallow_normalize(place)
+        if isinstance(place, ComptimeBox):
+            # a scalar held compile-time: the value it holds
+            return self._node_of(place.value)
+        if isinstance(place, ComptimeAggregatePtr):
+            elem_types = _aggregate_place_types(place.type)
+            return CompoundArgNode(place.type, tuple(
+                self._content_node(p, elem_type)
+                for p, elem_type in zip(place.ptrs, elem_types)
+            ))
+        if isinstance(place, ComptimeTuplePtr):
+            assert isinstance(type, sval.TupleType)
+            return tuple(
+                self._content_node(p, elem_type)
+                for p, elem_type in zip(place.values, type.types)
+            )
+        if isinstance(place, ComptimeDictPtr):
+            assert isinstance(type, sval.StrDictType)
+            return frozendict(
+                (name, self._content_node(p, type.values[name]))
+                for name, p in place.values.items()
+            )
+        if isinstance(place, ComptimeOptionPtr):
+            assert isinstance(type, sval.OptionType)
+            return CompoundArgNode(
+                type,
+                (self._node_of(place.is_null), self._content_node(place.payload_ptr, type.child)),
+            )
+        if isinstance(place, ComptimeTaggedUnionPtr):
+            variant_type = _union_variant_type(place.type, place.tag)
+            return CompoundArgNode(
+                place.type,
+                (self._node_of(place.tag), self._content_node(place.payload_ptr, variant_type)),
+            )
+        # a leaf place (a runtime slot, a const reference, ...): its own node
+        return self._node_of(place)
 
     def _call_function_entry(
         self,
@@ -7863,7 +8112,8 @@ class HirRunner:
                 has_varargs=sig.varargs is not None,
                 has_kwargs=sig.kwargs is not None,
             )
-        capture_specs, capture_args = self._compile_capture_args(closure)
+        capture_args = tuple(ArgEntry(capture, False) for capture in closure.captures)
+        capture_specs = tuple(self._provided_node(arg) for arg in capture_args)
         provided = self._provided_types(sig, binded_args)
         for node in provided.values():
             for type in _arg_node_types(node):
@@ -7892,35 +8142,6 @@ class HirRunner:
                 self._commit_pending_slot(capture)
             out.append(_shallow_normalize(capture))
         return tuple(out)
-
-    def _compile_capture_args(
-        self, closure: ClosureValue
-    ) -> tuple[tuple[ArgNode, ...], tuple[ArgEntry[InterpVal], ...]]:
-        """The capture parameters and arguments of a compiled closure call: a
-        runtime place becomes a by-value pointer parameter, a compile-time place
-        a compile-time argument (there is no runtime parameter for it)."""
-        specs: list[ArgNode] = []
-        cargs: list[ArgEntry[InterpVal]] = []
-        for capture in closure.captures:
-            if isinstance(capture, PendingSlot) and capture.committed is None:
-                self._commit_pending_slot(capture)
-            ev = _shallow_normalize(capture)
-            if isinstance(ev, RuntimeVal) and isinstance(ev.type, sval.PointerType):
-                specs.append(RuntimeArgNode(ev.type, False))
-                cargs.append(ArgEntry(ev, False))
-                continue
-            value = _to_comptime(ev)
-            if isinstance(value, sval.ConstRef):
-                value = value.value
-            if value is None:
-                # a compile-time place (a box, a const reference): read it
-                value = _to_comptime(self.load(ev))
-            if value is None:
-                raise CompileError(
-                    'cannot capture this compile-time value in a non-inlined closure'
-                )
-            specs.append(cast(sval.Value, value))
-        return tuple(specs), tuple(cargs)
 
     def _request_function(
         self,
@@ -7957,6 +8178,14 @@ class HirRunner:
         mir_args: list[mir.Value] = []
 
         def convert_one(arg: ArgEntry[InterpVal], sig_arg: ArgNode) -> None:
+            if isinstance(sig_arg, ComptimePtrArg):
+                # a compile-time pointer: no MIR argument for the pointer itself,
+                # but its content's runtime leaves are passed separately.  The
+                # pointer is the argument value (or, when the argument is a place,
+                # what that place holds - the loaded pointer)
+                pointer = self.load(arg.value) if arg.is_ref else arg.value
+                convert_content(ArgEntry(pointer, False), sig_arg.content)
+                return
             if not isinstance(sig_arg, RuntimeArgNode):
                 # a compound argument: its elements are passed separately, in
                 # their own order (see ``ArgNode``)
@@ -7997,6 +8226,54 @@ class HirRunner:
             else:
                 ev = self.load(arg.value) if arg.is_ref else arg.value
                 mir_args.append(self._to_runtime(self._coerce(ev, sig_arg.type)))
+
+        def convert_content(arg: ArgEntry[InterpVal], node: ArgNode) -> None:
+            """Emit the MIR arguments of the runtime leaves of the compile-time
+            pointer content ``node`` (see ``ComptimePtrArg``): the mirror of
+            ``_init_ptr_target``, whose runtime leaves are consumed in the same
+            depth-first order.  ``arg`` is the place (or value) the content is
+            read out of."""
+            if isinstance(node, RuntimeArgNode):
+                # a runtime leaf of the pointee: its value, read out of the place
+                # that holds it, is passed by value
+                convert_one(ArgEntry(self.load(arg.value), False), node)
+                return
+            place = _shallow_normalize(arg.value)
+            if isinstance(node, ComptimePtrArg):
+                # a pointer inside the pointee: its content, read out of the place
+                # that holds the pointer
+                convert_content(ArgEntry(self.load(place), False), node.content)
+                return
+            if isinstance(node, tuple):
+                assert isinstance(place, ComptimeTuplePtr)
+                for child, sub in zip(node, place.values):
+                    convert_content(ArgEntry(sub, True), child)
+                return
+            if isinstance(node, frozendict):
+                assert isinstance(place, ComptimeDictPtr)
+                for key, child in node.items():
+                    convert_content(ArgEntry(place.values[key], True), child)
+                return
+            if isinstance(node, CompoundArgNode):
+                if isinstance(node.container_type, sval.OptionType):
+                    assert isinstance(place, ComptimeOptionPtr)
+                    tag, payload = node.elems
+                    convert_content(ArgEntry(place.is_null, False), tag)
+                    if not node.container_type.child.is_zst():
+                        convert_content(ArgEntry(place.payload_ptr, True), payload)
+                    return
+                if isinstance(node.container_type, sval.TaggedUnionType):
+                    assert isinstance(place, ComptimeTaggedUnionPtr)
+                    tag, payload = node.elems
+                    convert_content(ArgEntry(place.tag, False), tag)
+                    if _union_variant_type(node.container_type, place.tag).get_unit_value() is None:
+                        convert_content(ArgEntry(place.payload_ptr, True), payload)
+                    return
+                assert isinstance(place, ComptimeAggregatePtr)
+                for child, sub in zip(node.elems, place.ptrs):
+                    convert_content(ArgEntry(sub, True), child)
+                return
+            # a compile-time leaf: nothing to pass
 
         for arg, (_, sig_arg) in zip(args.positional, call_sig.positional):
             convert_one(arg, sig_arg)

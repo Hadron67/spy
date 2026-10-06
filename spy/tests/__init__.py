@@ -24,6 +24,7 @@ from .classname import all_tests as classname_tests
 from .closures import all_tests as closures_tests
 from .complex import all_tests as complex_tests
 from .comptime import all_tests as comptime_tests
+from .comptime_ptrs import all_tests as comptime_ptrs_tests
 from .comptime_structs import all_tests as comptime_structs_tests
 from .cross_context import all_tests as cross_context_tests
 from .defer import all_tests as defer_tests
@@ -59,6 +60,7 @@ all_tests: list[type[TestCase]] = [
     *structs_tests,
     *annotations_tests,
     *comptime_tests,
+    *comptime_ptrs_tests,
     *generics_tests,
     *pointers_tests,
     *slices_tests,

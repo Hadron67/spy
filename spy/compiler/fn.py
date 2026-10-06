@@ -15,6 +15,7 @@ from .sval import (
     FormalArg,
     FunctionType,
     MirLowerCache,
+    PointerType,
     ResultType,
     RetSpec,
     RetTuple,
@@ -115,16 +116,18 @@ class ArgList[T]:
 
 # The argument tree of one call.  A *leaf* is either a compile-time value
 # (``sval.AnyValue`` - an ``sval.Value`` or a plain Python scalar, carried as
-# the value itself, never passed in MIR) or a :class:`RuntimeArgNode` (one
-# runtime value of a spy type).  A *compound* node records a "shape": a tuple
-# has no runtime representation of its own (see ``sval.TupleType``), so its
-# elements are passed separately and rebound as one place tree at the callee,
-# and a ``dict[str, T]`` (``sval.StrDictType``) is its named counterpart.  Both
-# nest.  ``*args`` is such a positional compound and ``**kwargs`` a named one.
-# The very same tree is the *provided* argument of a call (see
-# ``Signature.solve_param_types``): a runtime leaf there carries the argument's
-# spy type, a compile-time leaf its value.
-type ArgNode = AnyValue | RuntimeArgNode | CompoundArgNode | tuple[ArgNode, ...] | frozendict[str, ArgNode]
+# the value itself, never passed in MIR), a :class:`RuntimeArgNode` (one
+# runtime value of a spy type) or a :class:`ComptimePtrArg` (a compile-time
+# pointer, whose pointee is carried losslessly and copied at every call).  A
+# *compound* node records a "shape": a tuple has no runtime representation of
+# its own (see ``sval.TupleType``), so its elements are passed separately and
+# rebound as one place tree at the callee, and a ``dict[str, T]``
+# (``sval.StrDictType``) is its named counterpart.  Both nest.  ``*args`` is
+# such a positional compound and ``**kwargs`` a named one.  The very same tree
+# is the *provided* argument of a call (see ``Signature.solve_param_types``): a
+# runtime leaf there carries the argument's spy type, a compile-time leaf its
+# value.
+type ArgNode = AnyValue | RuntimeArgNode | CompoundArgNode | ComptimePtrArg | tuple[ArgNode, ...] | frozendict[str, ArgNode]
 
 @dataclass(frozen=True, slots=True)
 class RuntimeArgNode:
@@ -136,17 +139,40 @@ class RuntimeArgNode:
 
 @dataclass(frozen=True, slots=True)
 class CompoundArgNode:
-    """An aggregate argument whose fields/elements are passed separately
-    (flattened): the container spy type and one node per field.  Nothing
-    produces one yet - a struct parameter is a single :class:`RuntimeArgNode`
-    whether it stands on its own or as an element of a flattened tuple - but the
-    consumers already handle it (see ``interp`` and ``glue``)."""
+    """A *container place* described by its parts: the container spy type and
+    one node per part.  It is the content of a :class:`ComptimePtrArg` whose
+    pointee is an aggregate (struct, array or complex - one node per field or
+    element), an ``Option[T]`` (the tag node and the payload node) or a tagged
+    union (likewise); the container type decides which place the callee rebuilds
+    (see ``interp._init_ptr_target``).  A struct *argument* is never flattened
+    this way - it is a single :class:`RuntimeArgNode` whether it stands on its
+    own or as an element of a flattened tuple."""
 
     container_type: Type
     elems: tuple[ArgNode, ...]
 
     def __str__(self) -> str:
         return f"({self.container_type}: {', '.join(str(e) for e in self.elems)})"
+
+@dataclass(frozen=True, slots=True)
+class ComptimePtrArg:
+    """A compile-time pointer passed as a compile-time argument: the pointer
+    type the callee sees (``type``) and the pointee the pointer refers to
+    (``content``), carried losslessly so that the callee can rebuild an
+    equivalent compile-time place.  No MIR argument is passed for the pointer
+    itself; the runtime leaves of ``content`` - a pointee that holds runtime
+    values - are the runtime arguments of the call, in depth-first order.
+
+    A compile-time pointer cannot be aliased across a non-inline call, so its
+    pointee is *copied* into the callee on every call; the identity of the
+    pointer is therefore irrelevant and two pointers with equal content denote
+    the same argument - ``content`` alone fixes the specialization key."""
+
+    type: Type
+    content: ArgNode
+
+    def __str__(self) -> str:
+        return f"&({self.type}: {self.content})"
 
 @dataclass(frozen=True, slots=True)
 class PartialReturnSignature:
@@ -419,7 +445,8 @@ class Signature:
                             constrain(child, sub)
                 return
             if isinstance(node, CompoundArgNode):
-                # nothing produces a flattened aggregate argument yet
+                # a container place (the content of a compile-time pointer): its
+                # type is solved from the pointer's own type, not decomposed here
                 return
             # only an annotation that names a type parameter of this signature
             # constrains one - directly (``b: T``), or inside a generic type
@@ -427,7 +454,9 @@ class Signature:
             # argument is converted to
             if not any(declared.contains(tv) for tv in self.generic_args):
                 return
-            if isinstance(node, RuntimeArgNode):
+            if isinstance(node, (RuntimeArgNode, ComptimePtrArg)):
+                # a runtime leaf or a compile-time pointer: the node's own type is
+                # the bound (a ``ComptimePtrArg`` carries the whole pointer type)
                 solver.add_constraint(node.type, declared, True)
             else:
                 # a compile-time leaf: its value's type is the bound (a plain
@@ -603,6 +632,23 @@ class Signature:
                     )
                     for key, child in node.items()
                 )
+            # a compile-time pointer: its pointee is resolved against the
+            # pointer's element type and carried losslessly (see ``ComptimePtrArg``)
+            if isinstance(node, ComptimePtrArg):
+                ptr_type: Type
+                if declared is None:
+                    ptr_type = node.type
+                elif isinstance(declared, PointerType):
+                    ptr_type = declared
+                else:
+                    raise TypeMismatchError(
+                        f"parameter '{name}' takes a {declared}, not a pointer"
+                    )
+                assert isinstance(ptr_type, PointerType)
+                content = resolve_type(
+                    name, ptr_type.elem, node.content, TriState.UNKNOWN, False, True,
+                )
+                return ComptimePtrArg(ptr_type, content)
             # a flattened aggregate whose container type is known
             if isinstance(node, CompoundArgNode):
                 return CompoundArgNode(
@@ -1075,6 +1121,11 @@ def _thunk_call_sig(call_sig: CallSignature, fn: mir.Function) -> CallSignature:
                     child, index = convert(child, index)
                     elems.append(child)
                 return CompoundArgNode(arg.container_type, tuple(elems)), index
+            case ComptimePtrArg():
+                # no MIR argument for the pointer itself, but its content's
+                # runtime leaves are the runtime arguments of the call
+                content, index = convert(arg.content, index)
+                return ComptimePtrArg(arg.type, content), index
         # a compile-time leaf carries no MIR argument
         return arg, index
 

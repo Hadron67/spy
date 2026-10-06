@@ -39,6 +39,7 @@ from .fn import (
     ArgNode,
     CallSignature,
     CompoundArgNode,
+    ComptimePtrArg,
     FunctionInstance,
     RuntimeArgNode,
 )
@@ -593,7 +594,9 @@ def invoke(
         if not isinstance(targ, RuntimeArgNode):
             # a compound argument: its elements are marshaled separately, in
             # their own order (see ``ArgNode``); a compile-time leaf is not
-            # marshaled at all
+            # marshaled at all.  A ``ComptimePtrArg`` is never provided by a
+            # Python-boundary call (``provided_node`` only makes runtime
+            # pointers); it is handled here for symmetry with ``_thunk_call_sig``.
             if isinstance(targ, tuple):
                 for sub, item in zip(targ, value):
                     marshal(sub, item)
@@ -605,6 +608,9 @@ def invoke(
             if isinstance(targ, CompoundArgNode):
                 for sub, item in zip(targ.elems, value):
                     marshal(sub, item)
+                return
+            if isinstance(targ, ComptimePtrArg):
+                marshal(targ.content, value)
                 return
             return
         argument, buffer = _marshal_arg(targ.type, value, targ.is_ref, cache)

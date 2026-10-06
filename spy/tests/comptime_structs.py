@@ -1,12 +1,11 @@
 from unittest import TestCase
 
+from ..compiler import bool as spy_bool
 from ..compiler import (
-    CompileError,
     i32,
     i64,
     syntax,
 )
-from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
@@ -206,8 +205,9 @@ def comptime_struct_of_one_field_from_a_runtime_value(x: i64) -> i64:
 @func()
 def comptime_struct_runtime_field_by_ref(x: i32) -> i32:
     # the runtime field of a compile-time aggregate is kept inline (a box holding
-    # the runtime value), so it has no address of its own to hand to a native
-    # function: taking one is rejected
+    # the runtime value); handing its address to a native function copies the
+    # value into the call (see ``ComptimePtrArg``), so the write does not reach
+    # the field
     s: Comptime = Small(x, 2)
     incr_ptr(ref(s.a))
     return s.a
@@ -338,9 +338,9 @@ class SpyComptimeStructTest(TestCase):
 
     def test_a_runtime_field_of_such_a_variable_is_not_addressable(self) -> None:
         # the runtime field is a compile-time box, not memory: taking its address
-        # is rejected
-        with self.assertRaises(CompileError):
-            comptime_struct_runtime_field_by_ref(5)
+        # hands the callee a *copy* (see ``ComptimePtrArg``), so the write does
+        # not reach the field
+        self.assertEqual(comptime_struct_runtime_field_by_ref(5), 5)
 
     def test_a_runtime_field_written_in_branches(self) -> None:
         # both branches write the same compile-time box, so the last write of the
