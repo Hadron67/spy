@@ -92,7 +92,7 @@ import sys
 import types as pytypes
 from abc import abstractmethod
 from annotationlib import Format
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from enum import IntEnum, auto
 from typing import Any, Self, cast, override
@@ -103,23 +103,21 @@ from .errors import CoerceError, CompileError
 from .fn import (
     ArgEntry,
     ArgList,
+    ArgNode,
     CallSignature,
     ClosureValue,
     CompileBatch,
+    CompoundArgNode,
     FunctionInstance,
     FunctionIR,
     FunctionValue,
     NativeFn,
     PartialReturnSignature,
-    ProvidedArg,
     RawArgList,
     ReturnSignature,
+    RuntimeArgNode,
     Signature,
     SignatureFormalArg,
-    SpecializedComptimeArg,
-    SpecializedFormalArg,
-    SpecializedRuntimeArg,
-    plain_provided_arg,
     signature_of_fn_type,
 )
 from .hir import InlineMode
@@ -1107,6 +1105,86 @@ def _arg_type_of(arg: ArgEntry[InterpVal]) -> sval.Type | None:
     return type.elem
 
 
+def _tuple_arg_entries(ev: ArgEntry[InterpVal]) -> tuple[ArgEntry[InterpVal], ...]:
+    """One operand per element of a tuple argument (the value or pointer form,
+    see ``ComptimeTuple``/``ComptimeTuplePtr``), for a call that passes the
+    elements separately (see ``ArgNode``).  An element of the pointer form is a
+    *place*, so its operand is a reference."""
+    value = _shallow_normalize(ev.value)
+    match value:
+        case ComptimeTuple(values=values):
+            assert not ev.is_ref
+            return values
+        case ComptimeTuplePtr(values=values):
+            assert ev.is_ref
+            return tuple(ArgEntry(place, True) for place in values)
+    raise CompileError(f'cannot take the elements of the argument value {ev!r}')
+
+
+def _dict_arg_entries(ev: ArgEntry[InterpVal]) -> dict[str, ArgEntry[InterpVal]]:
+    """One operand per name of a ``dict[str, T]`` argument (the value or
+    pointer form, see ``ComptimeDict``/``ComptimeDictPtr``); an entry of the
+    pointer form is a place, so its operand is a reference."""
+    value = _shallow_normalize(ev.value)
+    match value:
+        case ComptimeDict(values=values):
+            assert not ev.is_ref
+            return values
+        case ComptimeDictPtr(values=values):
+            assert ev.is_ref
+            return {key: ArgEntry(place, True) for key, place in values.items()}
+    raise CompileError(f'cannot take the values of the argument value {ev!r}')
+
+
+def _aggregate_arg_entries(ev: ArgEntry[InterpVal]) -> tuple[ArgEntry[InterpVal], ...]:
+    """One operand per field/element of a flattened aggregate argument (the
+    value or pointer form, see ``ComptimeAggregate``/``ComptimeAggregatePtr``);
+    a place of the pointer form is a reference."""
+    value = _shallow_normalize(ev.value)
+    match value:
+        case ComptimeAggregate(values=values):
+            assert not ev.is_ref
+            return tuple(ArgEntry(value, False) for value in values)
+        case ComptimeAggregatePtr(ptrs=ptrs):
+            assert ev.is_ref
+            return tuple(ArgEntry(place, True) for place in ptrs)
+    raise CompileError(f'cannot take the fields of the argument value {ev!r}')
+
+
+def _arg_node_types(node: ArgNode) -> Iterator[sval.Type]:
+    """The spy type of every runtime leaf of a provided :data:`ArgNode` (and the
+    type of a compile-time leaf), in order - what a check over the arguments of
+    a call reads (see ``_call_closure``)."""
+    if isinstance(node, RuntimeArgNode):
+        yield node.type
+    elif isinstance(node, tuple):
+        for child in node:
+            yield from _arg_node_types(child)
+    elif isinstance(node, frozendict):
+        for child in node.values():
+            yield from _arg_node_types(child)
+    elif isinstance(node, CompoundArgNode):
+        for child in node.elems:
+            yield from _arg_node_types(child)
+    else:
+        type = sval.type_of(node)
+        if type is not None:
+            yield type
+
+
+def _provided_node_of_type(type: sval.Type) -> ArgNode:
+    """A provided :data:`ArgNode` for every leaf of ``type`` (see
+    ``Signature.solve_param_types``): a compile-time-only aggregate is provided
+    element by element, any other type as one runtime argument.  It is what a
+    call that specializes a function pointer without passing values uses (see
+    ``exec_as_func_ptr``)."""
+    if isinstance(type, sval.TupleType):
+        return tuple(_provided_node_of_type(child) for child in type.types)
+    if isinstance(type, sval.StrDictType):
+        return frozendict((key, _provided_node_of_type(child)) for key, child in type.values.items())
+    return RuntimeArgNode(type, False)
+
+
 # ---------------------------------------------------------------------------
 # stateless helpers of field/element access, struct/array construction and the
 # result location of a function that returns several values: pure functions
@@ -1482,7 +1560,8 @@ def _check_comptime_args(
     """Require a *deeply* compile-time value for every parameter declared
     compile-time (``Comptime``/``Comptime[T]``): the callee reads such a
     parameter as a compile-time value whatever it is given, so a runtime
-    argument would be silently dropped (see ``SpecializedComptimeArg``).
+    argument would be silently dropped (see ``RuntimeArgNode``/
+    ``Signature.specialize``).
     Every other parameter may be given a runtime value - a zero-sized one
     is delivered as its unit value whatever it is given (see
     ``Signature.specialize``)."""
@@ -1671,11 +1750,16 @@ class HirRunner:
             value_loc, self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE),
         )
 
-    def _init_one_arg(self, node: SpecializedFormalArg, mir_args: list[mir.Type], arg_is_ref: bool) -> InterpVal:
+    def _init_arg_node(self, node: ArgNode, mir_args: list[mir.Type], arg_is_ref: bool) -> InterpVal:
+        """The place one specialized formal argument is bound to: one form of
+        the argument tree (see :class:`~spy.compiler.fn.ArgNode`).  A
+        compile-time leaf is a const reference to its value and consumes no MIR
+        argument; a runtime leaf consumes one and becomes a slot (or the
+        argument itself when it is passed by address); a compound (a tuple, a
+        ``dict`` or a flattened aggregate) is the place tree of its
+        elements."""
         match node:
-            case SpecializedComptimeArg():
-                return ComptimeVal(sval.ConstRef(node.value))
-            case SpecializedRuntimeArg():
+            case RuntimeArgNode():
                 index = len(mir_args)
                 if node.is_ref:
                     # the signature passes the address of the value as a const
@@ -1688,7 +1772,7 @@ class HirRunner:
                         raise _no_runtime_type(node.type)
                 else:
                     mir_type = node.type.to_mir_type(self._mir_cache)
-                    # ZSTs are never present in SpecializedRuntimeArg
+                    # ZSTs are never present in RuntimeArgNode
                     assert not node.type.is_zst()
                     if mir_type is None:
                         raise _no_runtime_type(node.type)
@@ -1706,8 +1790,27 @@ class HirRunner:
                 self._commit_pending_slot(slot, node.type)
                 self.store(slot, RuntimeVal(mir.Param(index, arg_mir), node.type))
                 return slot
+            case tuple():
+                # a tuple has no representation of its own: its elements are
+                # their own places, and each is passed separately
+                return ComptimeTuplePtr(
+                    tuple(self._init_arg_node(child, mir_args, False) for child in node)
+                )
+            case frozendict():
+                # the named counterpart of a tuple (a ``dict[str, T]``)
+                return ComptimeDictPtr(
+                    {key: self._init_arg_node(child, mir_args, False) for key, child in node.items()}
+                )
+            case CompoundArgNode():
+                # an aggregate whose fields/elements are their own places
+                return ComptimeAggregatePtr(
+                    node.container_type,
+                    tuple(self._init_arg_node(child, mir_args, False) for child in node.elems),
+                )
             case _:
-                raise CompileError(f'unsupported specialized argument {node!r}')
+                # a compile-time leaf (an ``sval.Value``, or a plain Python
+                # scalar): a const reference to it, no MIR argument
+                return ComptimeVal(sval.ConstRef(node))
 
     def _init_args_from_signature(
         self,
@@ -1718,38 +1821,24 @@ class HirRunner:
         arg_values: list[InterpVal] = []
 
         for (_, arg), is_ref in zip(signature.positional, arg_is_ref):
-            arg_values.append(self._init_one_arg(arg, mir_args, is_ref))
+            arg_values.append(self._init_arg_node(arg, mir_args, is_ref))
 
         if signature.varargs is not None:
-            arg_values.append(ComptimeTuplePtr(tuple(self._init_one_arg(a, mir_args, False) for a in signature.varargs)))
+            arg_values.append(ComptimeTuplePtr(tuple(self._init_arg_node(a, mir_args, False) for a in signature.varargs)))
         if signature.kwargs is not None:
-            arg_values.append(ComptimeDictPtr({k: self._init_one_arg(v, mir_args, False) for k, v in signature.kwargs.items()}))
+            arg_values.append(ComptimeDictPtr({k: self._init_arg_node(v, mir_args, False) for k, v in signature.kwargs.items()}))
 
         return tuple(arg_values)
 
     def _init_closure_captures(
-        self, captures: tuple[SpecializedFormalArg, ...], mir_args: list[mir.Type]
+        self, captures: tuple[ArgNode, ...], mir_args: list[mir.Type]
     ) -> tuple[InterpVal, ...]:
         """The capture places of a closure body, from the captures a call
         passed (see :class:`~spy.compiler.hir.Closure`).  A runtime capture is a
         by-value pointer parameter (the address of the captured variable); a
         compile-time capture carries no runtime argument - it becomes a const
         reference to its value, so reading it loads the value."""
-        out: list[InterpVal] = []
-        for capture in captures:
-            match capture:
-                case SpecializedComptimeArg(value):
-                    out.append(ComptimeVal(sval.ConstRef(value)))
-                case SpecializedRuntimeArg(type=ptr_type) if isinstance(ptr_type, sval.PointerType):
-                    index = len(mir_args)
-                    mir_type = ptr_type.to_mir_type(self._mir_cache)
-                    if mir_type is None:
-                        raise _no_runtime_type(ptr_type)
-                    mir_args.append(mir_type)
-                    out.append(RuntimeVal(mir.Param(index, mir_type), ptr_type))
-                case _:
-                    raise CompileError(f'unsupported closure capture {capture!r}')
-        return tuple(out)
+        return tuple(self._init_arg_node(capture, mir_args, True) for capture in captures)
 
     def _ret_spec_place(self, node: RetSpec) -> InterpVal:
         """The result place the *value* part ``node`` of a declared result is
@@ -4807,7 +4896,7 @@ class HirRunner:
             return PollResult.AGAIN
         if not isinstance(obj, FunctionValue):
             raise CompileError(f'as_func_ptr expects a spy function, got {obj!r}')
-        capture_specs: tuple[SpecializedFormalArg, ...] = ()
+        capture_specs: tuple[ArgNode, ...] = ()
         if isinstance(obj, ClosureValue):
             # a non-inlined closure is an ordinary runtime function when none of
             # its captures refers to a runtime register: a runtime capture would
@@ -4820,7 +4909,7 @@ class HirRunner:
                 )
             capture_specs, _ = self._compile_capture_args(obj)
             for spec in capture_specs:
-                if isinstance(spec, SpecializedRuntimeArg):
+                if isinstance(spec, RuntimeArgNode):
                     raise CompileError(
                         'cannot take the function pointer of a closure that captures '
                         'a runtime value'
@@ -4842,9 +4931,11 @@ class HirRunner:
                     f'as_func_ptr: function {obj.hir.name} has type {declared}, not {fn_type}'
                 )
             sig = obj.hir.signature
-        provided = ArgList(
-            tuple(plain_provided_arg(arg.type) for arg in sig.positional.by_id), (), frozendict(),
-        )
+        provided_args: list[ArgNode] = []
+        for arg in sig.positional.by_id:
+            assert arg.type is not None
+            provided_args.append(_provided_node_of_type(arg.type))
+        provided = ArgList(tuple(provided_args), (), frozendict())
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
         if len(capture_specs) > 0:
             call_sig = replace(call_sig, captures=capture_specs)
@@ -6146,6 +6237,17 @@ class HirRunner:
             # the variants of a union are a set: order them by their rendered
             # form, so that the reflected order is stable
             fields = (self._type_slice(tuple(sorted(ty.types, key=str))),)
+        elif isinstance(ty, sval.StrDictType):
+            variant = 'StrDictType'
+            fields = (
+                self._const_slice(
+                    self._reflect_struct('DictEntry'),
+                    tuple(self._build_dict_entry(name, child) for name, child in ty.values.items()),
+                ),
+            )
+        elif isinstance(ty, sval.TupleType):
+            variant = 'TupleType'
+            fields = (self._type_slice(ty.types), ComptimeVal(ty.has_ellipsis))
         else:
             raise CompileError(f'cannot reflect the type {ty}')
         union = self._reflect_type_info()
@@ -6176,6 +6278,15 @@ class HirRunner:
             ComptimeVal(field.name.encode()),
             ComptimeVal(field.type),
             default,
+        ))
+
+    def _build_dict_entry(self, name: str, child: sval.Type) -> InterpVal:
+        """The ``std.reflect.DictEntry`` value describing one entry of a
+        ``dict[str, T]`` shape: its name as a compile-time ``bytes`` value and
+        its type."""
+        return ComptimeAggregate(self._reflect_struct('DictEntry'), (
+            ComptimeVal(name.encode()),
+            ComptimeVal(child),
         ))
 
     def _head_option(self, ty: sval.StructType) -> InterpVal:
@@ -7607,22 +7718,53 @@ class HirRunner:
 
     def _provided_types(
         self, sig: Signature, binded_args: ArgList[ArgEntry[InterpVal]]
-    ) -> ArgList[ProvidedArg]:
+    ) -> ArgList[ArgNode]:
         """The ``provided`` argument list of one call (see
-        ``Signature.solve_param_types``): the spy type of every argument, and -
-        for a ``type[X]`` parameter - the spy type its argument denotes."""
-        positional: list[ProvidedArg] = []
+        ``Signature.solve_param_types``): the :data:`ArgNode` of every argument -
+        its value when it is compile-time (including the spy type a ``type[X]``
+        argument denotes), its spy type when it is runtime, and the element tree
+        when it is a tuple/``dict[str, T]``."""
+        positional: list[ArgNode] = []
         for (name, param), arg in zip(sig.positional.items(), binded_args.positional):
-            type = _arg_type_of(arg)
             if param.is_type_value:
-                positional.append((type, self._type_value_arg(arg, f"the argument of parameter '{name}'")))
+                positional.append(
+                    self._type_value_arg(arg, f"the argument of parameter '{name}'")
+                )
             else:
-                positional.append(plain_provided_arg(type))
-        varargs = tuple(plain_provided_arg(_arg_type_of(arg)) for arg in binded_args.varargs)
+                positional.append(self._provided_node(arg))
+        varargs = tuple(self._provided_node(arg) for arg in binded_args.varargs)
         kwargs = frozendict(
-            (k, plain_provided_arg(_arg_type_of(arg))) for k, arg in binded_args.kwargs.items()
+            (k, self._provided_node(arg)) for k, arg in binded_args.kwargs.items()
         )
         return ArgList(tuple(positional), varargs, kwargs)
+
+    def _provided_node(self, arg: ArgEntry[InterpVal]) -> ArgNode:
+        """The :data:`ArgNode` one argument provides (see
+        ``Signature.solve_param_types``): a compile-time value as itself, a
+        runtime value as its spy type, and a tuple/``dict[str, T]`` value as its
+        element tree (whose elements are passed separately)."""
+        ev = _shallow_normalize(arg.value)
+        match ev:
+            case ComptimeTuple(values=values):
+                return tuple(self._provided_node(child) for child in values)
+            case ComptimeTuplePtr(values=values):
+                return tuple(self._provided_node(ArgEntry(place, True)) for place in values)
+            case ComptimeDict(values=values):
+                return frozendict((k, self._provided_node(child)) for k, child in values.items())
+            case ComptimeDictPtr(values=values):
+                return frozendict((k, self._provided_node(ArgEntry(place, True))) for k, place in values.items())
+            case _:
+                if not arg.is_ref and _is_comptime_val(ev):
+                    value = _to_comptime(ev)
+                    if value is not None:
+                        return value
+                type = _arg_type_of(arg)
+                if type is None:
+                    raise CompileError(
+                        'cannot determine the type of an argument passed to a '
+                        'spy function'
+                    )
+                return RuntimeArgNode(type, False)
 
     def _call_function_entry(
         self,
@@ -7723,9 +7865,10 @@ class HirRunner:
             )
         capture_specs, capture_args = self._compile_capture_args(closure)
         provided = self._provided_types(sig, binded_args)
-        for entry in provided.values():
-            if isinstance(entry[0], sval.ClosureType):
-                raise CompileError('a closure can only be passed to an inline function')
+        for node in provided.values():
+            for type in _arg_node_types(node):
+                if isinstance(type, sval.ClosureType):
+                    raise CompileError('a closure can only be passed to an inline function')
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
         call_sig = replace(call_sig, captures=capture_specs)
 
@@ -7752,18 +7895,18 @@ class HirRunner:
 
     def _compile_capture_args(
         self, closure: ClosureValue
-    ) -> tuple[tuple[SpecializedFormalArg, ...], tuple[ArgEntry[InterpVal], ...]]:
+    ) -> tuple[tuple[ArgNode, ...], tuple[ArgEntry[InterpVal], ...]]:
         """The capture parameters and arguments of a compiled closure call: a
         runtime place becomes a by-value pointer parameter, a compile-time place
         a compile-time argument (there is no runtime parameter for it)."""
-        specs: list[SpecializedFormalArg] = []
+        specs: list[ArgNode] = []
         cargs: list[ArgEntry[InterpVal]] = []
         for capture in closure.captures:
             if isinstance(capture, PendingSlot) and capture.committed is None:
                 self._commit_pending_slot(capture)
             ev = _shallow_normalize(capture)
             if isinstance(ev, RuntimeVal) and isinstance(ev.type, sval.PointerType):
-                specs.append(SpecializedRuntimeArg(ev.type, False))
+                specs.append(RuntimeArgNode(ev.type, False))
                 cargs.append(ArgEntry(ev, False))
                 continue
             value = _to_comptime(ev)
@@ -7776,7 +7919,7 @@ class HirRunner:
                 raise CompileError(
                     'cannot capture this compile-time value in a non-inlined closure'
                 )
-            specs.append(SpecializedComptimeArg(cast(sval.Value, value)))
+            specs.append(cast(sval.Value, value))
         return tuple(specs), tuple(cargs)
 
     def _request_function(
@@ -7813,10 +7956,24 @@ class HirRunner:
         path, which is unwound like any other ended one (see ``_cut``)."""
         mir_args: list[mir.Value] = []
 
-        def convert_one(arg: ArgEntry[InterpVal], sig_arg: SpecializedFormalArg) -> None:
-            if not isinstance(sig_arg, SpecializedRuntimeArg):
-                # a compile-time (zero-sized) argument carries no runtime
-                # value and is never passed
+        def convert_one(arg: ArgEntry[InterpVal], sig_arg: ArgNode) -> None:
+            if not isinstance(sig_arg, RuntimeArgNode):
+                # a compound argument: its elements are passed separately, in
+                # their own order (see ``ArgNode``)
+                if isinstance(sig_arg, tuple):
+                    for child, sub in zip(sig_arg, _tuple_arg_entries(arg)):
+                        convert_one(sub, child)
+                    return
+                if isinstance(sig_arg, frozendict):
+                    entries = _dict_arg_entries(arg)
+                    for key, child in sig_arg.items():
+                        convert_one(entries[key], child)
+                    return
+                if isinstance(sig_arg, CompoundArgNode):
+                    for child, sub in zip(sig_arg.elems, _aggregate_arg_entries(arg)):
+                        convert_one(sub, child)
+                    return
+                # a compile-time leaf carries no runtime value and is never passed
                 return
             if sig_arg.is_ref:
                 if arg.is_ref:

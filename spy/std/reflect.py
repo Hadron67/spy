@@ -3,7 +3,7 @@ from typing import Any
 from ..compiler import Option, builtin_func, struct
 from .core import ConstSlicePtr
 
-type TypeInfo = IntType | PointerType | ArrayType | StructType | UnionType | TaggedUnionType | OptionType | ComplexType
+type TypeInfo = IntType | PointerType | ArrayType | StructType | UnionType | TaggedUnionType | OptionType | ComplexType | TupleType | StrDictType
 
 @struct()
 class IntType:
@@ -48,6 +48,27 @@ class OptionType:
 @struct()
 class ComplexType:
     elem: type
+
+
+@struct()
+class TupleType:
+    # the type of every element, in order, and whether it is written
+    # ``tuple[T, ...]`` (there is no fixed count then)
+    types: ConstSlicePtr[type]
+    has_ellipsis: bool
+
+
+@struct()
+class DictEntry:
+    name: bytes
+    type: type
+
+
+@struct()
+class StrDictType:
+    # the named entries of a ``**kwargs``/``dict[str, T]`` shape, in order
+    entries: ConstSlicePtr[DictEntry]
+
 
 @builtin_func
 def type_info(ty: Any) -> TypeInfo: ...

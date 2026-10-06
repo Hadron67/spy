@@ -36,12 +36,11 @@ from . import mir, sval
 from .errors import CompileError, SpyError
 from .fn import (
     ArgList,
+    ArgNode,
     CallSignature,
+    CompoundArgNode,
     FunctionInstance,
-    ProvidedArg,
-    SpecializedFormalArg,
-    SpecializedRuntimeArg,
-    plain_provided_arg,
+    RuntimeArgNode,
 )
 from .lower import to_ctype
 from .sval import (
@@ -520,31 +519,50 @@ def arg_spy_type(value: Any) -> Type | None:
 
 def boundary_arg(value: Any, context: CompileContext) -> Any:
     """One Python argument of a call, in the spy domain: a Python-side spy
-    value passes through, anything else is resolved by ``sval.as_value``."""
+    value passes through, a tuple/dictionary is converted element by element, and
+    anything else is resolved by ``sval.as_value``."""
     if isinstance(value, (_StructInstance, _PtrInstance)):
         return value
+    if isinstance(value, tuple):
+        return tuple(boundary_arg(item, context) for item in value)
+    if isinstance(value, (dict, frozendict)):
+        return frozendict((key, boundary_arg(item, context)) for key, item in value.items())
     return sval.as_value(value, context)
 
 
-def provided_arglist(sig: Any, arglist: ArgList[Any]) -> ArgList[ProvidedArg]:
+def provided_arglist(sig: Any, arglist: ArgList[Any]) -> ArgList[ArgNode]:
     """The ``provided`` argument list of one Python-boundary call (see
-    ``Signature.solve_param_types``)."""
-    positional: list[ProvidedArg] = []
+    ``Signature.solve_param_types``): the :data:`ArgNode` of every argument,
+    with a tuple/``dict[str, T]`` provided element by element."""
+    positional: list[ArgNode] = []
     for (name, param), value in zip(sig.positional.items(), arglist.positional):
-        type = arg_spy_type(value)
         if param.is_type_value:
             if not isinstance(value, Type):
                 raise CompileError(
                     f"the argument of parameter '{name}' must be a spy type"
                 )
-            positional.append((type, value))
+            positional.append(value)
         else:
-            positional.append(plain_provided_arg(type))
-    varargs = tuple(plain_provided_arg(arg_spy_type(v)) for v in arglist.varargs)
+            positional.append(provided_node(value))
+    varargs = tuple(provided_node(v) for v in arglist.varargs)
     kwargs = frozendict(
-        (k, plain_provided_arg(arg_spy_type(v))) for k, v in arglist.kwargs.items()
+        (k, provided_node(v)) for k, v in arglist.kwargs.items()
     )
     return ArgList(tuple(positional), varargs, kwargs)
+
+
+def provided_node(value: Any) -> ArgNode:
+    """The :data:`ArgNode` one Python argument provides (see
+    ``provided_arglist``): a tuple/dictionary as its element tree, anything else
+    as one runtime argument of its spy type."""
+    if isinstance(value, tuple):
+        return tuple(provided_node(item) for item in value)
+    if isinstance(value, (dict, frozendict)):
+        return frozendict((key, provided_node(item)) for key, item in value.items())
+    type = arg_spy_type(value)
+    if type is None:
+        raise CompileError('cannot determine the type of an argument passed to a spy function')
+    return RuntimeArgNode(type, False)
 
 
 # ---------------------------------------------------------------------------
@@ -571,8 +589,23 @@ def invoke(
     temps: list[Any] = []
     py_args: list[Any] = []
 
-    def marshal(targ: SpecializedFormalArg, value: Any) -> None:
-        if not isinstance(targ, SpecializedRuntimeArg):
+    def marshal(targ: ArgNode, value: Any) -> None:
+        if not isinstance(targ, RuntimeArgNode):
+            # a compound argument: its elements are marshaled separately, in
+            # their own order (see ``ArgNode``); a compile-time leaf is not
+            # marshaled at all
+            if isinstance(targ, tuple):
+                for sub, item in zip(targ, value):
+                    marshal(sub, item)
+                return
+            if isinstance(targ, frozendict):
+                for key, sub in targ.items():
+                    marshal(sub, value[key])
+                return
+            if isinstance(targ, CompoundArgNode):
+                for sub, item in zip(targ.elems, value):
+                    marshal(sub, item)
+                return
             return
         argument, buffer = _marshal_arg(targ.type, value, targ.is_ref, cache)
         py_args.append(argument)

@@ -19,10 +19,13 @@ from .sval import (
     RetSpec,
     RetTuple,
     RetValue,
+    StrDictType,
+    TupleType,
     Type,
     TypeVar,
     TypeVarSolver,
     Value,
+    coerce_const,
     iter_ret_leaves,
     make_ret_spec,
     pass_by_ref,
@@ -81,17 +84,6 @@ class ArgEntry[T]:
     is_ref: bool
 
 
-# one argument of a call as ``Signature.solve_param_types``/``specialize`` see it:
-# the spy type of the value, and - only for a ``type[X]`` parameter - the spy
-# type its argument denotes (None otherwise)
-type ProvidedArg = tuple[Type | None, Value | None]
-
-def plain_provided_arg(type: Type | None) -> ProvidedArg:
-    """A :data:`ProvidedArg` for an argument that is not a type value: the
-    argument's spy type, with no denoted type."""
-    return (type, None)
-
-
 @dataclass(frozen=True, slots=True)
 class RawArgList[T]:
     positional: tuple[T, ...]
@@ -121,18 +113,21 @@ class ArgList[T]:
         yield from self.varargs
         yield from self.kwargs.values()
 
-type ArgNode = Value | RuntimeArgNode | tuple[ArgNode, ...] | frozendict[str, ArgNode]
+# The argument tree of one call.  A *leaf* is either a compile-time value
+# (``sval.AnyValue`` - an ``sval.Value`` or a plain Python scalar, carried as
+# the value itself, never passed in MIR) or a :class:`RuntimeArgNode` (one
+# runtime value of a spy type).  A *compound* node records a "shape": a tuple
+# has no runtime representation of its own (see ``sval.TupleType``), so its
+# elements are passed separately and rebound as one place tree at the callee,
+# and a ``dict[str, T]`` (``sval.StrDictType``) is its named counterpart.  Both
+# nest.  ``*args`` is such a positional compound and ``**kwargs`` a named one.
+# The very same tree is the *provided* argument of a call (see
+# ``Signature.solve_param_types``): a runtime leaf there carries the argument's
+# spy type, a compile-time leaf its value.
+type ArgNode = AnyValue | RuntimeArgNode | CompoundArgNode | tuple[ArgNode, ...] | frozendict[str, ArgNode]
 
 @dataclass(frozen=True, slots=True)
 class RuntimeArgNode:
-    type: Type
-    by_ref: bool
-
-class SpecializedFormalArg:
-    pass
-
-@dataclass(frozen=True, slots=True)
-class SpecializedRuntimeArg(SpecializedFormalArg):
     type: Type
     is_ref: bool
 
@@ -140,11 +135,18 @@ class SpecializedRuntimeArg(SpecializedFormalArg):
         return f"<{'&' if self.is_ref else ''}{self.type}>"
 
 @dataclass(frozen=True, slots=True)
-class SpecializedComptimeArg(SpecializedFormalArg):
-    value: Value
+class CompoundArgNode:
+    """An aggregate argument whose fields/elements are passed separately
+    (flattened): the container spy type and one node per field.  Nothing
+    produces one yet - a struct parameter is a single :class:`RuntimeArgNode`
+    whether it stands on its own or as an element of a flattened tuple - but the
+    consumers already handle it (see ``interp`` and ``glue``)."""
+
+    container_type: Type
+    elems: tuple[ArgNode, ...]
 
     def __str__(self) -> str:
-        return str(self.value)
+        return f"({self.container_type}: {', '.join(str(e) for e in self.elems)})"
 
 @dataclass(frozen=True, slots=True)
 class PartialReturnSignature:
@@ -239,13 +241,13 @@ class ReturnSignature:
 @dataclass(frozen=True, slots=True)
 class CallSignature:
     generic_args: tuple[AnyValue, ...]
-    positional: tuple[tuple[str, SpecializedFormalArg], ...]
-    varargs: tuple[SpecializedFormalArg, ...] | None
-    kwargs: frozendict[str, SpecializedFormalArg] | None
+    positional: tuple[tuple[str, ArgNode], ...]
+    varargs: tuple[ArgNode, ...] | None
+    kwargs: frozendict[str, ArgNode] | None
     # the hidden capture parameters of a closure (see ``ClosureFunction``):
     # independent of ``positional``/``varargs``/``kwargs``, so the declared
     # argument layout can grow ``*args``/``**kwargs`` without disturbing them
-    captures: tuple[SpecializedFormalArg, ...] = ()
+    captures: tuple[ArgNode, ...] = ()
     # whether the callee may panic (see ``Signature.may_panic``): a call of it
     # may unwind through the enclosing deferred bodies (see ``interp``)
     may_panic: bool = True
@@ -375,13 +377,15 @@ class Signature:
         return ArgList(tuple(bound), tuple(varargs_out), frozendict(kwargs_out))
 
     def solve_param_types(
-        self, provided: ArgList[ProvidedArg]
+        self, provided: ArgList[ArgNode]
     ) -> tuple[AnyValue, ...]:
         """The concrete value of every declared generic type parameter of
-        one call.  ``provided`` carries one :data:`ProvidedArg` per argument
-        the call provides - the marshal type of its value and, for a
-        ``type[X]`` parameter, the spy type its argument denotes - and ``None``
-        for a parameter the call leaves out (its default value applies).
+        one call.  ``provided`` carries one :data:`ArgNode` per argument the
+        call provides: a compile-time value (a ``sval.Value``, which includes
+        the spy type a ``type[X]`` argument denotes) or a runtime value (a
+        :class:`RuntimeArgNode`), a ``tuple``/``frozendict`` node when the
+        argument is a compile-time-only aggregate whose elements are passed
+        separately.
 
         Every provided argument records a subtype constraint on the type
         parameter of the parameter it is provided for; ``finish`` solves
@@ -390,48 +394,65 @@ class Signature:
         (``denoted <: X``).  A parameter annotated with a concrete type
         constrains nothing here - it keeps its annotation, and the call
         specialized for it converts the argument to that type (see
-        :meth:`specialize`).  A missing
-        argument can still solve a type parameter when its default value
-        has a spy type.  A parameter that stands for something other than
+        :meth:`specialize`).  A parameter that stands for something other than
         a type - the length of an ``Array[T, N]`` - is solved to the value
         itself (the Python integer)."""
         assert len(provided.positional) == len(self.positional.by_id), 'argument count mismatch'
-        # unify the type parameters over the provided arguments:
-        # arguments of parameters annotated with the same type parameter
-        # are recorded as subtype bounds, which the solver binds the
-        # parameter to the peer type of
+        # unify the type parameters over the provided arguments: arguments of
+        # parameters annotated with the same type parameter are recorded as
+        # subtype bounds, which the solver binds the parameter to the peer type
+        # of.  A tuple/dict argument is walked element by element - the solver
+        # does not decompose those types.
         solver = TypeVarSolver()
-        for param, entry in zip(self.positional.by_id, provided.positional):
-            declared = param.type
-            if param.is_type_value:
-                # ``type[X]``: the argument denotes a spy type, which is the
-                # bound of ``X`` (usually a type parameter of the signature)
-                if declared is not None and entry is not None and entry[1] is not None:
-                    solver.add_constraint(entry[1], declared, True)
-                continue
-            cand = entry[0] if entry is not None else None
+
+        def constrain(declared: Type, node: ArgNode) -> None:
+            if isinstance(node, tuple):
+                if isinstance(declared, TupleType):
+                    for child, sub in zip(declared.types, node):
+                        constrain(child, sub)
+                return
+            if isinstance(node, frozendict):
+                if isinstance(declared, StrDictType):
+                    for key, sub in node.items():
+                        child = declared.values.get(key)
+                        if child is not None:
+                            constrain(child, sub)
+                return
+            if isinstance(node, CompoundArgNode):
+                # nothing produces a flattened aggregate argument yet
+                return
             # only an annotation that names a type parameter of this signature
             # constrains one - directly (``b: T``), or inside a generic type
             # (``p: Pair[T]``); any other annotation is just the type the
             # argument is converted to
-            if declared is None or not any(declared.contains(tv) for tv in self.generic_args):
+            if not any(declared.contains(tv) for tv in self.generic_args):
+                return
+            if isinstance(node, RuntimeArgNode):
+                solver.add_constraint(node.type, declared, True)
+            else:
+                # a compile-time leaf: its value's type is the bound (a plain
+                # Python scalar has a spy type too, see ``sval.type_of``)
+                cand = type_of(node)
+                if cand is not None:
+                    solver.add_constraint(cand, declared, True)
+
+        for param, node in zip(self.positional.by_id, provided.positional):
+            declared = param.type
+            if declared is None:
                 continue
-            if cand is not None:
-                solver.add_constraint(cand, declared, True)
-            elif param.default_value is not None:
-                default_type = type_of(param.default_value)
-                if default_type is not None:
-                    solver.add_constraint(default_type, declared, True)
-        if self.varargs is not None and isinstance(self.varargs.type, TypeVar):
-            for entry in provided.varargs:
-                cand = entry[0] if entry is not None else None
-                if cand is not None:
-                    solver.add_constraint(cand, self.varargs.type, True)
-        if self.kwargs is not None and isinstance(self.kwargs.type, TypeVar):
-            for entry in provided.kwargs.values():
-                cand = entry[0] if entry is not None else None
-                if cand is not None:
-                    solver.add_constraint(cand, self.kwargs.type, True)
+            if param.is_type_value:
+                # ``type[X]``: the argument denotes a spy type, which is the
+                # bound of ``X`` (usually a type parameter of the signature)
+                if isinstance(node, Value):
+                    solver.add_constraint(node, declared, True)
+                continue
+            constrain(declared, node)
+        if self.varargs is not None and self.varargs.type is not None:
+            for node in provided.varargs:
+                constrain(self.varargs.type, node)
+        if self.kwargs is not None and self.kwargs.type is not None:
+            for node in provided.kwargs.values():
+                constrain(self.kwargs.type, node)
         solver.finish()
         solved = solver.get_solved()
         ret: list[AnyValue] = []
@@ -490,7 +511,7 @@ class Signature:
             exceptions=None if self.exceptions is None else _substitute_exceptions(self.exceptions, substitute),
         )
 
-    def specialize(self, provided: ArgList[ProvidedArg], cache: MirLowerCache) -> tuple[CallSignature, PartialReturnSignature]:
+    def specialize(self, provided: ArgList[ArgNode], cache: MirLowerCache) -> tuple[CallSignature, PartialReturnSignature]:
         """Specialize one call of this signature: the concrete typing of
         its arguments and the return convention this signature declares.
 
@@ -526,24 +547,78 @@ class Signature:
                 raise TypeMismatchError(f"type variable {replaced.name} is not solved")
             return replaced
 
-        def resolve(name: str, param: SignatureFormalArg, entry: ProvidedArg | None) -> SpecializedFormalArg:
-            cand = entry[0] if entry is not None else None
+        def resolve(name: str, param: SignatureFormalArg, node: ArgNode) -> ArgNode:
             if param.is_type_value:
                 # ``type[X]``: the parameter holds the spy type its argument
                 # denotes, as a compile-time value - there is no runtime argument
-                den = entry[1] if entry is not None else None
-                if not isinstance(den, Type):
+                if not isinstance(node, Type):
                     raise TypeMismatchError(
                         f"the argument of parameter '{name}' must be a spy type"
                     )
-                return SpecializedComptimeArg(den)
-            resolved: Type | None = None
+                return node
+            declared: Type | None = None
             if param.type is not None:
-                resolved = substitute(param.type)
+                declared = substitute(param.type)
+            return resolve_type(name, declared, node, param.by_ref, param.is_comptime, False)
+
+        def resolve_type(
+            name: str, declared: Type | None, node: ArgNode,
+            by_ref_hint: TriState, is_comptime: bool, flattened: bool,
+        ) -> ArgNode:
+            # a tuple-shaped argument: a tuple has no runtime representation of
+            # its own, so its elements are passed separately (flattened) and
+            # rebound as one place tree at the callee
+            if isinstance(node, tuple):
+                if declared is None:
+                    elem_decls: tuple[Type | None, ...] = (None,) * len(node)
+                elif isinstance(declared, TupleType):
+                    if declared.has_ellipsis or len(declared.types) != len(node):
+                        raise TypeMismatchError(
+                            f"parameter '{name}' takes a {declared}, not a "
+                            f"tuple of {len(node)} element(s)"
+                        )
+                    elem_decls = declared.types
+                else:
+                    raise TypeMismatchError(
+                        f"parameter '{name}' takes a {declared}, not a tuple"
+                    )
+                return tuple(
+                    resolve_type(name, elem_decls[i], child, TriState.UNKNOWN, False, True)
+                    for i, child in enumerate(node)
+                )
+            # a ``dict[str, T]`` argument: the named counterpart of a tuple
+            if isinstance(node, frozendict):
+                if declared is not None and not isinstance(declared, StrDictType):
+                    raise TypeMismatchError(
+                        f"parameter '{name}' takes a {declared}, not a dictionary"
+                    )
+                return frozendict(
+                    (
+                        key,
+                        resolve_type(
+                            name,
+                            None if declared is None else declared.values.get(key),
+                            child, TriState.UNKNOWN, False, True,
+                        ),
+                    )
+                    for key, child in node.items()
+                )
+            # a flattened aggregate whose container type is known
+            if isinstance(node, CompoundArgNode):
+                return CompoundArgNode(
+                    node.container_type,
+                    tuple(
+                        resolve_type(name, None, child, TriState.UNKNOWN, False, True)
+                        for child in node.elems
+                    ),
+                )
+            # a leaf: a compile-time value or a runtime argument
+            resolved: Type | None = declared
             if resolved is None:
-                resolved = cand
-            if resolved is None and param.default_value is not None:
-                resolved = type_of(param.default_value)
+                if isinstance(node, RuntimeArgNode):
+                    resolved = node.type
+                else:
+                    resolved = type_of(node)
             if resolved is None:
                 raise TypeMismatchError(
                     f"cannot determine the type of parameter '{name}'"
@@ -551,10 +626,13 @@ class Signature:
             unit = resolved.get_unit_value()
             if unit is not None:
                 assert isinstance(unit, Value)
-                return SpecializedComptimeArg(unit)
-            if param.is_comptime:
+                return unit
+            if not isinstance(node, RuntimeArgNode) and (is_comptime or flattened):
+                # a compile-time leaf: carried as its value, never passed in MIR
+                return coerce_const(node, resolved)
+            if is_comptime:
                 raise TypeMismatchError(
-                    f"compile-time parameter '{name}' must have a zero-sized type"
+                    f"compile-time parameter '{name}' must be a compile-time value"
                 )
             # the convention the formal declares (unknown while its type was a
             # type parameter) and the one the substituted type asks for: by
@@ -563,22 +641,22 @@ class Signature:
             if is_c:
                 by_ref = TriState.FALSE
             else:
-                by_ref = TriState.or_(param.by_ref, pass_by_ref(resolved, cache))
-            return SpecializedRuntimeArg(resolved, by_ref is not TriState.FALSE)
+                by_ref = TriState.or_(by_ref_hint, pass_by_ref(resolved, cache))
+            return RuntimeArgNode(resolved, by_ref is not TriState.FALSE)
 
         positional = tuple(
             (name, resolve(name, param, entry))
             for (name, param), entry in zip(self.positional.items(), provided.positional)
         )
 
-        varargs: tuple[SpecializedFormalArg, ...] | None = None
+        varargs: tuple[ArgNode, ...] | None = None
         if self.varargs is not None:
             formal = self.varargs
             varargs = tuple(
                 resolve('*args', formal, entry) for entry in provided.varargs
             )
 
-        kwargs: frozendict[str, SpecializedFormalArg] | None = None
+        kwargs: frozendict[str, ArgNode] | None = None
         if self.kwargs is not None:
             kw = self.kwargs
             kwargs = frozendict(
@@ -975,30 +1053,46 @@ def _thunk_call_sig(call_sig: CallSignature, fn: mir.Function) -> CallSignature:
     with every runtime argument whose aggregate form crosses the boundary as a
     pointer marked ``is_ref`` (its value is then the address)."""
 
-    def convert(arg: SpecializedFormalArg, index: int) -> tuple[SpecializedFormalArg, int]:
+    def convert(arg: ArgNode, index: int) -> tuple[ArgNode, int]:
         match arg:
-            case SpecializedComptimeArg():
-                return arg, index
-            case SpecializedRuntimeArg():
+            case RuntimeArgNode():
                 is_ref = arg.is_ref or _must_pass_by_ref(fn.args[index])
-                return SpecializedRuntimeArg(arg.type, is_ref), index + 1
-        raise AssertionError(f'unsupported specialized argument {arg!r}')
+                return RuntimeArgNode(arg.type, is_ref), index + 1
+            case tuple():
+                children: list[ArgNode] = []
+                for child in arg:
+                    child, index = convert(child, index)
+                    children.append(child)
+                return tuple(children), index
+            case frozendict():
+                values: dict[str, ArgNode] = {}
+                for key, child in arg.items():
+                    values[key], index = convert(child, index)
+                return frozendict(values), index
+            case CompoundArgNode():
+                elems: list[ArgNode] = []
+                for child in arg.elems:
+                    child, index = convert(child, index)
+                    elems.append(child)
+                return CompoundArgNode(arg.container_type, tuple(elems)), index
+        # a compile-time leaf carries no MIR argument
+        return arg, index
 
-    positional: list[tuple[str, SpecializedFormalArg]] = []
+    positional: list[tuple[str, ArgNode]] = []
     index = 0
     for name, arg in call_sig.positional:
         arg, index = convert(arg, index)
         positional.append((name, arg))
-    varargs: tuple[SpecializedFormalArg, ...] | None = None
+    varargs: tuple[ArgNode, ...] | None = None
     if call_sig.varargs is not None:
-        varargs_values: list[SpecializedFormalArg] = []
+        varargs_values: list[ArgNode] = []
         for arg in call_sig.varargs:
             arg, index = convert(arg, index)
             varargs_values.append(arg)
         varargs = tuple(varargs_values)
-    kwargs: frozendict[str, SpecializedFormalArg] | None = None
+    kwargs: frozendict[str, ArgNode] | None = None
     if call_sig.kwargs is not None:
-        kwargs_values: dict[str, SpecializedFormalArg] = {}
+        kwargs_values: dict[str, ArgNode] = {}
         for name, arg in call_sig.kwargs.items():
             kwargs_values[name], index = convert(arg, index)
         kwargs = frozendict(kwargs_values)

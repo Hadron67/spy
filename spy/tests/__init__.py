@@ -45,6 +45,7 @@ from .std.mem import all_tests as mem_tests
 from .strings import all_tests as strings_tests
 from .structs import all_tests as structs_tests
 from .tagged_unions import all_tests as tagged_unions_tests
+from .tuple_args import all_tests as tuple_args_tests
 from .types import all_tests as types_tests
 from .undefined import all_tests as undefined_tests
 from .varargs import all_tests as varargs_tests
@@ -82,6 +83,7 @@ all_tests: list[type[TestCase]] = [
     *static_tests,
     *strings_tests,
     *mem_tests,
+    *tuple_args_tests,
     *varargs_tests,
     *varargs_combos_tests,
 ]
