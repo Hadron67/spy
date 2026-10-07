@@ -67,7 +67,6 @@ from .fn import (
     ArgEntry,
     ClosureFunction,
     FunctionIR,
-    RawArgList,
     Signature,
     SignatureFormalArg,
 )
@@ -664,7 +663,7 @@ class _Builder:
             base = iter_slot
         else:
             base = self._as_ref(self._gen_expr(node.iter)[0])
-        self.add(hir.CallMethodInplace(base, '__iter__', RawArgList((), frozendict()), it))
+        self.add(hir.CallMethodInplace(base, '__iter__', hir.CallArgs((), ()), it))
         self.add(hir.CommitSlot(it))
         # the loop body, in a block of its own: the loop variable(s) are
         # declared there and are not visible after the loop.  Its scope also
@@ -677,7 +676,7 @@ class _Builder:
             node.target, new_slots,
             hir.InlineMode.FULL if is_inline else hir.InlineMode.NONE,
         )
-        self.add(hir.CallMethodInplace(it, '__next__', RawArgList((), frozendict()), place))
+        self.add(hir.CallMethodInplace(it, '__next__', hir.CallArgs((), ()), place))
         for slot in new_slots:
             self.add(hir.CommitSlot(slot))
         self._gen_body(node.body)
@@ -1629,13 +1628,13 @@ class _Builder:
         self._scopes.pop()
         self.add(hir.End())
 
-    def _gen_arglist(self, args: list[ast.expr], keywords: list[ast.keyword]) -> RawArgList[ArgEntry[hir.Value]]:
+    def _gen_arglist(self, args: list[ast.expr], keywords: list[ast.keyword]) -> hir.CallArgs:
         positional = tuple(self._gen_expr(a)[0] for a in args)
-        kwargs: dict[str, ArgEntry[hir.Value]] = {}
+        kwargs: list[tuple[str, ArgEntry[hir.Value]]] = []
         for kw in keywords:
             if kw.arg is not None:
-                kwargs[kw.arg] = self._gen_expr(kw.value)[0]
-        return RawArgList(positional, frozendict(kwargs.items()))
+                kwargs.append((kw.arg, self._gen_expr(kw.value)[0]))
+        return hir.CallArgs(positional, tuple(kwargs))
 
     def _gen_struct_ctor(self, struct: hir.Value, args: list[ast.expr], keywords: list[ast.keyword], result_loc: hir.Value) -> None:
         """One construction ``Foo(a1, a2, k=v)``: every argument is generated

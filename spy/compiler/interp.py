@@ -1168,7 +1168,7 @@ def _aggregate_arg_entries(ev: ArgEntry[InterpVal]) -> tuple[ArgEntry[InterpVal]
 def _arg_node_types(node: ArgNode) -> Iterator[sval.Type]:
     """The spy type of every runtime leaf of a provided :data:`ArgNode` (and the
     type of a compile-time leaf), in order - what a check over the arguments of
-    a call reads (see ``_call_closure``)."""
+    a call reads (see ``_call_function_entry``)."""
     if isinstance(node, RuntimeArgNode):
         yield node.type
     elif isinstance(node, ComptimePtrArg):
@@ -1636,6 +1636,25 @@ class PollResult(IntEnum):
     SUSPEND = auto()
     DONE = auto()
 
+
+@dataclass(slots=True)
+class RuntimeClosurePlan:
+    """The struct type and generated ``__call__`` ``std.core.as_runtime_closure``
+    builds for one closure value (see ``_build_runtime_closure``).  The struct's
+    fields are its runtime captures (a leaf each, in canonical order); the fields
+    are named ``_cap0``, ``_cap1``, ... and typed per 2.7 of the spec (a
+    top-level capture is a pointer, or its pointee under ``as_copy``; a nested
+    leaf is the leaf's own type)."""
+
+    struct_type: sval.StructType
+    call_fn: FunctionValue
+    as_copy: bool
+    field_names: tuple[str, ...]
+    field_types: tuple[sval.Type, ...]
+    captures: tuple[ArgNode, ...]
+    capture_places: tuple[InterpVal, ...]
+    leaf_bases: tuple[int, ...]
+
 class HirRunner:
     """Runs one function body (and everything it inlines) at compile
     time, filling the pre-created typed :class:`mir.Function` of one
@@ -1701,6 +1720,12 @@ class HirRunner:
         # ``_unroll_inline_loop``)
         self._loop_unrolls: int = 0
         self.max_loop_unroll: int = 1024
+        # the ids handed out to the anonymous struct types and ``__call__``
+        # functions ``std.core.as_runtime_closure`` generates (see
+        # ``_builtin_as_runtime_closure``); a counter on the runner keeps the
+        # symbols unique within it (the enclosing function name, already part of
+        # ``closure.name_base``, separates different runners)
+        self._runtime_closure_counter: int = 0
 
     @property
     def _special_type(self) -> sval.SpecialTypes:
@@ -1764,7 +1789,7 @@ class HirRunner:
         args = self._init_args_from_signature(sig, mir_args, arg_is_ref)
         # the closure captures a call passed become the frame's capture places,
         # bound after the declared arguments (see ``hir.Closure``)
-        frame.closure_values = self._init_closure_captures(sig.captures, mir_args)
+        frame.closure_values = self._init_capture_values(sig.captures, mir_args)
         for arg in mir_args:
             assert arg is not None
         frame.arg_values = args
@@ -1798,16 +1823,25 @@ class HirRunner:
             value_loc, self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE),
         )
 
-    def _init_arg_node(self, node: ArgNode, mir_args: list[mir.Type], arg_is_ref: bool) -> InterpVal:
+    def _init_arg_node(self, node: ArgNode, mir_args: list[mir.Type], arg_is_ref: bool, leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None) -> InterpVal:
         """The place one specialized formal argument is bound to: one form of
         the argument tree (see :class:`~spy.compiler.fn.ArgNode`).  A
         compile-time leaf is a const reference to its value and consumes no MIR
         argument; a runtime leaf consumes one and becomes a slot (or the
         argument itself when it is passed by address); a compound (a tuple, a
         ``dict`` or a flattened aggregate) is the place tree of its
-        elements."""
+        elements.
+
+        ``leaf_source`` (see ``_rebuild_capture``) overrides where a runtime
+        leaf's place comes from: when it is not None, every ``RuntimeArgNode``
+        leaf is taken from ``leaf_source(node)`` directly instead of consuming a
+        MIR formal (no MIR argument is appended)."""
         match node:
             case RuntimeArgNode():
+                if leaf_source is not None:
+                    # the leaf comes from a struct field, not a MIR formal (see
+                    # ``_rebuild_capture``)
+                    return leaf_source(node)
                 index = len(mir_args)
                 if node.is_ref:
                     # the signature passes the address of the value as a const
@@ -1842,24 +1876,24 @@ class HirRunner:
                 # a tuple has no representation of its own: its elements are
                 # their own places, and each is passed separately
                 return ComptimeTuplePtr(
-                    tuple(self._init_arg_node(child, mir_args, False) for child in node)
+                    tuple(self._init_arg_node(child, mir_args, False, leaf_source) for child in node)
                 )
             case frozendict():
                 # the named counterpart of a tuple (a ``dict[str, T]``)
                 return ComptimeDictPtr(
-                    {key: self._init_arg_node(child, mir_args, False) for key, child in node.items()}
+                    {key: self._init_arg_node(child, mir_args, False, leaf_source) for key, child in node.items()}
                 )
             case CompoundArgNode():
                 # an aggregate whose fields/elements are their own places
                 return ComptimeAggregatePtr(
                     node.container_type,
-                    tuple(self._init_arg_node(child, mir_args, False) for child in node.elems),
+                    tuple(self._init_arg_node(child, mir_args, False, leaf_source) for child in node.elems),
                 )
             case ComptimePtrArg(type=type, content=content):
                 # a compile-time pointer: the callee gets a fresh, writable place
                 # holding a copy of the pointee (see ``_init_ptr_target``)
                 assert isinstance(type, sval.PointerType)
-                place = self._init_ptr_target(content, type.elem, mir_args)
+                place = self._init_ptr_target(content, type.elem, mir_args, leaf_source)
                 if arg_is_ref:
                     # the parameter is a place: the pointer itself is the place
                     return place
@@ -1871,39 +1905,40 @@ class HirRunner:
                 # scalar): a const reference to it, no MIR argument
                 return ComptimeVal(sval.ConstRef(node))
 
-    def _init_ptr_target(self, node: ArgNode, type: sval.Type, mir_args: list[mir.Type]) -> InterpVal:
+    def _init_ptr_target(self, node: ArgNode, type: sval.Type, mir_args: list[mir.Type], leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None) -> InterpVal:
         """A fresh, writable compile-time place of spy type ``type`` holding a
         copy of the pointee ``node``: what a compile-time pointer argument's
         pointee is rebuilt as at the callee (see :class:`~spy.compiler.fn.ComptimePtrArg`).
         A runtime leaf consumes one MIR argument, in depth-first order (the order
-        the caller passed them, see ``_convert_content``)."""
+        the caller passed them, see ``_convert_content``) - or is taken from
+        ``leaf_source`` when one is given (see ``_rebuild_capture``)."""
         match node:
             case RuntimeArgNode():
                 # a runtime leaf of the pointee: a fresh slot seeded with the
                 # value passed by value
-                return self._init_arg_node(node, mir_args, False)
+                return self._init_arg_node(node, mir_args, False, leaf_source)
             case ComptimePtrArg(inner_type, inner_content):
                 # a pointer inside the pointee: rebuild the place it points at,
                 # then hold the pointer in a fresh place of its own
                 assert isinstance(inner_type, sval.PointerType)
-                inner = self._init_ptr_target(inner_content, inner_type.elem, mir_args)
+                inner = self._init_ptr_target(inner_content, inner_type.elem, mir_args, leaf_source)
                 place = self._declared_comptime_place(type)
                 self.store(place, inner)
                 return place
             case tuple():
                 assert isinstance(type, sval.TupleType)
                 return ComptimeTuplePtr(tuple(
-                    self._init_ptr_target(child, elem_type, mir_args)
+                    self._init_ptr_target(child, elem_type, mir_args, leaf_source)
                     for child, elem_type in zip(node, type.types)
                 ))
             case frozendict():
                 assert isinstance(type, sval.StrDictType)
                 return ComptimeDictPtr({
-                    name: self._init_ptr_target(child, type.values[name], mir_args)
+                    name: self._init_ptr_target(child, type.values[name], mir_args, leaf_source)
                     for name, child in node.items()
                 })
             case CompoundArgNode(container_type, elems):
-                return self._init_container_target(container_type, elems, mir_args)
+                return self._init_container_target(container_type, elems, mir_args, leaf_source)
             case _:
                 # a compile-time value leaf: a fresh place of the declared type
                 # (a box for a scalar, the type's own place form otherwise)
@@ -1921,44 +1956,48 @@ class HirRunner:
         return self.alloca(InlineMode.FULL, declared=type)
 
     def _init_container_target(
-        self, container_type: sval.Type, elems: tuple[ArgNode, ...], mir_args: list[mir.Type]
+        self, container_type: sval.Type, elems: tuple[ArgNode, ...], mir_args: list[mir.Type], leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None
     ) -> InterpVal:
         """A fresh place of the container type ``container_type`` (an aggregate,
         an ``Option[T]`` or a tagged union) built from the content parts ``elems``
-        (see ``CompoundArgNode`` and ``_init_ptr_target``)."""
-        payload_place: InterpVal
+        (see ``CompoundArgNode`` and ``_init_ptr_target``).  The parts are
+        consumed in the canonical order (see ``_content_node``/``convert_content``):
+        an ``Option``/tagged union's tag first, then its payload."""
         if isinstance(container_type, sval.OptionType):
             tag, payload = elems
+            # tag first (the canonical order, matching ``_content_node`` and
+            # ``convert_content``), then the payload
+            tag_value = self._init_value(tag, mir_args, leaf_source)
             child = container_type.child
             if child.is_zst():
                 # a zero-sized child has no payload storage
-                payload_place = ComptimeVal(sval.Undefined(sval.PointerType(child, is_const=False)))
+                payload_place: InterpVal = ComptimeVal(sval.Undefined(sval.PointerType(child, is_const=False)))
             else:
-                payload_place = self._init_ptr_target(payload, child, mir_args)
-            return ComptimeOptionPtr(self._init_value(tag, mir_args), payload_place)
+                payload_place = self._init_ptr_target(payload, child, mir_args, leaf_source)
+            return ComptimeOptionPtr(tag_value, payload_place)
         if isinstance(container_type, sval.TaggedUnionType):
             tag, payload = elems
-            tag_value = self._init_value(tag, mir_args)
+            tag_value = self._init_value(tag, mir_args, leaf_source)
             variant = container_type.types[self._tagged_union_int(tag_value)]
             if variant.get_unit_value() is not None:
                 # a zero-sized variant has no payload storage
                 payload_place = ComptimeVal(sval.Undefined(sval.PointerType(variant, is_const=False)))
             else:
-                payload_place = self._init_ptr_target(payload, variant, mir_args)
+                payload_place = self._init_ptr_target(payload, variant, mir_args, leaf_source)
             return ComptimeTaggedUnionPtr(container_type, tag_value, payload_place)
         if _is_aggregate(container_type):
             elem_types = _aggregate_place_types(container_type)
             return ComptimeAggregatePtr(container_type, tuple(
-                self._init_ptr_target(child, elem_type, mir_args)
+                self._init_ptr_target(child, elem_type, mir_args, leaf_source)
                 for child, elem_type in zip(elems, elem_types)
             ))
         raise CompileError(f'cannot rebuild the content of a {container_type} place')
 
-    def _init_value(self, node: ArgNode, mir_args: list[mir.Type]) -> InterpVal:
+    def _init_value(self, node: ArgNode, mir_args: list[mir.Type], leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None) -> InterpVal:
         """The *value* a value leaf ``node`` denotes (see ``_init_container_target``):
         a compile-time value as itself, a runtime one read back out of the fresh
         slot it is passed in."""
-        return self.load(self._init_arg_node(node, mir_args, False))
+        return self.load(self._init_arg_node(node, mir_args, False, leaf_source))
 
     def _init_args_from_signature(
         self,
@@ -1978,14 +2017,14 @@ class HirRunner:
 
         return tuple(arg_values)
 
-    def _init_closure_captures(
+    def _init_capture_values(
         self, captures: tuple[ArgNode, ...], mir_args: list[mir.Type]
     ) -> tuple[InterpVal, ...]:
-        """The capture places of a closure body, from the captures a call
-        passed (see :class:`~spy.compiler.hir.Closure`).  A runtime capture is a
-        by-value pointer parameter (the address of the captured variable); a
-        compile-time capture carries no runtime argument - it becomes a const
-        reference to its value, so reading it loads the value."""
+        """The capture places a body is run with, from the captures a call
+        passed (see ``hir.Closure``/``CallSignature.captures``).  A runtime
+        capture is a by-value pointer parameter (the address of the captured
+        variable); a compile-time capture carries no runtime argument - it
+        becomes a const reference to its value, so reading it loads the value."""
         return tuple(self._init_arg_node(capture, mir_args, True) for capture in captures)
 
     def _ret_spec_place(self, node: RetSpec) -> InterpVal:
@@ -2790,9 +2829,15 @@ class HirRunner:
             case hir.Ord():
                 return self._eval_ord(self.operand(inst.operand), self.operand(inst.ret))
             case hir.CallInplace():
-                return self.call(self.operand(inst.callee), self.operand_arglist(inst.args), self.operand(inst.ret))
+                captures = (
+                    None if inst.captures is None
+                    else tuple(self.operand(c) for c in inst.captures)
+                )
+                return self.call(self.operand(inst.callee), self.eval_call_args(inst.args), self.operand(inst.ret), captures=captures)
             case hir.CallMethodInplace():
-                return self.call_method(self.operand(inst.base), inst.name, self.operand_arglist(inst.args), self.operand(inst.ret))
+                return self.call_method(self.operand(inst.base), inst.name, self.eval_call_args(inst.args), self.operand(inst.ret))
+            case hir.RebuildCapture():
+                regs[inst] = self._rebuild_capture(inst.node, inst.as_copy, inst.field_base, self.operand(inst.base))
             case hir.FieldAddr():
                 regs[inst] = self.exec_field_name_addr(self.operand(inst.base), inst.name, inst.is_aggregate_init)
             case hir.FieldIndexAddr():
@@ -4973,7 +5018,7 @@ class HirRunner:
         time; the captures are kept as they are - the compiler decides at the
         call site whether each is passed as a pointer (a runtime place) or used
         as a compile-time value (a compile-time place), and an inlined closure
-        forwards them as they came (see ``_call_closure``)."""
+        forwards them as they came (see ``_call_function_entry``)."""
         fn = inst.fn
         positional: IndexedMap[str, SignatureFormalArg] = IndexedMap()
         for i, name in enumerate(fn.param_names):
@@ -5746,7 +5791,7 @@ class HirRunner:
 
     # -- calls ----------------------------------------------------------------
 
-    def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None) -> PollResult:
+    def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None, captures: tuple[InterpVal, ...] | None = None) -> PollResult:
         """Resolve one call by its callee value and run it.  Spy
         functions compile to a native ``call`` producing a typed
         register, plain Python functions are inlined, and the spy
@@ -5758,6 +5803,12 @@ class HirRunner:
         (see ``_call_function_entry``); None when the caller wants nothing
         more.
 
+        ``captures`` are the capture places the call point provides (see
+        ``hir.CallInplace.captures``): ``None`` when the call point provides
+        none, a tuple (possibly empty) to override the callee's own.  It only
+        applies to a ``FunctionValue``/``ClosureValue`` callee; any other
+        callee with a non-``None`` ``captures`` is an error.
+
         Returns ``PollResult.AGAIN`` when the call completed here (an
         inlined callee's body writes into the result location directly),
         or ``PollResult.SUSPEND`` when the callee's specialization was
@@ -5767,27 +5818,43 @@ class HirRunner:
         callee = self._auto_deref(callee)
         target = _callee_object(callee)
         if target is not None:
-            if isinstance(target, ClosureValue):
-                return self._call_closure(target, args, ret, on_return=on_return)
             if isinstance(target, FunctionValue):
-                return self._call_function_entry(target, args, ret, on_return=on_return)
+                # a ``ClosureValue`` is a ``FunctionValue``: both dispatch through
+                # the common entry, which unifies the captures (see
+                # ``_call_function_entry``)
+                return self._call_function_entry(target, args, ret, on_return=on_return, captures=captures)
             if isinstance(target, sval.BoundMethod):
                 # a method of a generic struct resolved from a value: the
                 # struct's type-argument values are substituted into the
                 # method's signature (see ``_call_function_entry``)
                 fn = target.fn
                 assert isinstance(fn, FunctionValue), 'a bound method holds a function value'
-                return self._call_function_entry(fn, args, ret, target.generic_var_values, on_return=on_return)
+                return self._call_function_entry(fn, args, ret, target.generic_var_values, on_return=on_return, captures=captures)
             if isinstance(target, sval.BuiltinFn):
+                if captures is not None:
+                    raise CompileError('cannot provide captures to a builtin call')
                 res = self._call_builtin(target, args, ret)
                 if res == PollResult.AGAIN and on_return is not None:
                     on_return()
                 return res
+        callee_type = _type_of(callee)
+        # a call of a *struct value* through its ``__call__`` method: the callee
+        # is a place, so its type is a pointer to the struct, and the address is
+        # the receiver the method is called on (see ``std.core.as_runtime_closure``)
+        if (
+            isinstance(callee_type, sval.PointerType)
+            and isinstance(callee_type.elem, sval.StructType)
+            and callee_type.elem.get_method('__call__') is not None
+        ):
+            if captures is not None:
+                raise CompileError('cannot provide captures to a struct ``__call__``')
+            return self.call_method(callee, '__call__', args, ret, on_return)
         # a runtime function pointer: a value of a pointer-to-function type,
         # called through the pointer the value carries (a function type alone
         # is dynamically sized, so only a pointer to one is a value)
-        callee_type = _type_of(callee)
         if isinstance(callee_type, sval.PointerType) and isinstance(callee_type.elem, sval.FunctionType):
+            if captures is not None:
+                raise CompileError('cannot provide captures to a function pointer call')
             return self._call_fn_ptr(callee, callee_type.elem, args, ret, on_return)
         raise CompileError(
             f"cannot compile a call to {callee!r}; only spy functions, plain Python "
@@ -5852,6 +5919,8 @@ class HirRunner:
             return self._builtin_sstr(args, ret)
         if fn.name == 'bitcast':
             return self._builtin_bitcast(args, ret)
+        if fn.name == 'as_runtime_closure':
+            return self._builtin_as_runtime_closure(args, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 
     # -- ``std.core.gstr`` / ``std.core.sstr`` -------------------------------
@@ -6009,7 +6078,308 @@ class HirRunner:
                 'into a runtime function (@syntax.closure(inline=False))'
             )
         empty: RawArgList[ArgEntry[InterpVal]] = RawArgList((), frozendict())
-        return self._call_closure(target, empty, ret, catch_unwind=True)
+        return self._call_function_entry(target, empty, ret, catch_unwind=True)
+
+    # -- ``std.core.as_runtime_closure`` -------------------------------------
+
+    def _builtin_as_runtime_closure(
+        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.as_runtime_closure(closure, as_copy=False)``: turn a
+        compile-time closure into an ordinary spy struct value (see
+        ``RuntimeClosurePlan``).  The struct's fields hold the closure's runtime
+        captures and its ``__call__`` rebuilds them and calls the closure, so the
+        value can be stored, passed, returned and called like any other."""
+        closure, as_copy = self._runtime_closure_args(args)
+        # materialize the captures first: ``_provided_node`` reads them as places
+        capture_places: list[InterpVal] = []
+        for capture in closure.captures:
+            if isinstance(capture, PendingSlot) and capture.committed is None:
+                self._commit_pending_slot(capture)
+            capture_places.append(_shallow_normalize(capture))
+        plan = self._build_runtime_closure(closure, tuple(capture_places), as_copy)
+        # build the struct straight into the destination: the leaves are written
+        # through its address (see ``_fill_runtime_closure``), so no temporary
+        # struct and no whole-struct copy is made.  A destination that has no
+        # address of its own yet - a variable slot (its ``CommitSlot`` commits
+        # it later) or a field of a struct still being built (``finish_struct``
+        # binds it later) - is written through the deferred address
+        # ``_defer_ptr_convertion`` supplies; recording that action also forces
+        # the slot into memory (its ``info`` is never-inline), which the
+        # ``self`` the generated ``__call__`` receives requires (see 2.9).
+        if isinstance(ret, PendingSlot) and ret.committed is None:
+            dest = self._defer_ptr_convertion(ret, plan.struct_type)
+        else:
+            dest = ret
+        self._fill_runtime_closure(plan, dest)
+        return PollResult.AGAIN
+
+    def _runtime_closure_args(
+        self, args: RawArgList[ArgEntry[InterpVal]]
+    ) -> tuple[ClosureValue, bool]:
+        """The ``(closure, as_copy)`` of one ``as_runtime_closure`` call.  A
+        builtin has no ``Signature``, so nothing fills a default here: the two
+        arguments are bound (positionally or by the keyword) by hand."""
+        extra = [key for key in args.kwargs if key not in ('closure', 'as_copy')]
+        if extra:
+            raise CompileError(
+                f"std.core.as_runtime_closure got an unexpected keyword argument '{extra[0]}'"
+            )
+        if len(args.positional) > 2:
+            raise CompileError('std.core.as_runtime_closure takes at most 2 positional arguments')
+        if len(args.positional) >= 1 and 'closure' in args.kwargs:
+            raise CompileError("std.core.as_runtime_closure got multiple values for 'closure'")
+        if len(args.positional) >= 2 and 'as_copy' in args.kwargs:
+            raise CompileError("std.core.as_runtime_closure got multiple values for 'as_copy'")
+        closure_arg = args.positional[0] if len(args.positional) >= 1 else args.kwargs.get('closure')
+        if closure_arg is None:
+            raise CompileError('std.core.as_runtime_closure requires a closure argument')
+        target = _callee_object(self._arg_value(closure_arg))
+        if not isinstance(target, ClosureValue):
+            raise CompileError('the closure argument of std.core.as_runtime_closure must be a closure')
+        as_copy_arg = args.positional[1] if len(args.positional) >= 2 else args.kwargs.get('as_copy')
+        if as_copy_arg is None:
+            return target, False
+        obj = _to_comptime(_shallow_normalize(self._arg_value(as_copy_arg)))
+        if not isinstance(obj, bool):
+            raise CompileError('the as_copy argument of std.core.as_runtime_closure must be a compile-time bool')
+        return target, obj
+
+    def _build_runtime_closure(
+        self, closure: ClosureValue, capture_places: tuple[InterpVal, ...], as_copy: bool
+    ) -> RuntimeClosurePlan:
+        """Build the struct type and ``__call__`` of one converted closure (see
+        ``RuntimeClosurePlan``): collect the fields in canonical order, make the
+        struct type, generate ``__call__`` (whose ``self`` is a pointer to the
+        struct) and attach it as the struct's method."""
+        uid = self._runtime_closure_counter
+        self._runtime_closure_counter += 1
+        captures = tuple(self._provided_node(ArgEntry(place, False)) for place in capture_places)
+        field_types: list[sval.Type] = []
+        leaf_bases: list[int] = []
+        for node in captures:
+            leaf_bases.append(len(field_types))
+            self._collect_capture_fields(node, as_copy, True, field_types)
+        head = sval.StructTypeHead(f'{closure.name_base}$closure#{uid}')
+        for i, type in enumerate(field_types):
+            head.add_field(f'_cap{i}', type)
+        struct_type = head.specialize(())
+        call_fn = self._build_call_function(
+            closure, struct_type, captures, tuple(leaf_bases), as_copy, uid
+        )
+        # ``StructType.get_method`` reads ``head.methods`` on every call, so
+        # attaching the method after ``specialize`` is fine
+        head.methods['__call__'] = call_fn
+        return RuntimeClosurePlan(
+            struct_type=struct_type,
+            call_fn=call_fn,
+            as_copy=as_copy,
+            field_names=tuple(f'_cap{i}' for i in range(len(field_types))),
+            field_types=tuple(field_types),
+            captures=captures,
+            capture_places=capture_places,
+            leaf_bases=tuple(leaf_bases),
+        )
+
+    def _collect_capture_fields(
+        self, node: ArgNode, as_copy: bool, top: bool, out: list[sval.Type]
+    ) -> None:
+        """Append the field type of every runtime leaf of one capture ``node`` to
+        ``out``, in the canonical order (see ``_content_node``).  ``top`` marks
+        the capture's own root: a top-level runtime capture is a place, so it
+        contributes a pointer field (or its pointee under ``as_copy``)."""
+        if isinstance(node, RuntimeArgNode):
+            if top:
+                assert isinstance(node.type, sval.PointerType), \
+                    f'a runtime capture must be a place, got {node.type}'
+                out.append(node.type.elem if as_copy else node.type)
+            else:
+                out.append(node.type)
+            return
+        if isinstance(node, ComptimePtrArg):
+            self._collect_capture_fields(node.content, as_copy, False, out)
+            return
+        if isinstance(node, tuple):
+            for child in node:
+                self._collect_capture_fields(child, as_copy, False, out)
+            return
+        if isinstance(node, frozendict):
+            for child in node.values():
+                self._collect_capture_fields(child, as_copy, False, out)
+            return
+        if isinstance(node, CompoundArgNode):
+            for child in node.elems:
+                self._collect_capture_fields(child, as_copy, False, out)
+            return
+        # a pure compile-time leaf: no field
+
+    def _build_call_function(
+        self,
+        closure: ClosureValue,
+        struct_type: sval.StructType,
+        captures: tuple[ArgNode, ...],
+        leaf_bases: tuple[int, ...],
+        as_copy: bool,
+        uid: int,
+    ) -> FunctionValue:
+        """Build the ``__call__`` of one runtime closure struct: an ordinary
+        ``FunctionValue`` whose signature mirrors the closure's (with ``self: Ptr[Struct]``
+        prepended) and whose body rebuilds the captures from the fields and calls
+        the closure."""
+        csig = closure.hir.signature
+        positional = IndexedMap[str, SignatureFormalArg]()
+        positional.add('self', SignatureFormalArg(
+            sval.PointerType(struct_type, is_const=False), False, None, TriState.UNKNOWN, False,
+        ))
+        for name, param in csig.positional.items():
+            positional.add(name, param)
+        sig = Signature(
+            csig.generic_args, positional, csig.varargs, csig.kwargs, csig.ret_type,
+            csig.exceptions, csig.callconv, csig.may_panic,
+        )
+        arg_is_ref = (True,) + closure.hir.arg_is_ref
+        body = self._generate_call_body(closure, captures, leaf_bases, as_copy)
+        fn_ir = FunctionIR(f'{closure.name_base}.__call__', sig, arg_is_ref, body)
+        return FunctionValue(f'{closure.name_base}.__call__#{uid}', fn_ir)
+
+    def _generate_call_body(
+        self,
+        closure: ClosureValue,
+        captures: tuple[ArgNode, ...],
+        leaf_bases: tuple[int, ...],
+        as_copy: bool,
+    ) -> tuple[hir.Inst, ...]:
+        """The HIR body of the generated ``__call__``: one operand per capture
+        (a ``hir.RebuildCapture`` or, for a pure compile-time capture, a
+        ``hir.Const``), then the call of the closure itself."""
+        csig = closure.hir.signature
+        npos = len(csig.positional.by_id)
+        insts: list[hir.Inst] = []
+        operands: list[hir.Value] = []
+        for i, node in enumerate(captures):
+            if isinstance(node, (RuntimeArgNode, ComptimePtrArg, CompoundArgNode, tuple, frozendict)):
+                rebuild = hir.RebuildCapture(node, as_copy, leaf_bases[i], hir.Arg(0))
+                insts.append(rebuild)
+                operands.append(rebuild)
+            else:
+                # a pure compile-time leaf (a spy value or a plain scalar): baked
+                # straight into the body
+                operands.append(hir.Const(node))
+        # the declaration parameters are passed by place: ``hir.Arg(i)`` is the
+        # parameter's storage and ``is_ref=True`` says the argument logically is
+        # the value it holds (see ``_provided_node``)
+        positional: list[ArgEntry[hir.Value] | hir.Spread] = [
+            ArgEntry(hir.Arg(i), True) for i in range(1, npos + 1)
+        ]
+        kwargs: list[tuple[str, ArgEntry[hir.Value]] | hir.Spread] = []
+        if csig.varargs is not None:
+            positional.append(hir.Spread(hir.Arg(1 + npos)))
+        if csig.kwargs is not None:
+            kwargs.append(hir.Spread(hir.Arg(1 + npos + (1 if csig.varargs is not None else 0))))
+        insts.append(hir.CallInplace(
+            callee=hir.Const(closure),
+            args=hir.CallArgs(tuple(positional), tuple(kwargs)),
+            ret=hir.ResultLoc(),
+            captures=tuple(operands),
+        ))
+        # a body that returns ``Never`` has no value: it may not terminate with a
+        # ``Ret`` (every path of the call already left the frame)
+        if not (csig.ret_type is not None and isinstance(csig.ret_type, sval.EmptyType)):
+            insts.append(hir.Ret())
+        return tuple(insts)
+
+    def _fill_runtime_closure(self, plan: RuntimeClosurePlan, dest: InterpVal) -> None:
+        """Write every runtime leaf of the captures into its field of ``dest``
+        (the struct the conversion builds), in the canonical order shared with
+        ``_content_node`` and ``convert_content``."""
+        index = 0
+        for place, node in zip(plan.capture_places, plan.captures):
+            for value in self._capture_leaf_values(place, node, plan.as_copy):
+                self.store(self.field_index_addr(dest, _index_value(index)), value)
+                index += 1
+        assert index == len(plan.field_types), (index, len(plan.field_types))
+
+    def _capture_leaf_values(
+        self, place: InterpVal, node: ArgNode, as_copy: bool
+    ) -> Iterator[InterpVal]:
+        """The runtime leaf values of one capture (the mirror of ``convert_content``
+        read off the capture *place* instead of the MIR arguments): a top-level
+        capture is the place itself (or the value it holds under ``as_copy``); a
+        nested leaf is the value its field will hold."""
+        if isinstance(node, RuntimeArgNode):
+            yield self.load(place) if as_copy else place
+            return
+        if isinstance(node, ComptimePtrArg):
+            yield from self._content_leaf_values(place, node.content)
+            return
+        # a pure compile-time leaf: no field
+        assert not isinstance(node, (tuple, frozendict, CompoundArgNode))
+
+    def _content_leaf_values(self, place: InterpVal, node: ArgNode) -> Iterator[InterpVal]:
+        """The runtime leaf values nested in a ``ComptimePtrArg``'s content (the
+        mirror of ``convert_content``)."""
+        if isinstance(node, RuntimeArgNode):
+            yield self.load(place)
+            return
+        place = _shallow_normalize(place)
+        if isinstance(node, ComptimePtrArg):
+            yield from self._content_leaf_values(self.load(place), node.content)
+            return
+        if isinstance(node, tuple):
+            assert isinstance(place, ComptimeTuplePtr)
+            for child, sub in zip(node, place.values):
+                yield from self._content_leaf_values(sub, child)
+            return
+        if isinstance(node, frozendict):
+            assert isinstance(place, ComptimeDictPtr)
+            for key, child in node.items():
+                yield from self._content_leaf_values(place.values[key], child)
+            return
+        if isinstance(node, CompoundArgNode):
+            if isinstance(node.container_type, sval.OptionType):
+                assert isinstance(place, ComptimeOptionPtr)
+                if not node.container_type.child.is_zst():
+                    yield from self._content_leaf_values(place.payload_ptr, node.elems[1])
+                return
+            if isinstance(node.container_type, sval.TaggedUnionType):
+                assert isinstance(place, ComptimeTaggedUnionPtr)
+                if _union_variant_type(node.container_type, place.tag).get_unit_value() is None:
+                    yield from self._content_leaf_values(place.payload_ptr, node.elems[1])
+                return
+            assert isinstance(place, ComptimeAggregatePtr)
+            for child, sub in zip(node.elems, place.ptrs):
+                yield from self._content_leaf_values(sub, child)
+            return
+        # a compile-time leaf: no field
+
+    def _rebuild_capture(
+        self, node: ArgNode, as_copy: bool, field_base: int, base: InterpVal
+    ) -> InterpVal:
+        """Rebuild one capture place from the fields of the runtime closure
+        struct ``base`` points at (see ``hir.RebuildCapture``).  It mirrors
+        ``_init_ptr_target`` but takes every runtime leaf from a fresh field place
+        (``leaf_source``) instead of a MIR formal."""
+        index = field_base
+
+        def leaf_source(leaf: RuntimeArgNode) -> InterpVal:
+            nonlocal index
+            i = index
+            index += 1
+            field = self.field_index_addr(base, _index_value(i))
+            if leaf is node:
+                # the capture's own place: the stored pointer (``as_copy=False``),
+                # or the field that holds the copied value (``as_copy=True``)
+                return field if as_copy else self.load(field)
+            return self._leaf_place_from_field(leaf, field)
+
+        return self._init_arg_node(node, [], True, leaf_source)
+
+    def _leaf_place_from_field(self, leaf: RuntimeArgNode, field: InterpVal) -> InterpVal:
+        """Turn the value stored in a field back into a fresh place holding it (a
+        nested leaf; only ever called for a ``RuntimeArgNode``)."""
+        place = self._declared_comptime_place(leaf.type)
+        self.store(place, self.load(field))
+        return place
 
     # -- ``std.core.as_static_ptr`` ------------------------------------------
 
@@ -7735,9 +8105,17 @@ class HirRunner:
         method = struct.get_method(method_name)
         if method is None:
             return None
-        resolved = self._analyser._resolver.resolve_global(method)
-        if resolved is None:
-            return None
+        if isinstance(method, sval.Value):
+            # the entry is already a spy value (the ``__call__``
+            # ``as_runtime_closure`` attaches to its generated struct, see
+            # ``_builtin_as_runtime_closure``): use it as it is.  A method read
+            # off a Python class body is a plain object and resolves through the
+            # host instead.
+            resolved = method
+        else:
+            resolved = self._analyser._resolver.resolve_global(method)
+            if resolved is None:
+                return None
         generic_var_values = frozendict(zip(struct.head.generic_args, struct.generic_args))
         if len(generic_var_values) == 0:
             return resolved
@@ -7853,11 +8231,49 @@ class HirRunner:
             on_return,
         )
 
-    def operand_arglist(self, args: RawArgList[ArgEntry[hir.Value]]) -> RawArgList[ArgEntry[InterpVal]]:
-        return RawArgList(
-            tuple(self.operand_arg(a) for a in args.positional),
-            frozendict((k, self.operand_arg(v)) for k, v in args.kwargs.items()),
-        )
+    def eval_call_args(self, args: hir.CallArgs) -> RawArgList[ArgEntry[InterpVal]]:
+        """Evaluate one call's HIR argument list (see ``hir.CallArgs``), flattening
+        its ``*``/``**`` forwarding items into an already-evaluated ``RawArgList``
+        (what ``call``/``call_method`` consume)."""
+        positional: list[ArgEntry[InterpVal]] = []
+        for item in args.positional:
+            if isinstance(item, hir.Spread):
+                positional.extend(self._spread_positional(self.operand(item.value)))
+            else:
+                positional.append(self.operand_arg(item))
+        kwargs: dict[str, ArgEntry[InterpVal]] = {}
+        for item in args.kwargs:
+            if isinstance(item, hir.Spread):
+                spread = self._spread_kwargs(self.operand(item.value))
+                for key, value in spread.items():
+                    if key in kwargs:
+                        raise CompileError(f"got multiple values for argument '{key}'")
+                    kwargs[key] = value
+            else:
+                key, entry = item
+                if key in kwargs:
+                    raise CompileError(f"got multiple values for argument '{key}'")
+                kwargs[key] = self.operand_arg(entry)
+        return RawArgList(tuple(positional), frozendict(kwargs))
+
+    def _spread_positional(self, place: InterpVal) -> tuple[ArgEntry[InterpVal], ...]:
+        """The positional arguments a ``*`` forwarding item contributes: the
+        element places of a ``ComptimeTuplePtr`` (the pointer form only - the
+        shape a frame's varargs slot holds; the value form ``ComptimeTuple`` is
+        rejected)."""
+        place = _shallow_normalize(place)
+        if not isinstance(place, ComptimeTuplePtr):
+            raise CompileError(f'cannot unpack {_type_of(place)} positionally')
+        return tuple(ArgEntry(element, True) for element in place.values)
+
+    def _spread_kwargs(self, place: InterpVal) -> frozendict[str, ArgEntry[InterpVal]]:
+        """The keyword arguments a ``**`` forwarding item contributes: the value
+        places of a ``ComptimeDictPtr`` (the pointer form only - the shape a
+        frame's kwargs slot holds; the value form ``ComptimeDict`` is rejected)."""
+        place = _shallow_normalize(place)
+        if not isinstance(place, ComptimeDictPtr):
+            raise CompileError(f'cannot unpack {_type_of(place)} by keyword')
+        return frozendict((key, ArgEntry(value, True)) for key, value in place.values.items())
 
     def operand_arg(self, arg: ArgEntry[hir.Value]) -> ArgEntry[InterpVal]:
         return ArgEntry(self.operand(arg.value), arg.is_ref)
@@ -8022,13 +8438,16 @@ class HirRunner:
         ret: InterpVal,
         generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
         on_return: Callable[[], None] | None = None,
+        captures: tuple[InterpVal, ...] | None = None,
+        catch_unwind: bool = False,
     ) -> PollResult:
         """A call of a registered spy function with the given (already
         evaluated) argument values - the common tail of an ordinary
-        function call and of a method call, whose ``self`` the caller
-        prepended to the arguments.  The call is specialized from the
-        marshaled argument types (an annotated parameter fixes its type,
-        an unannotated one is typed by its argument); a plain Python
+        function call, of a method call (whose ``self`` the caller
+        prepended to the arguments) and of a closure call
+        (``ClosureValue``, a ``FunctionValue``).  The call is specialized
+        from the marshaled argument types (an annotated parameter fixes its
+        type, an unannotated one is typed by its argument); a plain Python
         callee (``force_inline``) is inlined into the current stream
         instead of being compiled into a native specialization.
 
@@ -8042,21 +8461,34 @@ class HirRunner:
         ``generic_var_values`` are the type-argument values of the struct
         the callee is a method of (see :class:`sval.BoundMethod`): the
         method's signature names the struct's type parameters, and they are
-        substituted into it before it is specialized."""
+        substituted into it before it is specialized.
+
+        ``captures`` are the capture places the call point provides (see
+        ``hir.CallInplace.captures`` and :attr:`FunctionValue.captures`):
+        None to use the callee's own captures, a tuple (possibly empty) to
+        override them - only the ``__call__`` ``as_runtime_closure``
+        generates provides them.
+
+        ``catch_unwind`` emits a may-panic call as a ``CatchUnwind`` instead
+        of a ``CallMayPanic`` (see ``_builtin_catch_unwind``)."""
         sig = fn.hir.signature
         if generic_var_values:
             sig = sig.substitute_type_vars(dict(generic_var_values))
         binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
         _check_comptime_args(sig, binded_args)
+        # the capture places this call runs with: what the call point provided,
+        # or the callee's own (empty for an ordinary function)
+        effective_captures = captures if captures is not None else fn.captures
         if fn.force_inline:
-            # an undecorated plain Python function: its body is inlined into
-            # the current stream (it has no native specialization of its own).
-            # Its declared return type still says when it can never return a
-            # value, which its body must respect (see ``_current_value_is_empty``).
-            # Its own type parameters are solved from the argument types here,
-            # since the body may name them in a type expression
-            # (``syntax.MultiPtr[T]``, see ``astgen``): the frame then resolves
-            # them like the type arguments of a compiled call (see ``operand``)
+            # an undecorated plain Python function or a forced-inline closure:
+            # its body is inlined into the current stream (it has no native
+            # specialization of its own).  Its declared return type still says
+            # when it can never return a value, which its body must respect (see
+            # ``_current_value_is_empty``).  Its own type parameters are solved
+            # from the argument types here, since the body may name them in a
+            # type expression (``syntax.MultiPtr[T]``, see ``astgen``): the frame
+            # then resolves them like the type arguments of a compiled call (see
+            # ``operand``)
             solved = sig.solve_param_types(self._provided_types(sig, binded_args))
             frame_values: dict[sval.TypeVar, sval.AnyValue] = dict(zip(sig.generic_args, solved))
             if generic_var_values:
@@ -8067,60 +8499,23 @@ class HirRunner:
                 frozendict(frame_values),
                 value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
                 on_done=on_return,
+                closure_values=self._inline_capture_values(effective_captures),
                 has_varargs=sig.varargs is not None,
                 has_kwargs=sig.kwargs is not None,
             )
-        spec_sig = sig.specialize(self._provided_types(sig, binded_args), self._mir_cache)
-
-        def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
-            res = self0._make_runtime_call(fn_mir, binded_args, ret, spec_sig[0], ret_sig)
-            if on_return is not None and not ret_sig.value_is_empty():
-                # the callee delivered its value into ``ret``: finish what the
-                # caller had to do with it (see ``subscript``)
-                on_return()
-            return res
-
-        return self._request_function(fn, spec_sig[0], spec_sig[1], _resumer, generic_var_values)
-
-    def _call_closure(
-        self,
-        closure: ClosureValue,
-        args: RawArgList[ArgEntry[InterpVal]],
-        ret: InterpVal,
-        on_return: Callable[[], None] | None = None,
-        catch_unwind: bool = False,
-    ) -> PollResult:
-        """Call a closure (see :class:`ClosureValue`).  A forced-inline closure
-        is inlined like a plain Python function, its captures handed over as the
-        frame's ``closure_values``; any other is compiled into a runtime
-        function whose declarations come first and whose captures follow as
-        hidden parameters (a runtime capture a by-value pointer, a compile-time
-        one a compile-time argument that never reaches the MIR)."""
-        sig = closure.hir.signature
-        binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
-        _check_comptime_args(sig, binded_args)
-        if closure.force_inline:
-            solved = sig.solve_param_types(self._provided_types(sig, binded_args))
-            frame_values: dict[sval.TypeVar, sval.AnyValue] = dict(zip(sig.generic_args, solved))
-            return self._start_inline(
-                closure.hir.body, closure.hir.arg_is_ref, binded_args, ret,
-                closure.name_base,
-                frozendict(frame_values),
-                value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
-                on_done=on_return,
-                closure_values=self._inline_capture_values(closure),
-                has_varargs=sig.varargs is not None,
-                has_kwargs=sig.kwargs is not None,
-            )
-        capture_args = tuple(ArgEntry(capture, False) for capture in closure.captures)
+        capture_args = tuple(ArgEntry(capture, False) for capture in effective_captures)
         capture_specs = tuple(self._provided_node(arg) for arg in capture_args)
         provided = self._provided_types(sig, binded_args)
-        for node in provided.values():
-            for type in _arg_node_types(node):
-                if isinstance(type, sval.ClosureType):
-                    raise CompileError('a closure can only be passed to an inline function')
+        if isinstance(fn, ClosureValue):
+            # a closure argument can only be handed to an inline call (a runtime
+            # specialization has no place for a closure value)
+            for node in provided.values():
+                for type in _arg_node_types(node):
+                    if isinstance(type, sval.ClosureType):
+                        raise CompileError('a closure can only be passed to an inline function')
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
-        call_sig = replace(call_sig, captures=capture_specs)
+        if len(capture_specs) > 0:
+            call_sig = replace(call_sig, captures=capture_specs)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
             res = self0._make_runtime_call(
@@ -8128,16 +8523,18 @@ class HirRunner:
                 catch_unwind=catch_unwind,
             )
             if on_return is not None and not ret_sig.value_is_empty():
+                # the callee delivered its value into ``ret``: finish what the
+                # caller had to do with it (see ``subscript``)
                 on_return()
             return res
 
-        return self._request_function(closure, call_sig, partial_ret_sig, _resumer)
+        return self._request_function(fn, call_sig, partial_ret_sig, _resumer, generic_var_values)
 
-    def _inline_capture_values(self, closure: ClosureValue) -> tuple[InterpVal, ...]:
-        """The capture places an inlined closure body is run with: the places
-        the closure value kept, each materialized if it is still a pending slot."""
+    def _inline_capture_values(self, captures: tuple[InterpVal, ...]) -> tuple[InterpVal, ...]:
+        """The capture places an inlined body is run with: the given places,
+        each materialized if it is still a pending slot."""
         out: list[InterpVal] = []
-        for capture in closure.captures:
+        for capture in captures:
             if isinstance(capture, PendingSlot) and capture.committed is None:
                 self._commit_pending_slot(capture)
             out.append(_shallow_normalize(capture))
@@ -8287,7 +8684,7 @@ class HirRunner:
                 convert_one(arg, call_sig.kwargs[name])
 
         # the hidden capture parameters of a closure call come after every
-        # declared argument (see ``_call_closure``)
+        # declared argument (see ``_call_function_entry``)
         for arg, sig_arg in zip(capture_args, call_sig.captures):
             convert_one(arg, sig_arg)
 

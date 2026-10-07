@@ -831,12 +831,16 @@ class FunctionValue(Value):
     and the host, not here.
     """
 
-    def __init__(self, name_base: str, hir: FunctionIR, force_inline: bool = False) -> None:
+    def __init__(self, name_base: str, hir: FunctionIR, force_inline: bool = False, captures: tuple[Any, ...] = ()) -> None:
         # the context-unique base name of the native symbols
         self.name_base = name_base
         # the parsed HIR of the function (see ``astgen.parse_function``)
         self.hir = hir
         self.force_inline = force_inline
+        # the capture places of a closure (see :class:`ClosureValue`); empty for
+        # an ordinary function value.  A call substitutes its own captures here
+        # (see ``interp._call_function_entry``).
+        self.captures = captures
         # specialized call signatures -> the compiled artifacts of the
         # specialization
         self.specs: dict[CallSignature, FunctionInstance] = {}
@@ -915,7 +919,7 @@ class ClosureValue(FunctionValue):
 
     It is a :class:`FunctionValue` so the call/compile machinery treats it
     like any other function entry; a call dispatches through
-    ``interp._call_closure``, which inlines a forced-inline closure and
+    ``interp._call_function_entry``, which inlines a forced-inline closure and
     compiles the others.  ``name_base`` is built by the ``hir.MakeClosure``
     that creates it, from the *creating frame's* function name (the
     specialization's name, with its signature) and the closure's local name -
@@ -926,12 +930,8 @@ class ClosureValue(FunctionValue):
     could not tell apart."""
 
     def __init__(self, fn: ClosureFunction, hir_ir: FunctionIR, captures: tuple[Any, ...], name_base: str) -> None:
-        super().__init__(name_base, hir_ir, force_inline=fn.force_inline)
+        super().__init__(name_base, hir_ir, force_inline=fn.force_inline, captures=captures)
         self.closure_fn = fn
-        # the capture places, in the order of the closure's ``hir.Closure``
-        # indices (interpreter values, kept untyped here - ``fn`` cannot name
-        # ``interp``'s ``InterpVal``)
-        self.captures = captures
 
     @override
     def get_type(self) -> Type:

@@ -243,6 +243,17 @@ def as_static_ptr[T](value: T) -> ConstPtr[T]: ...
 @builtin_func
 def bitcast[T](value: Any, typ: type[T]) -> T: ...
 
+# ``as_runtime_closure(closure, as_copy=False)``: turn a compile-time closure
+# into an ordinary spy struct value (fields = its runtime captures, ``__call__``
+# = a generated function that rebuilds the captures and calls the closure), so
+# it can be stored, passed, returned and called (see ``interp``).  ``as_copy``
+# selects whether a top-level runtime capture is held by reference (``False``)
+# or copied into the struct (``True``).  The annotation does not take part in
+# compilation (``@builtin_func`` binds only the name); the result is an anonymous
+# struct type.
+@builtin_func
+def as_runtime_closure[T: Callable](closure: T, as_copy: bool = False) -> T: ...
+
 @func_type()
 class DestructorFn:
     def __call__(self, ptr: Ptr[Opaque]): ...

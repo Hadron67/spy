@@ -82,7 +82,7 @@ from enum import IntEnum, IntFlag, auto
 from typing import Any
 
 from .binop import BinaryOp, CompareOp, UnaryOp
-from .fn import ArgEntry, ClosureFunction, RawArgList, frozendict
+from .fn import ArgEntry, ArgNode, ClosureFunction, frozendict
 
 
 class Value:
@@ -311,8 +311,31 @@ class CallMethodInplace(Inst):
 
     base: Value
     name: str
-    args: RawArgList[ArgEntry[Value]]
+    args: CallArgs
     ret: Value
+
+
+@dataclass(frozen=True, slots=True)
+class Spread(Value):
+    """A ``*``/``**`` forwarding item of a call argument list: ``value``
+    evaluates to a :class:`~spy.compiler.interp.ComptimeTuplePtr` (``*``) or a
+    :class:`~spy.compiler.interp.ComptimeDictPtr` (``**``).  Only the
+    generated ``as_runtime_closure`` ``__call__`` body produces one (source
+    ``*``/``**`` call syntax is not implemented, see ``astgen``)."""
+
+    value: Value
+
+
+@dataclass(frozen=True, slots=True)
+class CallArgs:
+    """The argument list of one call, in source order: each positional item is
+    an :class:`ArgEntry` or a ``*`` :class:`Spread`, and each keyword item a
+    ``(name, ArgEntry)`` pair or a ``**`` :class:`Spread` (see
+    :class:`CallInplace`).  ``interp`` flattens it into a ``RawArgList`` when
+    the call is evaluated."""
+
+    positional: tuple[ArgEntry[Value] | Spread, ...]
+    kwargs: tuple[tuple[str, ArgEntry[Value]] | Spread, ...]
 
 
 @dataclass(eq=False)
@@ -321,12 +344,21 @@ class CallInplace(Inst):
     like Zig: ``ret`` is the pointer the callee's result goes to and the
     instruction itself produces no register.  The ``callee`` is a
     reference to the function value (see ``astgen``'s ``is_ref``
-    context), the ``args`` are by-value leaves/registers.  A consumer
-    that needs the value loads it back from ``ret``."""
+    context), the ``args`` are the (by-value) argument list.  A consumer
+    that needs the value loads it back from ``ret``.
+
+    ``captures`` are the capture places the call point explicitly provides
+    (aligned with ``fn.CallSignature.captures``): ``None`` (the default the
+    ``astgen`` construction points leave) means the call point provides no
+    capture and the callee's own ``fn.captures`` are used; a tuple (possibly
+    empty) means the call point provides them, overriding the callee's own -
+    only the ``as_runtime_closure`` ``__call__`` body sets one (see
+    ``interp``)."""
 
     callee: Value
-    args: RawArgList[ArgEntry[Value]]
+    args: CallArgs
     ret: Value
+    captures: tuple[Value, ...] | None = None
 
 
 @dataclass(eq=False)
@@ -428,6 +460,22 @@ class MakeClosure(Inst):
     vararg_annotation: Value | None
     kwarg_annotation: Value | None
     captures: tuple[Value, ...]
+
+
+@dataclass(eq=False)
+class RebuildCapture(Inst):
+    """Rebuild one capture place from the field(s) of a runtime closure struct
+    (see ``std.core.as_runtime_closure``).  ``base`` is the address of the
+    struct; ``node`` is the capture's :data:`~spy.compiler.fn.ArgNode` (the one
+    ``_provided_node`` gave at conversion time), ``field_base`` the index of its
+    first runtime leaf among the struct's fields and ``as_copy`` whether the
+    top-level capture is held by value (see ``interp._rebuild_capture``)."""
+
+    node: ArgNode
+    as_copy: bool
+    field_base: int
+    base: Value
+
 
 @dataclass(eq=False)
 class InitTuple(Inst):
