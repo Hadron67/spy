@@ -316,7 +316,7 @@ class CallMethodInplace(Inst):
 
 
 @dataclass(frozen=True, slots=True)
-class Spread(Value):
+class Spread:
     """A ``*``/``**`` forwarding item of a call argument list: ``value``
     evaluates to a :class:`~spy.compiler.interp.ComptimeTuplePtr` (``*``) or a
     :class:`~spy.compiler.interp.ComptimeDictPtr` (``**``).  Only the

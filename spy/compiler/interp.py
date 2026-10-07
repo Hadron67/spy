@@ -6208,6 +6208,12 @@ class HirRunner:
                 self._collect_capture_fields(child, as_copy, False, out)
             return
         if isinstance(node, CompoundArgNode):
+            if isinstance(node.container_type, sval.OptionType):
+                # mirror ``_content_leaf_values``: the tag is a compile-time leaf
+                # (no field) and a zero-sized child has no payload storage
+                if not node.container_type.child.is_zst():
+                    self._collect_capture_fields(node.elems[1], as_copy, False, out)
+                return
             for child in node.elems:
                 self._collect_capture_fields(child, as_copy, False, out)
             return
@@ -6297,7 +6303,14 @@ class HirRunner:
             for value in self._capture_leaf_values(place, node, plan.as_copy):
                 self.store(self.field_index_addr(dest, _index_value(index)), value)
                 index += 1
-        assert index == len(plan.field_types), (index, len(plan.field_types))
+        if index != len(plan.field_types):
+            # the two traversals can only disagree on a capture holding a nested
+            # runtime-tagged option/union, which is not transportable (see
+            # ``pending-problems`` #1)
+            raise CompileError(
+                'the runtime captures of a closure do not match its struct fields '
+                f'({index} written, {len(plan.field_types)} declared)'
+            )
 
     def _capture_leaf_values(
         self, place: InterpVal, node: ArgNode, as_copy: bool
@@ -6307,6 +6320,8 @@ class HirRunner:
         capture is the place itself (or the value it holds under ``as_copy``); a
         nested leaf is the value its field will hold."""
         if isinstance(node, RuntimeArgNode):
+            assert isinstance(node.type, sval.PointerType), \
+                f'a runtime capture must be a place, got {node.type}'
             yield self.load(place) if as_copy else place
             return
         if isinstance(node, ComptimePtrArg):
@@ -6359,6 +6374,9 @@ class HirRunner:
         struct ``base`` points at (see ``hir.RebuildCapture``).  It mirrors
         ``_init_ptr_target`` but takes every runtime leaf from a fresh field place
         (``leaf_source``) instead of a MIR formal."""
+        if isinstance(node, RuntimeArgNode):
+            assert isinstance(node.type, sval.PointerType), \
+                f'a runtime capture must be a place, got {node.type}'
         index = field_base
 
         def leaf_source(leaf: RuntimeArgNode) -> InterpVal:

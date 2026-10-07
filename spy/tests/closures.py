@@ -3,12 +3,33 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    hir,
     i32,
+    interp,
+    sval,
     syntax,
+    u0,
 )
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import _GLOBAL_CONTEXT, func, func_type, struct
+from ..compiler.fn import (
+    ArgEntry,
+    ArgList,
+    ArgNode,
+    ClosureValue,
+    CompoundArgNode,
+    ComptimePtrArg,
+    FunctionIR,
+    FunctionValue,
+    IndexedMap,
+    RuntimeArgNode,
+    Signature,
+    SignatureFormalArg,
+    frozendict,
+)
+from ..compiler.interp import Analyser, InterpVal, RuntimeClosurePlan
 from ..compiler.syntax import Option, as_func_ptr
+from ..compiler.util import ArraySet
 from ..std.core import as_runtime_closure
 
 # ---------------------------------------------------------------------------
@@ -397,6 +418,31 @@ def rtc_capture_option(x: i32) -> i32:
 
 
 @func()
+def rtc_capture_zst_option(n: i32) -> i32:
+    # a captured compile-time option over a zero-sized child (``u0``): only the
+    # tag has storage, the payload has none, so the capture contributes no field
+    o: syntax.Comptime[Option[u0]] = 0
+    def get() -> i32:
+        if o is None:
+            return n - 1
+        return n + 1
+    f = as_runtime_closure(get)
+    return f()
+
+
+@func()
+def rtc_capture_zst_option_absent(n: i32) -> i32:
+    # the absent value of the same zero-sized option: only the tag differs
+    o: syntax.Comptime[Option[u0]] = None
+    def get() -> i32:
+        if o is None:
+            return n - 1
+        return n + 1
+    f = as_runtime_closure(get)
+    return f()
+
+
+@func()
 def rtc_capture_union(x: i32) -> i32:
     # a captured tagged union
     u: RtTagA | RtTagB = RtTagA(x)
@@ -545,6 +591,125 @@ def rtc_in_struct_field_copies(start: i32) -> i32:
     return g()
 
 
+@func()
+def rtc_kwargs_only(n: i32) -> i32:
+    # only ``**kwargs`` (no ``*args``): its forwarding slot sits right after the
+    # positional ones
+    def combine(**kwargs: i32) -> i32:
+        return kwargs['a'] + kwargs['b']
+    f = as_runtime_closure(combine)
+    return f(a=1, b=2) + n
+
+
+@func()
+def rtc_varargs_compiled(n: i32) -> i32:
+    # a non-inline closure with ``*args``: the forwarding is the same
+    @syntax.closure(inline=False)
+    def add(*args: i32) -> i32:
+        i: syntax.Comptime = 0
+        total: i32 = 0
+        syntax.unroll()
+        while i < len(args):
+            total = total + args[i]
+            i = i + 1
+        return total
+    f = as_runtime_closure(add)
+    return f(1, 2, 3) + n
+
+
+@func()
+def rtc_capture_scalar_local(n: i32) -> i32:
+    # a runtime scalar local captured by reference: a write to the local after
+    # the conversion is seen through the capture
+    x: i32 = n
+    def get() -> i32:
+        return x
+    f = as_runtime_closure(get)
+    x = x + 1
+    return f()
+
+
+@func()
+def rtc_capture_scalar_local_copies(n: i32) -> i32:
+    # the same scalar captured by value: the copy is made when the closure is
+    # converted, so the later write is not seen
+    x: i32 = n
+    def get() -> i32:
+        return x
+    f = as_runtime_closure(get, True)
+    x = x + 1
+    return f()
+
+
+@func()
+def rtc_single_leaf(n: i32) -> i32:
+    # exactly one runtime capture: the struct's MIR mirror is its own field
+    def add(x: i32) -> i32:
+        return x + n
+    f = as_runtime_closure(add)
+    return f(3)
+
+
+@func()
+def rtc_round_trip(n: i32) -> i32:
+    # one capture of every shape, so a test can check that building the struct
+    # and rebuilding the capture round-trips the ``ArgNode``
+    s: i32 = n + 100
+    p = RtBox(n)
+    o: Option[i32] = n
+    u: RtTagA | RtTagB = RtTagA(n)
+    t: syntax.Comptime = (n, n + 1)
+    k: syntax.Comptime = 3
+    def get() -> i32:
+        total: i32 = s
+        total = total + p.v
+        if (v := o) is not None:
+            total = total + v
+        if isinstance(w := u, RtTagA):
+            total = total + w.x
+        total = total + t[0] + t[1] + k
+        return total
+    f = as_runtime_closure(get)
+    return f()
+
+
+@func()
+def rtc_option_contrast(n: i32) -> i32:
+    # a runtime option (one runtime pointer) next to a compile-time one (a
+    # compound tag + payload), so a test can tell their captures apart
+    o: Option[i32] = n
+    c: syntax.Comptime[Option[u0]] = 0
+    def get() -> i32:
+        total: i32 = 0
+        if (v := o) is not None:
+            total = total + v
+        if c is None:
+            return -1
+        return total
+    f = as_runtime_closure(get)
+    return f()
+
+
+def _a_builtin_call_with_captures() -> FunctionValue:
+    """A hand-built body whose call carries captures to a builtin - a call the
+    generated ``__call__`` never makes (its callee is a closure)."""
+    pos: IndexedMap[str, SignatureFormalArg] = IndexedMap()
+    sig = Signature((), pos, None, None, sval.VoidType(), ArraySet(), 'default', True)
+    body = (
+        hir.CallInplace(
+            callee=hir.Const(sval.BuiltinFn('as_runtime_closure')),
+            args=hir.CallArgs((ArgEntry(hir.Const(0), False),), ()),
+            ret=hir.ResultLoc(),
+            captures=(hir.Const(0),),
+        ),
+        hir.Ret(),
+    )
+    return FunctionValue(
+        'a_builtin_call_with_captures',
+        FunctionIR('a_builtin_call_with_captures', sig, (), body),
+    )
+
+
 # ---------------------------------------------------------------------------
 # runtime closures: errors
 # ---------------------------------------------------------------------------
@@ -680,6 +845,104 @@ class SpyClosureTest(TestCase):
 
     def test_runtime_closure_captures_an_option(self) -> None:
         self.assertEqual(rtc_capture_option(5), 5)
+
+    def test_runtime_closure_captures_a_zst_option(self) -> None:
+        # a zero-sized option child has no payload storage: the capture carries
+        # only the tag (its presence)
+        self.assertEqual(rtc_capture_zst_option(5), 6)
+        self.assertEqual(rtc_capture_zst_option_absent(5), 4)
+
+    def test_runtime_closure_forwards_kwargs_only(self) -> None:
+        # only ``**kwargs``: its forwarding slot sits right after the positional
+        self.assertEqual(rtc_kwargs_only(10), 13)
+
+    def test_runtime_closure_forwards_compiled_varargs(self) -> None:
+        self.assertEqual(rtc_varargs_compiled(0), 6)
+
+    def test_runtime_closure_captures_a_runtime_scalar_local(self) -> None:
+        # by reference the write-back is visible, by value it is not
+        self.assertEqual(rtc_capture_scalar_local(5), 6)
+        self.assertEqual(rtc_capture_scalar_local_copies(5), 5)
+
+    def test_a_capture_round_trips_through_the_struct(self) -> None:
+        # building the struct and running ``_rebuild_capture`` back through
+        # ``_provided_node`` must give the capture's own ``ArgNode``
+        pairs: list[tuple[ArgNode, ArgNode]] = []
+        orig = interp.HirRunner._rebuild_capture
+
+        def patched(self: interp.HirRunner, node: ArgNode, as_copy: bool, field_base: int, base: InterpVal) -> InterpVal:
+            place = orig(self, node, as_copy, field_base, base)
+            pairs.append((node, self._provided_node(ArgEntry(place, False))))
+            return place
+
+        interp.HirRunner._rebuild_capture = patched
+        try:
+            self.assertEqual(rtc_round_trip(5), 134)
+        finally:
+            interp.HirRunner._rebuild_capture = orig
+        self.assertEqual(len(pairs), 6)
+        for node, rebuilt in pairs:
+            self.assertEqual(rebuilt, node, (node, rebuilt))
+
+    def test_a_single_runtime_leaf_mirrors_as_its_field(self) -> None:
+        plans: list[RuntimeClosurePlan] = []
+        orig = interp.HirRunner._build_runtime_closure
+
+        def patched(self: interp.HirRunner, closure: ClosureValue, capture_places: tuple[InterpVal, ...], as_copy: bool) -> RuntimeClosurePlan:
+            plan = orig(self, closure, capture_places, as_copy)
+            plans.append(plan)
+            return plan
+
+        interp.HirRunner._build_runtime_closure = patched
+        try:
+            self.assertEqual(rtc_single_leaf(5), 8)
+        finally:
+            interp.HirRunner._build_runtime_closure = orig
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(len(plans[0].field_types), 1)
+        self.assertTrue(plans[0].struct_type.mirror_is_a_field(_GLOBAL_CONTEXT.mir_lower_cache))
+
+    def test_a_runtime_tag_option_is_a_single_pointer(self) -> None:
+        # contrast: a runtime option is one runtime pointer (its tag is only
+        # known at runtime, so it is not transportable as compile-time content),
+        # while a compile-time option is a compound tag + payload
+        plans: list[RuntimeClosurePlan] = []
+        orig = interp.HirRunner._build_runtime_closure
+
+        def patched(self: interp.HirRunner, closure: ClosureValue, capture_places: tuple[InterpVal, ...], as_copy: bool) -> RuntimeClosurePlan:
+            plan = orig(self, closure, capture_places, as_copy)
+            plans.append(plan)
+            return plan
+
+        interp.HirRunner._build_runtime_closure = patched
+        try:
+            self.assertEqual(rtc_option_contrast(5), 5)
+        finally:
+            interp.HirRunner._build_runtime_closure = orig
+        captures = plans[0].captures
+        self.assertTrue(any(
+            isinstance(c, RuntimeArgNode)
+            and isinstance(c.type, sval.PointerType)
+            and isinstance(c.type.elem, sval.OptionType)
+            for c in captures
+        ))
+        self.assertTrue(any(
+            isinstance(c, ComptimePtrArg) and isinstance(c.content, CompoundArgNode)
+            and isinstance(c.content.container_type, sval.OptionType)
+            for c in captures
+        ))
+
+    def test_a_non_closure_callee_cannot_take_captures(self) -> None:
+        # captures are only ever produced by the generated ``__call__`` (whose
+        # callee is a closure); handing them to a builtin is rejected
+        entry = _a_builtin_call_with_captures()
+        call_sig, ret_sig = entry.hir.signature.specialize(
+            ArgList((), (), frozendict()), _GLOBAL_CONTEXT.mir_lower_cache,
+        )
+        analyser = Analyser(_GLOBAL_CONTEXT, _GLOBAL_CONTEXT.mir_lower_cache)
+        with self.assertRaises(CompileError) as ctx:
+            analyser.analyse_function(entry, call_sig, ret_sig)
+        self.assertIn('captures', str(ctx.exception))
 
     def test_runtime_closure_captures_a_tagged_union(self) -> None:
         self.assertEqual(rtc_capture_union(5), 5)
