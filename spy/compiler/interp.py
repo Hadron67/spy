@@ -4319,6 +4319,18 @@ class HirRunner:
         t = _type_of(ev)
         if isinstance(t, sval.PointerType) and isinstance(t.elem, sval.PointerType):
             return self.load(ev)
+        place = _shallow_normalize(ev)
+        # a compile-time box may be declared to hold no fixed type (an ``Any``
+        # variable, see ``ComptimeBox``) yet hold a pointer - a function pointer,
+        # say (``comptime(); fn: Any = foo``).  What it holds is what a
+        # callee/field access needs, so it is dereferenced like a pointer that
+        # points at a pointer
+        if (
+            isinstance(t, sval.PointerType)
+            and isinstance(place, ComptimeBox)
+            and isinstance(_type_of(place.value), sval.PointerType)
+        ):
+            return self.load(place)
         return ev
 
     # -- struct and array values ---------------------------------------------

@@ -1,6 +1,6 @@
 import contextlib
 import ctypes
-from typing import Protocol
+from typing import Any, Protocol
 from unittest import TestCase
 
 from ..compiler import (
@@ -9,6 +9,7 @@ from ..compiler import (
     i64,
     mir,
     sval,
+    syntax,
 )
 from ..compiler import as_ as spy_as
 from ..compiler import typeof as spy_typeof
@@ -131,10 +132,40 @@ def c_bad_decl(x: i32) -> i32:
     ...
 
 
+@decl_func("toupper")
+def c_toupper(x: i32) -> i32:
+    # a second ``i32 -> i32`` declaration, so reassigning the compile-time
+    # variable below really changes the callee
+    ...
+
+
 @func()
 def call_c_abs(x: i32) -> i32:
     # the declared name is a function pointer value: the call goes through it
     return c_abs(x)
+
+
+@func()
+def call_any_decl(x: i32) -> i32:
+    # a declared function held in a compile-time ``Any`` variable: ``Any`` holds
+    # the pointer as it is, and the call dereferences the box to reach it (see
+    # ``HirRunner._auto_deref``)
+    syntax.comptime()
+    fn: Any = c_abs
+    return fn(x)
+
+
+@func()
+def call_any_decl_reassigned(x: i32) -> i32:
+    # the variable is reassigned in a compile-time branch: only the chosen
+    # branch is walked, so the callee is the one written there
+    syntax.comptime()
+    pick_upper = 1
+    syntax.comptime()
+    fn: Any = c_abs
+    if pick_upper == 1:
+        fn = c_toupper
+    return fn(x)
 
 
 @func()
@@ -346,6 +377,17 @@ class SpyDeclFuncTest(TestCase):
     def test_calling_a_declared_c_function(self) -> None:
         self.assertEqual(call_c_abs(-5), 5)
         self.assertEqual(call_c_abs(7), 7)
+
+    def test_a_declared_function_held_in_a_compile_time_variable(self) -> None:
+        # an ``Any`` variable holds the function pointer as it is, and the call
+        # dereferences the box it is held in
+        self.assertEqual(call_any_decl(-5), 5)
+        self.assertEqual(call_any_decl(7), 7)
+
+    def test_a_reassigned_declared_function_held_in_a_compile_time_variable(self) -> None:
+        # the callee is the one the taken compile-time branch assigned
+        self.assertEqual(call_any_decl_reassigned(ord('a')), ord('A'))
+        self.assertEqual(call_any_decl_reassigned(ord('z')), ord('Z'))
 
     def test_it_lowers_to_an_extern_symbol(self) -> None:
         self.assertEqual(call_c_abs(-1), 1)
