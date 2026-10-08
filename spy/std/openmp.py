@@ -174,52 +174,44 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
     comptime()
     LT: Any = typeof(length)
 
-    # ``LT`` selects the runtime entry point; the schedule bookkeeping (the
-    # ``stride`` the runtime writes and the ``incr``/``chunk`` it is given) is
-    # ``i32`` for the 32-bit variants and ``i64`` for the 64-bit ones.
+    # ``LT`` selects the runtime entry point (``init_fn``) and the type of the
+    # schedule bookkeeping (the ``stride`` the runtime writes and the
+    # ``incr``/``chunk`` it is given): ``i32`` for the 32-bit variants, ``i64``
+    # for the 64-bit ones.  Both are compile-time choices.
+    comptime()
+    init_fn: Any = __kmpc_for_static_init_4
     comptime()
     ST: Any = i32
-    if LT == i32 or LT == u32:
+    if LT == i32:
+        init_fn = __kmpc_for_static_init_4
         ST = i32
-    elif LT == i64 or LT == u64:
+    elif LT == u32:
+        init_fn = __kmpc_for_static_init_4u
+        ST = i32
+    elif LT == i64:
+        init_fn = __kmpc_for_static_init_8
+        ST = i64
+    elif LT == u64:
+        init_fn = __kmpc_for_static_init_8u
         ST = i64
     else:
         compile_error('parallel_loop: the index type must be i32/u32/i64/u64')
-
-    def __run(kern: Ptr[Opaque], gtid: Ptr[i32], n: Any):
-        # on entry ``lower``/``upper`` hold the whole range; the runtime
-        # overwrites them with the slice ``[lower, upper]`` this thread got.
-        # ``incr`` is 1 (a ``++`` loop) and the step is 1 because the runtime
-        # returns a contiguous block.
-        lastiter: i32 = 0
-        lower = coerce(LT, 0)
-        upper = n - 1
-        stride = coerce(ST, 0)
-        if LT == i32:
-            __kmpc_for_static_init_4(_ident(), gtid[...], _SCHED_STATIC,
-                                     ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
-        elif LT == u32:
-            __kmpc_for_static_init_4u(_ident(), gtid[...], _SCHED_STATIC,
-                                      ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
-        elif LT == i64:
-            __kmpc_for_static_init_8(_ident(), gtid[...], _SCHED_STATIC,
-                                     ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
-        else:
-            # the remaining case is ``u64`` (``LT`` is validated above)
-            __kmpc_for_static_init_8u(_ident(), gtid[...], _SCHED_STATIC,
-                                      ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
-        i = lower
-        while i <= upper:
-            ptr_cast(kern, Ptr[K])[...](i)
-            i += 1
-        __kmpc_for_static_fini(_ident(), gtid[...])
 
     @closure(inline=False, callconv='c')
     def outlined(gtid: Ptr[i32], bound_tid: Ptr[i32], n: i64, kernel: Ptr[Opaque]) -> None:
         # a zero length makes no iterations (the guard clang also emits, and what
         # keeps the unsigned variants from wrapping ``n - 1``)
         if n > 0:
-            __run(kernel, gtid, coerce(LT, n))
+            lastiter: i32 = 0
+            lower = coerce(LT, 0)
+            upper = coerce(LT, n - 1) # TODO: replace with int_cast
+            stride = coerce(ST, 0)
+            init_fn(_ident(), gtid[...], _SCHED_STATIC, ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
+            i = lower
+            while i <= upper:
+                ptr_cast(kernel, Ptr[K])[...](i)
+                i += 1
+            __kmpc_for_static_fini(_ident(), gtid[...])
 
     __kmpc_fork_call(_ident(), 2, as_func_ptr(_Microtask, outlined),
                      cast(i64, length), ptr_cast(ref(rtc), Ptr[Opaque]))
