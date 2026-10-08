@@ -72,3 +72,6 @@ class StrDictType:
 
 @builtin_func
 def type_info(ty: Any) -> TypeInfo: ...
+
+@builtin_func
+def reify(info: TypeInfo) -> type: ...

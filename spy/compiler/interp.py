@@ -5903,6 +5903,8 @@ class HirRunner:
                 raise CompileError(f'spy.type_info takes a type, got {obj!r}')
             self.store(ret, self._build_type_info(obj))
             return PollResult.AGAIN
+        if fn.name == 'reify':
+            return self._builtin_reify(args, ret)
         if fn.name == 'undefined':
             # ``std.core.undefined``: the undefined literal, the value of any
             # type (see ``sval.UndefinedType``); the store into the result
@@ -6912,6 +6914,174 @@ class HirRunner:
             array,
             ComptimeVal(sval.Int(len(values), self._usize_type())),
         ))
+
+    # -- ``std.reflect.reify`` -----------------------------------------------
+
+    def _builtin_reify(
+        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.reflect.reify(info)``: the compile-time type a ``TypeInfo`` value
+        describes - the inverse of ``type_info``.  It accepts a whole ``TypeInfo``
+        (the tagged union ``type_info`` builds) or one of its variant values (a
+        variant struct a body constructs, or the payload an ``isinstance`` unwrap
+        bound).  A reified *struct* is built fresh every time, so it never has the
+        identity of the struct it was reflected from (see ``_reify_struct``)."""
+        if len(args.positional) != 1 or len(args.kwargs) > 0:
+            raise CompileError('std.reflect.reify takes exactly one argument')
+        info = self._arg_value(args.positional[0])
+        self.store(ret, ComptimeVal(self._reify_type_info(info)))
+        return PollResult.AGAIN
+
+    def _reify_type_info(self, ev: InterpVal) -> sval.Type:
+        """The compile-time type a reflected value describes: a whole ``TypeInfo``
+        value, or a bare ``TypeInfo`` variant value."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, ComptimeTaggedUnionPtr):
+            ev = self.load(ev)
+        if isinstance(ev, ComptimeTaggedUnionValue):
+            index = _comptime_int(ev.tag)
+            if index is None:
+                raise CompileError(
+                    'std.reflect.reify needs a TypeInfo known at compile time'
+                )
+            variant = ev.type.types[index]
+            payload = _shallow_normalize(ev.value)
+            if isinstance(payload, ComptimeAggregatePtr):
+                payload = self.load(payload)
+            aggregate = _as_aggregate(payload)
+            if aggregate is None:
+                raise CompileError('std.reflect.reify expects a TypeInfo variant value')
+            return self._reify_variant(variant, aggregate.values)
+        if isinstance(ev, ComptimeAggregatePtr):
+            ev = self.load(ev)
+        aggregate = _as_aggregate(ev)
+        if aggregate is None:
+            raise CompileError('std.reflect.reify expects a TypeInfo or one of its variants')
+        return self._reify_variant(aggregate.type, aggregate.values)
+
+    def _reify_variant(self, variant: sval.Type, fields: tuple[InterpVal, ...]) -> sval.Type:
+        """The compile-time type the ``TypeInfo`` variant ``variant`` (whose
+        field values are ``fields``, in declaration order) describes."""
+        from ..std import reflect
+        resolve = self._analyser._resolver.resolve_global
+        if variant is resolve(reflect.IntType):
+            return sval.IntType(self._reify_int(fields[0]), self._reify_bool(fields[1]))
+        if variant is resolve(reflect.PointerType):
+            # the pointer variant (single/multi) is not reflected, so the
+            # reified pointer is always a single one
+            return sval.PointerType(self._reify_type(fields[0]), self._reify_bool(fields[1]))
+        if variant is resolve(reflect.ArrayType):
+            return sval.ArrayType(self._reify_type(fields[0]), self._reify_size(fields[1]))
+        if variant is resolve(reflect.OptionType):
+            return sval.OptionType(self._reify_type(fields[0]))
+        if variant is resolve(reflect.ComplexType):
+            elem = self._reify_type(fields[0])
+            if not isinstance(elem, sval.FloatType):
+                raise CompileError(f'the element of a complex type is not a float, got {elem}')
+            return sval.ComplexType(elem)
+        if variant is resolve(reflect.StructType):
+            return self._reify_struct(fields[0], fields[1])
+        if variant is resolve(reflect.UnionType):
+            return sval.UnionType(frozenset(self._reify_type_slice(fields[0])))
+        if variant is resolve(reflect.TaggedUnionType):
+            return sval.tagged_union_of(self._reify_type_slice(fields[0]))
+        if variant is resolve(reflect.TupleType):
+            return sval.TupleType(
+                self._reify_type_slice(fields[0]), self._reify_bool(fields[1])
+            )
+        if variant is resolve(reflect.StrDictType):
+            return self._reify_strdict(fields[0])
+        raise CompileError(f'{variant} is not a TypeInfo variant')
+
+    def _reify_type(self, ev: InterpVal) -> sval.Type:
+        """The spy type a reflected ``type`` field holds."""
+        obj = _to_comptime(ev)
+        if not isinstance(obj, sval.Type):
+            raise CompileError('a reflected field that names a type is not a type')
+        return obj
+
+    def _reify_int(self, ev: InterpVal) -> int:
+        """The Python integer a reflected integer field holds."""
+        value = _comptime_int(ev)
+        if value is None:
+            raise CompileError('a reflected integer is not known at compile time')
+        return value
+
+    def _reify_bool(self, ev: InterpVal) -> bool:
+        """The Python bool a reflected bool field holds."""
+        return _comptime_bool(ev, 'a reflected bool')
+
+    def _reify_option(self, ev: InterpVal) -> tuple[bool, InterpVal]:
+        """The tag and the payload of a reflected option field: whether it is
+        absent and the value it wraps."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, ComptimeOptionPtr):
+            ev = self.load(ev)
+        if not isinstance(ev, ComptimeOption):
+            raise CompileError('a reflected option is not a compile-time option')
+        return _comptime_bool(ev.is_null, 'a reflected option tag'), ev.value
+
+    def _reify_size(self, ev: InterpVal) -> int | None:
+        """The element count a reflected ``ArrayType.size`` holds: the absent
+        option of an unsized array."""
+        is_absent, value = self._reify_option(ev)
+        return None if is_absent else self._reify_int(value)
+
+    def _reify_slice(self, ev: InterpVal) -> tuple[InterpVal, ...]:
+        """The element values a reflected ``ConstSlicePtr`` field holds."""
+        ev = _shallow_normalize(ev)
+        if isinstance(ev, ComptimeAggregatePtr):
+            ev = self.load(ev)
+        if not isinstance(ev, ComptimeAggregate):
+            raise CompileError('a reflected slice is not a compile-time slice')
+        array = _shallow_normalize(ev.values[0])
+        if not isinstance(array, ComptimeAggregatePtr):
+            raise CompileError('a reflected slice does not point at a compile-time array')
+        return tuple(self.load(place) for place in array.ptrs)
+
+    def _reify_type_slice(self, ev: InterpVal) -> tuple[sval.Type, ...]:
+        """The types a reflected ``ConstSlicePtr[type]`` field holds."""
+        return tuple(self._reify_type(item) for item in self._reify_slice(ev))
+
+    def _reify_struct(self, field_slice: InterpVal, head: InterpVal) -> sval.StructType:
+        """The struct type a reflected ``StructType`` describes: a *fresh* struct,
+        built field by field, so that every reify of the same struct is a type of
+        its own (see ``_builtin_reify``).  A reflected template head only lends its
+        name; its methods and modifiers are not reflected and so are not restored."""
+        name_base = 'struct'
+        is_absent, head_value = self._reify_option(head)
+        if not is_absent:
+            head_obj = _to_comptime(head_value)
+            if isinstance(head_obj, sval.StructTypeHead):
+                name_base = head_obj.name_base
+        new_head = sval.StructTypeHead(name_base)
+        for item in self._reify_slice(field_slice):
+            field = _as_aggregate(item)
+            if field is None:
+                raise CompileError('a reflected struct field is not a struct value')
+            name = _to_comptime(field.values[0])
+            if not isinstance(name, bytes):
+                raise CompileError('a reflected field name is not a byte string')
+            is_default_absent, default_value = self._reify_option(field.values[2])
+            default = None if is_default_absent else _to_comptime(default_value)
+            new_head.add_field(
+                name.decode(errors='replace'), self._reify_type(field.values[1]), default
+            )
+        return new_head.specialize(())
+
+    def _reify_strdict(self, entry_slice: InterpVal) -> sval.StrDictType:
+        """The ``**kwargs``/``dict[str, T]`` type a reflected ``StrDictType``
+        describes."""
+        values: dict[str, sval.Type] = {}
+        for item in self._reify_slice(entry_slice):
+            entry = _as_aggregate(item)
+            if entry is None:
+                raise CompileError('a reflected dict entry is not a struct value')
+            name = _to_comptime(entry.values[0])
+            if not isinstance(name, bytes):
+                raise CompileError('a reflected entry name is not a byte string')
+            values[name.decode(errors='replace')] = self._reify_type(entry.values[1])
+        return sval.StrDictType(frozendict(values))
 
     def _call_fn_ptr(
         self,

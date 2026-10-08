@@ -4,6 +4,8 @@ from ..compiler import bool as spy_bool
 from ..compiler import (
     i32,
     i64,
+    u32,
+    u64,
 )
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
@@ -13,6 +15,7 @@ from ..compiler.syntax import (
     Option,
     Ptr,
 )
+from ..std.core import coerce
 from ..std.reflect import (
     ArrayType,
     IntType,
@@ -20,6 +23,7 @@ from ..std.reflect import (
     PointerType,
     StructType,
     TaggedUnionType,
+    reify,
     type_info,
 )
 
@@ -159,6 +163,95 @@ def reflect_generic_has_head() -> spy_bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# ``std.reflect.reify``: the inverse of ``type_info`` - the compile-time type a
+# ``TypeInfo`` value (or one of its variants) describes.  A reified *struct* is
+# built fresh, so it never shares the identity of the struct it came from
+# ---------------------------------------------------------------------------
+
+
+@func()
+def reify_int() -> spy_bool:
+    return reify(type_info(i32)) == i32
+
+
+@func()
+def reify_ptr() -> spy_bool:
+    return reify(type_info(Ptr[i32])) == Ptr[i32]
+
+
+@func()
+def reify_option() -> spy_bool:
+    return reify(type_info(Option[i64])) == Option[i64]
+
+
+@func()
+def reify_tagged_union() -> spy_bool:
+    return reify(type_info(ReflectA | ReflectB)) == (ReflectA | ReflectB)
+
+
+@func()
+def reify_array_child() -> spy_bool:
+    t: Comptime = reify(type_info(Array[i32, 3]))
+    info: Comptime = type_info(t)
+    if isinstance(v := info, ArrayType):
+        return v.child == i32
+    return False
+
+
+@func()
+def reify_array_is_the_type() -> spy_bool:
+    return reify(type_info(Array[i32, 3])) == Array[i32, 3]
+
+
+@func()
+def reify_a_variant() -> spy_bool:
+    # a variant value is accepted too, not just a whole ``TypeInfo``: the
+    # payload an ``isinstance`` unwrap binds is a bare variant
+    info: Comptime = type_info(i64)
+    if isinstance(v := info, IntType):
+        return reify(v) == i64
+    return False
+
+
+@func()
+def reify_a_struct_is_a_fresh_type() -> spy_bool:
+    return reify(type_info(ReflectPoint)) != ReflectPoint
+
+
+@func()
+def reify_a_struct_is_fresh_each_time() -> spy_bool:
+    a: Comptime = reify(type_info(ReflectPoint))
+    b: Comptime = reify(type_info(ReflectPoint))
+    return a != b
+
+
+@func()
+def reify_a_struct_keeps_its_fields() -> i32:
+    t: Comptime = reify(type_info(ReflectPoint))
+    info: Comptime = type_info(t)
+    if isinstance(v := info, StructType):
+        return v.fields.length
+    return -1
+
+
+@func()
+def reify_a_struct_keeps_its_field_types() -> spy_bool:
+    t: Comptime = reify(type_info(ReflectPoint))
+    info: Comptime = type_info(t)
+    if isinstance(v := info, StructType):
+        field: Comptime = v.fields.ptr[1]
+        return field.name == b'c' and field.type == i32
+    return False
+
+
+@func()
+def reify_feeds_a_coerce(x: u32) -> u64:
+    # the reified type is an ordinary compile-time type value: it can be the
+    # type argument of another builtin
+    return coerce(reify(type_info(u64)), x)
+
+
 class SpyReflectTest(TestCase):
     """``std.reflect.type_info`` at compile time."""
 
@@ -196,6 +289,37 @@ class SpyReflectTest(TestCase):
         self.assertTrue(reflect_generic_has_head())
 
 
+class SpyReifyTest(TestCase):
+    """``std.reflect.reify`` turns a ``TypeInfo`` back into the compile-time type
+    it describes."""
+
+    def test_scalar_like_types_reify_to_themselves(self) -> None:
+        self.assertTrue(reify_int())
+        self.assertTrue(reify_ptr())
+        self.assertTrue(reify_option())
+        self.assertTrue(reify_tagged_union())
+
+    def test_an_array_type(self) -> None:
+        self.assertTrue(reify_array_child())
+        self.assertTrue(reify_array_is_the_type())
+
+    def test_a_variant_is_accepted(self) -> None:
+        self.assertTrue(reify_a_variant())
+
+    def test_a_struct_is_a_fresh_type(self) -> None:
+        # a struct is rebuilt from its fields, so it is neither the original ...
+        self.assertTrue(reify_a_struct_is_a_fresh_type())
+        # ... nor equal to another reify of the same struct
+        self.assertTrue(reify_a_struct_is_fresh_each_time())
+        # ... but it still describes the same fields
+        self.assertEqual(reify_a_struct_keeps_its_fields(), 2)
+        self.assertTrue(reify_a_struct_keeps_its_field_types())
+
+    def test_the_reified_type_can_be_used(self) -> None:
+        self.assertEqual(reify_feeds_a_coerce(0xFFFFFFFF), 0xFFFFFFFF)
+
+
 all_tests = [
     SpyReflectTest,
+    SpyReifyTest,
 ]

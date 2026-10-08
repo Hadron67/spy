@@ -174,6 +174,8 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
     comptime()
     RET_TYPE = typeof(rtc(0))
 
+    comptime()
+    bits = 32
     # One runner per index type: each lays out its own schedule slots (whose
     # types differ) and loops the slice ``[lower, upper]`` the runtime hands this
     # thread.  ``stride``/``incr``/``chunk`` are the ABI's static-schedule
