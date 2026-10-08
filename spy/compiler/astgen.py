@@ -1271,6 +1271,13 @@ class _Builder:
                     # store may target it (``p[...] = v``)
                     return ArgEntry(self._as_value(self._gen_expr(node.value)[0]), True), False
                 marker = self._try_resolve_object(node.value)
+                if marker is Literal:
+                    # ``Literal[X]``: the compile-time value ``X`` (the very value
+                    # a ``typing.Literal`` annotation denotes at the Python level,
+                    # see ``sval.as_value``), used where a *value* is what a type
+                    # argument stands for - e.g. the length of
+                    # ``Array[T, Literal[N]]``
+                    return ArgEntry(self._gen_literal(node.slice), False), False
                 if marker is not None:
                     # ``Ptr[T]``/``Array[T, N]``/``Option[T]``/...: a ``syntax``
                     # type marker used as a value.  The type is built by the
@@ -1565,6 +1572,23 @@ class _Builder:
             name = getattr(marker, '__name__', marker)
             raise CompileError(f'{name} takes exactly {count} type argument(s)')
         return args
+
+    def _gen_literal(self, slice_node: ast.expr) -> hir.Value:
+        """The compile-time value a ``Literal[X]`` subscript denotes: ``X``
+        itself, the value a ``typing.Literal`` annotation stands for (see
+        ``sval.as_value``).  ``X`` has to be a single literal constant - a
+        ``bool``, an ``int`` or a ``bytes`` - since that is what a value used as
+        a type argument (the length of an ``Array``) can be."""
+        if isinstance(slice_node, ast.Tuple):
+            raise CompileError('Literal[...] takes exactly one value')
+        value = self._as_value(self._gen_expr(slice_node)[0])
+        if not (isinstance(value, hir.Const) and isinstance(value.value, (bool, int, bytes))):
+            raise CompileError(
+                'Literal[...] must name a single compile-time bool, integer or '
+                'byte string'
+            )
+        return value
+
     # -- struct values ---------------------------------------------------------
 
     def _gen_result_loc(self, node: ast.expr, result_loc: hir.Value, allow_fall_back: bool = True) -> None:

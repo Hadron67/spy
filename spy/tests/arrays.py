@@ -5,6 +5,7 @@ from ..compiler import (
     CompileError,
     i32,
     i64,
+    usize,
 )
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
@@ -162,6 +163,21 @@ def length_keyword(x: i32) -> i32:
     # the number of elements and ignores the keyword
     a = array(x, x + 1, length=2)
     return a[0] + a[1]
+
+
+@func()
+def array_length(x: i32) -> usize:
+    # ``len(a)`` reads an array's length off its type - a compile-time ``usize``
+    a = array(x, x + 1, x + 2)
+    return len(a)
+
+
+@func()
+def declared_array_length(x: i32) -> usize:
+    # the length of a local array may be written as ``Literal[N]`` (the same
+    # spelling a struct field's annotation uses), and ``len`` reads it back
+    a: Array[i32, Literal[3]] = array(x, x + 1, x + 2, length=3)
+    return len(a)
 
 
 @func()
@@ -345,6 +361,11 @@ class SpyArrayTest(TestCase):
 
     def test_length_keyword_is_ignored(self) -> None:
         self.assertEqual(length_keyword(5), 11)
+
+    def test_array_length(self) -> None:
+        # ``len(a)`` is the array's compile-time length, whatever its elements
+        self.assertEqual(array_length(5), 3)
+        self.assertEqual(declared_array_length(5), 3)
 
     def test_discarded_array(self) -> None:
         self.assertEqual(discard_array(5), 5)

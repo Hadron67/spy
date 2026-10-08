@@ -7360,11 +7360,12 @@ class HirRunner:
         raise CompileError(f'an if condition must be a bool value, got {type}')
 
     def exec_len(self, inst: hir.Len) -> PollResult:
-        """``len(x)`` (see ``hir.Len``): the element count of a tuple, or the
-        answer of a struct's own ``__len__``.  The operand is logically a
-        *value*: a tuple yields its length directly (a by-reference one is the
-        ``ComptimeTuplePtr`` place tree at the address it carries), and a struct
-        is handed to its method through its own place - no copy for a
+        """``len(x)`` (see ``hir.Len``): the element count of a tuple, the length
+        of an array, or the answer of a struct's own ``__len__``.  The operand is
+        logically a *value*: a tuple yields its length directly (a by-reference
+        one is the ``ComptimeTuplePtr`` place tree at the address it carries), an
+        array its own length (part of its type, a compile-time ``usize``), and a
+        struct is handed to its method through its own place - no copy for a
         by-reference one, and a value is materialized into a fresh place
         first."""
         operand = self.operand_arg(inst.value)
@@ -7378,6 +7379,17 @@ class HirRunner:
                 self._frames[-1].regs[inst] = ComptimeVal(len(operand.value.values))
                 return PollResult.AGAIN
         type = _arg_type_of(operand)
+        if isinstance(type, sval.ArrayType):
+            # an array's length is part of its type: a compile-time ``usize``
+            # (the value ``sstr`` gives), rejected when it is not known yet
+            length = type.length_int
+            if length is None:
+                raise CompileError(
+                    f'cannot take the length of {type}: an array of unknown '
+                    f'length has no element count'
+                )
+            self._frames[-1].regs[inst] = ComptimeVal(sval.Int(length, self._usize_type()))
+            return PollResult.AGAIN
         if isinstance(type, sval.StructType) and self._resolve_method(type, _LEN_METHOD) is not None:
             slot = self.alloca(InlineMode.NON_AGGREGATE)
             regs = self._frames[-1].regs

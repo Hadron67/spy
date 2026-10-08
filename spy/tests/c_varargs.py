@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Literal, Protocol
 from unittest import TestCase
 
 from ..compiler import (
@@ -13,9 +13,10 @@ from ..compiler import (
 )
 from ..compiler import as_ as spy_as
 from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type
-from ..compiler.syntax import closure
-from ..std.c import free, malloc, snprintf
-from ..std.core import gstr
+from ..compiler.syntax import closure, ref
+from ..std import Array
+from ..std.c import snprintf
+from ..std.core import const_arr_ptr, gstr, undefined
 from .structs import MIR_CACHE
 
 # ---------------------------------------------------------------------------
@@ -76,54 +77,45 @@ def c_variadic_closure(x: i32) -> i32:
 
 @func()
 def snprintf_len(n: i32) -> i32:
-    # ``snprintf(buf, 8, "%d", n)``: the number of characters the format would
-    # produce (here it fits, so it is what is written)
-    if (buf := malloc(8)) is not None:
-        r = snprintf(buf, 8, gstr(b'%d'), n)
-        free(buf)
-        return r
-    return -1
+    # ``snprintf`` writes into a stack-allocated buffer and returns the number
+    # of characters the format produced (they fit in 10, so it is what is
+    # written); ``const_arr_ptr`` turns ``&buf`` into the ``MultiPtr[u8]`` the C
+    # signature asks for, and ``len(buf)`` is the array's compile-time length
+    buf: Array[u8, Literal[10]] = undefined()
+    r = snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'%d'), n)
+    return r
 
 
 @func()
 def snprintf_first_digit(n: i32) -> i32:
     # the formatted text really lands in the buffer: the first byte of ``n``
-    if (buf := malloc(8)) is not None:
-        snprintf(buf, 8, gstr(b'%d'), n)
-        r = buf[0] - 48
-        free(buf)
-        return r
-    return -1
+    buf: Array[u8, Literal[10]] = undefined()
+    snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'%d'), n)
+    return buf[0] - 48
 
 
 @func()
 def snprintf_no_vararg() -> i32:
     # a call that passes no extra argument: the ``...`` takes zero
-    if (buf := malloc(8)) is not None:
-        r = snprintf(buf, 8, gstr(b'hi'))
-        free(buf)
-        return r
-    return -1
+    buf: Array[u8, Literal[10]] = undefined()
+    r = snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'hi'))
+    return r
 
 
 @func()
 def snprintf_narrow(n: i8) -> i32:
     # an ``i8`` is a byte: C promotes it to ``int`` (the callee reads an int)
-    if (buf := malloc(8)) is not None:
-        r = snprintf(buf, 8, gstr(b'%d'), n)
-        free(buf)
-        return r
-    return -1
+    buf: Array[u8, Literal[10]] = undefined()
+    r = snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'%d'), n)
+    return r
 
 
 @func()
 def snprintf_float(x: f32) -> i32:
     # an ``f32`` is promoted to ``double`` (the callee reads a double)
-    if (buf := malloc(8)) is not None:
-        r = snprintf(buf, 8, gstr(b'%.1f'), x)
-        free(buf)
-        return r
-    return -1
+    buf: Array[u8, Literal[10]] = undefined()
+    r = snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'%.1f'), x)
+    return r
 
 
 class SpyCVariadicTypeTest(TestCase):

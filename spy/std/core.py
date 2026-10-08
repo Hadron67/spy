@@ -210,6 +210,9 @@ def const_arr_slice[T, N: int](arr: ConstPtr[Array[T, N]]) -> ConstSlicePtr[T]:
     """Likewise for a const pointer: the slice of it is a ``ConstSlicePtr``."""
     return cast(ConstSlicePtr[T], ConstSlicePtr(ptr_cast(arr, ConstMultiPtr[T]), cast(int, N)))
 
+def const_arr_ptr[T, N: int](arr: Ptr[Array[T, N]]) -> MultiPtr[T]:
+    return cast(MultiPtr[T], arr)
+
 @struct()
 class NullException(Exception):
     pass

@@ -69,6 +69,9 @@ class Array[T, L: int | None]:
     def __setitem__(self, value: int, val: T) -> None:
         ...
 
+    def __len__(self) -> int:
+        ...
+
 type Comptime[T = Any] = T
 type Option[T] = T | None
 
