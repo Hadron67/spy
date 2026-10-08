@@ -5939,6 +5939,8 @@ class HirRunner:
             return self._builtin_sstr(args, ret)
         if fn.name == 'bitcast':
             return self._builtin_bitcast(args, ret)
+        if fn.name == 'truncate':
+            return self._builtin_truncate(args, ret)
         if fn.name == 'coerce':
             return self._builtin_coerce(args, ret)
         if fn.name == 'compile_error':
@@ -6055,6 +6057,47 @@ class HirRunner:
         assert target_mir is not None
         self.store(ret, RuntimeVal(
             self._emit(mir.BitCast(self._to_runtime(ev), target_mir)), target
+        ))
+        return PollResult.AGAIN
+
+    # -- ``std.int.truncate`` ------------------------------------------------
+
+    def _builtin_truncate(
+        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.int.truncate(value, T)``: narrow the integer ``value`` to the
+        integer type ``T``, which must have the same signedness and fewer bits.
+        A compile-time value is truncated in Python and stays compile-time; a
+        runtime value is ``mir.Convert('trunc')``."""
+        if len(args.positional) != 2 or len(args.kwargs) > 0:
+            raise CompileError('std.int.truncate takes exactly two arguments')
+        target = self._type_value_arg(
+            args.positional[1], 'the type argument of std.int.truncate'
+        )
+        ev = self._arg_value(args.positional[0])
+        source = _type_of(ev)
+        if not isinstance(source, sval.IntType) or not isinstance(target, sval.IntType):
+            raise CompileError(
+                f'std.int.truncate supports only integers, got {source} and {target}'
+            )
+        if source.signed != target.signed:
+            raise CompileError(
+                f'cannot truncate a {source} to a {target}: the signedness must match'
+            )
+        if target.bits < 1 or target.bits >= source.bits:
+            raise CompileError(
+                f'cannot truncate a {source} to {target}: the target must have '
+                f'fewer bits'
+            )
+        obj = ev.obj if isinstance(ev, ComptimeVal) else None
+        if isinstance(obj, sval.Int):
+            bits = obj.value & ((1 << target.bits) - 1)
+            self.store(ret, ComptimeVal(_scalar_of_bits(bits, target)))
+            return PollResult.AGAIN
+        target_mir = target.to_mir_type(self._mir_cache)
+        assert target_mir is not None
+        self.store(ret, RuntimeVal(
+            self._emit(mir.Convert('trunc', self._to_runtime(ev), target_mir)), target
         ))
         return PollResult.AGAIN
 

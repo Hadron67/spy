@@ -35,6 +35,7 @@ from .func_types import all_tests as func_types_tests
 from .generics import all_tests as generics_tests
 from .ifexpr import all_tests as ifexpr_tests
 from .inline_loops import all_tests as inline_loops_tests
+from .int import all_tests as int_tests
 from .loops import all_tests as loops_tests
 from .operators import all_tests as operators_tests
 from .options import all_tests as options_tests
@@ -84,6 +85,7 @@ all_tests: list[type[TestCase]] = [
     *defer_tests,
     *func_types_tests,
     *reflect_tests,
+    *int_tests,
     *operators_tests,
     *undefined_tests,
     *static_tests,
