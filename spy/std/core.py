@@ -238,6 +238,9 @@ def undefined() -> Any: ...
 @builtin_func
 def coerce[T](typ: type[T], value: Any) -> T: ...
 
+@builtin_func
+def compile_error(msg: str | bytes) -> Never: ...
+
 # ``gstr(s)``: the compile-time byte string ``s`` as a global static constant,
 # the result a ``ConstMultiPtr[u8]`` to its bytes (see ``interp``).
 @builtin_func

@@ -95,7 +95,7 @@ from annotationlib import Format
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from enum import IntEnum, auto
-from typing import Any, Self, override
+from typing import Any, Never, Self, override
 
 from . import hir, mir, sval
 from .binop import BinaryOp, CompareOp, UnaryOp
@@ -5927,6 +5927,8 @@ class HirRunner:
             return self._builtin_bitcast(args, ret)
         if fn.name == 'coerce':
             return self._builtin_coerce(args, ret)
+        if fn.name == 'compile_error':
+            return self._builtin_compile_error(args)
         if fn.name == 'as_runtime_closure':
             return self._builtin_as_runtime_closure(args, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
@@ -5978,6 +5980,15 @@ class HirRunner:
             ComptimeVal(sval.Int(len(data), self._usize_type())),
         )))
         return PollResult.AGAIN
+
+    # -- ``std.core.compile_error`` ------------------------------------------
+
+    def _builtin_compile_error(self, args: RawArgList[ArgEntry[InterpVal]]) -> Never:
+        """``std.core.compile_error(msg)``: abort the compilation with ``msg`` -
+        a compile-time byte string (a string literal is encoded to bytes at parse
+        time, see ``astgen``) - as the error message."""
+        data = self._bytes_builtin_arg(args, 'std.core.compile_error')
+        raise CompileError(data.decode(errors='replace'))
 
     # -- ``std.core.bitcast`` ------------------------------------------------
 
