@@ -308,7 +308,14 @@ class _Builder:
 
     def _as_marker(self, node: ast.stmt) -> _Pragma | None:
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            fn = self._try_resolve_object(node.value.func)
+            try:
+                fn = self._try_resolve_object(node.value.func)
+            except CompileError:
+                # a name that does not resolve (yet) cannot be a marker: a
+                # ``def`` name is only declared where its sub-block begins, so a
+                # reference to it from an earlier sub-block is not a marker (its
+                # own error surfaces when the statement is generated)
+                return None
             if fn is syntax.unroll:
                 return _UNROLL
             if fn is syntax.comptime:
@@ -316,32 +323,56 @@ class _Builder:
         return None
 
     def _gen_body(self, stmts: list[ast.stmt]) -> None:
-        """Generate a whole statement list.  Every declaration of the block -
-        an assignment target, an annotated declaration, a ``def`` - is
-        *pre-declared* first (see ``_predeclare``), so a nested closure written
-        before a variable is assigned can still capture it, and a name assigned
-        in a closure body is local to that closure.  A marker that no loop or
-        declaration follows at its end is rejected."""
-        self._predeclare(stmts)
-        for stmt in stmts:
-            self._gen_stmt(stmt)
+        """Generate a whole statement list, one *sub-block* at a time.  A
+        sub-block begins at the block's start or at a nested ``def`` that
+        follows a non-``def`` statement; every declaration of the sub-block - an
+        assignment target, an annotated declaration, a ``def`` - is
+        *pre-declared* just before the sub-block is generated (see
+        ``_predeclare``), so a nested closure written before a variable is
+        assigned can still capture it, and a name assigned in a closure body is
+        local to that closure.  Declaring a ``def``'s slot where the sub-block
+        begins (rather than at the block's head) keeps its ``Alloca`` in the
+        same runtime block as the closure value it stores, so a sub-block that
+        follows runtime control flow still compiles (see
+        ``pending-problems.md`` #5).  A marker that no loop or declaration
+        follows at its end is rejected."""
+        index = 0
+        while index < len(stmts):
+            end = self._predeclare(stmts, index)
+            for stmt in stmts[index:end]:
+                self._gen_stmt(stmt)
+            index = end
         if self._pragmas:
             raise CompileError('unused pragmas')
 
-    def _predeclare(self, stmts: list[ast.stmt]) -> None:
-        """Declare, in the current block, every name the *direct* statements of
-        ``stmts`` will bind: an assignment target, an annotated declaration (its
-        annotation is evaluated here, so its type is fixed before the closure
-        bodies below can capture it) and a ``def`` name (a full compile-time
-        slot the closure value is written into).  A name bound already -
-        by a parameter, an enclosing block, or a preceding marker - is left
-        alone.  Compound statements are not descended into: their own bodies
-        pre-declare the names they bind."""
+    def _predeclare(self, stmts: list[ast.stmt], start: int) -> int:
+        """Declare every name one *sub-block* of ``stmts`` - the run beginning
+        at ``start``, up to the next ``def`` that follows a non-``def`` - will
+        bind: an assignment target, an annotated declaration (its annotation is
+        evaluated here, so its type is fixed before the closure bodies below can
+        capture it) and a ``def`` name (a full compile-time slot the closure
+        value is written into).  A name bound already - by a parameter, an
+        enclosing block, or a preceding marker - is left alone.  Compound
+        statements are not descended into: their own bodies pre-declare the
+        names they bind.  Returns the index the next sub-block begins at, where
+        *its* declarations are pre-declared in turn (see ``_gen_body``)."""
         composable = False
-        for stmt in stmts:
+        index = start
+        while index < len(stmts):
+            stmt = stmts[index]
+            if (
+                index > start
+                and isinstance(stmt, ast.FunctionDef)
+                and not isinstance(stmts[index - 1], ast.FunctionDef)
+            ):
+                # a ``def`` following a non-``def`` starts the next sub-block:
+                # its slots are allocated there, in that sub-block's own runtime
+                # block
+                break
             marker = self._as_marker(stmt)
             if marker is _COMPTIME:
                 composable = True
+                index += 1
                 continue
             if isinstance(stmt, ast.FunctionDef):
                 self._predeclare_name(stmt.name, hir.InlineMode.FULL)
@@ -352,6 +383,8 @@ class _Builder:
             elif isinstance(stmt, ast.AnnAssign):
                 self._predeclare_ann(stmt, composable)
             composable = False
+            index += 1
+        return index
 
     def _predeclare_name(self, name: str, mode: hir.InlineMode) -> None:
         if self._lookup_within_function(name) is not None:
@@ -380,6 +413,13 @@ class _Builder:
                 f"annotation; drop the syntax.comptime() marker before it"
             )
         is_comptime = is_comptime or marker_comptime
+        if is_comptime and type_node is None:
+            # a compile-time slot with no declared type is committed by its
+            # initializing store, not at the pre-scan: declaring it here would
+            # put its ``Alloca`` in the wrong runtime block (see
+            # ``pending-problems.md`` #5).  It is declared where it is written
+            # instead, like any ordinary declaration.
+            return
         declared = None if type_node is None else self._as_value(self._gen_expr(type_node)[0])
         slot = self.add(hir.Alloca(
             hir.InlineMode.FULL if is_comptime else hir.InlineMode.NONE, declared

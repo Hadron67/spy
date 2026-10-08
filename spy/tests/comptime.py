@@ -124,6 +124,18 @@ def comptime_marker_in_a_branch(c: spy_bool) -> i32:
 
 
 @func()
+def comptime_declared_after_runtime_control_flow(n: i32) -> i32:
+    # a compile-time local written after runtime control flow: its slot is
+    # declared where it is written, so the ``Alloca`` and the value's store stay
+    # in one runtime block (see pending-problems.md #5)
+    x: i32 = 0
+    if n > 0:
+        x = n
+    c: Comptime = 7
+    return c + x
+
+
+@func()
 def comptime_marker_before_a_non_declaration() -> i32:
     syntax.comptime()
     return 1
@@ -245,6 +257,12 @@ class SpyComptimeMarkerTest(TestCase):
     def test_a_declaration_in_a_branch(self) -> None:
         self.assertEqual(comptime_marker_in_a_branch(True), 3)
         self.assertEqual(comptime_marker_in_a_branch(False), 0)
+
+    def test_a_declaration_after_runtime_control_flow(self) -> None:
+        # the declaration sits after a runtime ``if``: its slot is declared right
+        # there, not at the block's head
+        self.assertEqual(comptime_declared_after_runtime_control_flow(0), 7)
+        self.assertEqual(comptime_declared_after_runtime_control_flow(4), 11)
 
     def test_it_must_be_followed_by_a_declaration(self) -> None:
         with self.assertRaises(CompileError):

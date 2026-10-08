@@ -80,6 +80,42 @@ def closure_forward_declaration() -> i32:
 
 
 @func()
+def closure_after_runtime_control_flow(n: i32) -> i32:
+    # a closure written after runtime control flow: its slot is declared where
+    # the closure is written, so the ``Alloca`` and the closure value's store
+    # stay in one runtime block (see pending-problems.md #5)
+    x: i32 = 0
+    if n > 0:
+        x = n
+    def get() -> i32:
+        return x + 1
+    return get()
+
+
+@func()
+def closures_mutually_recursive(n: i32) -> i32:
+    # two sibling ``def``s referencing each other, after runtime control flow:
+    # their slots are declared together at the head of their sub-block, so each
+    # closure's capture exists before the closure is created
+    if n > 100:
+        return -1
+
+    @syntax.closure(inline=False)
+    def even(x: i32) -> i32:
+        if x == 0:
+            return 1
+        return odd(x - 1)
+
+    @syntax.closure(inline=False)
+    def odd(x: i32) -> i32:
+        if x == 0:
+            return 0
+        return even(x - 1)
+
+    return even(n)
+
+
+@func()
 def closure_nested(a: i32) -> i32:
     def outer() -> i32:
         def inner() -> i32:
@@ -797,6 +833,14 @@ class SpyClosureTest(TestCase):
 
     def test_forward_declaration(self) -> None:
         self.assertEqual(closure_forward_declaration(), 7)
+
+    def test_a_closure_after_runtime_control_flow(self) -> None:
+        self.assertEqual(closure_after_runtime_control_flow(0), 1)
+        self.assertEqual(closure_after_runtime_control_flow(4), 5)
+
+    def test_mutually_recursive_closures(self) -> None:
+        self.assertEqual(closures_mutually_recursive(4), 1)
+        self.assertEqual(closures_mutually_recursive(3), 0)
 
     def test_nested_closures(self) -> None:
         self.assertEqual(closure_nested(10), 12)
