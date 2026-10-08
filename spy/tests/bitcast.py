@@ -99,6 +99,19 @@ def bitcast_comptime_fold() -> u64:
 
 
 @func()
+def bitcast_comptime_and_fold() -> u64:
+    # the same, but the compile-time condition is an ``and`` chain (lowered to a
+    # ``hir.Block`` of ``break_if``s): a compile-time-false operand must not make
+    # the ``else`` branch (whose bitcast does not size check) reachable, so it is
+    # never typed either
+    comptime()
+    x: f64 = 1.0
+    if x == 1.0 and bitcast(x, u64) == 0x3FF0000000000000:
+        return 1
+    return bitcast(x, u8)
+
+
+@func()
 def bitcast_size_mismatch(x: i32) -> f64:
     return bitcast(x, f64)
 
@@ -143,6 +156,11 @@ class SpyBitcastTest(TestCase):
 
     def test_comptime_fold(self) -> None:
         self.assertEqual(bitcast_comptime_fold(), 1)
+
+    def test_comptime_and_fold(self) -> None:
+        # a compile-time ``and`` condition folds too: the dead ``else`` branch is
+        # not typed (see pending-problems.md #3)
+        self.assertEqual(bitcast_comptime_and_fold(), 1)
 
     def test_size_mismatch(self) -> None:
         with self.assertRaises(CompileError):

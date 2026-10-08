@@ -3051,7 +3051,15 @@ class HirRunner:
 
     def _block_exit(self, data: PlainBlockData) -> mir.BasicBlock:
         """The block the code after a ``hir.Block``'s ``End`` is typed in -
-        created on demand."""
+        created on demand.
+
+        **This has a side effect**: creating the exit is what marks the code
+        after the block as *reachable* - ``_cut`` continues the walk in it once
+        ``exit_block`` is set (see ``_cut`` and ``PlainBlockData``).  A caller
+        must therefore only invoke it when the code after the block really is
+        reachable (a taken ``break``, or the body falling off its ``End``), and
+        never for a break that turns out not to be taken (a compile-time-false
+        ``hir.BreakIf``, see ``_exec_break_if``)."""
         if data.exit_block is None:
             data.exit_block = mir.BasicBlock()
         return data.exit_block
@@ -3074,32 +3082,44 @@ class HirRunner:
     def _exec_break_if(self, inst: hir.BreakIf) -> PollResult:
         """``hir.BreakIf``: leave ``inst.levels`` enclosing ``hir.Block``s when
         ``inst.cond`` holds (unconditionally when it is ``None``).  A compile-
-        time condition folds: a ``false`` one does nothing, and any other taken
-        break ends the path at the target block's exit block like
+        time condition folds: a ``false`` one does nothing - and, in
+        particular, does *not* make the code after the block reachable, so the
+        block's exit is left uncreated (see ``_block_exit``) - while any other
+        taken break ends the path at the target block's exit block like
         ``break_loop``/``continue`` do (see ``_cut``).  A *runtime* condition
         splits the block being typed instead: the taken edge jumps to the exit
         and the walk continues in a fresh block for the rest of the body."""
         target_bf = self._find_block(inst.levels)
         target = target_bf.data
         assert isinstance(target, PlainBlockData)
-        exit_block = self._block_exit(target)
-        defer_blocks = self._collect_exit_defers(
-            hir.DeferPath.OK, target, inclusive=True, current_frame_only=False,
-        )
+        runtime_cond: mir.Value | None = None
         if inst.cond is not None:
             cond = self.operand(inst.cond)
             if _is_undefined_val(cond):
                 raise CompileError('the condition of a break_if is undefined')
             if isinstance(cond, ComptimeVal):
                 if not cond.obj:
+                    # the break is not taken: leave the block's exit uncreated,
+                    # so ``_cut`` keeps the code after the block dead (it stays
+                    # reachable only through a fall-through or another taken
+                    # break, see ``_exec_end``)
                     return PollResult.AGAIN
             else:
-                cont_block = mir.BasicBlock()
-                self._cur_block.emit(
-                    mir.Br(self._to_runtime(cond), exit_block, cont_block, if_true_defer_blocks=defer_blocks)
-                )
-                self._cur_block = cont_block
-                return PollResult.AGAIN
+                runtime_cond = self._to_runtime(cond)
+        # the break is taken (unconditionally, on a compile-time true condition,
+        # or on the true edge of a runtime one): the code after the block now is
+        # reachable
+        exit_block = self._block_exit(target)
+        defer_blocks = self._collect_exit_defers(
+            hir.DeferPath.OK, target, inclusive=True, current_frame_only=False,
+        )
+        if runtime_cond is not None:
+            cont_block = mir.BasicBlock()
+            self._cur_block.emit(
+                mir.Br(runtime_cond, exit_block, cont_block, if_true_defer_blocks=defer_blocks)
+            )
+            self._cur_block = cont_block
+            return PollResult.AGAIN
         if not self._cur_block.is_finished:
             self._cur_block.emit(mir.Jmp(exit_block, defer_blocks))
         return self._cut()
