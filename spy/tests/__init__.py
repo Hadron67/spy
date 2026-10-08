@@ -44,6 +44,7 @@ from .returns import all_tests as returns_tests
 from .slices import all_tests as slices_tests
 from .static import all_tests as static_tests
 from .std.mem import all_tests as mem_tests
+from .std.openmp import all_tests as openmp_tests
 from .strings import all_tests as strings_tests
 from .structs import all_tests as structs_tests
 from .tagged_unions import all_tests as tagged_unions_tests
@@ -86,6 +87,7 @@ all_tests: list[type[TestCase]] = [
     *static_tests,
     *strings_tests,
     *mem_tests,
+    *openmp_tests,
     *tuple_args_tests,
     *varargs_tests,
     *varargs_combos_tests,
