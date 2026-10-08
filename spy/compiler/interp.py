@@ -6187,7 +6187,10 @@ class HirRunner:
         """Append the field type of every runtime leaf of one capture ``node`` to
         ``out``, in the canonical order (see ``_val_to_node``).  ``top`` marks
         the capture's own root: a top-level runtime capture is a place, so it
-        contributes a pointer field (or its pointee under ``as_copy``)."""
+        contributes a pointer field (or its pointee under ``as_copy``).  A
+        zero-sized pointee (the ``self`` of a zero-sized struct, say)
+        contributes a zero-sized field: ``field_index_addr`` has no storage for
+        it and its stores are no-ops, which is self-consistent."""
         if isinstance(node, RuntimeArgNode):
             if top:
                 assert isinstance(node.type, sval.PointerType), \

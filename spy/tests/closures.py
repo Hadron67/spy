@@ -303,6 +303,34 @@ class RtOptHolder:
 
 
 @struct()
+class RtEmpty:
+    # a zero-sized struct: a method's ``self`` is a pointer to a zero-sized
+    # value, so a capture of it under ``as_copy=True`` gives the runtime-closure
+    # struct a zero-sized field (see ``pending-problems.md`` #4)
+
+    def helper(self) -> i32:
+        return 1
+
+    def capture_self_by_value(self) -> i32:
+        def get() -> i32:
+            return self.helper()
+        f = as_runtime_closure(get, True)
+        return f() + f()
+
+    def capture_self_by_ref(self) -> i32:
+        def get() -> i32:
+            return self.helper()
+        f = as_runtime_closure(get, False)
+        return f() + f()
+
+    def capture_self_and_scalar(self, n: i32) -> i32:
+        def get() -> i32:
+            return self.helper() + n
+        f = as_runtime_closure(get, True)
+        return f() + f()
+
+
+@struct()
 class RtHolder[T]:
     # a generic holder: the anonymous runtime-closure type can only reach a
     # struct field through a type parameter (it cannot be written in a source
@@ -868,6 +896,19 @@ class SpyClosureTest(TestCase):
         # an option field of a captured compile-time struct, tag only known at
         # runtime
         self.assertEqual(rtc_capture_nested_runtime_tag_option(5), 6)
+
+    def test_runtime_closure_copies_a_zero_sized_capture(self) -> None:
+        # the captured ``self`` is a pointer to a zero-sized value: with
+        # ``as_copy=True`` the runtime-closure struct gets a zero-sized field
+        self.assertEqual(RtEmpty().capture_self_by_value(), 2)
+
+    def test_runtime_closure_refs_a_zero_sized_capture(self) -> None:
+        # ``as_copy=False`` keeps the pointer instead
+        self.assertEqual(RtEmpty().capture_self_by_ref(), 2)
+
+    def test_runtime_closure_mixes_a_zero_sized_capture(self) -> None:
+        # the zero-sized field sits next to an ordinary one
+        self.assertEqual(RtEmpty().capture_self_and_scalar(5), 12)
 
     def test_runtime_closure_captures_a_zst_option(self) -> None:
         # a zero-sized option child has no payload storage: the capture carries
