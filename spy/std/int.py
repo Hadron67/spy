@@ -45,47 +45,54 @@ def try_int_cast[T](value, typ: type[T]) -> T:
     return annotation makes the compiler reject a conversion that does not
     type check.
     """
-    src: Comptime = type_info(typeof(value))
-    dst: Comptime = type_info(typ)
-    if isinstance(s := src, IntType):
-        d_is_int: Comptime = isinstance(d := dst, IntType)
-        if d_is_int:
-            sb: Comptime = s.bits
-            rs: Comptime = s.signed
-            db: Comptime = d.bits
-            rd: Comptime = d.signed
+    comptime()
+    src = type_info(typeof(value))
+    comptime()
+    dst = type_info(typ)
+    if isinstance(s := src, IntType) and isinstance(d := dst, IntType):
+        comptime()
+        sb = s.bits
+        comptime()
+        rs = s.signed
+        comptime()
+        db = d.bits
+        comptime()
+        rd = d.signed
 
-            # the range each type holds, and whether the source's is contained
-            # in the target's: then no value can fail, and the value is returned
-            # as is (the compiler widens it)
-            comptime()
-            src_min, src_max = valid_range(sb, rs)
-            comptime()
-            dst_min, dst_max = valid_range(db, rd)
-            contained: Comptime = src_min >= dst_min and src_max <= dst_max
-            if contained:
-                return value
+        # the range each type holds, and whether the source's is contained
+        # in the target's: then no value can fail, and the value is returned
+        # as is (the compiler widens it)
+        comptime()
+        src_min, src_max = valid_range(sb, rs)
+        comptime()
+        dst_min, dst_max = valid_range(db, rd)
+        contained: Comptime = src_min >= dst_min and src_max <= dst_max
+        if contained:
+            return value
 
-            # otherwise the value may not fit.  It is checked against the target
-            # range clamped to the source one, so that both bounds are
-            # representable in the source type (comparing against the raw target
-            # bounds could form a constant that overflows it).
-            lo: Comptime = dst_min
-            if src_min > dst_min:
-                lo = src_min
-            hi: Comptime = dst_max
-            if src_max < dst_max:
-                hi = src_max
-            if value >= lo and value <= hi:
-                if rs == rd:
-                    return truncate(value, typ)
-                if sb == db:
-                    return bitcast(value, typ)
-                mid: Comptime = IntType(db, rs)
-                if sb > db:
-                    return bitcast(truncate(value, reify(mid)), typ)
-                return bitcast(coerce(reify(mid), value), typ)
-            raise IntCastError()
+        # otherwise the value may not fit.  It is checked against the target
+        # range clamped to the source one, so that both bounds are
+        # representable in the source type (comparing against the raw target
+        # bounds could form a constant that overflows it).
+        comptime()
+        lo = dst_min
+        if src_min > dst_min:
+            lo = src_min
+        comptime()
+        hi = dst_max
+        if src_max < dst_max:
+            hi = src_max
+        if value >= lo and value <= hi:
+            if rs == rd:
+                return truncate(value, typ)
+            if sb == db:
+                return bitcast(value, typ)
+            comptime()
+            mid = IntType(db, rs)
+            if sb > db:
+                return bitcast(truncate(value, reify(mid)), typ)
+            return bitcast(coerce(reify(mid), value), typ)
+        raise IntCastError()
     return value
 
 

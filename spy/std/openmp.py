@@ -17,7 +17,9 @@ the process, and they become visible only once the library is loaded with
 import ctypes
 import ctypes.util
 import os
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
+
+from spy.std.int import int_cast
 
 from ..compiler import (
     ConstMultiPtr,
@@ -204,7 +206,7 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
         if n > 0:
             lastiter: i32 = 0
             lower = coerce(LT, 0)
-            upper = coerce(LT, n - 1) # TODO: replace with int_cast
+            upper = int_cast(n - 1, LT) # TODO: replace with int_cast
             stride = coerce(ST, 0)
             init_fn(_ident(), gtid[...], _SCHED_STATIC, ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
             i = lower
@@ -213,5 +215,4 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
                 i += 1
             __kmpc_for_static_fini(_ident(), gtid[...])
 
-    __kmpc_fork_call(_ident(), 2, as_func_ptr(_Microtask, outlined),
-                     cast(i64, length), ptr_cast(ref(rtc), Ptr[Opaque]))
+    __kmpc_fork_call(_ident(), 2, as_func_ptr(_Microtask, outlined), int_cast(length, i64), ptr_cast(ref(rtc), Ptr[Opaque]))
