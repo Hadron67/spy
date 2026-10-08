@@ -192,6 +192,10 @@ class FunctionType(Type):
     # whether the function may panic: a call of one may have an unwind edge
     # (see ``CallMayPanic``); a function may panic by default
     may_panic: bool = True
+    # whether the function is C-variadic (a trailing ``...``): a call of it may
+    # carry any number of extra arguments after ``args`` (see
+    # ``sval.FunctionType.varargs``)
+    varargs: bool = False
 
     def get_children(self) -> tuple[Any, ...]:
         return (*self.args, self.return_type)

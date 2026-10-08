@@ -10,10 +10,13 @@ from . import hir, mir, opt
 from .errors import CompileError, TypeMismatchError
 from .sval import (
     AnyFunction,
+    AnyIntType,
     AnyValue,
     ClosureType,
+    FloatType,
     FormalArg,
     FunctionType,
+    IntType,
     MirLowerCache,
     PointerType,
     ResultType,
@@ -698,9 +701,19 @@ class Signature:
         varargs: tuple[ArgNode, ...] | None = None
         if self.varargs is not None:
             formal = self.varargs
-            varargs = tuple(
-                resolve('*args', formal, entry) for entry in provided.varargs
-            )
+            # a C-variadic argument (the unannotated ``*args`` formal of a C
+            # convention) keeps its own type, promoted by the C default argument
+            # promotions - the type the callee reads it back as with ``va_arg``
+            is_c_varargs = is_c and formal.type is None
+            resolved_varargs: list[ArgNode] = []
+            for entry in provided.varargs:
+                node = resolve('*args', formal, entry)
+                if is_c_varargs and isinstance(node, RuntimeArgNode):
+                    promoted = _c_default_promotion(node.type, cache)
+                    if promoted != node.type:
+                        node = RuntimeArgNode(promoted, node.is_ref)
+                resolved_varargs.append(node)
+            varargs = tuple(resolved_varargs)
 
         kwargs: frozendict[str, ArgNode] | None = None
         if self.kwargs is not None:
@@ -749,22 +762,52 @@ def signature_of_fn_type(fn_type: FunctionType) -> Signature:
     """The :class:`Signature` a function-pointer type denotes: its formal
     parameters (by name, with their defaults) and its return convention.  A
     function type is always concrete, so the signature has no generic type
-    parameters and no ``*args``/``**kwargs``; ``callconv`` and ``may_panic``
-    are carried over.  The call logic rebuilds the :class:`CallSignature` and
-    :class:`ReturnSignature` of one call through it (see ``interp``)."""
+    parameters and no ``**kwargs``; a C-variadic one (``fn_type.varargs``) has
+    a single unannotated ``*args`` formal, so every extra argument the call
+    passes keeps its own type (see ``Signature.specialize``).  ``callconv`` and
+    ``may_panic`` are carried over.  The call logic rebuilds the
+    :class:`CallSignature` and :class:`ReturnSignature` of one call through it
+    (see ``interp``)."""
     positional: IndexedMap[str, SignatureFormalArg] = IndexedMap()
     for arg in fn_type.args:
         positional.add(
             arg.name,
             SignatureFormalArg(arg.type, False, arg.default_value, TriState.UNKNOWN),
         )
+    # a C-variadic function type takes the excess positional arguments as they
+    # come: an unannotated formal resolves each against its own type (and, for a
+    # C convention, applies the default argument promotions - see
+    # ``Signature.specialize``)
+    varargs = (
+        SignatureFormalArg(None, False, None, TriState.FALSE)
+        if fn_type.varargs else None
+    )
     exceptions: ArraySet[Type] = ArraySet()
     for exception in fn_type.exceptions:
         exceptions.add(exception)
     return Signature(
-        (), positional, None, None, fn_type.return_type, exceptions,
+        (), positional, varargs, None, fn_type.return_type, exceptions,
         fn_type.callconv, fn_type.may_panic,
     )
+
+
+def _c_default_promotion(type: Type, cache: MirLowerCache) -> Type:
+    """The C *default argument promotion* of the type of one variadic argument:
+    the type the callee reads it back as with ``va_arg``.  An integer narrower
+    than ``int`` is promoted to ``int`` (the width ``c_int`` names on the
+    target) and a ``float`` to ``double``; every other type is passed
+    unchanged.  It is what makes a call read like the C source (``printf("%d",
+    3)`` passes an ``int``, not a byte)."""
+    c_int_bits = cache.target.c_int_bits
+    match type:
+        case AnyIntType():
+            return IntType(c_int_bits, True)
+        case IntType() if type.bits < c_int_bits:
+            return IntType(c_int_bits, True)
+        case FloatType() if type.bits == 32:
+            return FloatType(64)
+        case _:
+            return type
 
 
 @dataclass

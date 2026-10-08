@@ -29,6 +29,9 @@ def realloc(ptr: MultiPtr[u8], size: usize) -> Option[MultiPtr[u8]]: ...
 @decl_func()
 def puts(ptr: MultiPtr[u8]) -> None: ...
 
+@decl_func()
+def snprintf(buf: MultiPtr[u8], size: usize, fmt: ConstMultiPtr[u8], *args) -> i32: ...
+
 @struct()
 class CError(Exception):
     code: i32

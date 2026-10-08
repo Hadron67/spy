@@ -5055,6 +5055,12 @@ class HirRunner:
             kwargs = SignatureFormalArg(
                 kwarg_type, fn.kwarg_is_comptime, None, TriState.UNKNOWN, False,
             )
+        if fn.callconv != 'default' and (varargs is not None or kwargs is not None):
+            # a C-variadic closure is a C-variadic function *definition*, which
+            # is not implemented yet (see ``astgen.parse_function``)
+            raise CompileError(
+                f'a non-default-callconv closure {fn.name} may not declare *args/**kwargs'
+            )
         sig = Signature(
             fn.generic_args, positional, varargs, kwargs, ret_type, fn.exceptions,
             fn.callconv, fn.may_panic,

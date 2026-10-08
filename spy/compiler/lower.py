@@ -95,6 +95,7 @@ class _ModuleTypes:
                 return sllvm.fn_type(
                     self.to_llvm(type.return_type),
                     *(self.to_llvm(a) for a in type.args),
+                    *((...,) if type.varargs else ()),
                 )
             case mir.StructType():
                 ret = self._structs.get(type)

@@ -2263,6 +2263,14 @@ def parse_function(
     varargs = vararg_formal(node.args.vararg)
     kwargs = vararg_formal(node.args.kwarg)
 
+    if callconv != 'default' and (varargs is not None or kwargs is not None):
+        # a C-variadic function *declaration* is supported (see
+        # ``dsl._build_fn_type``), but defining one - a body that reads its
+        # arguments with ``va_arg`` - is not implemented yet
+        raise CompileError(
+            f'a non-default-callconv function {node.name} may not declare *args/**kwargs'
+        )
+
     signature = Signature(
         tuple(generic_args), positional, varargs, kwargs, annotation_of(ret_annotation), exception_set(),
         callconv, may_panic,

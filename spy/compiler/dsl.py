@@ -45,6 +45,7 @@ builtins (``spy.compile_log``) are evaluated at compile time; ``spy.typeof``
 is a ``syntax`` marker, lowered by the parser to a type probe.
 """
 
+import inspect
 import types as pytypes
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -441,13 +442,33 @@ def _build_fn_type(
     ``std`` struct they name is that context's copy.  ``exceptions`` is the
     declared exception set (``"infer"`` is rejected: a declared function type
     has no body to infer from); ``callconv``/``may_panic`` are carried over.
-    ``what`` names the declaration in the errors."""
+    ``what`` names the declaration in the errors.
+
+    A trailing ``*args`` (unannotated) declares a C-variadic function, and is
+    only accepted for a non-default ``callconv`` - a ``...`` in the signature,
+    whose extra arguments are passed by value with their own types (see
+    ``sval.FunctionType.varargs``).  ``**kwargs`` has no C meaning and is
+    rejected."""
     code = getattr(fn, '__code__', None)
     if code is None:
         raise CompileError(f'{what} must declare a Python function')
     count = code.co_argcount
     names = code.co_varnames[:count]
     annotations = fn.__annotations__
+    has_varargs = bool(code.co_flags & inspect.CO_VARARGS)
+    if code.co_flags & inspect.CO_VARKEYWORDS:
+        raise CompileError(f'{what} may not declare **kwargs')
+    if has_varargs:
+        if callconv == 'default':
+            raise CompileError(
+                f'a default-callconv {what} may not declare *args'
+            )
+        vararg_name = code.co_varnames[count]
+        if vararg_name in annotations:
+            raise CompileError(
+                f'the *args of {what} may not be annotated: a C-variadic '
+                f'function passes every extra argument with its own type'
+            )
     defaults = fn.__defaults__ if fn.__defaults__ is not None else ()
     offset = count - len(defaults)
     args: list[sval.FormalArg] = []
@@ -492,6 +513,7 @@ def _build_fn_type(
         raise CompileError(f'a non-default-callconv {what} may not declare exceptions')
     return sval.FunctionType(
         tuple(args), ret, FrozenArraySet(exception_types), callconv, may_panic,
+        has_varargs,
     )
 
 

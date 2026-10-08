@@ -1877,6 +1877,11 @@ class FunctionType(Type):
     # whether the function may panic (see ``interp``: a call of one may unwind
     # through the enclosing deferred bodies); a function may panic by default
     may_panic: bool = True
+    # whether the function is C-variadic (a trailing ``...``): the call passes
+    # any number of extra arguments after the declared ones, each by value with
+    # its own type (see ``Signature.specialize``).  Only a non-default calling
+    # convention may declare it (see ``dsl._build_fn_type``)
+    varargs: bool = False
 
     def ret_spec(self, cache: MirLowerCache) -> RetSpec:
         """How a call of a function of this signature delivers its result
@@ -1948,10 +1953,15 @@ class FunctionType(Type):
                 if mir_type is None:
                     return None
                 ret_type = mir_type
-        return mir.FunctionType(tuple(args), ret_type, self.callconv, self.may_panic)
+        return mir.FunctionType(
+            tuple(args), ret_type, self.callconv, self.may_panic, self.varargs,
+        )
 
     def __str__(self) -> str:
-        return f"fn({', '.join(str(arg.type) for arg in self.args)}) -> {self.return_type}"
+        args = ', '.join(str(arg.type) for arg in self.args)
+        if self.varargs:
+            args = f'{args}, ...' if len(self.args) > 0 else '...'
+        return f"fn({args}) -> {self.return_type}"
 
 
 @dataclass(frozen=True)
