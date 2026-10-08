@@ -298,6 +298,11 @@ class RtTagB:
 
 
 @struct()
+class RtOptHolder:
+    o: Option[i32]
+
+
+@struct()
 class RtHolder[T]:
     # a generic holder: the anonymous runtime-closure type can only reach a
     # struct field through a type parameter (it cannot be written in a source
@@ -461,6 +466,19 @@ def rtc_capture_comptime_union() -> i32:
     def get() -> i32:
         if isinstance(v := u, RtTagA):
             return v.x
+        return -1
+    f = as_runtime_closure(get)
+    return f()
+
+
+@func()
+def rtc_capture_nested_runtime_tag_option(n: i32) -> i32:
+    # a captured compile-time struct whose option field's tag is only known at
+    # runtime (see ``_val_to_node`` and ``pending-problems.md`` #1)
+    s: syntax.Comptime = RtOptHolder(n)
+    def get() -> i32:
+        if (v := s.o) is not None:
+            return v + 1
         return -1
     f = as_runtime_closure(get)
     return f()
@@ -846,6 +864,11 @@ class SpyClosureTest(TestCase):
     def test_runtime_closure_captures_an_option(self) -> None:
         self.assertEqual(rtc_capture_option(5), 5)
 
+    def test_runtime_closure_captures_a_nested_runtime_tag_option(self) -> None:
+        # an option field of a captured compile-time struct, tag only known at
+        # runtime
+        self.assertEqual(rtc_capture_nested_runtime_tag_option(5), 6)
+
     def test_runtime_closure_captures_a_zst_option(self) -> None:
         # a zero-sized option child has no payload storage: the capture carries
         # only the tag (its presence)
@@ -866,13 +889,13 @@ class SpyClosureTest(TestCase):
 
     def test_a_capture_round_trips_through_the_struct(self) -> None:
         # building the struct and running ``_rebuild_capture`` back through
-        # ``_provided_node`` must give the capture's own ``ArgNode``
+        # ``_val_to_node`` must give the capture's own ``ArgNode``
         pairs: list[tuple[ArgNode, ArgNode]] = []
         orig = interp.HirRunner._rebuild_capture
 
         def patched(self: interp.HirRunner, node: ArgNode, as_copy: bool, field_base: int, base: InterpVal) -> InterpVal:
             place = orig(self, node, as_copy, field_base, base)
-            pairs.append((node, self._provided_node(ArgEntry(place, False))))
+            pairs.append((node, self._val_to_node(place, False)))
             return place
 
         interp.HirRunner._rebuild_capture = patched

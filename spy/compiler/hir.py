@@ -467,7 +467,7 @@ class RebuildCapture(Inst):
     """Rebuild one capture place from the field(s) of a runtime closure struct
     (see ``std.core.as_runtime_closure``).  ``base`` is the address of the
     struct; ``node`` is the capture's :data:`~spy.compiler.fn.ArgNode` (the one
-    ``_provided_node`` gave at conversion time), ``field_base`` the index of its
+    ``_val_to_node`` gave at conversion time), ``field_base`` the index of its
     first runtime leaf among the struct's fields and ``as_copy`` whether the
     top-level capture is held by value (see ``interp._rebuild_capture``)."""
 

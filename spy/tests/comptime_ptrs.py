@@ -160,6 +160,51 @@ def comptime_ptr_union_other_variant() -> i32:
     return take_union_ptr(ref(u))
 
 
+# -- an option/union field whose tag is only known at runtime ---------------
+# a nested runtime-tag option/union is materialized as one runtime value (see
+# ``_val_to_node`` and ``pending-problems.md`` #1)
+
+
+@struct()
+class WithOpt:
+    o: Option[i32]
+
+
+@struct()
+class WithUnion:
+    u: V_A | V_B
+
+
+@func()
+def take_with_opt_ptr(p: Ptr[WithOpt]) -> i32:
+    if (v := p[...].o) is not None:
+        return v + 1
+    return -1
+
+
+@func()
+def comptime_ptr_runtime_tag_option(n: i32) -> i32:
+    # ``n`` coerces to a runtime ``Option[i32]`` (its tag is only known at
+    # runtime): the field of the compile-time ``s`` holds it, and ``ref(s)``
+    # carries the whole option over as one runtime value
+    s: Comptime = WithOpt(n)
+    return take_with_opt_ptr(ref(s))
+
+
+@func()
+def take_with_union_ptr(p: Ptr[WithUnion]) -> i32:
+    if isinstance(v := p[...].u, V_A):
+        return v.x + 1
+    return -1
+
+
+@func()
+def comptime_ptr_runtime_tag_union(u: V_A | V_B) -> i32:
+    # ``u`` is a runtime tagged union (its tag is only known at runtime)
+    s: Comptime = WithUnion(u)
+    return take_with_union_ptr(ref(s))
+
+
 # -- a compile-time variable as a ``Comptime`` parameter --------------------
 
 
@@ -294,6 +339,14 @@ class SpyComptimePtrTest(TestCase):
     def test_a_tagged_union_pointee(self) -> None:
         self.assertEqual(comptime_ptr_union(), 6)
         self.assertEqual(comptime_ptr_union_other_variant(), -1)
+
+    def test_a_nested_runtime_tag_option(self) -> None:
+        # the option field's tag is only known at runtime
+        self.assertEqual(comptime_ptr_runtime_tag_option(5), 6)
+
+    def test_a_nested_runtime_tag_union(self) -> None:
+        self.assertEqual(comptime_ptr_runtime_tag_union(V_A(5)), 6)
+        self.assertEqual(comptime_ptr_runtime_tag_union(V_B(5)), -1)
 
     def test_a_compile_time_var_as_a_comptime_param(self) -> None:
         self.assertEqual(comptime_var_to_comptime_param(), 6)
