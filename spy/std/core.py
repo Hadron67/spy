@@ -213,6 +213,7 @@ def const_arr_slice[T, N: int](arr: ConstPtr[Array[T, N]]) -> ConstSlicePtr[T]:
 def const_arr_ptr[T, N: int](arr: Ptr[Array[T, N]]) -> MultiPtr[T]:
     return cast(MultiPtr[T], arr)
 
+
 @struct()
 class NullException(Exception):
     pass
@@ -229,6 +230,13 @@ def unwrap_or[T](val: Option[T], default: T) -> T:
 
 @builtin_func
 def undefined() -> Any: ...
+
+# ``coerce(T, value)``: the value ``value`` materialized as the spy type ``T`` -
+# the same conversion a store into a location of ``T`` performs (a compile-time
+# value is converted in Python and stays compile-time, a runtime value gets the
+# numeric conversion ``T`` needs).  See ``interp.HirRunner._builtin_coerce``.
+@builtin_func
+def coerce[T](typ: type[T], value: Any) -> T: ...
 
 # ``gstr(s)``: the compile-time byte string ``s`` as a global static constant,
 # the result a ``ConstMultiPtr[u8]`` to its bytes (see ``interp``).

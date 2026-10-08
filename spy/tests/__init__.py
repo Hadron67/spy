@@ -23,6 +23,7 @@ from .bitcast import all_tests as bitcast_tests
 from .c_varargs import all_tests as c_varargs_tests
 from .classname import all_tests as classname_tests
 from .closures import all_tests as closures_tests
+from .coerce import all_tests as coerce_tests
 from .complex import all_tests as complex_tests
 from .comptime import all_tests as comptime_tests
 from .comptime_ptrs import all_tests as comptime_ptrs_tests
@@ -79,6 +80,7 @@ all_tests: list[type[TestCase]] = [
     *classname_tests,
     *complex_tests,
     *closures_tests,
+    *coerce_tests,
     *defer_tests,
     *func_types_tests,
     *reflect_tests,

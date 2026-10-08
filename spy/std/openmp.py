@@ -171,6 +171,8 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
     K = typeof(rtc)
     comptime()
     LT = typeof(length)
+    comptime()
+    RET_TYPE = typeof(rtc(0))
 
     # One runner per index type: each lays out its own schedule slots (whose
     # types differ) and loops the slice ``[lower, upper]`` the runtime hands this
@@ -245,6 +247,7 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
             elif LT == u64:
                 run_u64(kernel, gtid, cast(u64, n))
             else:
+                # TODO: replace by compile_error
                 panic(sstr(b'parallel_loop: the index type must be i32/u32/i64/u64'))
 
     __kmpc_fork_call(_ident(), 2, as_func_ptr(_Microtask, outlined),

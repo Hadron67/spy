@@ -5925,6 +5925,8 @@ class HirRunner:
             return self._builtin_sstr(args, ret)
         if fn.name == 'bitcast':
             return self._builtin_bitcast(args, ret)
+        if fn.name == 'coerce':
+            return self._builtin_coerce(args, ret)
         if fn.name == 'as_runtime_closure':
             return self._builtin_as_runtime_closure(args, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
@@ -6029,6 +6031,26 @@ class HirRunner:
         self.store(ret, RuntimeVal(
             self._emit(mir.BitCast(self._to_runtime(ev), target_mir)), target
         ))
+        return PollResult.AGAIN
+
+    # -- ``std.core.coerce`` -------------------------------------------------
+
+    def _builtin_coerce(
+        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.coerce(T, value)``: materialize ``value`` as the spy type
+        ``T`` - the same conversion a store into a location of ``T`` performs
+        (see ``_coerce``).  A compile-time value is converted in Python and
+        stays compile-time; a runtime value gets whatever numeric conversion
+        ``T`` needs (widening or narrowing).  The result is written into the
+        call's result location, which the store commits to the coerced type."""
+        if len(args.positional) != 2 or len(args.kwargs) > 0:
+            raise CompileError('std.core.coerce takes exactly two arguments')
+        target = self._type_value_arg(
+            args.positional[0], 'the type argument of std.core.coerce'
+        )
+        ev = self._arg_value(args.positional[1])
+        self.store(ret, self._coerce(ev, target))
         return PollResult.AGAIN
 
     # -- ``std.core.panic`` / ``std.core.catch_unwind`` ----------------------
