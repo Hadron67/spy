@@ -8,7 +8,7 @@ live here rather than in ``std.core`` so that they can import ``std.reflect``
 """
 
 from ..compiler import builtin_func, func, struct, typeof
-from ..compiler.syntax import Comptime
+from ..compiler.syntax import Comptime, comptime
 from .core import bitcast, coerce, panic, sstr
 from .reflect import IntType, reify, type_info
 
@@ -49,7 +49,7 @@ def try_int_cast[T](value, typ: type[T]) -> T:
     dst: Comptime = type_info(typ)
     if isinstance(s := src, IntType):
         d_is_int: Comptime = isinstance(d := dst, IntType)
-        if isinstance(d := dst, IntType):
+        if d_is_int:
             sb: Comptime = s.bits
             rs: Comptime = s.signed
             db: Comptime = d.bits
@@ -58,12 +58,10 @@ def try_int_cast[T](value, typ: type[T]) -> T:
             # the range each type holds, and whether the source's is contained
             # in the target's: then no value can fail, and the value is returned
             # as is (the compiler widens it)
-            src_rng: Comptime = valid_range(sb, rs)
-            dst_rng: Comptime = valid_range(db, rd)
-            src_min: Comptime = src_rng[0]
-            src_max: Comptime = src_rng[1]
-            dst_min: Comptime = dst_rng[0]
-            dst_max: Comptime = dst_rng[1]
+            comptime()
+            src_min, src_max = valid_range(sb, rs)
+            comptime()
+            dst_min, dst_max = valid_range(db, rd)
             contained: Comptime = src_min >= dst_min and src_max <= dst_max
             if contained:
                 return value

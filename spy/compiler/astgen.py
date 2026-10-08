@@ -377,9 +377,16 @@ class _Builder:
             if isinstance(stmt, ast.FunctionDef):
                 self._predeclare_name(stmt.name, hir.InlineMode.FULL)
             elif isinstance(stmt, ast.Assign):
-                mode = hir.InlineMode.FULL if composable else hir.InlineMode.NONE
-                if len(stmt.targets) > 0:
-                    self._predeclare_target(stmt.targets[0], mode)
+                # a ``syntax.comptime()`` marker makes the assignment declare a
+                # compile-time variable of no declared type (``a = e`` is
+                # ``a: Comptime = e``, see ``_gen_assign``): like the annotated
+                # case, such a slot is committed by its initializing store and
+                # declared where it is written - pre-declaring it here would put
+                # its ``Alloca`` in the wrong runtime block, before a later
+                # call's continuation (see ``_predeclare_ann`` and
+                # ``pending-problems.md`` #5)
+                if not composable and len(stmt.targets) > 0:
+                    self._predeclare_target(stmt.targets[0], hir.InlineMode.NONE)
             elif isinstance(stmt, ast.AnnAssign):
                 self._predeclare_ann(stmt, composable)
             composable = False

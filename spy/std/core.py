@@ -2,8 +2,6 @@
 
 from typing import TYPE_CHECKING, Any, Never, Protocol, Self, cast
 
-from spy.compiler.hir import Except
-
 from ..compiler import builtin_func, i32, i64, u8, u32, u64, usize
 from ..compiler.dsl import Callable, func, func_type, struct
 from ..compiler.syntax import (

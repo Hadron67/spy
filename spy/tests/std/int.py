@@ -1,6 +1,6 @@
 from unittest import TestCase
 
-from ..compiler import (
+from ...compiler import (
     CompileError,
     f32,
     i8,
@@ -11,11 +11,11 @@ from ..compiler import (
     u16,
     u32,
 )
-from ..compiler import bool as spy_bool
-from ..compiler.dsl import func
-from ..compiler.syntax import closure, comptime
-from ..std.core import UnwindException, catch_unwind
-from ..std.int import IntCastError, int_cast, truncate, try_int_cast, valid_range
+from ...compiler import bool as spy_bool
+from ...compiler.dsl import func
+from ...compiler.syntax import closure, comptime
+from ...std.core import UnwindException, catch_unwind
+from ...std.int import IntCastError, int_cast, truncate, try_int_cast, valid_range
 
 # ---------------------------------------------------------------------------
 # ``std.int``: ``truncate`` narrows an integer to a same-signedness type with

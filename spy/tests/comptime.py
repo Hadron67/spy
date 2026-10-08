@@ -136,6 +136,35 @@ def comptime_declared_after_runtime_control_flow(n: i32) -> i32:
     return c + x
 
 
+def pair(a: i32) -> tuple[i32, i32]:
+    # a plain (inline) function returning two values
+    return a, a + 1
+
+
+@func()
+def comptime_marker_unpack_after_an_inline_call() -> i32:
+    # the marker unpacks an inline multi-value call and another declaration
+    # follows: the marked slots are declared where they are written - after the
+    # call's continuation - not at the sub-block's head, which would put their
+    # ``Alloca`` in a runtime block the store no longer dominates (see
+    # pending-problems.md #3)
+    syntax.comptime()
+    a, b = pair(5)
+    syntax.comptime()
+    c = 9
+    return a * 100 + b * 10 + c
+
+
+@func()
+def comptime_marker_unpack_before_an_inline_call() -> i32:
+    # the other order: the marker precedes the one after the call
+    syntax.comptime()
+    c = 9
+    syntax.comptime()
+    a, b = pair(5)
+    return a * 100 + b * 10 + c
+
+
 @func()
 def comptime_marker_before_a_non_declaration() -> i32:
     syntax.comptime()
@@ -254,6 +283,12 @@ class SpyComptimeMarkerTest(TestCase):
 
     def test_a_destructuring_declaration(self) -> None:
         self.assertEqual(comptime_marker_destructuring(), 1 * 10 + 2)
+
+    def test_unpacking_an_inline_call_before_a_later_declaration(self) -> None:
+        # the marker unpacks an inline multi-value call, and another declaration
+        # follows (see pending-problems.md #3)
+        self.assertEqual(comptime_marker_unpack_after_an_inline_call(), 569)
+        self.assertEqual(comptime_marker_unpack_before_an_inline_call(), 569)
 
     def test_a_declaration_in_a_branch(self) -> None:
         self.assertEqual(comptime_marker_in_a_branch(True), 3)

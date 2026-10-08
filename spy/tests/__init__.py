@@ -35,7 +35,6 @@ from .func_types import all_tests as func_types_tests
 from .generics import all_tests as generics_tests
 from .ifexpr import all_tests as ifexpr_tests
 from .inline_loops import all_tests as inline_loops_tests
-from .int import all_tests as int_tests
 from .loops import all_tests as loops_tests
 from .operators import all_tests as operators_tests
 from .options import all_tests as options_tests
@@ -45,8 +44,7 @@ from .reflect import all_tests as reflect_tests
 from .returns import all_tests as returns_tests
 from .slices import all_tests as slices_tests
 from .static import all_tests as static_tests
-from .std.mem import all_tests as mem_tests
-from .std.openmp import all_tests as openmp_tests
+from .std import all_tests as std_tests
 from .strings import all_tests as strings_tests
 from .structs import all_tests as structs_tests
 from .tagged_unions import all_tests as tagged_unions_tests
@@ -85,13 +83,11 @@ all_tests: list[type[TestCase]] = [
     *defer_tests,
     *func_types_tests,
     *reflect_tests,
-    *int_tests,
     *operators_tests,
     *undefined_tests,
     *static_tests,
     *strings_tests,
-    *mem_tests,
-    *openmp_tests,
+    *std_tests,
     *tuple_args_tests,
     *varargs_tests,
     *varargs_combos_tests,
