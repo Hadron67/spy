@@ -231,12 +231,12 @@ def unwrap_or[T](val: Option[T], default: T) -> T:
 @builtin_func
 def undefined() -> Any: ...
 
-# ``coerce(T, value)``: the value ``value`` materialized as the spy type ``T`` -
+# ``coerce(value, T)``: the value ``value`` materialized as the spy type ``T`` -
 # the same conversion a store into a location of ``T`` performs (a compile-time
 # value is converted in Python and stays compile-time, a runtime value gets the
 # numeric conversion ``T`` needs).  See ``interp.HirRunner._builtin_coerce``.
 @builtin_func
-def coerce[T](typ: type[T], value: Any) -> T: ...
+def coerce[T](value: Any, typ: type[T]) -> T: ...
 
 @builtin_func
 def compile_error(msg: str | bytes) -> Never: ...

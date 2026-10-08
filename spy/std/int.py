@@ -91,7 +91,7 @@ def try_int_cast[T](value, typ: type[T]) -> T:
             mid = IntType(db, rs)
             if sb > db:
                 return bitcast(truncate(value, reify(mid)), typ)
-            return bitcast(coerce(reify(mid), value), typ)
+            return bitcast(coerce(value, reify(mid)), typ)
         raise IntCastError()
     return value
 

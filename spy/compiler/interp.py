@@ -6126,7 +6126,7 @@ class HirRunner:
     def _builtin_coerce(
         self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
-        """``std.core.coerce(T, value)``: materialize ``value`` as the spy type
+        """``std.core.coerce(value, T)``: materialize ``value`` as the spy type
         ``T`` - the same conversion a store into a location of ``T`` performs
         (see ``_coerce``).  A compile-time value is converted in Python and
         stays compile-time; a runtime value gets whatever numeric conversion
@@ -6134,10 +6134,10 @@ class HirRunner:
         call's result location, which the store commits to the coerced type."""
         if len(args.positional) != 2 or len(args.kwargs) > 0:
             raise CompileError('std.core.coerce takes exactly two arguments')
+        ev = self._arg_value(args.positional[0])
         target = self._type_value_arg(
-            args.positional[0], 'the type argument of std.core.coerce'
+            args.positional[1], 'the type argument of std.core.coerce'
         )
-        ev = self._arg_value(args.positional[1])
         self.store(ret, self._coerce(ev, target))
         return PollResult.AGAIN
 

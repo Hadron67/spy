@@ -18,7 +18,7 @@ from ..compiler.syntax import (
 from ..std.core import coerce
 
 # ---------------------------------------------------------------------------
-# ``std.core.coerce(T, value)``: materialize ``value`` as the spy type ``T`` -
+# ``std.core.coerce(value, T)``: materialize ``value`` as the spy type ``T`` -
 # the same conversion a store into a location of ``T`` performs.  A
 # compile-time value is converted in Python and stays compile-time; a runtime
 # value gets the numeric conversion ``T`` needs (widening or narrowing)
@@ -27,17 +27,17 @@ from ..std.core import coerce
 
 @func()
 def coerce_widen(x: u32) -> u64:
-    return coerce(u64, x)
+    return coerce(x, u64)
 
 
 @func()
 def coerce_narrow(x: i32) -> i8:
-    return coerce(i8, x)
+    return coerce(x, i8)
 
 
 @func()
 def coerce_int_to_float(x: i32) -> f64:
-    return coerce(f64, x)
+    return coerce(x, f64)
 
 
 @func()
@@ -47,30 +47,30 @@ def coerce_comptime_fold() -> u64:
     # is never typed
     comptime()
     x: f64 = 1.0
-    if coerce(f64, x) == 1.0:
+    if coerce(x, f64) == 1.0:
         return 1
-    return coerce(u64, None)
+    return coerce(None, u64)
 
 
 @func()
 def coerce_option_present(x: i32) -> Option[i32]:
-    return coerce(Option[i32], x)  # pyright: ignore[reportArgumentType]
+    return coerce(x, Option[i32])  # pyright: ignore[reportArgumentType]
 
 
 @func()
 def coerce_option_absent() -> Option[i32]:
-    return coerce(Option[i32], None)  # pyright: ignore[reportArgumentType]
+    return coerce(None, Option[i32])  # pyright: ignore[reportArgumentType]
 
 
 @func()
 def coerce_pointer_to_int(x: i32) -> u8:
     # an address has no numeric conversion to an integer
     p = ref(x)
-    return coerce(u8, p)
+    return coerce(p, u8)
 
 
 class SpyCoerceTest(TestCase):
-    """``std.core.coerce(T, value)`` materializes a value as the spy type ``T``,
+    """``std.core.coerce(value, T)`` materializes a value as the spy type ``T``,
     folding a compile-time value in Python and emitting the numeric conversion
     a runtime one needs."""
 

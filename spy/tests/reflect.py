@@ -249,7 +249,7 @@ def reify_a_struct_keeps_its_field_types() -> spy_bool:
 def reify_feeds_a_coerce(x: u32) -> u64:
     # the reified type is an ordinary compile-time type value: it can be the
     # type argument of another builtin
-    return coerce(reify(type_info(u64)), x)
+    return coerce(x, reify(type_info(u64)))
 
 
 class SpyReflectTest(TestCase):

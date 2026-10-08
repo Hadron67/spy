@@ -205,9 +205,9 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
         # keeps the unsigned variants from wrapping ``n - 1``)
         if n > 0:
             lastiter: i32 = 0
-            lower = coerce(LT, 0)
-            upper = int_cast(n - 1, LT) # TODO: replace with int_cast
-            stride = coerce(ST, 0)
+            lower = coerce(0, LT)
+            upper = int_cast(n - 1, LT)
+            stride = coerce(0, ST)
             init_fn(_ident(), gtid[...], _SCHED_STATIC, ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
             i = lower
             while i <= upper:
