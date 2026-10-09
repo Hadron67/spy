@@ -238,6 +238,14 @@ def undefined() -> Any: ...
 @builtin_func
 def coerce[T](value: Any, typ: type[T]) -> T: ...
 
+# ``const_array(elem, length)``: an array of ``length`` (a compile-time integer)
+# elements, every element equal to ``elem`` (evaluated once, may be a runtime
+# value).  ``elem`` is written into each element place, so a compile-time one
+# builds a compile-time array and a runtime one emits one store per element
+# (see ``interp.HirRunner._builtin_const_array``).
+@builtin_func
+def const_array[T, Len: int](elem: T, length: Len) -> Array[T, Len]: ...
+
 @builtin_func
 def compile_error(msg: str | bytes) -> Never: ...
 

@@ -15,6 +15,7 @@ from ..compiler.syntax import (
     array,
     ref,
 )
+from ..std.core import const_array
 from .comptime_structs import runtime_struct_unroll
 from .structs import Blank, Small
 
@@ -288,6 +289,91 @@ def comptime_array_from_a_runtime_value(x: i32) -> i32:
     return c[1]
 
 
+# ---------------------------------------------------------------------------
+# ``std.core.const_array(elem, length)``: an array of ``length`` elements, every
+# one equal to ``elem`` (a single expression, evaluated once and copied into
+# each element).  ``length`` has to be a compile-time integer, ``elem`` may be a
+# runtime value - then one store is emitted per element - or a compile-time one
+# (a compile-time array with no runtime code), exactly like ``array(...)``.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def const_array_runtime_elem(x: i32) -> i32:
+    a = const_array(x, 3)
+    return a[0] + a[1] + a[2]
+
+
+@func()
+def const_array_expression_elem(x: i32) -> i32:
+    # the element expression is evaluated once, its value copied into every
+    # element
+    a = const_array(x + 1, 4)
+    return a[0] + a[3]
+
+
+@func()
+def const_array_declared(x: i32) -> i32:
+    a: Array[i32, Literal[4]] = const_array(x, 4)
+    return a[0] + a[3]
+
+
+@func()
+def const_array_length(x: i32) -> usize:
+    a = const_array(x, 5)
+    return len(a)
+
+
+@func()
+def const_array_comptime() -> i32:
+    a: Comptime = const_array(7, 4)
+    return a[0] + a[3]
+
+
+@func()
+def const_array_comptime_length(x: i32) -> i32:
+    # the length is a compile-time value that is not a syntactic literal
+    n: Comptime = 3
+    a = const_array(x, n)
+    return a[0] + a[1] + a[2]
+
+
+@func()
+def const_array_of_structs(x: i32) -> i32:
+    a = const_array(Small(x, 1), 2)
+    return a[0].a + a[1].b
+
+
+@func()
+def const_array_nested(x: i32) -> i32:
+    a = const_array(array(x, x + 1), 2)
+    return a[0][1] + a[1][0]
+
+
+@func()
+def const_array_empty(x: i32) -> usize:
+    # a zero-length array is zero-sized whatever its element type is
+    a: Array[i32, Literal[0]] = const_array(x, 0)
+    return len(a)
+
+
+@func()
+def const_array_runtime_length(x: i32, n: i32) -> i32:
+    a = const_array(x, n)
+    return a[0]
+
+
+@func()
+def const_array_negative_length(x: i32) -> i32:
+    a = const_array(x, -1)
+    return a[0]
+
+
+@func()
+def const_array_wrong_length(x: i32) -> Array[i32, Literal[3]]:
+    return const_array(x, 4)  # pyright: ignore[reportReturnType]
+
+
 class SpyComptimeArrayTest(TestCase):
     """Compile-time arrays: an array built in an inline slot - an expression
     temporary or a ``Comptime`` variable - is an aggregate whose elements are
@@ -316,6 +402,50 @@ class SpyComptimeArrayTest(TestCase):
     def test_a_runtime_struct_cannot_unroll(self) -> None:
         with self.assertRaises(CompileError):
             runtime_struct_unroll()
+
+
+class SpyConstArrayTest(TestCase):
+    """``std.core.const_array(elem, length)`` builds an array of ``length``
+    (a compile-time integer) elements, every one equal to ``elem``."""
+
+    def test_runtime_element(self) -> None:
+        self.assertEqual(const_array_runtime_elem(5), 15)
+
+    def test_element_expression_evaluated_once(self) -> None:
+        self.assertEqual(const_array_expression_elem(5), 12)
+
+    def test_declared_type(self) -> None:
+        self.assertEqual(const_array_declared(5), 10)
+
+    def test_array_length(self) -> None:
+        self.assertEqual(const_array_length(5), 5)
+
+    def test_comptime_array(self) -> None:
+        self.assertEqual(const_array_comptime(), 14)
+
+    def test_comptime_length(self) -> None:
+        self.assertEqual(const_array_comptime_length(5), 15)
+
+    def test_of_structs(self) -> None:
+        self.assertEqual(const_array_of_structs(5), 6)
+
+    def test_nested(self) -> None:
+        self.assertEqual(const_array_nested(5), 11)
+
+    def test_empty(self) -> None:
+        self.assertEqual(const_array_empty(5), 0)
+
+    def test_runtime_length_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            const_array_runtime_length(5, 3)
+
+    def test_negative_length_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            const_array_negative_length(5)
+
+    def test_wrong_length_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            const_array_wrong_length(5)
 
 
 class SpyArrayTest(TestCase):
@@ -398,4 +528,5 @@ class SpyArrayTest(TestCase):
 all_tests = [
     SpyComptimeArrayTest,
     SpyArrayTest,
+    SpyConstArrayTest,
 ]

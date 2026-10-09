@@ -17,6 +17,7 @@ the process, and they become visible only once the library is loaded with
 import ctypes
 import ctypes.util
 import os
+from enum import Enum
 from typing import Any, Protocol
 
 from spy.std.int import int_cast

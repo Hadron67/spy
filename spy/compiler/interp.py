@@ -6105,6 +6105,8 @@ class HirRunner:
             return self._builtin_gstr(binded, ret)
         if fn.name == 'sstr':
             return self._builtin_sstr(binded, ret)
+        if fn.name == 'const_array':
+            return self._builtin_const_array(binded, ret)
         if fn.name == 'bitcast':
             return self._builtin_bitcast(binded, ret)
         if fn.name == 'truncate':
@@ -6171,6 +6173,34 @@ class HirRunner:
             RuntimeVal(self._string_global(data), self._string_ptr_type()),
             ComptimeVal(sval.Int(len(data), self._usize_type())),
         )))
+        return PollResult.AGAIN
+
+    # -- ``std.core.const_array`` --------------------------------------------
+
+    def _builtin_const_array(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.const_array(elem, length)``: build an array of ``length``
+        (a compile-time integer) elements, every one equal to ``elem`` - the
+        single element expression, evaluated once by the call and written into
+        each element place.  ``elem`` may be a runtime value (one store per
+        element) or a compile-time one (a compile-time array, no runtime code),
+        exactly like the ``array(...)`` construction: the elements are the
+        storage's places (``field_index_addr``), and ``finish_array`` closes the
+        construction (resolving the array type and binding the pending places)."""
+        elem = self._arg_value(args.positional[0])
+        length = self._arg_value(args.positional[1])
+        count = _comptime_int(length)
+        if count is None:
+            raise CompileError('the length of std.core.const_array must be a compile-time integer')
+        if count < 0:
+            raise CompileError('the length of std.core.const_array must not be negative')
+        places: list[InterpVal] = []
+        for index in range(count):
+            place = self.field_index_addr(ret, _index_value(index), is_aggregate_init=True)
+            self.store(place, elem)
+            places.append(place)
+        self.finish_array(ret, tuple(places))
         return PollResult.AGAIN
 
     # -- ``std.core.compile_error`` ------------------------------------------
