@@ -228,7 +228,12 @@ class Type(Value):
         return self.classify() == SpecialTypeKind.ZST
 
     def is_copyable(self) -> bool:
-        return True
+        """Whether a value of this type may be copied: loaded out of a place,
+        passed by value, or returned by value.  A dynamically-sized type has no
+        value of its own - only a pointer to it is a value - so it is never
+        copyable; a container or struct override decides the rest (an aggregate
+        is copyable only when its members are)."""
+        return self.classify() != SpecialTypeKind.DST
 
     def get_type_children(self) -> tuple[Type, ...]:
         return ()
@@ -361,6 +366,10 @@ class TupleType(Type):
         return SpecialTypeKind.COMPTIME
 
     @override
+    def is_copyable(self) -> bool:
+        return super().is_copyable() and all(t.is_copyable() for t in self.types)
+
+    @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
@@ -437,6 +446,10 @@ class UnionType(Type):
         if all(type.classify() == SpecialTypeKind.ZST for type in self.types):
             return SpecialTypeKind.ZST
         return SpecialTypeKind.NONE
+
+    @override
+    def is_copyable(self) -> bool:
+        return super().is_copyable() and all(t.is_copyable() for t in self.types)
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
@@ -558,6 +571,10 @@ class TaggedUnionType(Type):
         # with more than one variant the tag alone holds storage, so a tagged
         # union is never zero-sized
         return SpecialTypeKind.NONE
+
+    @override
+    def is_copyable(self) -> bool:
+        return super().is_copyable() and all(t.is_copyable() for t in self.types)
 
     @override
     def is_subtype_of(self, other: Type) -> bool:
@@ -1095,7 +1112,7 @@ class OptionType(Type):
 
     @override
     def is_copyable(self) -> bool:
-        return self.child.is_copyable()
+        return super().is_copyable() and self.child.is_copyable()
 
     def __str__(self) -> str:
         return f'Option[{self.child}]'
@@ -1845,8 +1862,9 @@ class ArrayType(Type):
 
     @override
     def is_copyable(self) -> bool:
-        """An array is copyable when its element type is."""
-        return self.length == 0 or self.elem.is_copyable()
+        """An array is copyable when it is sized and its element type is (an
+        empty array has nothing to copy)."""
+        return super().is_copyable() and (self.length == 0 or self.elem.is_copyable())
 
     @override
     def classify(self) -> SpecialTypeKind:
@@ -2114,11 +2132,11 @@ class FunctionType(Type):
                     return None
                 args.append(arg_ptr)
             else:
-                if arg.type.classify() == SpecialTypeKind.DST:
-                    # the C convention forces a dynamically-sized argument by
-                    # value, which has no size to pass
+                if not arg.type.is_copyable():
+                    # the C convention forces the argument by value, which would
+                    # copy it: a non-copyable value cannot be passed
                     raise CompileError(
-                        f'a C function may not take the dynamically-sized type {arg.type}'
+                        f'a C function may not take the non-copyable type {arg.type}'
                     )
                 mir_type = arg.type.to_mir_type(cache)
                 if mir_type is None:
@@ -2138,11 +2156,11 @@ class FunctionType(Type):
                     return None
                 args.append(ptr_mir)
             else:
-                if leaf.type.classify() == SpecialTypeKind.DST:
-                    # only a non-default convention could force a dynamically-
-                    # sized result by value, which has no size to return
+                if not leaf.type.is_copyable():
+                    # only a non-default convention could force a non-copyable
+                    # result by value, which would copy it
                     raise CompileError(
-                        f'a C function may not return the dynamically-sized type {leaf.type}'
+                        f'a C function may not return the non-copyable type {leaf.type}'
                     )
                 mir_type = leaf.type.to_mir_type(cache)
                 if mir_type is None:
@@ -2390,8 +2408,11 @@ class StructType(Type):
 
     @override
     def is_copyable(self) -> bool:
-        """A struct is copyable when its ``copyable`` modifier says so;
-        ``inherit`` (the default) means its fields all are."""
+        """A struct is copyable when it is not dynamically sized and its
+        ``copyable`` modifier says so; ``inherit`` (the default) means its
+        fields all are."""
+        if not super().is_copyable():
+            return False
         match self.modifiers.copyable:
             case 'inherit':
                 return all(f.type.is_copyable() for f in self.fields().values())
@@ -2682,14 +2703,15 @@ def returns_via_result_ptr(type: Type, cache: MirLowerCache) -> bool:
     :data:`_AGGREGATE_VALUE_RETURN_LIMIT` bytes) and through a result
     pointer once it outgrows it, and a new aggregate kind (arrays) only
     needs to extend this function.  Scalars are always returned by
-    value, and a dynamically-sized type - which has no size at all - is
-    always delivered through a result pointer.  The size is the one of the
+    value, and a non-copyable type - a dynamically-sized one (which has no
+    size at all), or a struct whose copy is forbidden - is always delivered
+    through a result pointer.  The size is the one of the
     type's MIR mirror - the layout the lowered code uses (see
     ``mir.estimated_size_of``) - for pointers of the target the cache
     belongs to.  A signature may override the default
     (``fn.ReturnSignature.ret_spec``)."""
-    if type.classify() == SpecialTypeKind.DST:
-        # a dynamically-sized type has no size to return by value: it is always
+    if not type.is_copyable():
+        # a non-copyable type has no value to deliver by copy: it is always
         # delivered through a hidden result pointer (see also
         # ``HirRunner._ret_leaf_ptr``)
         return True
@@ -2899,8 +2921,9 @@ def pass_by_ref(type: Type, cache: MirLowerCache) -> TriState:
     large to be passed in registers (larger than the by-value limit) is
     passed as a pointer, everything else by value; the size is the one of
     the type's MIR mirror, for pointers of the cache's target.  A
-    dynamically-sized type (a function type) has no size to pass, so it is
-    always passed as a pointer.
+    dynamically-sized type (a function type) has no size to pass, and a
+    non-copyable type has no copy to make, so both are always passed as a
+    pointer.
 
     A type that still names a type parameter has no layout to size, so the
     answer is ``UNKNOWN``: the convention is settled when a call substitutes
@@ -2910,6 +2933,10 @@ def pass_by_ref(type: Type, cache: MirLowerCache) -> TriState:
         # the layout is not known until a call substitutes the type parameter:
         # left to the specialization to decide
         return TriState.UNKNOWN
+    if not type.is_copyable():
+        # a non-copyable value has no copy to make: it is always passed as a
+        # pointer, like a dynamically-sized one
+        return TriState.TRUE
     match type.classify():
         case SpecialTypeKind.DST:
             return TriState.TRUE

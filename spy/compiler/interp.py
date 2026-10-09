@@ -2240,11 +2240,11 @@ class HirRunner:
             mir_fn.args.append(ptr_type)
             mir_fn.arg_names.append('$result')
             return mir.Param(index, ptr_type)
-        if leaf.type.classify() == sval.SpecialTypeKind.DST:
-            # a dynamically-sized leaf is only ever delivered through the result
+        if not leaf.type.is_copyable():
+            # a non-copyable leaf is only ever delivered through the result
             # pointer: reaching here means a convention forced it by value
             raise CompileError(
-                f'cannot return a value of the dynamically-sized type {leaf.type} by value'
+                f'cannot return a value of the non-copyable type {leaf.type} by value'
             )
         if not leaf.type.is_zst():
             # a zero-sized result is delivered as its unit value; only a
@@ -3699,6 +3699,11 @@ class HirRunner:
         type = _type_of(ptr)
         if not isinstance(type, sval.PointerType):
             raise CompileError(f"cannot load from a {type} value")
+        if not type.elem.is_copyable():
+            # reading a value out of its place is a copy: a non-copyable type
+            # (a dynamically-sized one, or a struct whose copy is forbidden) has
+            # no such value
+            raise CompileError(f'cannot copy a value of the non-copyable type {type.elem}')
         unit_value = type.elem.get_unit_value()
         if unit_value is not None:
             return ComptimeVal(unit_value)
@@ -3734,10 +3739,6 @@ class HirRunner:
                 # the value it refers to
                 return ComptimeVal(obj.value)
             case RuntimeVal():
-                if type.elem.classify() == sval.SpecialTypeKind.DST:
-                    raise CompileError(
-                        f'cannot load a value of the dynamically-sized type {type.elem}'
-                    )
                 return RuntimeVal(self._emit(mir.Load(ptr.value)), type.elem)
         raise CompileError('cannot load from a compile-time pointer')
 

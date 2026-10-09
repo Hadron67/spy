@@ -425,6 +425,117 @@ def choose_two_zst_structs(c: spy_bool) -> spy_bool:
     return spy_typeof(s) == Blank
 
 
+# a non-copyable struct: a value of it may be passed by reference (and read
+# field by field through the reference), but it may never be copied - an
+# assignment or any other whole-value read is rejected (see
+# ``sval.Type.is_copyable``)
+@struct(copyable=False)
+class Handle:
+    id: i32
+
+
+# a struct that holds a non-copyable field is non-copyable too (``copyable``
+# defaults to ``inherit``, meaning "copyable exactly when every field is")
+@struct()
+class HandleBox:
+    handle: Handle
+    tag: i32
+
+
+@func()
+def handle_id(h: Handle) -> i32:
+    # the non-copyable parameter is passed by reference and its field is read
+    # through the reference: no copy happens
+    return h.id
+
+
+@func()
+def pass_handle(n: i32) -> i32:
+    # a non-copyable value is constructed in place and passed by reference
+    h = Handle(n)
+    return handle_id(h)
+
+
+@func()
+def return_handle(n: i32) -> Handle:
+    # a non-copyable result is delivered through a hidden result pointer: the
+    # construction writes it in place, no copy
+    return Handle(n)
+
+
+@func()
+def handle_id_of_made(n: i32) -> i32:
+    h = return_handle(n)
+    return h.id
+
+
+@func()
+def handle_box_tag(n: i32) -> i32:
+    b = HandleBox(Handle(n), 7)
+    return b.tag
+
+
+@func()
+def copy_handle(n: i32) -> i32:
+    # reading the whole value out of its place is a copy, which a non-copyable
+    # type forbids
+    h = Handle(n)
+    x = h
+    return x.id
+
+
+@func()
+def copy_handle_box(n: i32) -> i32:
+    b = HandleBox(Handle(n), 7)
+    x = b
+    return x.tag
+
+
+# an exception carrying a non-copyable value: the exception struct is
+# non-copyable too (``copyable`` defaults to ``inherit``)
+@struct(copyable=False)
+class HandleError(Exception):
+    handle: Handle
+
+
+@func(exceptions=HandleError)
+def raise_handle_error(n: i32) -> i32:
+    # raising a non-copyable exception builds it in place, straight into the
+    # error payload: no copy
+    if n < 0:
+        raise HandleError(Handle(n))
+    return n
+
+
+@func(exceptions=HandleError)
+def catch_handle_error(n: i32) -> i32:
+    # the caught binding is a pointer to the payload; its non-copyable field is
+    # read through the pointer
+    try:
+        return raise_handle_error(n)
+    except HandleError as e:
+        return e.handle.id + 100
+
+
+@func(exceptions=HandleError)
+def raise_and_return_handle(n: i32) -> Handle:
+    # both the raised exception type and the return type are non-copyable: the
+    # exception is built into the error payload, the result through the result
+    # pointer
+    if n < 0:
+        raise HandleError(Handle(n))
+    return Handle(n)
+
+
+@func(exceptions=HandleError)
+def use_raise_and_return(n: i32) -> i32:
+    try:
+        h = raise_and_return_handle(n)
+        return h.id
+    except HandleError as e:
+        return e.handle.id + 100
+
+
 class SpyStructTest(TestCase):
     """Struct values: a construction fills the fields in place - the
     arguments bind the fields by declaration order and by name - the
@@ -685,10 +796,48 @@ class SpyPythonSideStructTest(TestCase):
             Small(a=1, b=2, c=3)  # pyright: ignore
 
 
+class SpyNonCopyableStructTest(TestCase):
+    """A ``@struct(copyable=False)`` struct: a value may be passed by reference
+    and read through the reference, but never copied, and a struct that holds
+    one is non-copyable too."""
+
+    def test_a_non_copyable_value_passes_by_reference(self) -> None:
+        self.assertEqual(pass_handle(5), 5)
+
+    def test_a_non_copyable_result_comes_through_a_result_pointer(self) -> None:
+        self.assertEqual(handle_id_of_made(5), 5)
+
+    def test_a_field_of_a_holder_is_readable(self) -> None:
+        self.assertEqual(handle_box_tag(5), 7)
+
+    def test_copying_a_non_copyable_value_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            copy_handle(1)
+        self.assertIn('non-copyable', str(ctx.exception))
+
+    def test_copying_a_struct_with_a_non_copyable_field_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            copy_handle_box(1)
+        self.assertIn('non-copyable', str(ctx.exception))
+
+    def test_a_non_copyable_exception_is_raised_and_caught(self) -> None:
+        # raising builds the exception in place; the caught binding is a pointer
+        # to the payload, so nothing is copied
+        self.assertEqual(catch_handle_error(5), 5)
+        self.assertEqual(catch_handle_error(-3), 97)
+
+    def test_a_non_copyable_exception_and_a_non_copyable_result(self) -> None:
+        # adding ``e.handle.id`` is not a copy (a field read through the
+        # pointer); returning ``Handle`` goes through the result pointer
+        self.assertEqual(use_raise_and_return(5), 5)
+        self.assertEqual(use_raise_and_return(-3), 97)
+
+
 all_tests = [
     SpyStructTest,
     SpyStructDefaultsTest,
     SpyStructMirrorTest,
     SpyZeroSizedResultTest,
     SpyPythonSideStructTest,
+    SpyNonCopyableStructTest,
 ]

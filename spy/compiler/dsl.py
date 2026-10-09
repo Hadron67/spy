@@ -166,6 +166,7 @@ class FuncTypeMetadata:
 @dataclass(frozen=True)
 class StructMetadata:
     extern_c: bool
+    copyable: bool | Literal["inherit"]
 
 
 # the metadata of an undecorated method (see ``_RegisteredClass.get_entry``);
@@ -315,7 +316,9 @@ class _RegisteredClass(StructDecl):
             head = sval.StructTypeHead(
                 self.cls.__name__,
                 tuple(generic_args),
-                modifiers=sval.StructModifiers(extern_c=self.meta.extern_c),
+                modifiers=sval.StructModifiers(
+                    extern_c=self.meta.extern_c, copyable=self.meta.copyable,
+                ),
                 generic_defaults=tuple(generic_defaults),
             )
             # the head is bound before the class body is read: a field may
@@ -871,8 +874,15 @@ class _Context(CompileContext):
         return wrapper
 
     @dataclass_transform()
-    def struct(self, extern_c: bool = False):
-        meta = StructMetadata(extern_c=extern_c)
+    def struct(self, extern_c: bool = False, copyable: bool | Literal["inherit"] = "inherit"):
+        """Declare a spy struct.  ``extern_c`` keeps the C layout; ``copyable``
+        says whether a value of the struct may be copied (``True``), must not be
+        (``False``), or takes after its fields (``"inherit"``, the default)."""
+        if not (copyable is True or copyable is False or copyable == 'inherit'):
+            raise CompileError(
+                f"struct copyable must be True, False or 'inherit', got {copyable!r}"
+            )
+        meta = StructMetadata(extern_c=extern_c, copyable=copyable)
 
         def wrapper[T](cls: type[T]) -> type[T]:
             if cls in self._cls_annotation_cache:

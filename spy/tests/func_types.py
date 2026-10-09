@@ -19,7 +19,7 @@ from ..compiler.syntax import (
     as_func_ptr,
 )
 from ..compiler.util import FrozenArraySet
-from .structs import MIR_CACHE, struct_type
+from .structs import MIR_CACHE, Handle, struct_type
 
 # ---------------------------------------------------------------------------
 # function types: ``@func_type`` declares a spy function type from a Protocol's
@@ -118,6 +118,44 @@ def c_inferred_raise(n: i32) -> i32:
 def c_multi(n: i32) -> tuple[i32, i32]:
     # a C function may return only one value
     return n, n + 1
+
+
+@func_type(callconv='c')
+class CTakeHandle(Protocol):
+    # a C function type passes every argument by value: a non-copyable argument
+    # has no value to pass
+    def __call__(self, h: Handle) -> i32: ...
+
+
+@func_type(callconv='c')
+class CReturnHandle(Protocol):
+    # likewise, a C function type returns the result by value
+    def __call__(self) -> Handle: ...
+
+
+@func(callconv='c')
+def c_take_handle(h: Handle) -> i32:
+    # a non-default convention passes every argument by value; a non-copyable
+    # one has no value to pass (rejected when the call is specialized)
+    return 0
+
+
+@func()
+def call_c_take_handle(n: i32) -> i32:
+    return c_take_handle(Handle(n))
+
+
+@func(callconv='c')
+def c_return_handle(n: i32) -> Handle:
+    # a non-default convention returns the result by value; a non-copyable one
+    # has no value to return
+    return Handle(n)
+
+
+@func()
+def call_c_return_handle(n: i32) -> i32:
+    h = c_return_handle(n)
+    return h.id
 
 
 @decl_func("abs")
@@ -310,6 +348,30 @@ class SpyCallconvTest(TestCase):
         with self.assertRaises(CompileError) as ctx:
             c_multi(1)
         self.assertIn('only one value', str(ctx.exception))
+
+    def test_a_c_function_type_may_not_take_a_non_copyable(self) -> None:
+        t = _GLOBAL_CONTEXT.resolve_global(CTakeHandle)
+        assert isinstance(t, sval.FunctionType)
+        with self.assertRaises(CompileError) as ctx:
+            t.to_mir_type(MIR_CACHE)
+        self.assertIn('non-copyable', str(ctx.exception))
+
+    def test_a_c_function_type_may_not_return_a_non_copyable(self) -> None:
+        t = _GLOBAL_CONTEXT.resolve_global(CReturnHandle)
+        assert isinstance(t, sval.FunctionType)
+        with self.assertRaises(CompileError) as ctx:
+            t.to_mir_type(MIR_CACHE)
+        self.assertIn('non-copyable', str(ctx.exception))
+
+    def test_a_c_function_may_not_take_a_non_copyable(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            call_c_take_handle(1)
+        self.assertIn('non-copyable', str(ctx.exception))
+
+    def test_a_c_function_may_not_return_a_non_copyable(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            call_c_return_handle(1)
+        self.assertIn('non-copyable', str(ctx.exception))
 
 
 class SpyFrozenArraySetTest(TestCase):

@@ -688,6 +688,13 @@ class Signature:
             # reference unless one of them says otherwise - and never for a C
             # convention, which passes every argument by value
             if is_c:
+                if not resolved.is_copyable():
+                    # a C convention passes every argument by value, which would
+                    # copy it: a non-copyable value cannot be passed
+                    raise CompileError(
+                        f'a non-default-callconv function cannot take a value of '
+                        f'the non-copyable type {resolved}'
+                    )
                 by_ref = TriState.FALSE
             else:
                 by_ref = TriState.or_(by_ref_hint, pass_by_ref(resolved, cache))
@@ -742,6 +749,15 @@ class Signature:
                 None if self.ret_type is None
                 else make_ret_spec(substitute(self.ret_type), cache, force_by_value=True)
             )
+            if ret_type_spec is not None:
+                for leaf in iter_ret_leaves(ret_type_spec):
+                    if not leaf.type.is_copyable():
+                        # a C convention returns the result by value, which would
+                        # copy it: a non-copyable value cannot be returned
+                        raise CompileError(
+                            f'a non-default-callconv function cannot return a '
+                            f'value of the non-copyable type {leaf.type}'
+                        )
             exceptions = self.exceptions
         else:
             ret_type_spec = None if self.ret_type is None else make_ret_spec(substitute(self.ret_type), cache)

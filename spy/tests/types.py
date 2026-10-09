@@ -422,7 +422,7 @@ class SpyOpaqueAndUnsizedTest(TestCase):
     def test_a_fam_field_is_not_read_by_value(self) -> None:
         with self.assertRaises(CompileError) as ctx:
             fam_read_by_value(1)
-        self.assertIn('dynamically-sized', str(ctx.exception))
+        self.assertIn('non-copyable', str(ctx.exception))
 
     def test_only_the_first_dst_field_is_reachable(self) -> None:
         i32_type = sval.IntType(32, True)
