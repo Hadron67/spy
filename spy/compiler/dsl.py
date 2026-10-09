@@ -45,6 +45,7 @@ builtins (``spy.compile_log``) are evaluated at compile time; ``spy.typeof``
 is a ``syntax`` marker, lowered by the parser to a type probe.
 """
 
+import functools
 import inspect
 import types as pytypes
 from collections.abc import Callable
@@ -127,7 +128,11 @@ def builtin_func[T](fn: T) -> T:
 
 @dataclass(frozen=True)
 class FnMetadata:
-    sfv: bool  # self by value
+    # self by value: ``None`` (the default) leaves the choice to the context -
+    # ``False`` for every function and struct method, ``True`` for an enum
+    # method (see ``_RegisteredFn.get_entry``); an explicit ``@func(sfv=...)``
+    # overrides it
+    sfv: bool | None
     extern: bool
     linkname: str | None
     # an undecorated struct method: it is inlined at its call sites like a
@@ -161,8 +166,9 @@ class StructMetadata:
     extern_c: bool
 
 
-# the metadata of an undecorated method (see ``_RegisteredClass.get_entry``)
-_INLINE_META = FnMetadata(sfv=False, extern=False, linkname=None, inline=True)
+# the metadata of an undecorated method (see ``_RegisteredClass.get_entry``);
+# ``sfv=None`` takes the context default (by value for an enum method)
+_INLINE_META = FnMetadata(sfv=None, extern=False, linkname=None, inline=True)
 
 
 def _normalize_exceptions(
@@ -226,11 +232,32 @@ class _RegisteredFn:
 
         return glue.invoke(entry.specs[call_sig], call_sig, arglist, self.context)
 
+    def __get__(self, instance, owner=None):
+        """The descriptor protocol: a registered function used as a *class
+        attribute* - a method of a struct or of an ``Enum`` - binds the
+        accessed instance as its receiver.  Accessing it through the class
+        (``instance is None``) yields the handle itself (``TriState.m`` is
+        called with ``self`` explicit, like a struct's ``Foo.m``), and
+        accessing it through an instance (``member.m``) yields a callable that
+        prepends the instance as the first argument.
+
+        This is also what keeps a ``@func()``-decorated enum method from being
+        taken for an enum *member*: ``enum.Enum`` skips descriptors, and a
+        handle is one only because of this method."""
+        if instance is None:
+            return self
+        return functools.partial(self, instance)
+
     def get_entry(self):
         if self.entry is None:
+            self_by_value = self.meta.sfv
+            if self_by_value is None:
+                # the context default: a struct method's ``self`` is a pointer to
+                # the object, an enum method's is the value itself
+                self_by_value = isinstance(self.cls, sval.IntEnumType)
             hir = astgen.parse_function(
                 self.fn, self.context, self.cls,
-                self.meta.sfv, self.context_type_vars, self.meta.exceptions,
+                self_by_value, self.context_type_vars, self.meta.exceptions,
                 self.meta.callconv, self.meta.may_panic,
             )
             self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
@@ -612,6 +639,11 @@ class _Context(CompileContext):
         # analysis it runs and bound to the target it compiles for (see
         # ``sval.MirLowerCache``)
         self.mir_lower_cache = sval.MirLowerCache(target_info)
+        # the ``IntEnumType`` this context declares for each Python enum class
+        # (one per class, compared by identity) and its reverse mapping (see
+        # ``int_enum_type``/``enum_class_of``)
+        self._enum_cache: dict[type, sval.IntEnumType] = {}
+        self._enum_class_of: dict[sval.IntEnumType, type] = {}
         # the ``std`` types the type rules need, resolved lazily on the first
         # request (see ``sval.SpecialTypes``)
         self._special_types: sval.SpecialTypes | None = None
@@ -684,12 +716,70 @@ class _Context(CompileContext):
                     self._inline_cache[value] = entry
                 return entry
             case _:
+                if sval.is_int_enum_member(value):
+                    # a member of a Python enum class: the typed member value of this
+                    # context's enumeration
+                    enum_type = self._int_enum_type(type(value))
+                    index = enum_type.index_of(value.name)
+                    assert index is not None, f'{value!r} is not a member of {enum_type}'
+                    return sval.IntEnumValue(enum_type, index)
+                if sval.is_int_enum_class(value):
+                    # a Python enum class: the ``IntEnumType`` this context declares
+                    return self._int_enum_type(value)
                 # any other object stays a plain compile-time Python value
                 return None
 
     @override
     def target_info(self) -> TargetInfo:
         return self.mir_lower_cache.target
+
+    def _int_enum_type(self, cls: type) -> sval.IntEnumType:
+        # this context's ``IntEnumType`` for the Python enum class ``cls``: one
+        # per class (compared by identity), cached here, with its reverse
+        # mapping for the Python boundary (see ``enum_class_of``)
+        existing = self._enum_cache.get(cls)
+        if existing is None:
+            existing = sval.int_enum_type(cls.__name__, cls)
+            self._enum_cache[cls] = existing
+            self._enum_class_of[existing] = cls
+            self._collect_enum_methods(cls, existing)
+        return existing
+
+    def _collect_enum_methods(self, cls: type, enum_type: sval.IntEnumType) -> None:
+        """Collect the methods of the Python enum class ``cls`` into
+        ``enum_type`` (like ``_RegisteredClass.get_entry`` does for a struct):
+        every function of the class body (a ``@func()`` handle or an
+        undecorated Python function) becomes a method whose ``self`` is the
+        enumeration - by value, see ``_RegisteredFn.get_entry`` - resolved
+        through this context.  A ``@staticmethod`` takes no receiver.  Names
+        starting with an underscore are skipped (they are the enum machinery's
+        own, or convention-private)."""
+        for base in reversed(cls.__mro__):
+            if base is object or base.__module__ in ('enum', 'builtins'):
+                continue
+            for name, value in base.__dict__.items():
+                is_static = isinstance(value, staticmethod)
+                if is_static:
+                    value = value.__func__
+                if isinstance(value, _RegisteredFn):
+                    method = value if value.context is self else value.with_context(self)
+                elif isinstance(value, pytypes.FunctionType):
+                    # an undecorated method: inlined at its call sites like a
+                    # plain Python function (see ``_INLINE_META``)
+                    method = _RegisteredFn(value, None, _INLINE_META, self)
+                else:
+                    continue
+                method.cls = None if is_static else enum_type
+                method.context_type_vars = {}
+                enum_type.methods[name] = method
+                if is_static:
+                    enum_type.static_methods.add(name)
+                else:
+                    enum_type.static_methods.discard(name)
+
+    @override
+    def enum_class_of(self, type: sval.IntEnumType) -> type:
+        return self._enum_class_of[type]
 
     def _struct_head(self, handle: Any) -> sval.StructTypeHead:
         # the head this context declares for a ``std`` struct: the handle is
@@ -722,7 +812,7 @@ class _Context(CompileContext):
         sym = analyser.finish()
         sym.compile(self._symbol_table, self.backend, self.target_info())
 
-    def func(self, sfv: bool = False, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = True):
+    def func(self, sfv: bool | None = None, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = True):
         meta = FnMetadata(
             sfv=sfv, extern=extern, linkname=linkname,
             exceptions=_normalize_exceptions(exceptions),

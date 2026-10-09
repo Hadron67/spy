@@ -19,6 +19,7 @@ concrete argument types (comptime semantics: ``spy.typeof``, compile-time
 """
 
 import builtins as pybuiltins
+from enum import Enum
 from types import NoneType
 from typing import TYPE_CHECKING
 
@@ -102,6 +103,7 @@ __all__ = [
     'CompileError',
     'ConstMultiPtr',
     'ConstPtr',
+    'Enum',
     'MultiPtr',
     'Option',
     'Ptr',

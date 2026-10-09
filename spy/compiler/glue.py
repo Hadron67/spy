@@ -93,18 +93,23 @@ class _StructInstanceData:
     parent's allocation, so it writes through to the parent).  ``_cache`` is the
     MIR-mirror interning table the layout is computed from.
 
+    ``_context`` is the compile context (the MIR-mirror interning table the
+    layout is computed from lives on it), and the type layout is resolved
+    through it, so that an enumeration value can be delivered as its Python
+    member (see ``CompileContext.enum_class_of``).
+
     The fields and methods of the value are reached through :meth:`get_attr` /
     :meth:`set_attr` rather than ``__getattr__``/``__setattr__``, so that the
     :class:`_StructInstance` wrapping it can implement attribute access without
     re-entering itself.  It is held by exactly one :class:`_StructInstance`."""
 
-    __slots__ = ('_cache', '_offset', '_owner', 'type')
+    __slots__ = ('_context', '_offset', '_owner', 'type')
 
-    def __init__(self, type: StructType, owner: Any, offset: int, cache: MirLowerCache) -> None:
+    def __init__(self, type: StructType, owner: Any, offset: int, context: CompileContext) -> None:
         self.type = type
         self._owner = owner
         self._offset = offset
-        self._cache = cache
+        self._context = context
 
     def _base(self) -> int:
         return _address(self._owner, self._offset)
@@ -114,7 +119,7 @@ class _StructInstanceData:
         ``instance``."""
         index = self.type.field_index(name)
         if index is not None:
-            return _read_field(self, self.type, index, self._cache)
+            return _read_field(self, self.type, index, self._context)
         method = self.type.get_method(name)
         if method is not None:
             return _BoundMethod(instance, method)
@@ -125,7 +130,7 @@ class _StructInstanceData:
         index = self.type.field_index(name)
         if index is None:
             raise AttributeError(f'{self.type} has no field {name!r}')
-        _write_field(self, self.type, index, value, self._cache)
+        _write_field(self, self.type, index, value, self._context)
 
     def __repr__(self) -> str:
         return f'{self.type}(...)'
@@ -143,8 +148,8 @@ class _StructInstance:
     from it *and* from ``Exception``, whose layout does not combine with a
     class that has slots of its own."""
 
-    def __init__(self, type: StructType, owner: Any, offset: int, cache: MirLowerCache) -> None:
-        object.__setattr__(self, '_data', _StructInstanceData(type, owner, offset, cache))
+    def __init__(self, type: StructType, owner: Any, offset: int, context: CompileContext) -> None:
+        object.__setattr__(self, '_data', _StructInstanceData(type, owner, offset, context))
 
     def __getattr__(self, name: str) -> Any:
         # the data is read with ``object.__getattribute__``, so that a missing
@@ -190,8 +195,8 @@ class _ExceptionInstance(Exception, _StructInstance):
 
     __slots__ = ()
 
-    def __init__(self, type: StructType, owner: Any, offset: int, cache: MirLowerCache) -> None:
-        _StructInstance.__init__(self, type, owner, offset, cache)
+    def __init__(self, type: StructType, owner: Any, offset: int, context: CompileContext) -> None:
+        _StructInstance.__init__(self, type, owner, offset, context)
         object.__setattr__(self, 'args', ())
 
 
@@ -291,11 +296,12 @@ def _option_shape(
     return 'struct', ()
 
 
-def _read(type: Type, owner: Any, offset: int, cache: MirLowerCache) -> Any:
+def _read(type: Type, owner: Any, offset: int, context: CompileContext) -> Any:
     """The Python value of the spy value of ``type`` stored ``offset`` bytes
     into ``owner``."""
     if type.is_zst():
         return None
+    cache = context.mir_cache()
     match type:
         case sval.OptionType():
             shape, position = _option_shape(type, cache)
@@ -306,23 +312,37 @@ def _read(type: Type, owner: Any, offset: int, cache: MirLowerCache) -> Any:
             if shape == 'niche':
                 if _read_pointer_at(type.child, position, owner, offset, cache) == 0:
                     return None
-                return _read(type.child, owner, offset, cache)
+                return _read(type.child, owner, offset, context)
             child_offset = _option_value_offset(type, cache)
             if not _bool_reader(type, owner, offset, cache):
                 return None
-            return _read(type.child, owner, offset + child_offset, cache)
+            return _read(type.child, owner, offset + child_offset, context)
         case sval.TaggedUnionType():
-            return _read_tagged_union(type, owner, offset, cache)
+            return _read_tagged_union(type, owner, offset, context)
         case StructType():
-            return _StructInstance(type, owner, offset, cache)
+            return _StructInstance(type, owner, offset, context)
         case sval.ArrayType():
             raise SpyError('an array cannot cross the Python boundary yet')
         case sval.ComplexType():
             # a complex number crosses as a Python ``complex``: read its real and
             # imaginary parts out of the two float fields of its mirror
-            re = _read(type.elem, owner, offset + _child_offset(type, 0, cache), cache)
-            im = _read(type.elem, owner, offset + _child_offset(type, 1, cache), cache)
+            re = _read(type.elem, owner, offset + _child_offset(type, 0, cache), context)
+            im = _read(type.elem, owner, offset + _child_offset(type, 1, cache), context)
             return complex(re, im)
+        case sval.IntEnumType():
+            # an enumeration crosses as the integer it is represented by; the
+            # value is read at the enumeration's own width/signedness (the
+            # ctypes container is a whole byte) and delivered as its Python
+            # member (see ``CompileContext.enum_class_of``)
+            int_type = type.int_type
+            raw = _scalar_ctype(type, cache).from_address(_address(owner, offset)).value
+            raw &= (1 << int_type.bits) - 1
+            if int_type.signed and (raw >> (int_type.bits - 1)) & 1:
+                raw -= 1 << int_type.bits
+            try:
+                return context.enum_class_of(type)(raw)
+            except ValueError as e:
+                raise SpyError(f'{raw} is not a member of {type}') from e
         case _:
             value = _scalar_ctype(type, cache).from_address(_address(owner, offset)).value
             if isinstance(type, (sval.PointerType,)) or type.classify() == SpecialTypeKind.DST:
@@ -330,17 +350,18 @@ def _read(type: Type, owner: Any, offset: int, cache: MirLowerCache) -> Any:
             return value
 
 
-def _write(type: Type, value: Any, owner: Any, offset: int, cache: MirLowerCache) -> None:
+def _write(type: Type, value: Any, owner: Any, offset: int, context: CompileContext) -> None:
     """Store the Python value ``value`` as a spy value of ``type`` ``offset``
     bytes into ``owner``."""
     if type.is_zst():
         return
+    cache = context.mir_cache()
     address = _address(owner, offset)
     match type:
         case sval.OptionType():
-            _write_option(type, value, owner, offset, cache)
+            _write_option(type, value, owner, offset, context)
         case sval.TaggedUnionType():
-            _write_tagged_union(type, value, owner, offset, cache)
+            _write_tagged_union(type, value, owner, offset, context)
         case StructType():
             source = _as_instance(value, type)
             mir_type = type.get_mir_type(cache)
@@ -358,8 +379,18 @@ def _write(type: Type, value: Any, owner: Any, offset: int, cache: MirLowerCache
                 raise SpyError(f'cannot use {value!r} as a complex value')
             else:
                 re, im = value, 0.0
-            _write(type.elem, re, owner, offset + _child_offset(type, 0, cache), cache)
-            _write(type.elem, im, owner, offset + _child_offset(type, 1, cache), cache)
+            _write(type.elem, re, owner, offset + _child_offset(type, 0, cache), context)
+            _write(type.elem, im, owner, offset + _child_offset(type, 1, cache), context)
+        case sval.IntEnumType():
+            # an enumeration crosses as the integer it is represented by: a
+            # typed member value (the boundary's own form) or a Python member
+            if isinstance(value, sval.IntEnumValue):
+                raw = type.value_of(value.index)
+            elif sval.is_int_enum_member(value):
+                raw = value.value
+            else:
+                raise SpyError(f'cannot use {value!r} as a {type} value')
+            _scalar_ctype(type, cache).from_address(address).value = raw
         case _:
             pointer = isinstance(type, sval.PointerType) or type.classify() == SpecialTypeKind.DST
             if pointer:
@@ -432,21 +463,24 @@ def _write_pointer_at(type: Type, position: tuple[int, ...], owner: Any, offset:
     ctypes.c_void_p.from_address(_address(owner, offset)).value = value
 
 
-def _read_field(instance: _StructInstanceData, type: StructType, index: int, cache: MirLowerCache) -> Any:
+def _read_field(instance: _StructInstanceData, type: StructType, index: int, context: CompileContext) -> Any:
     field = type.fields().get_by_id(index)
     if field.type.is_zst():
         return None
-    return _read(field.type, instance._owner, instance._offset + _field_offset(type, index, cache), cache)
+    cache = context.mir_cache()
+    return _read(field.type, instance._owner, instance._offset + _field_offset(type, index, cache), context)
 
 
-def _write_field(instance: _StructInstanceData, type: StructType, index: int, value: Any, cache: MirLowerCache) -> None:
+def _write_field(instance: _StructInstanceData, type: StructType, index: int, value: Any, context: CompileContext) -> None:
     field = type.fields().get_by_id(index)
     if field.type.is_zst():
         return
-    _write(field.type, value, instance._owner, instance._offset + _field_offset(type, index, cache), cache)
+    cache = context.mir_cache()
+    _write(field.type, value, instance._owner, instance._offset + _field_offset(type, index, cache), context)
 
 
-def _write_option(type: sval.OptionType, value: Any, owner: Any, offset: int, cache: MirLowerCache) -> None:
+def _write_option(type: sval.OptionType, value: Any, owner: Any, offset: int, context: CompileContext) -> None:
+    cache = context.mir_cache()
     shape, position = _option_shape(type, cache)
     value = _py(value)
     if shape == 'void':
@@ -456,12 +490,12 @@ def _write_option(type: sval.OptionType, value: Any, owner: Any, offset: int, ca
         if value is None:
             _write_pointer_at(type.child, position, owner, offset, cache, None)
             return
-        _write(type.child, value, owner, offset, cache)
+        _write(type.child, value, owner, offset, context)
         return
     child_offset = _option_value_offset(type, cache)
     ctypes.c_bool.from_address(_address(owner, offset)).value = value is not None
     if value is not None:
-        _write(type.child, value, owner, offset + child_offset, cache)
+        _write(type.child, value, owner, offset + child_offset, context)
 
 
 def _payload_offset(type: sval.TaggedUnionType, cache: MirLowerCache) -> int:
@@ -471,23 +505,25 @@ def _payload_offset(type: sval.TaggedUnionType, cache: MirLowerCache) -> int:
     return cast(int, getattr(to_ctype(mir_type), name).offset)
 
 
-def _read_tagged_union(type: sval.TaggedUnionType, owner: Any, offset: int, cache: MirLowerCache) -> Any:
+def _read_tagged_union(type: sval.TaggedUnionType, owner: Any, offset: int, context: CompileContext) -> Any:
+    cache = context.mir_cache()
     shape = sval.tagged_union_shape(type, cache)
     if shape == 'single':
-        return _read(type.types[0], owner, offset, cache)
+        return _read(type.types[0], owner, offset, context)
     tag_mir = type.tag_type().to_mir_type(cache)
     assert isinstance(tag_mir, mir.IntType)
     tag = to_ctype(tag_mir).from_address(_address(owner, offset)).value
     if shape == 'tag_only':
         return None
     variant = type.types[tag]
-    return _read(variant, owner, offset + _payload_offset(type, cache), cache)
+    return _read(variant, owner, offset + _payload_offset(type, cache), context)
 
 
-def _write_tagged_union(type: sval.TaggedUnionType, value: Any, owner: Any, offset: int, cache: MirLowerCache) -> None:
+def _write_tagged_union(type: sval.TaggedUnionType, value: Any, owner: Any, offset: int, context: CompileContext) -> None:
+    cache = context.mir_cache()
     shape = sval.tagged_union_shape(type, cache)
     if shape == 'single':
-        _write(type.types[0], value, owner, offset, cache)
+        _write(type.types[0], value, owner, offset, context)
         return
     if isinstance(value, _StructInstance):
         variant_type: Type = value._data.type
@@ -500,7 +536,7 @@ def _write_tagged_union(type: sval.TaggedUnionType, value: Any, owner: Any, offs
     assert isinstance(tag_mir, mir.IntType)
     to_ctype(tag_mir).from_address(_address(owner, offset)).value = index
     if shape == 'tag_payload':
-        _write(type.types[index], value, owner, offset + _payload_offset(type, cache), cache)
+        _write(type.types[index], value, owner, offset + _payload_offset(type, cache), context)
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +649,7 @@ def invoke(
                 marshal(targ.content, value)
                 return
             return
-        argument, buffer = _marshal_arg(targ.type, value, targ.is_ref, cache)
+        argument, buffer = _marshal_arg(targ.type, value, targ.is_ref, context)
         py_args.append(argument)
         if buffer is not None:
             temps.append(buffer)
@@ -644,24 +680,25 @@ def invoke(
     return _read_result(instance, buffers, context)
 
 
-def _marshal_arg(type: Type, value: Any, is_ref: bool, cache: MirLowerCache) -> tuple[Any, Any]:
+def _marshal_arg(type: Type, value: Any, is_ref: bool, context: CompileContext) -> tuple[Any, Any]:
     """The native argument and (when the argument has to stay alive until the
     call) the buffer that holds it.  A pointer-like value (a pointer, or a
     dynamically-sized function value) crosses as the address it carries; an
     aggregate the thunk takes by pointer (``is_ref``) crosses as the address of
     a buffer holding it; anything else crosses by value."""
+    cache = context.mir_cache()
     if isinstance(type, sval.PointerType) or type.classify() == SpecialTypeKind.DST:
         return ctypes.c_void_p(_as_address(value)), None
     if is_ref:
         mir_type = type.to_mir_type(cache)
         assert mir_type is not None, f'{type} has no runtime representation'
         buffer = to_ctype(mir_type)()
-        _write(type, value, buffer, 0, cache)
+        _write(type, value, buffer, 0, context)
         return ctypes.c_void_p(ctypes.addressof(buffer)), buffer
     # a scalar crosses by value: build it in a temporary buffer and read it out
     ctype = _scalar_ctype(type, cache)
     buffer = ctype()
-    _write(type, value, buffer, 0, cache)
+    _write(type, value, buffer, 0, context)
     return buffer.value, None
 
 
@@ -676,7 +713,6 @@ def _read_result(
 ) -> Any:
     """Turn the out pointers of a finished call back into Python values,
     raising the spy exception the error code names."""
-    cache = context.mir_cache()
     ret_sig = instance.ret_sig
     assert ret_sig is not None
     value_spec = ret_sig.ret_type_spec
@@ -692,7 +728,7 @@ def _read_result(
                     return None
                 buffer = buffers[consumed]
                 consumed += 1
-                return _read(spec.type, buffer, 0, cache)
+                return _read(spec.type, buffer, 0, context)
             case RetTuple():
                 return tuple(read(value) for value in spec.values)
 
@@ -707,14 +743,14 @@ def _read_result(
         code_type = result_type.code_type
         code = 0
         if code_type.get_unit_value() is None:
-            code = _read(code_type, buffers[consumed], 0, cache)
+            code = _read(code_type, buffers[consumed], 0, context)
             consumed += 1
         if _value_is_empty(value_spec):
             index = code
         else:
             index = code - 1
         if index >= 0 and index < len(exceptions):
-            payload = _read_error_payload(exceptions[index], buffers[consumed], cache)
+            payload = _read_error_payload(exceptions[index], buffers[consumed], context)
             raise payload
     return value
 
@@ -723,9 +759,9 @@ def _value_is_empty(spec: RetSpec | None) -> bool:
     return isinstance(spec, RetValue) and isinstance(spec.type, sval.EmptyType)
 
 
-def _read_error_payload(exception: Type, buffer: Any, cache: MirLowerCache) -> _ExceptionInstance:
+def _read_error_payload(exception: Type, buffer: Any, context: CompileContext) -> _ExceptionInstance:
     assert isinstance(exception, StructType), 'an exception is a spy struct'
-    return _ExceptionInstance(exception, buffer, 0, cache)
+    return _ExceptionInstance(exception, buffer, 0, context)
 
 
 # ---------------------------------------------------------------------------
@@ -784,11 +820,11 @@ def construct(
     provided field values) or ``Foo[...](...)`` (``generic_args`` are the
     explicit ones)."""
     cache = context.mir_cache()
-    type = _resolve_struct(head, generic_args, args, kwargs)
+    type = _resolve_struct(head, generic_args, args, kwargs, context)
     mir_type = type.get_mir_type(cache)
     if mir_type is None:
         # a zero-sized struct has no storage
-        return _StructInstance(type, 0, 0, cache)
+        return _StructInstance(type, 0, 0, context)
     buffer = to_ctype(mir_type)()
 
     fields = type.fields()
@@ -812,14 +848,14 @@ def construct(
             continue
         offset = _field_offset(type, index, cache)
         if index in provided:
-            _write(field.type, boundary_arg(provided[index], context), buffer, offset, cache)
+            _write(field.type, boundary_arg(provided[index], context), buffer, offset, context)
         elif field.default is not None:
-            _write(field.type, field.default, buffer, offset, cache)
+            _write(field.type, field.default, buffer, offset, context)
         else:
             raise TypeError(
                 f'missing a value for field {field.name!r} of {head.name_base}'
             )
-    return _StructInstance(type, buffer, 0, cache)
+    return _StructInstance(type, buffer, 0, context)
 
 
 def _resolve_struct(
@@ -827,6 +863,7 @@ def _resolve_struct(
     generic_args: tuple[Any, ...] | None,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
+    context: CompileContext,
 ) -> StructType:
     """The struct specialization a Python construction builds: the explicit
     arguments, the head's only specialization when it is not generic, or the
@@ -847,7 +884,9 @@ def _resolve_struct(
     for index, value in provided.items():
         if index < 0 or index >= len(fields.by_id):
             continue
-        value_type = arg_spy_type(value)
+        # the value is normalized in the context first, so that a Python enum
+        # member (which has no spy type of its own) is typed as its enumeration
+        value_type = arg_spy_type(boundary_arg(value, context))
         if value_type is not None:
             solver.add_constraint(value_type, fields.get_by_id(index).type, True)
     solver.finish()

@@ -23,9 +23,9 @@ import typing
 from abc import abstractmethod
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from enum import IntEnum, auto
+from enum import Enum, IntEnum, auto
 from types import NoneType
-from typing import Any, Literal, override
+from typing import Any, Literal, TypeGuard, cast, override
 
 from . import mir, syntax
 from .errors import CompileError
@@ -1419,6 +1419,131 @@ class Int(Value):
 
     def __str__(self) -> str:
         return str(self.value) + str(self.type)
+
+
+class IntEnumType(Type, IdentityObj):
+    """A spy integer enumeration: the type an ``enum.Enum`` class with integer
+    member values declares.  It is *not* an integer - it never takes part in
+    arithmetic, implicit conversion or comparison with an ``int`` - and its
+    runtime representation is the smallest integer type that holds every member
+    value (unsigned when all the values are non-negative, signed otherwise).
+
+    Like a struct type it is compared by identity, so a Python enum class has
+    exactly one ``IntEnumType`` in each host context (see
+    ``CompileContext.int_enum_type``); the reverse mapping back to the class is
+    ``CompileContext.enum_class_of``.  ``members`` holds the members in
+    declaration order, as ``name -> (name, value)``."""
+
+    def __init__(self, name: str, members: IndexedMap[str, tuple[str, int]]) -> None:
+        self.name = name
+        self.members = members
+        values = [value for _, value in members.by_id]
+        # the smallest integer type that holds every member value: unsigned for
+        # non-negative values, signed as soon as one is negative (see
+        # ``min_int_type``, which always reserves at least one bit)
+        self.int_type = IntType(1, False) if len(values) == 0 else min_int_type(min(values), max(values))
+        # the methods of the enum class body, by name (see
+        # ``dsl._Context._collect_enum_methods``): a struct-like set, except an
+        # enum method's ``self`` is the value itself
+        self.methods: dict[str, Any] = {}
+        # the methods declared ``@staticmethod`` (they take no receiver)
+        self.static_methods: set[str] = set()
+
+    def get_method(self, name: str) -> Any | None:
+        """The method ``name`` of this enumeration, or ``None`` for any other
+        name."""
+        return self.methods.get(name)
+
+    def is_static_method(self, name: str) -> bool:
+        """Whether the method ``name`` is a ``@staticmethod`` (it takes no
+        receiver, so a call does not pass one)."""
+        return name in self.static_methods
+
+    def value_of(self, index: int) -> int:
+        """The integer value of the member at ``index``."""
+        return self.members.by_id[index][1]
+
+    def index_of(self, name: str) -> int | None:
+        """The index of the member named ``name``, or ``None`` for any other
+        name."""
+        return self.members.by_key.get(name)
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.NONE
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return mir.IntType(self.int_type.bits, self.int_type.signed)
+
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        # an enumeration is a subtype of itself only: it is not a subtype of an
+        # integer, and two different enumerations are unrelated
+        return self is other
+
+    def __repr__(self) -> str:
+        return f'<spy enum {self}>'
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True, slots=True)
+class IntEnumValue(Value):
+    """One member of an :class:`IntEnumType`: the type and the *index* of the
+    member in its declaration order (the integer value is read from the type,
+    see ``IntEnumType.value_of``)."""
+
+    type: IntEnumType
+    index: int
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def __str__(self) -> str:
+        return f'{self.type}.{self.type.members.by_id[self.index][0]}'
+
+
+_INT_ENUM_BASE = Enum
+"""The Python base class a spy enumeration inherits: ``enum.Enum``.  ``str``
+(and any non-integer) member values are rejected when the type is built (see
+``int_enum_type``)."""
+
+
+def is_int_enum_class(value: Any) -> TypeGuard[type]:
+    """Whether ``value`` is the class of a spy enumeration (a subclass of
+    ``enum.Enum``)."""
+    return isinstance(value, type) and issubclass(value, _INT_ENUM_BASE)
+
+
+def is_int_enum_member(value: Any) -> TypeGuard[Enum]:
+    """Whether ``value`` is a member of a spy enumeration."""
+    return isinstance(value, _INT_ENUM_BASE)
+
+
+def int_enum_type(name: str, cls: type) -> IntEnumType:
+    """The :class:`IntEnumType` the ``enum.Enum`` class ``cls`` declares: its
+    members in declaration order, each with an integer value (aliases are
+    skipped, as Python does)."""
+    members: IndexedMap[str, tuple[str, int]] = IndexedMap()
+    # iterating an ``Enum`` class yields its canonical members, in declaration
+    # order (aliases are skipped, as Python does); the checker does not know
+    # ``type`` is iterable here
+    for member in cast(Any, cls):
+        value = member.value
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise CompileError(
+                f'the enum {name} member {member.name!r} must have an integer '
+                f'value, got {value!r}'
+            )
+        members.add(member.name, (member.name, value))
+    return IntEnumType(name, members)
 
 @dataclass(frozen=True)
 class FloatType(Type):
@@ -2884,6 +3009,17 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
     ``dsl._Context.resolve_global``).  The resolver is required: an object
     only the host knows cannot be converted without one, and converting it in
     the wrong context would break the isolation between contexts."""
+    if isinstance(value, IntEnumValue):
+        return value
+    if isinstance(value, _INT_ENUM_BASE) or is_int_enum_class(value):
+        # a spy enumeration: one of its members (the typed member value) or the
+        # class itself (the ``IntEnumType``).  The host resolves both, so that
+        # the object is resolved in the resolving context (see
+        # ``CompileContext.resolve_global``)
+        resolved_enum = ctx.resolve_global(value)
+        if resolved_enum is None:
+            raise CompileError(f'cannot resolve the enum {value!r} to a spy value')
+        return resolved_enum
     if isinstance(value, (Value, int, float, bytes, bool, complex)):
         return value
     if isinstance(value, str) or value is str:
@@ -3495,6 +3631,20 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             if isinstance(value, (Void, Null)):
                 return Void()
             raise CompileError(f"cannot use {value!r} as a void constant")
+        case IntEnumType():
+            # a value of the enumeration is one of its members: a typed member
+            # value of this very enumeration, or one of its Python members (a
+            # plain integer is never accepted - an enumeration is not an integer)
+            if isinstance(value, IntEnumValue):
+                if value.type is not type:
+                    raise CompileError(f"cannot use {value!r} as a constant of {type}")
+                return value
+            if isinstance(value, _INT_ENUM_BASE):
+                index = type.index_of(value.name)
+                if index is None or type.value_of(index) != value.value:
+                    raise CompileError(f"cannot use {value!r} as a constant of {type}")
+                return IntEnumValue(type, index)
+            raise CompileError(f"cannot use {value!r} as a constant of {type}")
         case _ if type.classify() == SpecialTypeKind.DST:
             # a dynamically-sized type has no value of its own to build one from
             raise CompileError(
@@ -3517,6 +3667,14 @@ class CompileContext:
         Python functions it inlines; any other object is not a spy value
         of this host and returns ``None`` (the object stays a plain
         compile-time Python value)."""
+        ...
+
+    @abstractmethod
+    def enum_class_of(self, type: IntEnumType) -> type:
+        """The Python ``enum.Enum`` class the host's ``IntEnumType`` ``type``
+        was built from, so that a value read back at the Python boundary can be
+        delivered as its member (the reverse of the resolution
+        ``resolve_global`` performs for an enum class)."""
         ...
 
     def target_info(self) -> TargetInfo:

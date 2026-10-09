@@ -948,6 +948,12 @@ def _sval_to_runtime(value: sval.AnyValue, cache: sval.MirLowerCache) -> mir.Val
             return mir.BoolValue(value)
         case sval.Int():
             return mir.Int(value.value, mir.IntType(value.type.bits, value.type.signed))
+        case sval.IntEnumValue():
+            # an enumeration member: the integer is read off its type, and the
+            # MIR type is the smallest integer type the whole enumeration needs
+            enum_type = value.type
+            int_type = enum_type.int_type
+            return mir.Int(enum_type.value_of(value.index), mir.IntType(int_type.bits, int_type.signed))
         case sval.Float():
             return mir.Float(value.value, mir.FloatType(value.type.bits))
         case sval.DeclareFunction():
@@ -1080,6 +1086,19 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
             return sval.PointerType(sval.StrDictType(frozendict(name_types)), is_const=False)
         case _:
             return None
+
+def _enum_member_index(enum_type: sval.IntEnumType, value: sval.AnyValue) -> int:
+    """The index of the member of ``enum_type`` the compile-time value ``value``
+    denotes: a typed :class:`sval.IntEnumValue` of it, or one of its Python
+    members.  Raises when the value is not one of its members."""
+    if isinstance(value, sval.IntEnumValue):
+        return value.index
+    if sval.is_int_enum_member(value):
+        index = enum_type.index_of(value.name)
+        if index is not None and enum_type.value_of(index) == value.value:
+            return index
+    raise CompileError(f'{value!r} is not a member of {enum_type}')
+
 
 def _comptime_int(ev: InterpVal) -> int | None:
     """The Python integer a compile-time integer value denotes, or None when
@@ -1508,6 +1527,13 @@ def _convert_inst(
     the other - see ``sval.PointerType.is_subtype_of``)."""
     if from_type == to_type:
         return None
+    if isinstance(from_type, sval.IntEnumType) or isinstance(to_type, sval.IntEnumType):
+        # an enumeration is not an integer: it converts to neither an integer nor
+        # another enumeration (only a value of the very same enumeration is one)
+        raise CoerceError(
+            f'cannot convert a {from_type} value to {to_type}: an enumeration is '
+            f'not an integer'
+        )
     if isinstance(from_type, sval.UnionType) and isinstance(to_type, sval.UnionType):
         # a union value cannot be converted: its storage has to be
         # reinterpreted through a pointer instead (see ``_convert_result_ptr``),
@@ -5667,6 +5693,9 @@ class HirRunner:
         if isinstance(lhs_type, sval.StructType) or isinstance(rhs_type, sval.StructType):
             return self._cmp_overload(op, lhs, rhs, lhs_type, rhs_type, ret_reg)
 
+        if isinstance(lhs_type, sval.IntEnumType) or isinstance(rhs_type, sval.IntEnumType):
+            return self._eval_enum_cmp(op, lhs, rhs, lhs_type, rhs_type, ret_reg)
+
         if _is_comptime_val(lhs.value) and _is_comptime_val(rhs.value):
             lv = self._arg_value(lhs)
             rv = self._arg_value(rhs)
@@ -5690,6 +5719,40 @@ class HirRunner:
             self._frames[-1].regs[ret_reg] = RuntimeVal(value, sval.BoolType())
             return PollResult.AGAIN
         raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
+
+    def _eval_enum_cmp(self, op: CompareOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret_reg: hir.Inst) -> PollResult:
+        """``a == b`` / ``a != b`` of two values of the *same* integer
+        enumeration.  An enumeration is not an integer: it is only ever compared
+        to its own type (another enumeration or an ``int`` is rejected), and only
+        for equality (it has no order)."""
+        if not (
+            isinstance(lhs_type, sval.IntEnumType)
+            and isinstance(rhs_type, sval.IntEnumType)
+            and lhs_type is rhs_type
+        ):
+            raise CompileError(f'cannot compare {lhs_type} and {rhs_type}')
+        if op not in ('==', '!='):
+            raise CompileError(
+                f"unsupported comparison '{op}' for the enumeration {lhs_type}"
+            )
+        lv = self._arg_value(lhs)
+        rv = self._arg_value(rhs)
+        if _is_comptime_val(lv) and _is_comptime_val(rv):
+            # both compile-time: the two members are compared by their index in
+            # the enumeration (the value is read off the type)
+            lo = _to_comptime(lv)
+            ro = _to_comptime(rv)
+            assert lo is not None and ro is not None
+            equal = _enum_member_index(lhs_type, lo) == _enum_member_index(lhs_type, ro)
+            self._frames[-1].regs[ret_reg] = ComptimeVal(equal if op == '==' else not equal)
+            return PollResult.AGAIN
+        lc = self._coerce(lv, lhs_type)
+        rc = self._coerce(rv, lhs_type)
+        value = self._emit(
+            mir.Cmp(op, self._to_runtime(lc), self._to_runtime(rc))
+        )
+        self._frames[-1].regs[ret_reg] = RuntimeVal(value, sval.BoolType())
+        return PollResult.AGAIN
 
     def _cmp_overload(self, op: CompareOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret_reg: hir.Inst) -> PollResult:
         """A comparison with a struct operand: the left operand's magic method,
@@ -8405,10 +8468,21 @@ class HirRunner:
             return resolved
         return sval.BoundMethod(resolved, generic_var_values)
 
+    def _enum_method_of(self, enum_type: sval.IntEnumType, method_name: str) -> sval.AnyValue | None:
+        """The value of the method ``method_name`` of the enumeration
+        ``enum_type``: its function value (resolved through the host context).
+        An enumeration has no type arguments, so there is nothing to bind."""
+        method = enum_type.get_method(method_name)
+        if method is None or isinstance(method, sval.Value):
+            return method
+        return self._analyser._resolver.resolve_global(method)
+
     def _resolve_method(self, type: sval.Type, method_name: str) -> sval.AnyValue | None:
         match type:
             case sval.StructType():
                 return self._method_of(type, method_name)
+            case sval.IntEnumType():
+                return self._enum_method_of(type, method_name)
             case _:
                 return None
 
@@ -8454,6 +8528,11 @@ class HirRunner:
             if method is None:
                 raise CompileError(f'{obj} has no method named {method_name}')
             return self.call(ComptimeVal(sval.ConstRef(method)), args, ret, on_return)
+        if isinstance(obj, sval.IntEnumType):
+            method = self._enum_method_of(obj, method_name)
+            if method is None:
+                raise CompileError(f'{obj} has no method named {method_name}')
+            return self.call(ComptimeVal(sval.ConstRef(method)), args, ret, on_return)
         if isinstance(obj, sval.StructTypeHead):
             raise CompileError(
                 f'{obj} is a struct template: specialize it before calling its '
@@ -8492,7 +8571,7 @@ class HirRunner:
 
         # a ``@staticmethod`` takes no receiver: it is called with the given
         # arguments alone
-        if isinstance(struct_type, sval.StructType) and struct_type.is_static_method(method_name):
+        if isinstance(struct_type, (sval.StructType, sval.IntEnumType)) and struct_type.is_static_method(method_name):
             return self.call(ComptimeVal(sval.ConstRef(method)), args, ret, on_return)
 
         # a method's first parameter is the struct itself: it is passed by

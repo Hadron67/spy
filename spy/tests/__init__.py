@@ -30,6 +30,7 @@ from .comptime_ptrs import all_tests as comptime_ptrs_tests
 from .comptime_structs import all_tests as comptime_structs_tests
 from .cross_context import all_tests as cross_context_tests
 from .defer import all_tests as defer_tests
+from .enums import all_tests as enums_tests
 from .errors import all_tests as errors_tests
 from .func_types import all_tests as func_types_tests
 from .generics import all_tests as generics_tests
@@ -81,6 +82,7 @@ all_tests: list[type[TestCase]] = [
     *closures_tests,
     *coerce_tests,
     *defer_tests,
+    *enums_tests,
     *func_types_tests,
     *reflect_tests,
     *operators_tests,
