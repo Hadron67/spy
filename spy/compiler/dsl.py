@@ -128,11 +128,13 @@ def builtin_func[T](fn: T) -> T:
 
 @dataclass(frozen=True)
 class FnMetadata:
-    # self by value: ``None`` (the default) leaves the choice to the context -
-    # ``False`` for every function and struct method, ``True`` for an enum
-    # method (see ``_RegisteredFn.get_entry``); an explicit ``@func(sfv=...)``
+    # how a method receives its ``self``: ``"const ptr"``/``"ptr"`` pass it by a
+    # const/mutable pointer (the receiver's address), ``"value"`` by value, and
+    # ``None`` (the default) leaves the choice to the context - an enum method
+    # takes ``"value"``, a struct method ``"ptr"`` (see
+    # ``_RegisteredFn.get_entry``); an explicit ``@func(self_arg=...)``
     # overrides it
-    sfv: bool | None
+    self_arg: Literal["const ptr", "ptr", "value"] | None
     extern: bool
     linkname: str | None
     # an undecorated struct method: it is inlined at its call sites like a
@@ -167,8 +169,8 @@ class StructMetadata:
 
 
 # the metadata of an undecorated method (see ``_RegisteredClass.get_entry``);
-# ``sfv=None`` takes the context default (by value for an enum method)
-_INLINE_META = FnMetadata(sfv=None, extern=False, linkname=None, inline=True)
+# ``self_arg=None`` takes the context default (by value for an enum method)
+_INLINE_META = FnMetadata(self_arg=None, extern=False, linkname=None, inline=True)
 
 
 def _normalize_exceptions(
@@ -250,14 +252,14 @@ class _RegisteredFn:
 
     def get_entry(self):
         if self.entry is None:
-            self_by_value = self.meta.sfv
-            if self_by_value is None:
+            self_arg: Literal["const ptr", "ptr", "value"] | None = self.meta.self_arg
+            if self_arg is None:
                 # the context default: a struct method's ``self`` is a pointer to
                 # the object, an enum method's is the value itself
-                self_by_value = isinstance(self.cls, sval.IntEnumType)
+                self_arg = "value" if isinstance(self.cls, sval.IntEnumType) else "ptr"
             hir = astgen.parse_function(
                 self.fn, self.context, self.cls,
-                self_by_value, self.context_type_vars, self.meta.exceptions,
+                self_arg, self.context_type_vars, self.meta.exceptions,
                 self.meta.callconv, self.meta.may_panic,
             )
             self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
@@ -812,9 +814,9 @@ class _Context(CompileContext):
         sym = analyser.finish()
         sym.compile(self._symbol_table, self.backend, self.target_info())
 
-    def func(self, sfv: bool | None = None, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = True):
+    def func(self, self_arg: Literal["const ptr", "ptr", "value"] | None = None, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = True):
         meta = FnMetadata(
-            sfv=sfv, extern=extern, linkname=linkname,
+            self_arg=self_arg, extern=extern, linkname=linkname,
             exceptions=_normalize_exceptions(exceptions),
             callconv=callconv, may_panic=may_panic,
         )

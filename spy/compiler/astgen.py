@@ -2077,7 +2077,7 @@ def parse_function(
     fn: Callable,
     resolver: CompileContext,
     self_type: Type | None = None,
-    self_by_value: bool = False,
+    self_arg: Literal["const ptr", "ptr", "value"] = "ptr",
     context_type_vars: dict[TypeVar, Value] | None = None,
     exceptions: tuple[Any, ...] | Literal["infer"] | None = None,
     callconv: str = 'default',
@@ -2085,9 +2085,10 @@ def parse_function(
 ) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
-    ``self_type`` is the struct a *method* belongs to: the first parameter
-    is then typed as that struct itself and passed by reference (its
-    address), unless ``self_by_value`` asks for the object's value.
+    ``self_type`` is the struct a *method* belongs to: the first parameter is
+    then typed from ``self_arg`` - ``"ptr"``/``"const ptr"`` make it a
+    mutable/const pointer to the struct itself, passed by reference (its
+    address), and ``"value"`` passes the object's value itself.
 
     ``context_type_vars`` are the type parameters of an enclosing context a
     method may name in its annotations and its body - the generic type
@@ -2263,17 +2264,20 @@ def parse_function(
             annotated = inner[0]
         arg_type = annotation_of(annotated)
         if i == 0 and self_type is not None:
-            # the ``self`` of a method: its declared type is a pointer to the
-            # struct itself (``self_by_value`` passes the object's value
-            # instead); the HIR reads the receiver through it (see
-            # ``FunctionIR.arg_is_ref`` and ``interp``)
-            arg_type = self_type if self_by_value else PointerType(self_type)
+            # the ``self`` of a method: ``"ptr"``/``"const ptr"`` type it as a
+            # mutable/const pointer to the struct itself (the HIR reads the
+            # receiver through it, see ``FunctionIR.arg_is_ref`` and ``interp``),
+            # ``"value"`` passes the object's value instead
+            if self_arg == "value":
+                arg_type = self_type
+            else:
+                arg_type = PointerType(self_type, is_const=self_arg == "const ptr")
         positional.add(
             arg.arg, SignatureFormalArg(arg_type, is_comptime, default_value, TriState.UNKNOWN, is_type_value)
         )
         # a method's ``self`` is bound directly to its argument (the receiver's
         # address); every other parameter is passed as the signature says
-        arg_is_ref.append(i == 0 and self_type is not None and not self_by_value)
+        arg_is_ref.append(i == 0 and self_type is not None and self_arg != "value")
 
     # ``*args``/``**kwargs``: the excess positional/keyword arguments a call
     # passes are bound to them (see ``Signature.bind_arg_pos``).  The formal

@@ -43,8 +43,12 @@ class TriState(Enum):
     def unknown() -> TriState:
         return TriState.UNKNOWN
 
-    @func(sfv=False)
+    @func(self_arg="ptr")
     def is_true_by_ref(self) -> spy_bool:
+        return self == TriState.TRUE
+
+    @func(self_arg="const ptr")
+    def is_true_by_const_ref(self) -> spy_bool:
         return self == TriState.TRUE
 
 
@@ -149,8 +153,13 @@ def tri_state_static() -> TriState:
 
 
 @func()
-def tri_state_sfv_ref(a: TriState) -> spy_bool:
+def tri_state_self_arg_ref(a: TriState) -> spy_bool:
     return a.is_true_by_ref()
+
+
+@func()
+def tri_state_self_arg_const_ref(a: TriState) -> spy_bool:
+    return a.is_true_by_const_ref()
 
 
 @struct()
@@ -297,15 +306,27 @@ class SpyEnumTest(TestCase):
         first = handle.get_entry().hir.signature.positional.by_id[0]
         self.assertIs(first.type, enum_type)
 
-    def test_an_explicit_sfv_false_passes_self_by_reference(self) -> None:
+    def test_an_explicit_self_arg_ptr_passes_self_by_reference(self) -> None:
         enum_type = self.enum_type(TriState)
         handle = enum_type.get_method('is_true_by_ref')
         assert handle is not None
         first = handle.get_entry().hir.signature.positional.by_id[0]
         self.assertIsInstance(first.type, sval.PointerType)
+        self.assertFalse(first.type.is_const)
         self.assertIs(first.type.elem, enum_type)
-        self.assertTrue(tri_state_sfv_ref(TriState.TRUE))
-        self.assertFalse(tri_state_sfv_ref(TriState.FALSE))
+        self.assertTrue(tri_state_self_arg_ref(TriState.TRUE))
+        self.assertFalse(tri_state_self_arg_ref(TriState.FALSE))
+
+    def test_an_explicit_self_arg_const_ptr_passes_self_by_const_reference(self) -> None:
+        enum_type = self.enum_type(TriState)
+        handle = enum_type.get_method('is_true_by_const_ref')
+        assert handle is not None
+        first = handle.get_entry().hir.signature.positional.by_id[0]
+        self.assertIsInstance(first.type, sval.PointerType)
+        self.assertTrue(first.type.is_const)
+        self.assertIs(first.type.elem, enum_type)
+        self.assertTrue(tri_state_self_arg_const_ref(TriState.TRUE))
+        self.assertFalse(tri_state_self_arg_const_ref(TriState.FALSE))
 
     def test_the_representation_is_the_smallest_integer_type(self) -> None:
         tri_state_mir = self.enum_type(TriState).to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache)
