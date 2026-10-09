@@ -25,7 +25,7 @@ def spy_as[T](value: T, type: type[T]) -> T:
     return cast(T, coerce_const(cast(Any, value), type))
 
 
-def spy_compile_log(*args: Any) -> None:
+def spy_compile_log(*args: Any, **kwargs: Any) -> None:
     raise SpyError(
         'spy.compile_log may only be called from inside a spy function, '
         'where it prints at compile time'

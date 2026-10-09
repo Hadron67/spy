@@ -75,12 +75,40 @@ from .interp import Analyser
 from .lower import LLVMBackend
 from .sval import CompileContext, MirLowerCache, StructDecl
 from .target import TargetInfo
-from .util import FrozenArraySet, frozendict
+from .util import FrozenArraySet, IndexedMap, frozendict
+
+
+def _builtin_signature(fn: Callable[..., Any]) -> sval.BuiltinSignature:
+    """The :class:`sval.BuiltinSignature` of a builtin Python function, read
+    off its ``def``: the positional parameters in declaration order (each as
+    ``(name, default_value)``, or ``None`` for one with no default), whether it
+    takes ``*args`` and whether it takes ``**kwargs``.  A keyword-only
+    parameter is unsupported."""
+    positional: IndexedMap[str, tuple[str, AnyValue | None]] = IndexedMap()
+    varargs = False
+    kwargs = False
+    for name, param in inspect.signature(fn).parameters.items():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            varargs = True
+        elif param.kind == inspect.Parameter.VAR_KEYWORD:
+            kwargs = True
+        elif param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            default = None if param.default is inspect.Parameter.empty else param.default
+            positional.add(name, (name, default))
+        else:
+            raise CompileError(
+                f"the builtin {fn.__name__} may not take a keyword-only parameter"
+            )
+    return sval.BuiltinSignature(positional, varargs, kwargs)
+
 
 # the ``spy.*`` builtins, by the name the interpreter knows them by
-_BUILTINS: dict[Any, str] = {
-    spy_compile_log: 'compile_log',
-    spy_as: 'as',
+_BUILTINS: dict[Any, sval.BuiltinFn] = {
+    spy_compile_log: sval.BuiltinFn('compile_log', _builtin_signature(spy_compile_log)),
+    spy_as: sval.BuiltinFn('as', _builtin_signature(spy_as)),
 }
 
 
@@ -91,8 +119,10 @@ def builtin_func[T](fn: T) -> T:
     ``interp._call_builtin``).  Unlike the ``spy.*`` builtins of
     :mod:`spy.compiler.builtins`, which the host recognizes by object identity,
     a ``@builtin_func`` builtin lives in a ``std`` module and is dispatched on
-    its own ``__name__``."""
-    return cast(T, sval.BuiltinFn(cast(Any, fn).__name__))
+    its own ``__name__``.  The builtin's ``def`` is also read into a
+    :class:`sval.BuiltinSignature` (see ``_builtin_signature``), which the
+    interpreter binds every call's arguments with before evaluating it."""
+    return cast(T, sval.BuiltinFn(cast(Any, fn).__name__, _builtin_signature(cast(Any, fn))))
 
 
 @dataclass(frozen=True)
@@ -644,7 +674,7 @@ class _Context(CompileContext):
             case pytypes.FunctionType():
                 builtin = _BUILTINS.get(value)
                 if builtin is not None:
-                    return sval.BuiltinFn(builtin)
+                    return builtin
                 # an undecorated plain Python function: it is inlined where
                 # it is called (it contributes no native specialization)
                 entry = self._inline_cache.get(value)

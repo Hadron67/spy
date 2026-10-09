@@ -5903,10 +5903,15 @@ class HirRunner:
         self, fn: sval.BuiltinFn, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
         """Evaluate one ``spy.*`` builtin at compile time and hand its
-        result to the call's result location."""
+        result to the call's result location.  The arguments are first bound
+        to the builtin's signature (see ``sval.BuiltinSignature.bind``), so
+        every handler below reads a normalized ``ArgList``: exactly one entry
+        per declared positional parameter (defaults filled in), the excess
+        positionals in ``varargs`` and the trailing keywords in ``kwargs``."""
+        binded = fn.signature.bind(args, lambda e: ArgEntry(ComptimeVal(e), False))
         if fn.name == 'compile_log':
             parts: list[str] = []
-            for arg in args.positional:
+            for arg in binded.varargs:
                 ev = self._arg_value(arg)
                 obj = _to_comptime(ev)
                 if obj is None:
@@ -5917,7 +5922,7 @@ class HirRunner:
                     parts.append(obj.decode(errors='replace'))
                 else:
                     parts.append(str(obj))
-            for arg in args.kwargs.values():
+            for arg in binded.kwargs.values():
                 ev = self._arg_value(arg)
                 obj = _to_comptime(ev)
                 if isinstance(obj, bytes):
@@ -5928,54 +5933,48 @@ class HirRunner:
             self.store(ret, ComptimeVal(sval.Void()))
             return PollResult.AGAIN
         if fn.name == 'type_info':
-            if len(args.positional) != 1 or len(args.kwargs) > 0:
-                raise CompileError('spy.type_info takes exactly one argument')
-            obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[0])))
+            obj = _to_comptime(_shallow_normalize(self._arg_value(binded.positional[0])))
             if not isinstance(obj, sval.Type):
                 raise CompileError(f'spy.type_info takes a type, got {obj!r}')
             self.store(ret, self._build_type_info(obj))
             return PollResult.AGAIN
         if fn.name == 'reify':
-            return self._builtin_reify(args, ret)
+            return self._builtin_reify(binded, ret)
         if fn.name == 'undefined':
             # ``std.core.undefined``: the undefined literal, the value of any
             # type (see ``sval.UndefinedType``); the store into the result
             # location coerces it to that location's type
-            if len(args.positional) != 0 or len(args.kwargs) > 0:
-                raise CompileError('std.core.undefined takes no arguments')
             self.store(ret, ComptimeVal(sval.UntypedUndefined()))
             return PollResult.AGAIN
         if fn.name == 'as_static_ptr':
-            return self._as_static_ptr(args, ret)
+            return self._as_static_ptr(binded, ret)
         if fn.name == 'layout_of':
-            return self._layout_builtin(args, ret)
+            return self._layout_builtin(binded, ret)
         if fn.name == 'panic':
-            return self._builtin_panic(args)
+            return self._builtin_panic(binded)
         if fn.name == 'catch_unwind':
-            return self._builtin_catch_unwind(args, ret)
+            return self._builtin_catch_unwind(binded, ret)
         if fn.name == 'gstr':
-            return self._builtin_gstr(args, ret)
+            return self._builtin_gstr(binded, ret)
         if fn.name == 'sstr':
-            return self._builtin_sstr(args, ret)
+            return self._builtin_sstr(binded, ret)
         if fn.name == 'bitcast':
-            return self._builtin_bitcast(args, ret)
+            return self._builtin_bitcast(binded, ret)
         if fn.name == 'truncate':
-            return self._builtin_truncate(args, ret)
+            return self._builtin_truncate(binded, ret)
         if fn.name == 'coerce':
-            return self._builtin_coerce(args, ret)
+            return self._builtin_coerce(binded, ret)
         if fn.name == 'compile_error':
-            return self._builtin_compile_error(args)
+            return self._builtin_compile_error(binded)
         if fn.name == 'as_runtime_closure':
-            return self._builtin_as_runtime_closure(args, ret)
+            return self._builtin_as_runtime_closure(binded, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 
     # -- ``std.core.gstr`` / ``std.core.sstr`` -------------------------------
 
-    def _bytes_builtin_arg(self, args: RawArgList[ArgEntry[InterpVal]], what: str) -> bytes:
+    def _bytes_builtin_arg(self, args: ArgList[ArgEntry[InterpVal]], what: str) -> bytes:
         """The compile-time ``bytes`` value the one argument of a byte-string
         builtin holds."""
-        if len(args.positional) != 1 or len(args.kwargs) > 0:
-            raise CompileError(f'{what} takes exactly one argument')
         obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[0])))
         if not isinstance(obj, bytes):
             raise CompileError(f'{what} expects a compile-time byte string')
@@ -5999,14 +5998,14 @@ class HirRunner:
             sval.IntType(8, False), is_const=True, variant=sval.PointerVariant.MULTI
         )
 
-    def _builtin_gstr(self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+    def _builtin_gstr(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """``std.core.gstr(s)``: a global static constant holding the bytes of the
         compile-time byte string ``s``, the result a ``ConstMultiPtr[u8]`` to it."""
         data = self._bytes_builtin_arg(args, 'std.core.gstr')
         self.store(ret, RuntimeVal(self._string_global(data), self._string_ptr_type()))
         return PollResult.AGAIN
 
-    def _builtin_sstr(self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+    def _builtin_sstr(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """``std.core.sstr(s)``: the ``ConstSlicePtr[u8]`` of the compile-time byte
         string ``s`` - ``gstr(s)`` and the number of bytes."""
         data = self._bytes_builtin_arg(args, 'std.core.sstr')
@@ -6019,7 +6018,7 @@ class HirRunner:
 
     # -- ``std.core.compile_error`` ------------------------------------------
 
-    def _builtin_compile_error(self, args: RawArgList[ArgEntry[InterpVal]]) -> Never:
+    def _builtin_compile_error(self, args: ArgList[ArgEntry[InterpVal]]) -> Never:
         """``std.core.compile_error(msg)``: abort the compilation with ``msg`` -
         a compile-time byte string (a string literal is encoded to bytes at parse
         time, see ``astgen``) - as the error message."""
@@ -6029,7 +6028,7 @@ class HirRunner:
     # -- ``std.core.bitcast`` ------------------------------------------------
 
     def _builtin_bitcast(
-        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
         """``std.core.bitcast(value, T)``: reinterpret the bits of the scalar
         ``value`` as the scalar type ``T``.  Only booleans, integers and floats
@@ -6042,8 +6041,6 @@ class HirRunner:
         when the two share the LLVM type (a signedness change, or ``bool`` and
         its ``i1``/``u1`` counterpart, whose MIR types differ but whose LLVM
         type is the same ``i1``)."""
-        if len(args.positional) != 2 or len(args.kwargs) > 0:
-            raise CompileError('std.core.bitcast takes exactly two arguments')
         target = self._type_value_arg(
             args.positional[1], 'the type argument of std.core.bitcast'
         )
@@ -6083,14 +6080,12 @@ class HirRunner:
     # -- ``std.int.truncate`` ------------------------------------------------
 
     def _builtin_truncate(
-        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
         """``std.int.truncate(value, T)``: narrow the integer ``value`` to the
         integer type ``T``, which must have the same signedness and fewer bits.
         A compile-time value is truncated in Python and stays compile-time; a
         runtime value is ``mir.Convert('trunc')``."""
-        if len(args.positional) != 2 or len(args.kwargs) > 0:
-            raise CompileError('std.int.truncate takes exactly two arguments')
         target = self._type_value_arg(
             args.positional[1], 'the type argument of std.int.truncate'
         )
@@ -6124,7 +6119,7 @@ class HirRunner:
     # -- ``std.core.coerce`` -------------------------------------------------
 
     def _builtin_coerce(
-        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
         """``std.core.coerce(value, T)``: materialize ``value`` as the spy type
         ``T`` - the same conversion a store into a location of ``T`` performs
@@ -6132,8 +6127,6 @@ class HirRunner:
         stays compile-time; a runtime value gets whatever numeric conversion
         ``T`` needs (widening or narrowing).  The result is written into the
         call's result location, which the store commits to the coerced type."""
-        if len(args.positional) != 2 or len(args.kwargs) > 0:
-            raise CompileError('std.core.coerce takes exactly two arguments')
         ev = self._arg_value(args.positional[0])
         target = self._type_value_arg(
             args.positional[1], 'the type argument of std.core.coerce'
@@ -6160,11 +6153,9 @@ class HirRunner:
         assert isinstance(ret, sval.StructType)
         return ret
 
-    def _builtin_panic(self, args: RawArgList[ArgEntry[InterpVal]]) -> PollResult:
+    def _builtin_panic(self, args: ArgList[ArgEntry[InterpVal]]) -> PollResult:
         """``std.core.panic(data)``: throw a panic carrying ``data`` (see
         ``mir.Panic``).  It never returns, so it ends the current path."""
-        if len(args.positional) != 1 or len(args.kwargs) > 0:
-            raise CompileError('std.core.panic takes exactly one argument')
         panic_type = self._panic_data_type()
         value = self._arg_value(args.positional[0])
         slot = self.alloca(InlineMode.NONE)
@@ -6179,12 +6170,10 @@ class HirRunner:
         self._emit(mir.Panic(pointer, unwind_path, defers))
         return self._cut()
 
-    def _builtin_catch_unwind(self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+    def _builtin_catch_unwind(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """``std.core.catch_unwind(fn)``: call the non-inline closure ``fn`` and
         catch a panic it raises (see ``mir.CatchUnwind``); the caught payload is
         delivered as an ``UnwindException`` through the ordinary error path."""
-        if len(args.positional) != 1 or len(args.kwargs) > 0:
-            raise CompileError('std.core.catch_unwind takes exactly one argument')
         target = _callee_object(self._arg_value(args.positional[0]))
         if not isinstance(target, ClosureValue):
             raise CompileError('the argument of std.core.catch_unwind must be a closure')
@@ -6199,7 +6188,7 @@ class HirRunner:
     # -- ``std.core.as_runtime_closure`` -------------------------------------
 
     def _builtin_as_runtime_closure(
-        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
         """``std.core.as_runtime_closure(closure, as_copy=False)``: turn a
         compile-time closure into an ordinary spy struct value (see
@@ -6231,32 +6220,16 @@ class HirRunner:
         return PollResult.AGAIN
 
     def _runtime_closure_args(
-        self, args: RawArgList[ArgEntry[InterpVal]]
+        self, args: ArgList[ArgEntry[InterpVal]]
     ) -> tuple[ClosureValue, bool]:
-        """The ``(closure, as_copy)`` of one ``as_runtime_closure`` call.  A
-        builtin has no ``Signature``, so nothing fills a default here: the two
-        arguments are bound (positionally or by the keyword) by hand."""
-        extra = [key for key in args.kwargs if key not in ('closure', 'as_copy')]
-        if extra:
-            raise CompileError(
-                f"std.core.as_runtime_closure got an unexpected keyword argument '{extra[0]}'"
-            )
-        if len(args.positional) > 2:
-            raise CompileError('std.core.as_runtime_closure takes at most 2 positional arguments')
-        if len(args.positional) >= 1 and 'closure' in args.kwargs:
-            raise CompileError("std.core.as_runtime_closure got multiple values for 'closure'")
-        if len(args.positional) >= 2 and 'as_copy' in args.kwargs:
-            raise CompileError("std.core.as_runtime_closure got multiple values for 'as_copy'")
-        closure_arg = args.positional[0] if len(args.positional) >= 1 else args.kwargs.get('closure')
-        if closure_arg is None:
-            raise CompileError('std.core.as_runtime_closure requires a closure argument')
-        target = _callee_object(self._arg_value(closure_arg))
+        """The ``(closure, as_copy)`` of one ``as_runtime_closure`` call.  The
+        arguments are already bound to the builtin's signature (see
+        ``sval.BuiltinSignature.bind``), so the missing ``as_copy`` has been
+        filled with its default ``False``."""
+        target = _callee_object(self._arg_value(args.positional[0]))
         if not isinstance(target, ClosureValue):
             raise CompileError('the closure argument of std.core.as_runtime_closure must be a closure')
-        as_copy_arg = args.positional[1] if len(args.positional) >= 2 else args.kwargs.get('as_copy')
-        if as_copy_arg is None:
-            return target, False
-        obj = _to_comptime(_shallow_normalize(self._arg_value(as_copy_arg)))
+        obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[1])))
         if not isinstance(obj, bool):
             raise CompileError('the as_copy argument of std.core.as_runtime_closure must be a compile-time bool')
         return target, obj
@@ -6520,7 +6493,7 @@ class HirRunner:
 
     # -- ``std.core.as_static_ptr`` ------------------------------------------
 
-    def _as_static_ptr(self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+    def _as_static_ptr(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
         """``std.core.as_static_ptr(value)``: a global static constant holding
         ``value``, the result a pointer to it.  The value is lowered into a
         global (see ``mir.GlobalConstant``); it may be a compile-time value or a
@@ -6529,8 +6502,6 @@ class HirRunner:
         a ``mir.Param`` (see ``_references_register``).  A pointer inside it is
         not followed: the value it points at becomes a global of its own, and
         the pointer points at it (see ``_const_pointer_to_mir``)."""
-        if len(args.positional) != 1 or len(args.kwargs) > 0:
-            raise CompileError('std.core.as_static_ptr takes exactly one argument')
         arg = args.positional[0]
         value = _shallow_normalize(self._arg_value(arg))
         type = _arg_type_of(arg)
@@ -6755,12 +6726,10 @@ class HirRunner:
     # -- ``std.mem.layout_of`` -----------------------------------------------
 
     def _layout_builtin(
-        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
         """``std.mem.layout_of``: evaluate the layout of the queried type and
         hand it to the call's result location (see :meth:`_layout_of`)."""
-        if len(args.positional) != 1 or len(args.kwargs) > 0:
-            raise CompileError('std.mem.layout_of takes exactly one argument')
         obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[0])))
         if not isinstance(obj, sval.Type):
             raise CompileError(f'std.mem.layout_of takes a type, got {obj!r}')
@@ -6993,7 +6962,7 @@ class HirRunner:
     # -- ``std.reflect.reify`` -----------------------------------------------
 
     def _builtin_reify(
-        self, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
         """``std.reflect.reify(info)``: the compile-time type a ``TypeInfo`` value
         describes - the inverse of ``type_info``.  It accepts a whole ``TypeInfo``
@@ -7001,8 +6970,6 @@ class HirRunner:
         variant struct a body constructs, or the payload an ``isinstance`` unwrap
         bound).  A reified *struct* is built fresh every time, so it never has the
         identity of the struct it was reflected from (see ``_reify_struct``)."""
-        if len(args.positional) != 1 or len(args.kwargs) > 0:
-            raise CompileError('std.reflect.reify takes exactly one argument')
         info = self._arg_value(args.positional[0])
         self.store(ret, ComptimeVal(self._reify_type_info(info)))
         return PollResult.AGAIN

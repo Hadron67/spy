@@ -779,7 +779,9 @@ def _a_builtin_call_with_captures() -> FunctionValue:
     sig = Signature((), pos, None, None, sval.VoidType(), ArraySet(), 'default', True)
     body = (
         hir.CallInplace(
-            callee=hir.Const(sval.BuiltinFn('as_runtime_closure')),
+            callee=hir.Const(sval.BuiltinFn(
+                'as_runtime_closure', sval.BuiltinSignature(IndexedMap(), False, False)
+            )),
             args=hir.CallArgs((ArgEntry(hir.Const(0), False),), ()),
             ret=hir.ResultLoc(),
             captures=(hir.Const(0),),

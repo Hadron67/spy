@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import typing
 from abc import abstractmethod
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from types import NoneType
@@ -31,6 +31,9 @@ from . import mir, syntax
 from .errors import CompileError
 from .target import TargetInfo
 from .util import FrozenArraySet, IdentityObj, IndexedMap, TriState, frozendict
+
+if typing.TYPE_CHECKING:
+    from .fn import ArgList, RawArgList
 
 INT_DEFAULT_BITS = 32
 """The signedness/width of the default spy integer type: the type a
@@ -1230,15 +1233,82 @@ class ConstRef(Value):
     def __str__(self) -> str:
         return '&' + str(self.value)
 
+@dataclass(frozen=True, slots=True)
+class BuiltinSignature:
+    """The argument shape of a ``spy.*`` builtin the compile-time interpreter
+    evaluates (see :class:`BuiltinFn`).  A builtin is only ever called at
+    compile time, on already-evaluated arguments, so - unlike a spy function's
+    ``fn.Signature`` - it carries no types: the positional parameters in
+    declaration order, each ``(name, default_value)`` (``None`` for a parameter
+    with no default), keyed by name (see ``util.IndexedMap``), and whether the
+    builtin takes ``*args``/``**kwargs``."""
+
+    positional: IndexedMap[str, tuple[str, AnyValue | None]]
+    varargs: bool = False
+    kwargs: bool = False
+
+    def bind[T](
+        self, args: RawArgList[T], default_converter: Callable[[AnyValue], T]
+    ) -> ArgList[T]:
+        """Bind the arguments of one builtin call, exactly like
+        ``fn.Signature.bind_arg_pos``: the positional arguments fill the
+        declared parameters in order, the excess bind ``*args``, keyword
+        arguments bind by name (an unknown one is an error unless the builtin
+        takes a ``**kwargs``), and a parameter the call leaves out takes its
+        default value, converted by ``default_converter``.  Every binding error
+        is a :class:`CompileError`."""
+        from .fn import ArgList
+
+        n = len(self.positional.by_id)
+        values: dict[int, T] = {}
+        varargs_out: list[T] = []
+        for i, value in enumerate(args.positional):
+            if i < n:
+                values[i] = value
+            elif self.varargs:
+                varargs_out.append(value)
+            else:
+                raise CompileError(
+                    f'takes {n} positional argument(s) but {len(args.positional)} were given'
+                )
+        kwargs_out: dict[str, T] = {}
+        for key, value in args.kwargs.items():
+            idx = self.positional.by_key.get(key)
+            if idx is not None:
+                if idx in values:
+                    raise CompileError(f"got multiple values for argument '{key}'")
+                values[idx] = value
+            elif self.kwargs:
+                kwargs_out[key] = value
+            else:
+                raise CompileError(f"got an unexpected keyword argument '{key}'")
+        bound: list[T] = []
+        for i in range(n):
+            if i in values:
+                bound.append(values[i])
+                continue
+            name, default = self.positional.by_id[i]
+            if default is None:
+                raise CompileError(f"missing required argument '{name}'")
+            bound.append(default_converter(default))
+        return ArgList(tuple(bound), tuple(varargs_out), frozendict(kwargs_out))
+
+
 class BuiltinFn(Value):
     """A ``spy.*`` builtin that the compile-time interpreter evaluates
     while running the HIR (``spy.compile_log``).  The name identifies the
-    builtin to the interpreter; ``spy.as_`` is not a compile-time builtin
-    (it only exists at the call boundary), and ``spy.typeof`` is a
-    ``syntax`` marker lowered to a type probe rather than a builtin."""
+    builtin to the interpreter; ``signature`` (see :class:`BuiltinSignature`)
+    is what the interpreter binds the call's arguments with before evaluating
+    the builtin.  ``spy.as_`` is not a compile-time builtin (it only exists at
+    the call boundary), and ``spy.typeof`` is a ``syntax`` marker lowered to a
+    type probe rather than a builtin."""
 
-    def __init__(self, name: str) -> None:
+    name: str
+    signature: BuiltinSignature
+
+    def __init__(self, name: str, signature: BuiltinSignature) -> None:
         self.name = name
+        self.signature = signature
 
     @override
     def get_type(self) -> Type:
