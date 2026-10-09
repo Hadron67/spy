@@ -510,7 +510,7 @@ class ComptimeDict(InterpVal):
 
     values: dict[str, ArgEntry[InterpVal]]
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ComptimeTuplePtr(InterpVal):
     """The pointer form of a tuple: one *place* per element, in order - the
     storage a tuple variable or a multi-value result location is held as (a
@@ -518,7 +518,15 @@ class ComptimeTuplePtr(InterpVal):
     storage).  It is the tuple counterpart of :class:`ComptimeAggregatePtr`:
     ``HirRunner.load`` reads the tuple value out of it, ``HirRunner.store``
     distributes a value into the element places, and a destructuring target is
-    one of these (see ``_gen_target_tuple``/``hir.TuplePtr``)."""
+    one of these (see ``_gen_target_tuple``/``hir.TuplePtr``).
+
+    Unlike the other value forms it is *mutable*: a tuple variable grows in
+    place through ``t += u`` by rebinding :attr:`values` (see
+    ``HirRunner._tuple_extend_in_place``), which is the only place the field is
+    written after the tuple is built - that is why it is not frozen.  Nothing
+    else holds the tuple of places as a *value* (``HirRunner.load`` snapshots
+    it into a :class:`ComptimeTuple`), so the mutation only ever means "the
+    variable's storage grew"."""
 
     values: tuple[InterpVal, ...]
 
@@ -5987,11 +5995,53 @@ class HirRunner:
         # ``x op= y`` calls the target's in-place magic method when its struct
         # declares one (``__iadd__``, ...); otherwise it is ``x = x op y``
         left_type = _place_type(left)
+        if isinstance(left_type, sval.TupleType):
+            # a tuple has no storage of its own, so ``t += u`` is not
+            # ``t = t + u`` (which is not supported for tuples): it extends the
+            # tuple place *in place* by aliasing the elements of ``u`` onto it
+            # (see ``_tuple_extend_in_place``)
+            if op != '+':
+                raise CompileError(
+                    f"a tuple only supports in-place extension with '+=', got '{op}='"
+                )
+            return self._tuple_extend_in_place(left, right)
         if isinstance(left_type, sval.StructType):
             _, _, inplace = _BINARY_METHODS[op]
             if self._resolve_method(left_type, inplace) is not None:
                 return self.call_method(left, inplace, RawArgList((right,), frozendict()), left)
         return self._eval_binary(op, ArgEntry(left, True), right, left)
+
+    def _tuple_extend_in_place(self, place: InterpVal, right: ArgEntry[InterpVal]) -> PollResult:
+        """``t += u`` where ``t`` is a tuple place: extend ``t`` in place by the
+        elements of the tuple ``u``.
+
+        A tuple has no storage of its own - a tuple variable *is* its
+        :class:`ComptimeTuplePtr`, the tuple of element places - so extending it
+        neither copies nor goes through ``store``: every element of ``u`` is
+        aliased onto ``t`` as the place it already is (``u``'s element places
+        when it is a tuple place, the element operand's own place when it is a
+        tuple value, a fresh place for a bare value), and the target is
+        *re-seated* to the concatenation by rebinding its ``values``.  That is
+        what makes an in-place accumulation over non-copyable elements possible:
+        no element is ever loaded out of a place.
+
+        Only a committed tuple place can be a target: an uncommitted slot has no
+        element places yet (it is no operand, see ``PendingSlot``), and a box
+        never holds a tuple."""
+        target = _shallow_normalize(place)
+        if not isinstance(target, ComptimeTuplePtr):
+            raise CompileError(
+                f'cannot extend {target!r} in place: a tuple ``+=`` needs a tuple place'
+            )
+        if not isinstance(_arg_type_of(right), sval.TupleType):
+            raise CompileError('a tuple ``+=`` needs a tuple on the right-hand side')
+        places = list(target.values)
+        for entry in _tuple_arg_entries(right):
+            # a place is aliased as it is; a bare value goes into a fresh place
+            # of its own (a store *into* a place, never a read *out* of one)
+            places.append(self._inline_arg_place(entry))
+        target.values = tuple(places)
+        return PollResult.AGAIN
 
     # -- calls ----------------------------------------------------------------
 
