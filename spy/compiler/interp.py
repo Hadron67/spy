@@ -1927,7 +1927,11 @@ class HirRunner:
         if declared_value is not None:
             value_loc = self._ret_spec_place(declared_value)
         else:
-            value_loc = self.alloca(InlineMode.NONE)
+            # the value type is inferred from the body: the result location has
+            # to be able to hold a *tuple* of places (a multi-value return, see
+            # ``init_tuple``/``_deliver_packed_tuple``), which is only possible
+            # for an inline slot (``_finish_function`` materializes the tree)
+            value_loc = self.alloca(InlineMode.FULL)
         return ComptimeResultPtr(
             value_loc, self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE),
         )
@@ -3820,6 +3824,19 @@ class HirRunner:
                     ):
                         self.store(recorded.places[index], field_value)
                 return
+            if isinstance(value_type, sval.TupleType) and ptr.inline_mode != InlineMode.NONE:
+                # a tuple *value* into an inline slot: like a tuple literal, its
+                # elements become places of their own (a tuple has no storage a
+                # box could hold, see ``_PendingTuple``), which the value is
+                # distributed into
+                recorded = self._pending_tuple(ptr)
+                if recorded is None:
+                    recorded = _PendingTuple(
+                        tuple(self.alloca(InlineMode.FULL) for _ in value_type.types)
+                    )
+                    self._record_pending_action(ptr, recorded)
+                self.store(ComptimeTuplePtr(recorded.places), value)
+                return
             self._record_pending_store(ptr, value_type, value)
             return
 
@@ -4063,6 +4080,8 @@ class HirRunner:
             )
         location = self._result_loc()
         if isinstance(location, ComptimeTuplePtr):
+            raise CompileError('a function that returns several values must return them')
+        if isinstance(location, PendingSlot) and self._pending_tuple(location) is not None:
             raise CompileError('a function that returns several values must return them')
         self.store(location, ComptimeVal(sval.Void()))
 
@@ -7661,6 +7680,22 @@ class HirRunner:
             return self.init_inline_aggregate(type)
         return ComptimeAggregatePtr(type, recorded.places)
 
+    def _result_place_tree(self, place: InterpVal) -> InterpVal:
+        """The place tree a multi-value result location is made of (see
+        ``_finish_function``): the element places a pending slot recorded -
+        recursively, since a nested tuple records one on the element place it
+        lives in, and a packed group already records nested tuple pointers -
+        or the tuple pointer the place already is.  A leaf place is returned
+        as it is."""
+        place = _shallow_normalize(place)
+        if isinstance(place, ComptimeTuplePtr):
+            return ComptimeTuplePtr(tuple(self._result_place_tree(child) for child in place.values))
+        if isinstance(place, PendingSlot):
+            recorded = self._pending_tuple(place)
+            if recorded is not None:
+                return ComptimeTuplePtr(tuple(self._result_place_tree(child) for child in recorded.places))
+        return place
+
     def _inline_tuple_of(self, slot: PendingSlot, type: sval.TupleType) -> ComptimeTuplePtr:
         """The tuple storage a slot commits to: the element places its
         construction recorded (a literal ``(a, b)`` built by ``init_tuple``, or
@@ -8726,6 +8761,17 @@ class HirRunner:
                 )
             return
         if isinstance(location, PendingSlot) and location.inline_mode != InlineMode.NONE and location.committed is None:
+            recorded = self._pending_tuple(location)
+            if recorded is not None:
+                # a second ``return a, b`` into the same result location (another
+                # path): the element places are the same, so the values written on
+                # this path go where the earlier path's did (see ``_finish_function``)
+                if len(recorded.places) != length:
+                    raise CompileError(
+                        f'cannot initialize a tuple of {length} element(s) in a '
+                        f'location of {len(recorded.places)} place(s)'
+                    )
+                return
             self._record_pending_action(
                 location,
                 _PendingTuple(tuple(self.alloca(InlineMode.FULL) for _ in range(length))),
@@ -9626,8 +9672,6 @@ class HirRunner:
 
         if len(packed) == 0:
             return
-        for _, tree in packed:
-            self._commit_tuple_places(tree)
         for target, tree in packed:
             self._deliver_packed_tuple(target, tree)
 
@@ -9642,6 +9686,7 @@ class HirRunner:
         if isinstance(target, PendingSlot) and target.committed is None:
             self._record_pending_action(target, _PendingTuple(tree.values))
             return
+        self._commit_tuple_places(tree)
         self.store(target, self.load(tree))
 
     def _pair_places(
@@ -9824,6 +9869,16 @@ class HirRunner:
             # type is the *empty* type, so the function cannot return a value at
             # all (see ``sval.EmptyType``)
             value_spec = sval.make_ret_spec(location.committed_type(), self._mir_cache)
+            if isinstance(value_spec, sval.RetTuple):
+                # a multi-value result: the body wrote its values into the element
+                # places of the result slot (a tuple literal, a packed multi-value
+                # call, or a tuple value); the result location becomes the place
+                # tree those places make up, which ``_commit_ret_places`` then
+                # gives its result pointers (see ``_result_place_tree``)
+                ret_loc = self._current_result_loc()
+                self._frames[-1].ret_loc = ComptimeResultPtr(
+                    self._result_place_tree(location), ret_loc.code, ret_loc.payload,
+                )
         exceptions = partial.exceptions if partial is not None else None
         callconv = partial.callconv if partial is not None else 'default'
         if exceptions is None:

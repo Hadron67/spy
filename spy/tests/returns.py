@@ -201,6 +201,115 @@ def bad_ellipsis_return(x: i32) -> tuple[i32, ...]:
 
 
 # ---------------------------------------------------------------------------
+# the same multi-value returns without a declared annotation: the arity and the
+# types are inferred from the body's result location, exactly like a
+# single-value return (see ``interp``).  A tuple literal, a forwarded
+# multi-value call and a packed ``Comptime`` value all become the element places
+# of the result location, which then takes the same convention an annotation
+# would have fixed.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def infer_min_max(a: i32, b: i32):
+    # a tuple literal, written on two paths
+    if a < b:
+        return a, b
+    return b, a
+
+
+@func()
+def use_infer_min_max(a: i32, b: i32) -> i32:
+    lo, hi = infer_min_max(a, b)
+    return lo * 100 + hi
+
+
+@func()
+def infer_forward(a: i32, b: i32):
+    # forwarding another function's multi-value result
+    return min_max(a, b)
+
+
+@func()
+def use_infer_forward(a: i32, b: i32) -> i32:
+    lo, hi = infer_forward(a, b)
+    return lo * 100 + hi
+
+
+@func()
+def infer_packed(a: i32, b: i32):
+    # a packed ``Comptime`` value (pyright cannot tell)
+    packed: Comptime = min_max(a, b)
+    return packed  # pyright: ignore
+
+
+@func()
+def use_infer_packed(a: i32, b: i32) -> i32:
+    lo, hi = infer_packed(a, b)
+    return lo * 100 + hi
+
+
+@func()
+def infer_mixed(x: i32):
+    return x, Large(x, x, x, x), Small(x, x + 1)
+
+
+@func()
+def use_infer_mixed(x: i32) -> i32:
+    n, large, small = infer_mixed(x)
+    return n * 10000 + small.b * 1000 + large.d * 100 + small.a
+
+
+@func()
+def infer_nested(x: i32):
+    return x, (x + 1, Large(x, x, x, x)), Small(x, x + 2)
+
+
+@func()
+def use_infer_nested(x: i32) -> i32:
+    n, (m, large), small = infer_nested(x)
+    return n * 100000 + m * 10000 + large.d * 100 + small.b
+
+
+@func()
+def infer_group_first(x: i32):
+    return (Large(x, x, x, x), x + 1), x + 2
+
+
+@func()
+def use_infer_group_first(x: i32) -> i32:
+    (large, n), m = infer_group_first(x)
+    return large.d * 1000 + n * 100 + m
+
+
+@func()
+def infer_void_and_value(x: i32):
+    return None, x + 1
+
+
+@func()
+def use_infer_void_and_value(x: i32) -> i32:
+    _, n = infer_void_and_value(x)  # pyright: ignore[reportAssignmentType]
+    return n
+
+
+@func()
+def bad_infer_conflict(a: i32) -> i32:
+    # one path returns a tuple, another a scalar: the result location has no
+    # single type (pyright cannot tell, hence the ignore)
+    if a < 0:
+        return a, a  # pyright: ignore
+    return a
+
+
+@func()
+def bad_infer_falloff(a: i32):
+    # the body falls off its end after a tuple return (pyright cannot tell)
+    if a < 0:
+        return a, a
+
+
+# ---------------------------------------------------------------------------
 # a packed tuple is a compile-time place tree: its element count is known with
 # ``len`` (a compile-time integer), and its i-th element is a *place* read and
 # written with ``t[i]`` (a compile-time integer index, bounds-checked).
@@ -423,6 +532,55 @@ class SpyMultiReturnTest(TestCase):
             bad_packed_index_negative(3)
 
 
+class SpyInferredMultiReturnTest(TestCase):
+    """A function with no return annotation whose body returns several values:
+    the arity and the types are inferred from the body's result location, and
+    the lowered form follows the same convention as an annotated one."""
+
+    def test_a_tuple_literal(self) -> None:
+        self.assertEqual(use_infer_min_max(2, 7), 207)
+        self.assertEqual(use_infer_min_max(9, 3), 309)
+
+    def test_the_lowered_signature_matches_the_declared_one(self) -> None:
+        # an inferred multi-value return lowers exactly like the annotated one:
+        # one scalar by value, the other through a result pointer, so
+        # ``fn(i32, i32, *i32) -> i32``
+        self.assertEqual(use_infer_min_max(2, 7), 207)
+        self.assertEqual(use_infer_forward(2, 7), 207)
+        i32_mir = mir.IntType(32, True)
+        for fn in (infer_min_max, infer_forward):
+            args, ret = mir_signature(fn)
+            self.assertEqual(args, (i32_mir, i32_mir, mir.PointerType(i32_mir, False)))
+            self.assertEqual(ret, i32_mir)
+
+    def test_forwarding_a_multi_value_call(self) -> None:
+        self.assertEqual(use_infer_forward(2, 7), 207)
+
+    def test_packed_into_a_comptime_variable(self) -> None:
+        self.assertEqual(use_infer_packed(2, 7), 207)
+
+    def test_mixed_aggregate_results(self) -> None:
+        self.assertEqual(use_infer_mixed(3), 34303)
+
+    def test_nested_return(self) -> None:
+        self.assertEqual(use_infer_nested(3), 340305)
+
+    def test_a_leading_group(self) -> None:
+        self.assertEqual(use_infer_group_first(3), 3405)
+
+    def test_a_zero_sized_result(self) -> None:
+        self.assertEqual(use_infer_void_and_value(3), 4)
+
+    def test_a_conflicting_result_shape_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_infer_conflict(3)
+
+    def test_falling_off_after_a_multi_value_return_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            bad_infer_falloff(3)
+
+
 all_tests = [
     SpyMultiReturnTest,
+    SpyInferredMultiReturnTest,
 ]
