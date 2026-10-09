@@ -1423,40 +1423,20 @@ class _Builder:
         self.add(hir.Store(result_loc, test))
 
     def _gen_match(self, node: ast.Match) -> None:
-        """``match (e := union): case T1(): ... case T2(): ...`` over a tagged
-        union: each ``case Ti()`` is the tag test ``isinstance(e, Ti)`` and - in
-        the ``(e := union)`` form - binds its body's ``e`` to the payload of
-        ``Ti``; ``case _:`` is the fallback, which has to come last.  A plain
-        name subject (``match union:``) tests the tags only and binds nothing,
-        so the name keeps naming the union inside the cases.  The bound name is
-        only visible in the case that binds it - it is not declared outside the
-        cases."""
-        fn_name = self._fn_ir.name
-        subject = node.subject
-        bind_name: str | None
-        value_node: ast.expr
-        if isinstance(subject, ast.NamedExpr):
-            if not isinstance(subject.target, ast.Name):
-                raise CompileError('the target of ``:=`` has to be a name')
-            bind_name = subject.target.id
-            value_node = subject.value
-        elif isinstance(subject, ast.Name):
-            # a plain name: the tag is tested, but no payload is bound (the name
-            # is not redeclared, so it still names the union inside the cases)
-            bind_name = None
-            value_node = subject
-        else:
-            raise CompileError(
-                f'a ``match`` subject must be a name or ``(name := value)`` '
-                f'in spy function {fn_name}'
-            )
-        place = self._as_ref(self._gen_expr(value_node)[0])
+        """``match union: case T1() as e: ... case T2(): ...`` over a tagged
+        union: each ``case Ti()`` is the tag test ``isinstance(union, Ti)`` and
+        ``case Ti() as e`` also binds the body's ``e`` to the payload of ``Ti``;
+        ``case _:`` is the fallback, which has to come last.  The subject is
+        tested but binds nothing, so the name it names keeps naming the union
+        inside the cases.  The bound name is only visible in the case that binds
+        it - it is not declared outside the cases."""
+        place = self._as_ref(self._gen_expr(node.subject)[0])
         if_count = 0
         wildcard_seen = False
         for case in node.cases:
             if case.guard is not None:
                 raise CompileError('a ``match`` case guard is not supported yet')
-            type_node = self._match_case_type(case)
+            type_node, bind_name = self._match_case_pattern(case)
             if type_node is None:
                 # the wildcard fallback: everything after it would be dead
                 wildcard_seen = True
@@ -1480,17 +1460,25 @@ class _Builder:
         for _ in range(if_count):
             self.add(hir.End())
 
-    def _match_case_type(self, case: ast.match_case) -> ast.expr | None:
-        """The variant type a ``match`` case names (``case T():``), or None for
-        the wildcard ``case _:``."""
+    def _match_case_pattern(self, case: ast.match_case) -> tuple[ast.expr | None, str | None]:
+        """The variant type a ``match`` case names and the name its payload is
+        bound to (``case T() as e:``); ``(None, None)`` for the wildcard
+        ``case _:``."""
         pattern = case.pattern
+        bind_name: str | None = None
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.name is None:
+                # the wildcard ``case _:``
+                if pattern.pattern is not None:
+                    raise CompileError(f'unsupported ``match`` pattern {ast.unparse(case.pattern)!r}')
+                return None, None
+            bind_name = pattern.name
+            pattern = pattern.pattern
         if isinstance(pattern, ast.MatchClass):
             if len(pattern.patterns) > 0 or len(pattern.kwd_attrs) > 0 or len(pattern.kwd_patterns) > 0:
                 raise CompileError('a ``match`` case takes no arguments')
-            return pattern.cls
-        if isinstance(pattern, ast.MatchAs) and pattern.pattern is None and pattern.name is None:
-            return None
-        raise CompileError(f'unsupported ``match`` pattern {ast.unparse(pattern)!r}')
+            return pattern.cls, bind_name
+        raise CompileError(f'unsupported ``match`` pattern {ast.unparse(case.pattern)!r}')
 
     def _gen_syntax_call(self, callee: Any, args: list[ast.expr]) -> tuple[ArgEntry[hir.Value], bool]:
         if callee is syntax.ref:

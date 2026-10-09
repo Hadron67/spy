@@ -175,6 +175,8 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
     # their Python-level type, so the checker does not try to track the generic.
     comptime()
     LT: Any = typeof(length)
+    comptime()
+    RET = typeof(kernel(0))
 
     # ``LT`` selects the runtime entry point (``init_fn``) and the type of the
     # schedule bookkeeping (the ``stride`` the runtime writes and the

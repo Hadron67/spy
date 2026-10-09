@@ -17,8 +17,8 @@ from .structs import Large
 
 # ---------------------------------------------------------------------------
 # tagged unions: ``A | B``, the tag test ``isinstance(u, A)`` / the unwrap
-# ``isinstance(e := u, A)``, and ``match (e := u): case A(): ...`` (which binds
-# the payload) / ``match u: case A(): ...`` (which tests only)
+# ``isinstance(e := u, A)``, and ``match u: case A(): ...`` (which tests the
+# tag) / ``match u: case A() as e: ...`` (which binds the payload)
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +118,7 @@ def tu_widen_make(sel: i32) -> i32:
 
 @func()
 def tu_match(u: TU_A | TU_B) -> i32:
-    match (_ := u):
+    match u:
         case TU_A():
             return 1
         case TU_B():
@@ -133,7 +133,7 @@ def tu_match_make(sel: i32) -> i32:
 
 @func()
 def tu_match_wildcard(u: TU_A | TU_B) -> i32:
-    match (_ := u):
+    match u:
         case TU_A():
             return 1
         case _:
@@ -143,6 +143,37 @@ def tu_match_wildcard(u: TU_A | TU_B) -> i32:
 @func()
 def tu_match_wildcard_make(sel: i32) -> i32:
     return tu_match_wildcard(tu_make(sel))
+
+
+@func()
+def tu_match_bind(u: TU_A | TU_B) -> i32:
+    # ``case T() as name`` binds the payload of the matched variant
+    match u:
+        case TU_A() as a:
+            return a.x
+        case TU_B() as b:
+            return b.y
+    return -1
+
+
+@func()
+def tu_match_bind_make(sel: i32) -> i32:
+    return tu_match_bind(tu_make(sel))
+
+
+@func()
+def tu_match_bind_wildcard(u: TU_A | TU_B) -> i32:
+    # the wildcard binds nothing: only the case that names a variant binds
+    match u:
+        case TU_A() as a:
+            return a.x
+        case _:
+            return -1
+
+
+@func()
+def tu_match_bind_wildcard_make(sel: i32) -> i32:
+    return tu_match_bind_wildcard(tu_make(sel))
 
 
 @func()
@@ -312,10 +343,19 @@ def tu_bad_variant() -> i32:
 def tu_bad_pattern() -> i32:
     u: TU_A | TU_B
     u = TU_A(1)
-    match (_ := u):
+    match u:
         case TU_A(x):
             return x
         case _:
+            return 0
+
+
+@func()
+def tu_capture_pattern() -> i32:
+    u: TU_A | TU_B
+    u = TU_A(1)
+    match u:
+        case e:  # noqa: F841 (the pattern is what is under test)
             return 0
 
 
@@ -349,6 +389,15 @@ class SpyTaggedUnionTest(TestCase):
         # ``match u:`` (a plain-name subject) tests the tag only
         self.assertEqual(tu_match_tag_make(0), 1)
         self.assertEqual(tu_match_tag_make(1), 2)
+
+    def test_match_binds_the_payload(self) -> None:
+        # ``case T() as name`` binds the payload of the matched variant
+        self.assertEqual(tu_match_bind_make(0), 3)
+        self.assertEqual(tu_match_bind_make(1), 4)
+
+    def test_match_binds_the_payload_before_a_wildcard(self) -> None:
+        self.assertEqual(tu_match_bind_wildcard_make(0), 3)
+        self.assertEqual(tu_match_bind_wildcard_make(1), -1)
 
     def test_match_subject_keeps_naming_the_union(self) -> None:
         # nothing is bound, so the subject name is still the union in the body
@@ -396,6 +445,11 @@ class SpyTaggedUnionTest(TestCase):
     def test_an_unsupported_match_pattern_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
             tu_bad_pattern()
+
+    def test_a_capture_pattern_is_rejected(self) -> None:
+        # ``case e:`` binds the whole subject - only ``case T() as e`` is allowed
+        with self.assertRaises(CompileError):
+            tu_capture_pattern()
 
 
 class SpyPythonSideUnionTest(TestCase):
