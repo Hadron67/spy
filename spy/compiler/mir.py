@@ -2,7 +2,8 @@ from abc import abstractmethod
 from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field, replace
-from typing import Any, Self, override
+from enum import Enum
+from typing import Any, Literal, Self, override
 
 from .binop import BinaryOp, CompareOp
 from .errors import CompileError, SpyError
@@ -636,6 +637,166 @@ class Store(Inst):
         if ptr is self.ptr and value is self.value:
             return self
         return replace(self, ptr=ptr, value=value)
+
+
+class AtomicOrdering(Enum):
+    """The memory ordering of an atomic operation (``std.atomic.MemoryOrder``);
+    the values are the spellings LLVM's textual IR uses (see
+    ``llvm.Ordering``)."""
+
+    MONOTONIC = 'monotonic'
+    ACQUIRE = 'acquire'
+    RELEASE = 'release'
+    ACQ_REL = 'acq_rel'
+    SEQ_CST = 'seq_cst'
+
+
+type AtomicRmwOp = Literal['xchg', 'add', 'sub', 'and', 'or', 'xor']
+
+
+@dataclass(eq=False)
+class AtomicLoad(Inst):
+    """An atomic load (LLVM's ``load atomic``): read the pointee of ``ptr``
+    with the given memory ``ordering`` (and ``volatile`` when asked).  The
+    result has the pointee's type."""
+
+    ptr: Value
+    ordering: AtomicOrdering
+    volatile: bool = False
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        ptr_type = self.ptr.get_type()
+        assert isinstance(ptr_type, PointerType) and ptr_type.elem is not None
+        return ptr_type.elem
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.ptr,)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        ptr = f(self.ptr)
+        return self if ptr is self.ptr else replace(self, ptr=ptr)
+
+
+@dataclass(eq=False)
+class AtomicStore(Inst):
+    """An atomic store (LLVM's ``store atomic``): write ``value`` through
+    ``ptr`` with the given memory ``ordering`` (and ``volatile`` when asked)."""
+
+    ptr: Value
+    value: Value
+    ordering: AtomicOrdering
+    volatile: bool = False
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.ptr, self.value)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        ptr = f(self.ptr)
+        value = f(self.value)
+        if ptr is self.ptr and value is self.value:
+            return self
+        return replace(self, ptr=ptr, value=value)
+
+
+@dataclass(eq=False)
+class AtomicRmw(Inst):
+    """A read-modify-write (LLVM's ``atomicrmw``): apply ``op`` to the pointee
+    of ``ptr`` and ``value`` with the given memory ``ordering``, and produce
+    the *old* pointee value.  ``op`` is one of ``'xchg'``, ``'add'``,
+    ``'sub'``, ``'and'``, ``'or'`` and ``'xor'`` (the integer operations)."""
+
+    op: AtomicRmwOp
+    ptr: Value
+    value: Value
+    ordering: AtomicOrdering
+    volatile: bool = False
+
+    @override
+    def get_type(self) -> MayBeVoidType:
+        ptr_type = self.ptr.get_type()
+        assert isinstance(ptr_type, PointerType) and ptr_type.elem is not None
+        return ptr_type.elem
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.ptr, self.value)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        ptr = f(self.ptr)
+        value = f(self.value)
+        if ptr is self.ptr and value is self.value:
+            return self
+        return replace(self, ptr=ptr, value=value)
+
+
+@dataclass(eq=False)
+class AtomicCmpxchg(Inst):
+    """A compare-and-exchange (LLVM's ``cmpxchg``): if the pointee of ``ptr``
+    equals ``expected``, store ``desired`` into it.  The result is a struct
+    ``{value: T, ok: bool}`` holding the *old* pointee value and whether the
+    exchange happened (LLVM's ``{T, i1}``); the two are read out with
+    ``ExtractValue``.  ``success``/``failure`` are the memory orderings of the
+    two outcomes (the failure one must be no stronger than ``success``, and
+    never ``release``/``acq_rel``)."""
+
+    ptr: Value
+    expected: Value
+    desired: Value
+    success: AtomicOrdering
+    failure: AtomicOrdering
+    volatile: bool = False
+
+    def __init__(
+        self,
+        ptr: Value,
+        expected: Value,
+        desired: Value,
+        success: AtomicOrdering,
+        failure: AtomicOrdering,
+        volatile: bool = False,
+    ) -> None:
+        self.ptr = ptr
+        self.expected = expected
+        self.desired = desired
+        self.success = success
+        self.failure = failure
+        self.volatile = volatile
+        ptr_type = ptr.get_type()
+        assert isinstance(ptr_type, PointerType) and isinstance(ptr_type.elem, Type)
+        # the ``{value, ok}`` result LLVM's ``cmpxchg`` yields
+        self.type = StructType(
+            None,
+            (FormalArg('value', ptr_type.elem), FormalArg('ok', BoolType())),
+        )
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def get_children(self) -> tuple[Any, ...]:
+        return (self.ptr, self.expected, self.desired)
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        ptr = f(self.ptr)
+        expected = f(self.expected)
+        desired = f(self.desired)
+        if ptr is self.ptr and expected is self.expected and desired is self.desired:
+            return self
+        return replace(self, ptr=ptr, expected=expected, desired=desired)
+
+
+@dataclass(eq=False)
+class Fence(Inst):
+    """A memory ordering fence (LLVM's ``fence``): prevents the compiler and
+    the hardware from reordering memory operations across it."""
+
+    ordering: AtomicOrdering
+
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
 
 
 @dataclass(eq=False)

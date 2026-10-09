@@ -114,6 +114,18 @@ def simplify(fn: mir.Function) -> None:
             case mir.Store():
                 inst.ptr = resolve(inst.ptr)
                 inst.value = resolve(inst.value)
+            case mir.AtomicLoad():
+                inst.ptr = resolve(inst.ptr)
+            case mir.AtomicStore():
+                inst.ptr = resolve(inst.ptr)
+                inst.value = resolve(inst.value)
+            case mir.AtomicRmw():
+                inst.ptr = resolve(inst.ptr)
+                inst.value = resolve(inst.value)
+            case mir.AtomicCmpxchg():
+                inst.ptr = resolve(inst.ptr)
+                inst.expected = resolve(inst.expected)
+                inst.desired = resolve(inst.desired)
             case mir.Gep():
                 inst.ptr = resolve(inst.ptr)
                 if not isinstance(inst.index, int):
@@ -234,6 +246,18 @@ def _operands(inst: mir.Inst) -> tuple[tuple[mir.Value, str], ...]:
             return ((inst.ptr, 'load'),)
         case mir.Store():
             return ((inst.ptr, 'store'), (inst.value, 'use'))
+        case mir.AtomicLoad():
+            # an atomic access needs the memory: its address is a plain use, so
+            # the slot it names is never folded back into a register
+            return ((inst.ptr, 'use'),)
+        case mir.AtomicStore():
+            return ((inst.ptr, 'use'), (inst.value, 'use'))
+        case mir.AtomicRmw():
+            return ((inst.ptr, 'use'), (inst.value, 'use'))
+        case mir.AtomicCmpxchg():
+            return ((inst.ptr, 'use'), (inst.expected, 'use'), (inst.desired, 'use'))
+        case mir.Fence():
+            return ()
         case mir.Gep():
             if isinstance(inst.index, int):
                 return ((inst.ptr, 'use'),)

@@ -51,6 +51,23 @@ _ICMP_OPS = {
     '>=': sllvm.IcmpOp.GE,
 }
 
+# the LLVM operation of one ``mir.AtomicRmw``, by its ``op`` string
+_ATOMIC_RMW_OPS = {
+    'xchg': sllvm.Xchg,
+    'add': sllvm.Add,
+    'sub': sllvm.Sub,
+    'and': sllvm.AndOp,
+    'or': sllvm.OrOp,
+    'xor': sllvm.XorOp,
+}
+
+
+def _ordering(ordering: mir.AtomicOrdering) -> sllvm.Ordering:
+    """The LLVM ordering of a MIR atomic ordering (the two share their
+    spellings)."""
+    return sllvm.Ordering(ordering.value)
+
+
 _CTYPE_INT = {
     (8, True): ctypes.c_int8,
     (8, False): ctypes.c_uint8,
@@ -593,6 +610,41 @@ class _Lowerer:
                 )
             case mir.Load():
                 result = block.load(self._value(inst.ptr, arg_values), self._to_llvm(inst.get_type()))
+            case mir.AtomicLoad():
+                result = block.atomic_load(
+                    self._value(inst.ptr, arg_values),
+                    self._to_llvm(inst.get_type()),
+                    _ordering(inst.ordering),
+                    self._layout.align_of(self._to_llvm(inst.get_type())),
+                    inst.volatile,
+                )
+            case mir.AtomicStore():
+                block.atomic_store(
+                    self._value(inst.ptr, arg_values),
+                    self._value(inst.value, arg_values),
+                    _ordering(inst.ordering),
+                    self._layout.align_of(self._to_llvm(inst.value.get_type())),
+                    inst.volatile,
+                )
+            case mir.AtomicRmw():
+                result = block.atomicrmw(
+                    _ATOMIC_RMW_OPS[inst.op](),
+                    self._value(inst.ptr, arg_values),
+                    self._value(inst.value, arg_values),
+                    _ordering(inst.ordering),
+                    inst.volatile,
+                )
+            case mir.AtomicCmpxchg():
+                result = block.cmpxchg(
+                    self._value(inst.ptr, arg_values),
+                    self._value(inst.expected, arg_values),
+                    self._value(inst.desired, arg_values),
+                    _ordering(inst.success),
+                    _ordering(inst.failure),
+                    inst.volatile,
+                )
+            case mir.Fence():
+                block.fence(_ordering(inst.ordering))
             case mir.Gep():
                 ptr = self._value(inst.ptr, arg_values)
                 index = inst.index

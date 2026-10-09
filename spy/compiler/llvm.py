@@ -980,8 +980,8 @@ class BasicBlock(LocalValue):
     def fdiv(self, lhs: Value, rhs: Value):
         return self.emit(Binary(FDiv(), lhs, rhs))
 
-    def atomicrmw(self, op: BinaryOp, ptr: Value, rhs: Value, ordering: Ordering) -> Value:
-        return self.emit(AtomicRmw(op, ptr, rhs, ordering))
+    def atomicrmw(self, op: BinaryOp, ptr: Value, rhs: Value, ordering: Ordering, volatile: bool = False) -> Value:
+        return self.emit(AtomicRmw(op, ptr, rhs, ordering, volatile))
 
     def rem(self, lhs: Value, rhs: Value, signed: bool) -> Value:
         return self.emit(Binary(SRem() if signed else URem(), lhs, rhs))
@@ -997,6 +997,18 @@ class BasicBlock(LocalValue):
             assert isinstance(ptr_type, PointerType)
             assert isinstance(ptr_type.child, IntType)
             return self.emit(Store(ptr, IntValue(value, ptr_type.child)))
+
+    def atomic_load(self, ptr: Value, type: Type, ordering: Ordering, align: int, volatile: bool = False) -> Value:
+        return self.emit(AtomicLoad(ptr, type, ordering, align, volatile))
+
+    def atomic_store(self, ptr: Value, value: Value, ordering: Ordering, align: int, volatile: bool = False):
+        self.emit(AtomicStore(ptr, value, ordering, align, volatile))
+
+    def cmpxchg(self, ptr: Value, expected: Value, desired: Value, success: Ordering, failure: Ordering, volatile: bool = False) -> Value:
+        return self.emit(Cmpxchg(ptr, expected, desired, success, failure, volatile))
+
+    def fence(self, ordering: Ordering):
+        self.emit(Fence(ordering))
 
     def alloca(self, type: Type):
         return self.emit(Alloca(type))
@@ -1423,6 +1435,11 @@ class FDiv(BinaryOp):
                 return FloatValue(a / b, t)
         return None
 
+class Xchg(BinaryOp):
+    @override
+    def head_name(self) -> str:
+        return 'xchg'
+
 class Ordering(Enum):
     ACQUIRE = 'acquire'
     RELEASE = 'release'
@@ -1431,17 +1448,20 @@ class Ordering(Enum):
     RELAXED = 'relaxed'
     MONOTONIC = 'monotonic'
 
+@gen_get_children
 class AtomicRmw(Inst):
     op: BinaryOp
     ptr: Value
     value: Value
     ordering: Ordering
+    volatile: bool
 
-    def __init__(self, op: BinaryOp, ptr: Value, value: Value, ordering: Ordering = Ordering.SEQ_CST):
+    def __init__(self, op: BinaryOp, ptr: Value, value: Value, ordering: Ordering = Ordering.SEQ_CST, volatile: bool = False):
         self.op = op
         self.ptr = ptr
         self.value = value
         self.ordering = ordering
+        self.volatile = volatile
 
         ptr_type = ptr.get_type()
         value_type = value.get_type()
@@ -1454,7 +1474,106 @@ class AtomicRmw(Inst):
 
     @override
     def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
-        return f'atomicrmw {self.op.head_name()} {self.ptr.stringify(name_context, local_counter)}, {self.value.stringify(name_context, local_counter)} {self.ordering.value}'
+        volatile = ' volatile' if self.volatile else ''
+        return f'atomicrmw{volatile} {self.op.head_name()} {self.ptr.stringify(name_context, local_counter)}, {self.value.stringify(name_context, local_counter)} {self.ordering.value}'
+
+@gen_get_children
+class AtomicLoad(Inst):
+    ptr: Value
+    type: Type
+    ordering: Ordering
+    align: int
+    volatile: bool
+
+    def __init__(self, ptr: Value, type: Type, ordering: Ordering = Ordering.SEQ_CST, align: int = 1, volatile: bool = False):
+        self.ptr = ptr
+        self.type = type
+        self.ordering = ordering
+        self.align = align
+        self.volatile = volatile
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        volatile = ' volatile' if self.volatile else ''
+        return f'load atomic{volatile} {self.type.stringify(name_context)}, {self.ptr.stringify(name_context, local_counter)} {self.ordering.value}, align {self.align}'
+
+@gen_get_children
+class AtomicStore(Inst):
+    ptr: Value
+    value: Value
+    ordering: Ordering
+    align: int
+    volatile: bool
+
+    def __init__(self, ptr: Value, value: Value, ordering: Ordering = Ordering.SEQ_CST, align: int = 1, volatile: bool = False):
+        self.ptr = ptr
+        self.value = value
+        self.ordering = ordering
+        self.align = align
+        self.volatile = volatile
+
+    @override
+    def get_type(self) -> Type:
+        return VoidType()
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        volatile = ' volatile' if self.volatile else ''
+        return f'store atomic{volatile} {self.value.stringify(name_context, local_counter)}, {self.ptr.stringify(name_context, local_counter)} {self.ordering.value}, align {self.align}'
+
+@gen_get_children
+class Cmpxchg(Inst):
+    """An atomic compare-and-exchange: the result is the literal struct
+    ``{T, i1}`` LLVM yields - the old value and whether the exchange happened."""
+
+    ptr: Value
+    expected: Value
+    desired: Value
+    success: Ordering
+    failure: Ordering
+    volatile: bool
+    weak: bool
+
+    def __init__(self, ptr: Value, expected: Value, desired: Value, success: Ordering = Ordering.SEQ_CST, failure: Ordering = Ordering.SEQ_CST, volatile: bool = False, weak: bool = False):
+        self.ptr = ptr
+        self.expected = expected
+        self.desired = desired
+        self.success = success
+        self.failure = failure
+        self.volatile = volatile
+        self.weak = weak
+
+    @override
+    def get_type(self) -> Type:
+        return LiteralStructType(self.expected.get_type(), IntType(1))
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        weak = ' weak' if self.weak else ''
+        volatile = ' volatile' if self.volatile else ''
+        return (f'cmpxchg{weak}{volatile} {self.ptr.stringify(name_context, local_counter)}, '
+                f'{self.expected.stringify(name_context, local_counter)}, '
+                f'{self.desired.stringify(name_context, local_counter)} '
+                f'{self.success.value} {self.failure.value}')
+
+@gen_get_children
+class Fence(Inst):
+    ordering: Ordering
+
+    def __init__(self, ordering: Ordering = Ordering.SEQ_CST):
+        self.ordering = ordering
+
+    @override
+    def get_type(self) -> Type:
+        return VoidType()
+
+    @override
+    def stringify_inst(self, name_context: NameContext, local_counter: ObjectCounter[LocalValue]) -> str:
+        return f'fence {self.ordering.value}'
 
 @gen_get_children
 class Load(Inst):

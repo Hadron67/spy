@@ -191,6 +191,59 @@ _UNARY_METHODS: dict[str, str] = {'-': '__neg__', '~': '__invert__'}
 _BOOL_METHOD = '__bool__'
 _LEN_METHOD = '__len__'
 
+# the operation of one ``std.atomic.atomic_rmw``, by the name of the
+# ``std.atomic.RmwOp`` member that selects it
+_ATOMIC_RMW_OPS: dict[str, mir.AtomicRmwOp] = {
+    'XCHG': 'xchg',
+    'ADD': 'add',
+    'SUB': 'sub',
+    'AND': 'and',
+    'OR': 'or',
+    'XOR': 'xor',
+}
+
+# how strong each memory ordering is, for the success/failure ordering rule of
+# ``atomic_cmpxchg`` (see ``_check_atomic_failure_ordering``)
+_ATOMIC_ORDER_STRENGTH: dict[mir.AtomicOrdering, int] = {
+    mir.AtomicOrdering.MONOTONIC: 0,
+    mir.AtomicOrdering.ACQUIRE: 1,
+    mir.AtomicOrdering.RELEASE: 1,
+    mir.AtomicOrdering.ACQ_REL: 2,
+    mir.AtomicOrdering.SEQ_CST: 3,
+}
+
+
+def _check_atomic_ordering(
+    ordering: mir.AtomicOrdering, allowed: tuple[mir.AtomicOrdering, ...], what: str
+) -> mir.AtomicOrdering:
+    """Check that an atomic operation with the given allowed memory orderings
+    was given one of them (LLVM rejects the others)."""
+    if ordering not in allowed:
+        names = ', '.join(o.name for o in allowed)
+        raise CompileError(
+            f'{what} does not accept the {ordering.name} ordering; '
+            f'it must be one of {names}'
+        )
+    return ordering
+
+
+def _check_atomic_failure_ordering(
+    success: mir.AtomicOrdering, failure: mir.AtomicOrdering
+) -> None:
+    """Check the ordering pair of a ``cmpxchg`` against LLVM's rules: the
+    failure ordering may not be ``release``/``acq_rel``, and may not be
+    stronger than the success ordering."""
+    if failure in (mir.AtomicOrdering.RELEASE, mir.AtomicOrdering.ACQ_REL):
+        raise CompileError(
+            'the failure ordering of std.atomic.atomic_cmpxchg cannot be '
+            'release or acq_rel'
+        )
+    if _ATOMIC_ORDER_STRENGTH[failure] > _ATOMIC_ORDER_STRENGTH[success]:
+        raise CompileError(
+            'the failure ordering of std.atomic.atomic_cmpxchg cannot be '
+            'stronger than its success ordering'
+        )
+
 
 @dataclass(slots=True)
 class CompileVars:
@@ -6031,6 +6084,16 @@ class HirRunner:
             return self._builtin_compile_error(binded)
         if fn.name == 'as_runtime_closure':
             return self._builtin_as_runtime_closure(binded, ret)
+        if fn.name == 'atomic_load':
+            return self._builtin_atomic_load(binded, ret)
+        if fn.name == 'atomic_store':
+            return self._builtin_atomic_store(binded, ret)
+        if fn.name == 'atomic_rmw':
+            return self._builtin_atomic_rmw(binded, ret)
+        if fn.name == 'atomic_cmpxchg':
+            return self._builtin_atomic_cmpxchg(binded, ret)
+        if fn.name == 'atomic_fence':
+            return self._builtin_atomic_fence(binded, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 
     # -- ``std.core.gstr`` / ``std.core.sstr`` -------------------------------
@@ -6195,6 +6258,162 @@ class HirRunner:
             args.positional[1], 'the type argument of std.core.coerce'
         )
         self.store(ret, self._coerce(ev, target))
+        return PollResult.AGAIN
+
+    # -- ``std.atomic`` ------------------------------------------------------
+
+    def _atomic_pointer(
+        self, arg: ArgEntry[InterpVal], what: str
+    ) -> tuple[mir.Value, sval.Type]:
+        """The ``(address, pointee spy type)`` of the pointer argument ``arg``
+        of one atomic operation.  The pointee has to be an integer or a pointer -
+        the scalar types LLVM can access atomically, byte-sized (a ``bool`` is an
+        ``i1``, which LLVM will not access atomically, and an integer's width
+        must be a power of two)."""
+        ev = self._arg_value(arg)
+        ptr_type = _type_of(ev)
+        if not isinstance(ptr_type, sval.PointerType):
+            raise CompileError(f'{what} expects a pointer, got {ptr_type}')
+        elem = ptr_type.elem
+        if not isinstance(elem, (sval.IntType, sval.PointerType)):
+            raise CompileError(
+                f'{what} expects a pointer to an integer or a pointer, '
+                f'got {ptr_type}'
+            )
+        if isinstance(elem, sval.IntType) and not (
+            elem.bits > 0 and elem.bits & (elem.bits - 1) == 0 and elem.bits % 8 == 0
+        ):
+            raise CompileError(
+                f'{what} expects a pointer to an integer whose width is a '
+                f'byte-sized power of two, got {ptr_type}'
+            )
+        return self._to_runtime(ev), elem
+
+    def _atomic_ordering(self, arg: ArgEntry[InterpVal]) -> mir.AtomicOrdering:
+        """The :class:`mir.AtomicOrdering` the compile-time ``std.atomic``
+        ``MemoryOrder`` member ``arg`` denotes (a member passed explicitly, or
+        one that filled a parameter's default)."""
+        from ..std.atomic import MemoryOrder
+        enum_type = self._analyser._resolver.resolve_global(MemoryOrder)
+        assert isinstance(enum_type, sval.IntEnumType)
+        obj = _to_comptime(_shallow_normalize(self._arg_value(arg)))
+        assert obj is not None, 'the ordering argument has no compile-time value'
+        index = _enum_member_index(enum_type, obj)
+        name = enum_type.members.by_id[index][0]
+        return mir.AtomicOrdering[name]
+
+    def _atomic_rmw_op(self, arg: ArgEntry[InterpVal]) -> mir.AtomicRmwOp:
+        """The operation the compile-time ``std.atomic`` ``RmwOp`` member
+        ``arg`` denotes."""
+        from ..std.atomic import RmwOp
+        enum_type = self._analyser._resolver.resolve_global(RmwOp)
+        assert isinstance(enum_type, sval.IntEnumType)
+        obj = _to_comptime(_shallow_normalize(self._arg_value(arg)))
+        assert obj is not None, 'the operation argument has no compile-time value'
+        index = _enum_member_index(enum_type, obj)
+        name = enum_type.members.by_id[index][0]
+        return _ATOMIC_RMW_OPS[name]
+
+    def _atomic_volatile(self, arg: ArgEntry[InterpVal]) -> bool:
+        """The compile-time ``volatile`` flag of one atomic operation."""
+        obj = _to_comptime(_shallow_normalize(self._arg_value(arg)))
+        if not isinstance(obj, bool):
+            raise CompileError(
+                'the volatile argument of an atomic operation must be a '
+                'compile-time bool'
+            )
+        return obj
+
+    def _builtin_atomic_load(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.atomic.atomic_load(ptr, ordering, volatile)``: the value the
+        pointer ``ptr`` names, read atomically (see ``mir.AtomicLoad``)."""
+        ptr, elem = self._atomic_pointer(args.positional[0], 'std.atomic.atomic_load')
+        ordering = _check_atomic_ordering(
+            self._atomic_ordering(args.positional[1]),
+            (mir.AtomicOrdering.MONOTONIC, mir.AtomicOrdering.ACQUIRE, mir.AtomicOrdering.SEQ_CST),
+            'std.atomic.atomic_load',
+        )
+        volatile = self._atomic_volatile(args.positional[2])
+        self.store(ret, RuntimeVal(
+            self._emit(mir.AtomicLoad(ptr, ordering, volatile)), elem
+        ))
+        return PollResult.AGAIN
+
+    def _builtin_atomic_store(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.atomic.atomic_store(ptr, value, ordering, volatile)``: write
+        ``value`` through the pointer ``ptr`` atomically (see
+        ``mir.AtomicStore``)."""
+        ptr, elem = self._atomic_pointer(args.positional[0], 'std.atomic.atomic_store')
+        value = self._coerce(self._arg_value(args.positional[1]), elem)
+        ordering = _check_atomic_ordering(
+            self._atomic_ordering(args.positional[2]),
+            (mir.AtomicOrdering.MONOTONIC, mir.AtomicOrdering.RELEASE, mir.AtomicOrdering.SEQ_CST),
+            'std.atomic.atomic_store',
+        )
+        volatile = self._atomic_volatile(args.positional[3])
+        self._emit(mir.AtomicStore(ptr, self._to_runtime(value), ordering, volatile))
+        self.store(ret, ComptimeVal(sval.Void()))
+        return PollResult.AGAIN
+
+    def _builtin_atomic_rmw(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.atomic.atomic_rmw(ptr, op, value, ordering, volatile)``: apply
+        ``op`` to the pointee of ``ptr`` and ``value`` atomically and deliver
+        the old value (see ``mir.AtomicRmw``)."""
+        ptr, elem = self._atomic_pointer(args.positional[0], 'std.atomic.atomic_rmw')
+        op = self._atomic_rmw_op(args.positional[1])
+        value = self._coerce(self._arg_value(args.positional[2]), elem)
+        ordering = self._atomic_ordering(args.positional[3])
+        volatile = self._atomic_volatile(args.positional[4])
+        self.store(ret, RuntimeVal(
+            self._emit(mir.AtomicRmw(op, ptr, self._to_runtime(value), ordering, volatile)),
+            elem,
+        ))
+        return PollResult.AGAIN
+
+    def _builtin_atomic_cmpxchg(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.atomic.atomic_cmpxchg(ptr, expected, desired, success, failure,
+        volatile)``: compare the pointee of ``ptr`` against ``expected`` and, on
+        a match, store ``desired``; deliver ``(old_value, swapped)``."""
+        ptr, elem = self._atomic_pointer(args.positional[0], 'std.atomic.atomic_cmpxchg')
+        expected = self._coerce(self._arg_value(args.positional[1]), elem)
+        desired = self._coerce(self._arg_value(args.positional[2]), elem)
+        success = self._atomic_ordering(args.positional[3])
+        failure = self._atomic_ordering(args.positional[4])
+        volatile = self._atomic_volatile(args.positional[5])
+        _check_atomic_failure_ordering(success, failure)
+        exchange = self._emit(mir.AtomicCmpxchg(
+            ptr, self._to_runtime(expected), self._to_runtime(desired),
+            success, failure, volatile,
+        ))
+        old = self._emit(mir.ExtractValue(exchange, 0))
+        ok = self._emit(mir.ExtractValue(exchange, 1))
+        self.store(ret, ComptimeTuple((
+            ArgEntry(RuntimeVal(old, elem), False),
+            ArgEntry(RuntimeVal(ok, sval.BoolType()), False),
+        )))
+        return PollResult.AGAIN
+
+    def _builtin_atomic_fence(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.atomic.atomic_fence(ordering)``: a memory ordering fence (see
+        ``mir.Fence``)."""
+        ordering = _check_atomic_ordering(
+            self._atomic_ordering(args.positional[0]),
+            (mir.AtomicOrdering.ACQUIRE, mir.AtomicOrdering.RELEASE,
+             mir.AtomicOrdering.ACQ_REL, mir.AtomicOrdering.SEQ_CST),
+            'std.atomic.atomic_fence',
+        )
+        self._emit(mir.Fence(ordering))
+        self.store(ret, ComptimeVal(sval.Void()))
         return PollResult.AGAIN
 
     # -- ``std.core.panic`` / ``std.core.catch_unwind`` ----------------------
