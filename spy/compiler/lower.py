@@ -51,8 +51,11 @@ _ICMP_OPS = {
     '>=': sllvm.IcmpOp.GE,
 }
 
-# the LLVM operation of one ``mir.AtomicRmw``, by its ``op`` string
-_ATOMIC_RMW_OPS = {
+# the LLVM operation of one ``mir.AtomicRmw``, by its ``op`` string.  ``add``
+# and ``sub`` are the two operations LLVM spells differently for integers
+# (``add``/``sub``) and floats (``fadd``/``fsub``), so the operand type picks
+# the table (see the ``mir.AtomicRmw`` case below).
+_ATOMIC_INT_RMW_OPS = {
     'xchg': sllvm.Xchg,
     'add': sllvm.Add,
     'sub': sllvm.Sub,
@@ -60,11 +63,18 @@ _ATOMIC_RMW_OPS = {
     'or': sllvm.OrOp,
     'xor': sllvm.XorOp,
 }
+_ATOMIC_FLOAT_RMW_OPS = {
+    'xchg': sllvm.Xchg,
+    'add': sllvm.FAdd,
+    'sub': sllvm.FSub,
+}
 
 
 def _ordering(ordering: mir.AtomicOrdering) -> sllvm.Ordering:
-    """The LLVM ordering of a MIR atomic ordering (the two share their
-    spellings)."""
+    """The LLVM ordering of a MIR atomic ordering.  The two share every
+    spelling but ``RELAXED``, which LLVM spells ``monotonic``."""
+    if ordering is mir.AtomicOrdering.RELAXED:
+        return sllvm.Ordering.MONOTONIC
     return sllvm.Ordering(ordering.value)
 
 
@@ -627,8 +637,16 @@ class _Lowerer:
                     inst.volatile,
                 )
             case mir.AtomicRmw():
+                # ``add``/``sub`` on a float is LLVM's ``fadd``/``fsub``: the
+                # operand type picks the operation table (the mirror carries a
+                # single ``add``/``sub``, see ``mir.AtomicRmw``)
+                rmw_ops = (
+                    _ATOMIC_FLOAT_RMW_OPS
+                    if isinstance(inst.value.get_type(), mir.FloatType)
+                    else _ATOMIC_INT_RMW_OPS
+                )
                 result = block.atomicrmw(
-                    _ATOMIC_RMW_OPS[inst.op](),
+                    rmw_ops[inst.op](),
                     self._value(inst.ptr, arg_values),
                     self._value(inst.value, arg_values),
                     _ordering(inst.ordering),

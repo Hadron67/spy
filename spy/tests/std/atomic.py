@@ -9,7 +9,7 @@ no address to operate on); the address forces the local into memory.
 
 from unittest import TestCase
 
-from ...compiler import CompileError, i32
+from ...compiler import CompileError, c128, f64, i32
 from ...compiler import bool as spy_bool
 from ...compiler.dsl import func, struct
 from ...compiler.syntax import ref
@@ -19,6 +19,7 @@ from ...std.atomic import (
     atomic_cmpxchg,
     atomic_fence,
     atomic_fetch_add,
+    atomic_fetch_sub,
     atomic_load,
     atomic_rmw,
     atomic_store,
@@ -85,8 +86,8 @@ def cmpxchg_failure(x: i32) -> i32:
 @func()
 def store_and_load_relaxed(x: i32) -> i32:
     p = ref(x)
-    atomic_store(p, 5, MemoryOrder.MONOTONIC)
-    return atomic_load(p, MemoryOrder.MONOTONIC)
+    atomic_store(p, 5, MemoryOrder.RELAXED)
+    return atomic_load(p, MemoryOrder.RELAXED)
 
 
 @func()
@@ -119,6 +120,77 @@ def cmpxchg_release_success(x: i32) -> i32:
     return result
 
 
+# floating point: ``atomic_load``/``atomic_store`` take a float, and ``atomic_rmw``
+# supports ``ADD``/``SUB`` on one (LLVM emits ``fadd``/``fsub``)
+
+
+@func()
+def f64_store_load(x: f64) -> f64:
+    p = ref(x)
+    atomic_store(p, 3.5)
+    return atomic_load(p)
+
+
+@func()
+def f64_fetch_add(x: f64) -> f64:
+    p = ref(x)
+    old = atomic_fetch_add(p, 0.5)
+    return old * 1000.0 + x
+
+
+@func()
+def f64_fetch_sub(x: f64) -> f64:
+    p = ref(x)
+    old = atomic_fetch_sub(p, 0.5)
+    return old * 1000.0 + x
+
+
+@func()
+def f64_swap(x: f64) -> f64:
+    p = ref(x)
+    old = atomic_swap(p, 7.5)
+    return old * 1000.0 + x
+
+
+# pointers: only ``XCHG`` is valid on a pointer pointee
+
+
+@func()
+def ptr_swap(x: i32, y: i32) -> i32:
+    a = ref(x)
+    b = ref(y)
+    old = atomic_rmw(ref(a), RmwOp.XCHG, b)
+    # ``a`` now points at ``y``, ``old`` at ``x``: writing through ``old``
+    # changes ``x``, and reading ``a`` reads ``y``
+    old[...] = 5
+    return a[...] * 100 + x
+
+
+# a complex number: the real and the imaginary part are each read-modified-written
+# by their own atomic operation (a real addend leaves the imaginary part alone)
+
+
+@func()
+def c128_fetch_add(z: c128) -> c128:
+    p = ref(z)
+    old = atomic_fetch_add(p, 1.5 + 2.5j)
+    return old * 1000.0 + z
+
+
+@func()
+def c128_fetch_add_real_only(z: c128) -> c128:
+    p = ref(z)
+    old = atomic_fetch_add(p, 1.5)
+    return old * 1000.0 + z
+
+
+@func()
+def c128_swap(z: c128) -> c128:
+    p = ref(z)
+    old = atomic_swap(p, 7.5 + 1.5j)
+    return old * 1000.0 + z
+
+
 # the rejected shapes: a failure ordering that is too strong, a memory ordering
 # an operation does not accept, and a pointee that is not a scalar LLVM can
 # access atomically
@@ -130,8 +202,8 @@ def cmpxchg_bad_failure_ordering(x: i32) -> i32:
 
 
 @func()
-def fence_monotonic_rejected(x: i32) -> i32:
-    atomic_fence(MemoryOrder.MONOTONIC)
+def fence_relaxed_rejected(x: i32) -> i32:
+    atomic_fence(MemoryOrder.RELAXED)
     return x
 
 
@@ -144,6 +216,34 @@ def load_release_rejected(x: i32) -> i32:
 def store_acquire_rejected(x: i32) -> i32:
     atomic_store(ref(x), 1, MemoryOrder.ACQUIRE)
     return x
+
+
+@func()
+def f64_cmpxchg_rejected(x: f64) -> f64:
+    return atomic_cmpxchg(ref(x), 1.0, 2.0)[0]
+
+
+@func()
+def f64_and_rejected(x: f64) -> f64:
+    return atomic_rmw(ref(x), RmwOp.AND, 1.0)
+
+
+@func()
+def ptr_rmw_add_rejected(x: i32) -> i32:
+    a = ref(x)
+    b = ref(x)
+    atomic_rmw(ref(a), RmwOp.ADD, b)
+    return x
+
+
+@func()
+def c128_and_rejected(z: c128) -> c128:
+    return atomic_rmw(ref(z), RmwOp.AND, 1.0)
+
+
+@func()
+def c128_load_rejected(z: c128) -> c128:
+    return atomic_load(ref(z))
 
 
 @struct()
@@ -207,11 +307,57 @@ class SpyAtomicTest(TestCase):
     def test_a_stronger_success_ordering(self) -> None:
         self.assertEqual(cmpxchg_release_success(3), 10000 + 3 * 100 + 9)
 
+    def test_a_float_store_and_load(self) -> None:
+        self.assertEqual(f64_store_load(0.0), 3.5)
+
+    def test_a_float_fetch_add(self) -> None:
+        self.assertEqual(f64_fetch_add(2.0), 2.0 * 1000.0 + 2.5)
+
+    def test_a_float_fetch_sub(self) -> None:
+        self.assertEqual(f64_fetch_sub(2.0), 2.0 * 1000.0 + 1.5)
+
+    def test_a_float_swap(self) -> None:
+        self.assertEqual(f64_swap(2.0), 2.0 * 1000.0 + 7.5)
+
+    def test_a_pointer_swap(self) -> None:
+        self.assertEqual(ptr_swap(1, 2), 2 * 100 + 5)
+
+    def test_a_complex_fetch_add(self) -> None:
+        # (2+3j) += (1.5+2.5j): old is 2+3j, the pointee becomes 3.5+5.5j
+        self.assertEqual(
+            c128_fetch_add(2.0 + 3.0j), complex(2.0 * 1000.0 + 3.5, 3.0 * 1000.0 + 5.5)
+        )
+
+    def test_a_complex_fetch_add_of_a_real_leaves_the_imaginary_part(self) -> None:
+        self.assertEqual(
+            c128_fetch_add_real_only(2.0 + 3.0j), complex(2.0 * 1000.0 + 3.5, 3003.0)
+        )
+
+    def test_a_complex_swap(self) -> None:
+        self.assertEqual(
+            c128_swap(2.0 + 3.0j), complex(2007.5, 3001.5)
+        )
+
+    def test_a_complex_bitwise_rmw_is_rejected(self) -> None:
+        self.assertRaises(CompileError, c128_and_rejected, 1.0 + 1.0j)
+
+    def test_a_complex_load_is_rejected(self) -> None:
+        self.assertRaises(CompileError, c128_load_rejected, 1.0 + 1.0j)
+
+    def test_a_float_cmpxchg_is_rejected(self) -> None:
+        self.assertRaises(CompileError, f64_cmpxchg_rejected, 1.0)
+
+    def test_a_float_bitwise_rmw_is_rejected(self) -> None:
+        self.assertRaises(CompileError, f64_and_rejected, 1.0)
+
+    def test_a_pointer_add_rmw_is_rejected(self) -> None:
+        self.assertRaises(CompileError, ptr_rmw_add_rejected, 1)
+
     def test_a_failure_ordering_stronger_than_success_is_rejected(self) -> None:
         self.assertRaises(CompileError, cmpxchg_bad_failure_ordering, 1)
 
-    def test_a_monotonic_fence_is_rejected(self) -> None:
-        self.assertRaises(CompileError, fence_monotonic_rejected, 1)
+    def test_a_relaxed_fence_is_rejected(self) -> None:
+        self.assertRaises(CompileError, fence_relaxed_rejected, 1)
 
     def test_a_release_load_is_rejected(self) -> None:
         self.assertRaises(CompileError, load_release_rejected, 1)

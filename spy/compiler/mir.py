@@ -640,11 +640,12 @@ class Store(Inst):
 
 
 class AtomicOrdering(Enum):
-    """The memory ordering of an atomic operation (``std.atomic.MemoryOrder``);
-    the values are the spellings LLVM's textual IR uses (see
-    ``llvm.Ordering``)."""
+    """The memory ordering of an atomic operation (``std.atomic.MemoryOrder``).
+    The values are this compiler's own spellings; only ``RELAXED`` differs from
+    LLVM's textual IR, which spells it ``monotonic`` - ``lower`` converts (see
+    ``lower._ordering``)."""
 
-    MONOTONIC = 'monotonic'
+    RELAXED = 'relaxed'
     ACQUIRE = 'acquire'
     RELEASE = 'release'
     ACQ_REL = 'acq_rel'
@@ -704,7 +705,9 @@ class AtomicRmw(Inst):
     """A read-modify-write (LLVM's ``atomicrmw``): apply ``op`` to the pointee
     of ``ptr`` and ``value`` with the given memory ``ordering``, and produce
     the *old* pointee value.  ``op`` is one of ``'xchg'``, ``'add'``,
-    ``'sub'``, ``'and'``, ``'or'`` and ``'xor'`` (the integer operations)."""
+    ``'sub'``, ``'and'``, ``'or'`` and ``'xor'``; the operand type picks the
+    spelling of ``add``/``sub`` - LLVM's ``fadd``/``fsub`` for a float, ``add``/
+    ``sub`` otherwise (see ``lower``)."""
 
     op: AtomicRmwOp
     ptr: Value

@@ -5,11 +5,17 @@ LLVM atomic instructions (``load atomic`` / ``store atomic`` / ``atomicrmw`` /
 ``cmpxchg``), and ``atomic_fence`` to a ``fence``; the builtins are implemented
 by the compile-time interpreter (see ``interp.HirRunner._builtin_atomic_*``).
 
-The pointee of the pointer an operation takes has to be an integer or a pointer
-- the byte-sized scalar types LLVM can access atomically (a ``bool`` is an
-``i1``, which LLVM will not access atomically, and an integer's width must be a
-power of two bytes).  Every operation carries a :class:`MemoryOrder`, the memory
-ordering it is performed with.
+The pointee of the pointer an operation takes has to be an integer, a float or a
+pointer - the byte-sized scalar types LLVM can access atomically (a ``bool`` is
+an ``i1``, which LLVM will not access atomically, and an integer's width must be
+a power of two bytes).  ``atomic_cmpxchg`` takes no float (LLVM's ``cmpxchg``
+operates on integers and pointers only), and ``atomic_rmw`` supports a subset of
+its operations per pointee kind (see :class:`RmwOp`).  Every operation carries a
+:class:`MemoryOrder`, the memory ordering it is performed with.
+
+``atomic_rmw`` also takes a complex pointee: the real and the imaginary part of
+the number are each read-modified-written by their own atomic operation, so the
+two updates are not one atomic operation as a whole.
 """
 
 from enum import Enum
@@ -19,10 +25,10 @@ from ..compiler import ConstPtr, Ptr, builtin_func
 
 class MemoryOrder(Enum):
     """The memory ordering of an atomic operation, from the weakest
-    (``MONOTONIC``) to the strongest (``SEQ_CST``); the names are the ones
-    LLVM's IR uses (``relaxed`` is spelled ``MONOTONIC`` there)."""
+    (``RELAXED``) to the strongest (``SEQ_CST``).  ``RELAXED`` is LLVM's
+    ``monotonic``; ``lower`` spells it that way (see ``mir.AtomicOrdering``)."""
 
-    MONOTONIC = 0
+    RELAXED = 0
     ACQUIRE = 1
     RELEASE = 2
     ACQ_REL = 3
@@ -31,7 +37,12 @@ class MemoryOrder(Enum):
 
 class RmwOp(Enum):
     """The operation of an :func:`atomic_rmw`: store ``XCHG`` (a swap), or
-    apply ``ADD``/``SUB``/``AND``/``OR``/``XOR`` to the value already stored."""
+    apply ``ADD``/``SUB``/``AND``/``OR``/``XOR`` to the value already stored.
+
+    An integer pointee takes every operation; a float (or complex) pointee only
+    ``XCHG``, ``ADD`` and ``SUB`` - LLVM has ``fadd``/``fsub`` but no float
+    bitwise operation, and a complex number is handled part by part, each part a
+    float; a pointer pointee only ``XCHG``."""
 
     XCHG = 0
     ADD = 1
@@ -51,6 +62,9 @@ def atomic_store[T](ptr: Ptr[T], value: T, ordering: MemoryOrder = MemoryOrder.S
                     volatile: bool = False): ...
 
 
+# ``atomic_rmw`` also takes a complex pointee: each of its two parts (real and
+# imaginary, both floats) is read-modified-written by its own atomicrmw, so a
+# use that needs no per-number atomicity (a counter, say) is served by it.
 @builtin_func
 def atomic_rmw[T](ptr: Ptr[T], op: RmwOp, value: T, ordering: MemoryOrder = MemoryOrder.SEQ_CST,
                   volatile: bool = False) -> T: ...

@@ -205,7 +205,7 @@ _ATOMIC_RMW_OPS: dict[str, mir.AtomicRmwOp] = {
 # how strong each memory ordering is, for the success/failure ordering rule of
 # ``atomic_cmpxchg`` (see ``_check_atomic_failure_ordering``)
 _ATOMIC_ORDER_STRENGTH: dict[mir.AtomicOrdering, int] = {
-    mir.AtomicOrdering.MONOTONIC: 0,
+    mir.AtomicOrdering.RELAXED: 0,
     mir.AtomicOrdering.ACQUIRE: 1,
     mir.AtomicOrdering.RELEASE: 1,
     mir.AtomicOrdering.ACQ_REL: 2,
@@ -225,6 +225,36 @@ def _check_atomic_ordering(
             f'it must be one of {names}'
         )
     return ordering
+
+
+# the ``std.atomic.RmwOp`` operations each pointee kind accepts: an integer
+# takes every operation, a float only the arithmetic ones (LLVM has ``fadd``/
+# ``fsub`` but no float bitwise op), and a pointer only ``xchg``
+_ATOMIC_RMW_OPS_BY_KIND: dict[str, tuple[mir.AtomicRmwOp, ...]] = {
+    'float': ('xchg', 'add', 'sub'),
+    'pointer': ('xchg',),
+    'integer': ('xchg', 'add', 'sub', 'and', 'or', 'xor'),
+}
+
+
+def _check_atomic_rmw_op(elem: sval.Type, op: mir.AtomicRmwOp) -> None:
+    """Check that the pointee kind accepts the ``std.atomic.RmwOp`` operation
+    ``op`` (LLVM supports only the arithmetic atomicrmw operations on floats,
+    and only ``xchg`` on pointers; a complex number is handled part by part, so
+    it takes what a float takes)."""
+    if isinstance(elem, (sval.FloatType, sval.ComplexType)):
+        kind = 'float'
+    elif isinstance(elem, sval.PointerType):
+        kind = 'pointer'
+    else:
+        kind = 'integer'
+    allowed = _ATOMIC_RMW_OPS_BY_KIND[kind]
+    if op not in allowed:
+        names = ', '.join(o.upper() for o in allowed)
+        raise CompileError(
+            f'std.atomic.atomic_rmw supports only {names} on a {elem} pointee, '
+            f'not {op.upper()}'
+        )
 
 
 def _check_atomic_failure_ordering(
@@ -6266,18 +6296,26 @@ class HirRunner:
         self, arg: ArgEntry[InterpVal], what: str
     ) -> tuple[mir.Value, sval.Type]:
         """The ``(address, pointee spy type)`` of the pointer argument ``arg``
-        of one atomic operation.  The pointee has to be an integer or a pointer -
-        the scalar types LLVM can access atomically, byte-sized (a ``bool`` is an
-        ``i1``, which LLVM will not access atomically, and an integer's width
-        must be a power of two)."""
-        ev = self._arg_value(arg)
+        of one atomic operation (see ``_atomic_pointer_value``)."""
+        return self._atomic_pointer_value(self._arg_value(arg), what)
+
+    def _atomic_pointer_value(
+        self, ev: InterpVal, what: str
+    ) -> tuple[mir.Value, sval.Type]:
+        """The ``(address, pointee spy type)`` of the pointer value ``ev`` of an
+        atomic operation.  The pointee has to be an integer, a float or a pointer
+        - the scalar types LLVM can access atomically, byte-sized (a ``bool`` is
+        an ``i1``, which LLVM will not access atomically, and an integer's width
+        must be a byte-sized power of two).  A complex pointee is not a scalar:
+        only ``atomic_rmw`` takes one, and handles it part by part (see
+        ``_atomic_rmw_complex``)."""
         ptr_type = _type_of(ev)
         if not isinstance(ptr_type, sval.PointerType):
             raise CompileError(f'{what} expects a pointer, got {ptr_type}')
         elem = ptr_type.elem
-        if not isinstance(elem, (sval.IntType, sval.PointerType)):
+        if not isinstance(elem, (sval.IntType, sval.FloatType, sval.PointerType)):
             raise CompileError(
-                f'{what} expects a pointer to an integer or a pointer, '
+                f'{what} expects a pointer to an integer, a float or a pointer, '
                 f'got {ptr_type}'
             )
         if isinstance(elem, sval.IntType) and not (
@@ -6332,7 +6370,7 @@ class HirRunner:
         ptr, elem = self._atomic_pointer(args.positional[0], 'std.atomic.atomic_load')
         ordering = _check_atomic_ordering(
             self._atomic_ordering(args.positional[1]),
-            (mir.AtomicOrdering.MONOTONIC, mir.AtomicOrdering.ACQUIRE, mir.AtomicOrdering.SEQ_CST),
+            (mir.AtomicOrdering.RELAXED, mir.AtomicOrdering.ACQUIRE, mir.AtomicOrdering.SEQ_CST),
             'std.atomic.atomic_load',
         )
         volatile = self._atomic_volatile(args.positional[2])
@@ -6351,7 +6389,7 @@ class HirRunner:
         value = self._coerce(self._arg_value(args.positional[1]), elem)
         ordering = _check_atomic_ordering(
             self._atomic_ordering(args.positional[2]),
-            (mir.AtomicOrdering.MONOTONIC, mir.AtomicOrdering.RELEASE, mir.AtomicOrdering.SEQ_CST),
+            (mir.AtomicOrdering.RELAXED, mir.AtomicOrdering.RELEASE, mir.AtomicOrdering.SEQ_CST),
             'std.atomic.atomic_store',
         )
         volatile = self._atomic_volatile(args.positional[3])
@@ -6364,16 +6402,52 @@ class HirRunner:
     ) -> PollResult:
         """``std.atomic.atomic_rmw(ptr, op, value, ordering, volatile)``: apply
         ``op`` to the pointee of ``ptr`` and ``value`` atomically and deliver
-        the old value (see ``mir.AtomicRmw``)."""
-        ptr, elem = self._atomic_pointer(args.positional[0], 'std.atomic.atomic_rmw')
+        the old value (see ``mir.AtomicRmw``).  A complex pointee is operated on
+        part by part - one atomicrmw on the real part and one on the imaginary
+        part (see ``_atomic_rmw_complex``)."""
         op = self._atomic_rmw_op(args.positional[1])
-        value = self._coerce(self._arg_value(args.positional[2]), elem)
         ordering = self._atomic_ordering(args.positional[3])
         volatile = self._atomic_volatile(args.positional[4])
+        ev = self._arg_value(args.positional[0])
+        ptr_type = _type_of(ev)
+        if isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.ComplexType):
+            return self._atomic_rmw_complex(
+                ptr_type.elem, ev, args.positional[2], op, ordering, volatile, ret
+            )
+        ptr, elem = self._atomic_pointer_value(ev, 'std.atomic.atomic_rmw')
+        _check_atomic_rmw_op(elem, op)
+        value = self._coerce(self._arg_value(args.positional[2]), elem)
         self.store(ret, RuntimeVal(
             self._emit(mir.AtomicRmw(op, ptr, self._to_runtime(value), ordering, volatile)),
             elem,
         ))
+        return PollResult.AGAIN
+
+    def _atomic_rmw_complex(
+        self, complex_type: sval.ComplexType, ptr_ev: InterpVal, value_arg: ArgEntry[InterpVal],
+        op: mir.AtomicRmwOp, ordering: mir.AtomicOrdering, volatile: bool, ret: InterpVal,
+    ) -> PollResult:
+        """One ``atomic_rmw`` on a complex pointee: the real and the imaginary
+        part (each a float) are read-modified-written by their own
+        ``mir.AtomicRmw``, and the old part values are delivered as the old
+        complex number.  It is not one atomic operation - the two parts are not
+        updated as a unit - so only a use that needs no such guarantee (a
+        per-number counter, say) is served by it."""
+        _check_atomic_rmw_op(complex_type, op)
+        elem = complex_type.elem
+        ptr = self._to_runtime(ptr_ev)
+        parts = self.as_comptime_aggregate(
+            self._coerce(self._arg_value(value_arg), complex_type)
+        )
+        old: list[InterpVal] = []
+        for index in (0, 1):
+            part_ptr = self._emit(mir.Gep(ptr, index))
+            part_value = self._to_runtime(parts.values[index])
+            old.append(RuntimeVal(
+                self._emit(mir.AtomicRmw(op, part_ptr, part_value, ordering, volatile)),
+                elem,
+            ))
+        self.store(ret, ComptimeAggregate(complex_type, tuple(old)))
         return PollResult.AGAIN
 
     def _builtin_atomic_cmpxchg(
@@ -6383,6 +6457,11 @@ class HirRunner:
         volatile)``: compare the pointee of ``ptr`` against ``expected`` and, on
         a match, store ``desired``; deliver ``(old_value, swapped)``."""
         ptr, elem = self._atomic_pointer(args.positional[0], 'std.atomic.atomic_cmpxchg')
+        if isinstance(elem, sval.FloatType):
+            # LLVM's cmpxchg operates on integers and pointers only
+            raise CompileError(
+                'std.atomic.atomic_cmpxchg does not support a float pointee'
+            )
         expected = self._coerce(self._arg_value(args.positional[1]), elem)
         desired = self._coerce(self._arg_value(args.positional[2]), elem)
         success = self._atomic_ordering(args.positional[3])
