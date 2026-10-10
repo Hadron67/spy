@@ -273,6 +273,28 @@ def tu_comptime() -> i32:
 
 
 @func()
+def tu_comptime_reassigned(x: i32) -> i32:
+    # a second assignment that switches the variant rebuilds the payload place,
+    # which has no ``CommitSlot`` of its own and is committed when the
+    # construction closes (a runtime payload lands in memory)
+    u: Comptime[TU_A | TU_B] = TU_A(2)
+    u = TU_B(x)
+    if isinstance(b := u, TU_B):
+        return b.y
+    return -1
+
+
+@func()
+def tu_comptime_reassigned_comptime() -> i32:
+    # ... and a compile-time payload stays a box
+    u: Comptime[TU_A | TU_B] = TU_A(2)
+    u = TU_B(7)
+    if isinstance(b := u, TU_B):
+        return b.y
+    return -1
+
+
+@func()
 def tu_typeof(u: TU_A | TU_B) -> i32:
     if spy_typeof(u) == (TU_A | TU_B):
         return 1
@@ -421,6 +443,11 @@ class SpyTaggedUnionTest(TestCase):
 
     def test_compile_time_storage(self) -> None:
         self.assertEqual(tu_comptime(), 2)
+
+    def test_compile_time_storage_reassigned(self) -> None:
+        # a second assignment that switches the variant
+        self.assertEqual(tu_comptime_reassigned(7), 7)
+        self.assertEqual(tu_comptime_reassigned_comptime(), 7)
 
     def test_typeof(self) -> None:
         self.assertEqual(tu_typeof_make(0), 1)

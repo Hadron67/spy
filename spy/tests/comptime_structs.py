@@ -204,10 +204,9 @@ def comptime_struct_of_one_field_from_a_runtime_value(x: i64) -> i64:
 
 @func()
 def comptime_struct_runtime_field_by_ref(x: i32) -> i32:
-    # the runtime field of a compile-time aggregate is kept inline (a box holding
-    # the runtime value); handing its address to a native function copies the
-    # value into the call (see ``ComptimePtrArg``), so the write does not reach
-    # the field
+    # the runtime field of a compile-time aggregate lands in memory (a
+    # ``ComptimeBox`` never holds a runtime value), so handing its address to a
+    # native function hands it a real pointer and the write reaches the field
     s: Comptime = Small(x, 2)
     incr_ptr(ref(s.a))
     return s.a
@@ -215,10 +214,9 @@ def comptime_struct_runtime_field_by_ref(x: i32) -> i32:
 
 @func()
 def comptime_struct_field_written_in_branches(c: spy_bool, x: i32) -> i32:
-    # the field holds the runtime value ``x``, so it is an inline compile-time
-    # place (a box); writing it in both branches of a runtime ``if`` happens
-    # after the storage was committed, so the last write the walk performs wins -
-    # like a scalar compile-time local
+    # the field holds the runtime value ``x`` in memory, so writing it in both
+    # branches of a runtime ``if`` merges in that memory and the choice is a
+    # runtime one (the last write of the walk no longer wins)
     s: Comptime = Small(x, 1)
     if c:
         s.a = 5
@@ -262,6 +260,29 @@ def comptime_struct_field_comparison() -> spy_bool:
     # in Python
     s: Comptime = Small(1, 2)
     return s.a == 1
+
+
+@func()
+def comptime_struct_field_written_in_a_runtime_loop(x: i32) -> i32:
+    # a runtime field of a compile-time aggregate is memory, so a runtime loop
+    # may write it (see pending-problems.md #3)
+    s: Comptime = Small(x, 1)
+    y: i32 = 0
+    while y < 3:
+        s.a = s.a + 1
+        y = y + 1
+    return s.a
+
+
+@func()
+def comptime_struct_declared_field_written_in_a_runtime_loop(x: i32) -> i32:
+    # ... likewise for a declared compile-time variable
+    s: Comptime[Small] = Small(x, 1)
+    y: i32 = 0
+    while y < 3:
+        s.a = s.a + 1
+        y = y + 1
+    return s.a
 
 
 @func()
@@ -336,17 +357,19 @@ class SpyComptimeStructTest(TestCase):
     def test_a_whole_runtime_value_after_a_construction(self) -> None:
         self.assertEqual(comptime_struct_reassigned_from_a_runtime_value(5), 8)
 
-    def test_a_runtime_field_of_such_a_variable_is_not_addressable(self) -> None:
-        # the runtime field is a compile-time box, not memory: taking its address
-        # hands the callee a *copy* (see ``ComptimePtrArg``), so the write does
-        # not reach the field
-        self.assertEqual(comptime_struct_runtime_field_by_ref(5), 5)
+    def test_a_runtime_field_of_such_a_variable_is_addressable(self) -> None:
+        # the runtime field is memory, not a box: taking its address hands the
+        # callee a real pointer, so the write reaches the field
+        self.assertEqual(comptime_struct_runtime_field_by_ref(5), 6)
 
     def test_a_runtime_field_written_in_branches(self) -> None:
-        # both branches write the same compile-time box, so the last write of the
-        # walk wins whatever the runtime condition is
-        self.assertEqual(comptime_struct_field_written_in_branches(True, 3), 10)
+        # both branches write the field's memory, so the choice is a runtime one
+        self.assertEqual(comptime_struct_field_written_in_branches(True, 3), 6)
         self.assertEqual(comptime_struct_field_written_in_branches(False, 3), 10)
+
+    def test_a_runtime_field_written_in_a_runtime_loop(self) -> None:
+        self.assertEqual(comptime_struct_field_written_in_a_runtime_loop(10), 13)
+        self.assertEqual(comptime_struct_declared_field_written_in_a_runtime_loop(10), 13)
 
     def test_a_nested_runtime_aggregate_field(self) -> None:
         self.assertEqual(comptime_struct_from_a_nested_runtime_value(5), 10)

@@ -92,6 +92,50 @@ def tuple_inplace_sub(a: tuple[i32, i32]) -> i32:
     return a[0]
 
 
+# ---------------------------------------------------------------------------
+# a runtime control flow write into a tuple element place
+# ---------------------------------------------------------------------------
+
+
+@func()
+def pair2(x: i32) -> tuple[i32, i32]:
+    return x, x + 1
+
+
+@func()
+def tuple_literal_loop(x: i32) -> i32:
+    # a tuple built from runtime values holds its elements in memory, so a
+    # runtime loop may write them (see pending-problems.md #3)
+    t: Comptime = (x, x + 1)
+    y: i32 = 0
+    while y < 3:
+        t[0] = t[0] + 1
+        y = y + 1
+    return t[0]
+
+
+@func()
+def multi_value_result_loop(x: i32) -> i32:
+    # likewise for a tuple a multi-value call packed into the variable
+    t: Comptime = pair2(x)
+    y: i32 = 0
+    while y < 3:
+        t[0] = t[0] + 1
+        y = y + 1
+    return t[0]
+
+
+class SpyTupleRuntimeLoopTest(TestCase):
+    """A tuple's element places hold runtime values in memory, so a runtime
+    loop can write them (the bug of pending-problems.md #3)."""
+
+    def test_a_tuple_literal(self) -> None:
+        self.assertEqual(tuple_literal_loop(10), 13)
+
+    def test_a_multi_value_result(self) -> None:
+        self.assertEqual(multi_value_result_loop(10), 13)
+
+
 class SpyTupleExtendTest(TestCase):
     """``t += u``: the in-place extension of a tuple place."""
 
@@ -126,4 +170,5 @@ class SpyTupleExtendRejectedTest(TestCase):
 all_tests = [
     SpyTupleExtendTest,
     SpyTupleExtendRejectedTest,
+    SpyTupleRuntimeLoopTest,
 ]

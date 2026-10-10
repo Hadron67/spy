@@ -313,15 +313,18 @@ class RuntimeVal(InterpVal):
 
 @dataclass
 class ComptimeBox(InterpVal):
-    """A comptime-time writable box for non-aggregate values. Note that
-    ``value`` does not have to be a comptime-time value: it also can be
-    a runtime value :class:`RuntimeVal`. Supports non-aggregate values only,
+    """A compile-time writable box for non-aggregate values.  A box holds a
+    *compile-time* value only: a runtime value that refers to a register (a
+    load, a computation, a parameter) is never written into one - such a place
+    holds it in memory instead (see ``HirRunner._record_pending_store``).  A
+    runtime value that refers to no register (a global constant, a string, a
+    null pointer) is still held inline.  Supports non-aggregate values only,
     for aggregate values, use :class:`ComptimeAggregate` or
     :class:`ComptimeAggregatePtr` instead.
 
-    A box may be ``is_const`` - a field of the ``SlicePtr`` a slice subscript
-    builds is one (see ``HirRunner.slice_ptr``): the value it holds is read
-    through it, but no store may write through it."""
+    A box may be ``is_const``: the value it holds is read through it, but no
+    store may write through it (the fields of the ``SlicePtr`` a slice subscript
+    builds are such boxes, see ``HirRunner.slice_ptr``)."""
 
     type: sval.Type
     value: InterpVal
@@ -437,8 +440,11 @@ class PendingSlot(InterpVal):
     runtime_pos: mir.BasicBlock | None = None
     stores: list[_PendingAction] = field(default_factory=list)
     committed: InterpVal | None = None
+    declared: sval.Type | None = None
 
     def committed_type(self) -> sval.Type:
+        if self.declared is not None:
+            return self.declared
         type: sval.Type | None = None
         for store in self.stores:
             slot_type, _ = store.data.info()
@@ -660,17 +666,34 @@ def _is_comptime_val(val: InterpVal) -> bool:
     the HIR runs, so a computation over it can be folded in Python (see
     ``_eval_binary`` and friends) and a call may take it for a compile-time
     parameter.  A container is deeply compile-time when everything it holds
-    is, so a box or a tuple holding a runtime value is not."""
+    is.  A runtime value is compile-time when it refers to no register - a
+    global constant, a string, a function, a null pointer (see
+    ``_references_register``); one that refers to a register (a load, a
+    computation, a parameter) is not, and a container holding one is not
+    either."""
     todo = [val]
     while todo:
         val = todo.pop()
         match val:
             case RuntimeVal():
-                return False
-            case PendingSlot():
-                if val.committed is None:
+                # a runtime value that refers to no register - a global
+                # constant, a string, a function, a null pointer - is known in
+                # full at compile time; one that does (a load, a computation, a
+                # parameter) is not (see ``_references_register``)
+                if _references_register(val.value):
                     return False
-                todo.append(val.committed)
+            case PendingSlot():
+                if val.committed is not None:
+                    todo.append(val.committed)
+                elif val.declared is not None:
+                    # a declared-but-uncommitted slot is compile-time when every
+                    # store into it is an inline compile-time one
+                    for action in val.stores:
+                        if not isinstance(action.data, _PendingStore) or not action.data.is_inline:
+                            return False
+                        todo.append(action.data.value)
+                else:
+                    return False
             case ComptimeBox():
                 # a compile-time box is comptime only when the value it holds
                 # is (it may hold a runtime value, see ``ComptimeBox``)
@@ -734,6 +757,23 @@ def _references_register(value: mir.Value) -> bool:
         if children is not None:
             todo.extend(children)
     return False
+
+def _stores_decide_storage(type: sval.Type) -> bool:
+    """Whether a declared ``Comptime`` variable of ``type`` leaves its storage
+    to the stores into it (see ``alloca``): a scalar leaf, or a struct whose
+    fields all do - the construction records a place per field (see
+    ``finish_struct``).  An array, a tuple, a ``dict``, an ``Option`` or a
+    tagged union has a construction path that builds its place form up front, so
+    it is left as it is."""
+    if isinstance(type, sval.StructType):
+        return all(_stores_decide_storage(field.type) for field in type.fields().values())
+    return not (
+        _is_aggregate(type)
+        or isinstance(
+            type, (sval.TupleType, sval.StrDictType, sval.OptionType, sval.TaggedUnionType)
+        )
+    )
+
 
 def _is_aggregate(type: sval.Type) -> bool:
     """Whether ``type`` is an *aggregate*: a struct or an array.  An aggregate
@@ -1091,9 +1131,11 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
     Should work on non-normalized values."""
     match ev:
         case PendingSlot():
-            if ev.committed is None:
-                return None
-            return _type_of(ev.committed, allow_value_type)
+            if ev.committed is not None:
+                return _type_of(ev.committed, allow_value_type)
+            if ev.declared is not None:
+                return sval.PointerType(ev.declared, is_const=False)
+            return None
         case ComptimeBox():
             # a compile-time writable pointer: const when its box is (a field of
             # a slice, see ``ComptimeBox``)
@@ -2043,9 +2085,7 @@ class HirRunner:
                 # then hold the pointer in a fresh place of its own
                 assert isinstance(inner_type, sval.PointerType)
                 inner = self._init_ptr_target(inner_content, inner_type.elem, mir_args, leaf_source)
-                place = self._declared_comptime_place(type)
-                self.store(place, inner)
-                return place
+                return self._declared_comptime_place(type, inner)
             case tuple():
                 assert isinstance(type, sval.TupleType)
                 return ComptimeTuplePtr(tuple(
@@ -2061,20 +2101,26 @@ class HirRunner:
             case CompoundArgNode(container_type, elems):
                 return self._init_container_target(container_type, elems, mir_args, leaf_source)
             case _:
-                # a compile-time value leaf: a fresh place of the declared type
-                # (a box for a scalar, the type's own place form otherwise)
-                # holding a copy of the value
+                # a compile-time value leaf: the place of the declared type
+                # holding a copy of the value - a box for a compile-time value,
+                # memory for a runtime one (see ``_declared_comptime_place``)
                 value = self._coerce(ComptimeVal(node), type)
-                place = self._declared_comptime_place(type)
-                self.store(place, value)
-                return place
+                return self._declared_comptime_place(type, value)
 
-    def _declared_comptime_place(self, type: sval.Type) -> InterpVal:
-        """Fresh compile-time storage of the declared type ``type`` - a box for a
-        scalar, the type's own place form for an aggregate, tuple, ``dict``,
-        ``Option`` or tagged union (see ``alloca``) - the place a rebuilt
-        compile-time pointer's pointee lives in (see ``_init_ptr_target``)."""
-        return self.alloca(InlineMode.FULL, declared=type)
+    def _declared_comptime_place(self, type: sval.Type, value: InterpVal) -> InterpVal:
+        """The storage a rebuilt compile-time pointer's pointee lives in (see
+        ``_init_ptr_target``): a compile-time box holding ``value`` when it is a
+        compile-time value, real memory when it is a runtime one - a runtime
+        value cannot be held in a box (see ``ComptimeBox``)."""
+        unit = type.get_unit_value()
+        if unit is not None:
+            return ComptimeBox(type, ComptimeVal(unit))
+        if _is_comptime_val(value):
+            return ComptimeBox(type, value)
+        slot = self.alloca(InlineMode.NONE)
+        self._commit_pending_slot(slot, type)
+        self.store(slot, value)
+        return slot
 
     def _init_container_target(
         self, container_type: sval.Type, elems: tuple[ArgNode, ...], mir_args: list[mir.Type], leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None
@@ -2926,7 +2972,7 @@ class HirRunner:
             case hir.Load():
                 regs[inst] = self.load(self.operand(inst.ptr))
             case hir.Alloca():
-                regs[inst] = self.alloca(inst.inline, self._declared_type(inst.type))
+                regs[inst] = self.alloca(inst.inline, self._declared_type(inst.type), commit_declared=False)
             case hir.Store():
                 self.store(self.operand(inst.ptr), self.operand(inst.value))
             case hir.StoreVoidRetloc():
@@ -3986,7 +4032,17 @@ class HirRunner:
                     # coercion: the value stored need not even be of the type)
                     ptr.value = ComptimeVal(unit)
                 else:
-                    ptr.value = self._coerce(value, elem)
+                    coerced = self._coerce(value, elem)
+                    if not _is_comptime_val(coerced):
+                        # a box holds a compile-time value only: a runtime value
+                        # that refers to a register (a load, a computation, a
+                        # parameter) is never written into one - such a place
+                        # holds it in memory instead (see ``ComptimeBox``)
+                        raise CompileError(
+                            f'cannot store a runtime value into a compile-time place '
+                            f'of type {elem}'
+                        )
+                    ptr.value = coerced
             case RuntimeVal():
                 if unit is not None:
                     # a zero-sized type has no storage: nothing is emitted at
@@ -4171,7 +4227,7 @@ class HirRunner:
         """Fresh compile-time storage for a tagged union, at variant 0 (see
         ``ComptimeTaggedUnionPtr``)."""
         variant = type.types[0]
-        payload = self._fresh_place(variant, ComptimeVal(sval.Undefined(variant)))
+        payload = self._fresh_place(variant)
         return ComptimeTaggedUnionPtr(type, ComptimeVal(sval.Int(0, type.tag_type())), payload)
 
     def _tagged_union_tag(self, ev: InterpVal) -> InterpVal:
@@ -4224,7 +4280,7 @@ class HirRunner:
                 return place.payload_ptr
             # the current variant differs (a payload is only read once the tag
             # matched, so such a place is never written through)
-            return self._fresh_place(variant_type, ComptimeVal(sval.Undefined(variant_type)))
+            return self._fresh_place(variant_type)
         if sval.tagged_union_shape(type, self._mir_cache) == 'single':
             return RuntimeVal(self._to_runtime(place), sval.PointerType(variant_type, is_const=ptr_type.is_const))
         return self._union_variant_ptr(self._tagged_union_field_ptr(place), variant_type)
@@ -4240,7 +4296,7 @@ class HirRunner:
             if variant.get_unit_value() is None:
                 payload_type = _type_of(place.payload_ptr)
                 if not (isinstance(payload_type, sval.PointerType) and payload_type.elem == variant):
-                    place.payload_ptr = self._fresh_place(variant, ComptimeVal(sval.Undefined(variant)))
+                    place.payload_ptr = self._fresh_place(variant)
             return place
         assert isinstance(place, RuntimeVal)
         shape = sval.tagged_union_shape(type, self._mir_cache)
@@ -4280,8 +4336,9 @@ class HirRunner:
             return
         payload_type = _type_of(ptr.payload_ptr)
         if not (isinstance(payload_type, sval.PointerType) and payload_type.elem == variant):
-            ptr.payload_ptr = self._fresh_place(variant, ComptimeVal(sval.Undefined(variant)))
+            ptr.payload_ptr = self._fresh_place(variant)
         self.store(ptr.payload_ptr, value.value)
+        self._commit_place_tree(ptr.payload_ptr)
 
     def _materialize_union(self, value: InterpVal, union_type: sval.UnionType) -> InterpVal:
         """The runtime pointer of fresh memory the union storage ``value`` is
@@ -4589,8 +4646,10 @@ class HirRunner:
             # a construction into a tagged union: which variant the storage holds
             # is only known from the struct being built (see ``finish_struct``),
             # so the field gets a pending place the closing ``FinishStruct`` binds
-            # to the variant's field address
-            return self.alloca(InlineMode.NONE)
+            # to the variant's field address.  The place is inline: a compile-time
+            # field value stays compile-time (it is not needlessly materialized
+            # and read back as a register, see ``_finish_struct_into_tagged_union``)
+            return self.alloca(InlineMode.FULL)
 
         if isinstance(container_type, sval.StructType):
             index_int = _comptime_index(index)
@@ -4689,19 +4748,27 @@ class HirRunner:
             self._cur_block.emit(inst)
         return inst
 
-    def alloca(self, inline: InlineMode = InlineMode.NONE, declared: sval.Type | None = None) -> PendingSlot:
+    def alloca(self, inline: InlineMode = InlineMode.NONE, declared: sval.Type | None = None, commit_declared: bool = True) -> PendingSlot:
         """Reserve a fresh slot.  ``inline`` is how much of the value may be
         kept inline - nothing, anything but an aggregate, or anything (see
         ``InlineMode``); a ``declared`` type (an annotated variable, see
         ``_declared_type``) fixes the slot's storage right away - a
         compile-time value for a ``Comptime`` variable or a zero-sized type,
-        memory (a :class:`RuntimeVal`) for anything else (see ``hir.Alloca``)."""
+        memory (a :class:`RuntimeVal`) for anything else (see ``hir.Alloca``).
+
+        With ``commit_declared`` false a declared ``Comptime`` variable of a
+        type the stores can decide for (see ``_stores_decide_storage``) does not
+        fix its storage here: it is left to its stores, so a runtime value lands
+        in memory rather than a box (see ``_record_pending_store``)."""
         insertion = mir.Insertion([], None)
         self._emit(insertion)
         slot = PendingSlot(insertion, inline, self._runtime_position())
         if declared is not None:
             if inline != InlineMode.NONE and declared.get_unit_value() is None:
-                if _is_aggregate(declared):
+                if not commit_declared and _stores_decide_storage(declared):
+                    # the stores into the variable decide its storage
+                    slot.declared = declared
+                elif _is_aggregate(declared):
                     # a compile-time variable of an aggregate type: the aggregate
                     # is built in place, its fields (or elements) being their own
                     # places
@@ -6941,16 +7008,16 @@ class HirRunner:
                 # the capture's own place: the stored pointer (``as_copy=False``),
                 # or the field that holds the copied value (``as_copy=True``)
                 return field if as_copy else self.load(field)
-            return self._leaf_place_from_field(leaf, field)
+            # a nested runtime leaf: a fresh place holding a copy of the field's
+            # value.  A field only exists for a runtime leaf (see
+            # ``_collect_capture_fields``), so the value is a register read out of
+            # the struct and the place must live in memory - never a compile-time
+            # box (which holds compile-time values only)
+            place = self.alloca(InlineMode.NONE, declared=leaf.type)
+            self.store(place, self.load(field))
+            return place
 
         return self._init_arg_node(node, [], True, leaf_source)
-
-    def _leaf_place_from_field(self, leaf: RuntimeArgNode, field: InterpVal) -> InterpVal:
-        """Turn the value stored in a field back into a fresh place holding it (a
-        nested leaf; only ever called for a ``RuntimeArgNode``)."""
-        place = self._declared_comptime_place(leaf.type)
-        self.store(place, self.load(field))
-        return place
 
     # -- ``std.core.as_static_ptr`` ------------------------------------------
 
@@ -7414,6 +7481,7 @@ class HirRunner:
         array = self.init_inline_aggregate(sval.ArrayType(elem, len(values)))
         for index, value in enumerate(values):
             self.store(self.field_index_addr(array, _index_value(index)), value)
+        self._commit_place_tree(array)
         slice_type = self._special_type.slice_ptr_of(elem, True)
         return ComptimeAggregate(slice_type, (
             array,
@@ -7641,7 +7709,7 @@ class HirRunner:
             slot,
             _PendingStore(
                 type=value_type,
-                is_inline=self._runtime_position() == slot.runtime_pos,
+                is_inline=self._runtime_position() == slot.runtime_pos and _is_comptime_val(value),
                 value=value,
             ),
         )
@@ -7664,6 +7732,9 @@ class HirRunner:
         if not isinstance(val, PendingSlot):
             raise CompileError('can only commit a pending slot')
         if val.committed is not None:
+            # an already materialized storage may still hold unmaterialized leaf
+            # places (a place the stores decide, see ``_stores_decide_storage``)
+            self._commit_place_tree(val.committed)
             return
         if type is None:
             type = val.committed_type()
@@ -7672,7 +7743,7 @@ class HirRunner:
             self._bind_slot(val, ptr, type)
             return
 
-        if len(val.stores) > 0 and val.is_inline(type):
+        if val.is_inline(type) and (len(val.stores) > 0 or val.declared is not None):
             if _is_aggregate(type):
                 # a compile-time aggregate: its fields (or elements) are their
                 # own places (see ``init_inline_aggregate``)
@@ -7697,6 +7768,7 @@ class HirRunner:
                 # a single value in a compile-time box
                 val.committed = ComptimeBox(type, ComptimeVal(sval.Undefined(type)))
             self._exec_pending_actions(val, type)
+            self._commit_place_tree(val.committed)
             return
         unit = type.get_unit_value()
         if unit is not None:
@@ -7705,6 +7777,7 @@ class HirRunner:
                 # carries: it is held by its own places like any other aggregate
                 val.committed = self._inline_aggregate_of(val, type)
                 self._exec_pending_actions(val, type)
+                self._commit_place_tree(val.committed)
                 return
             val.committed = ComptimeBox(type, ComptimeVal(unit))
             return
@@ -7763,7 +7836,7 @@ class HirRunner:
         ``_fresh_place``), which is what a tuple a store delivers is written
         into."""
         return ComptimeTuplePtr(tuple(
-            self._fresh_place(elem_type, ComptimeVal(sval.Undefined(elem_type)))
+            self._fresh_place(elem_type)
             for elem_type in type.types
         ))
 
@@ -7771,7 +7844,7 @@ class HirRunner:
         """Fresh compile-time storage for a ``**kwargs`` dictionary: one place
         per name (see ``_fresh_place``)."""
         return ComptimeDictPtr({
-            name: self._fresh_place(elem_type, ComptimeVal(sval.Undefined(elem_type)))
+            name: self._fresh_place(elem_type)
             for name, elem_type in type.values.items()
         })
 
@@ -7800,7 +7873,7 @@ class HirRunner:
                 # with the slot (no ``hir.CommitSlot`` names them) - the slot
                 # itself is already the tuple of places (see ``init_tuple`` and
                 # ``_inline_tuple_of``)
-                self._commit_tuple_places(ComptimeTuplePtr(action.places))
+                self._commit_place_tree(ComptimeTuplePtr(action.places))
                 if not isinstance(ptr, ComptimeTuplePtr):
                     raise CompileError('cannot deliver a tuple into storage')
             case _PendingPtrConvertion():
@@ -8515,28 +8588,25 @@ class HirRunner:
 
     def init_inline_aggregate(self, type: sval.Type) -> ComptimeAggregatePtr:
         """Fresh compile-time storage for an aggregate: every field (or array
-        element) gets a place of its own - a box holding the type's unit value
-        for a zero-sized one, an aggregate pointer of its own for a nested
-        aggregate (a box never holds an aggregate), an undefined box otherwise -
-        and the places, in declaration (or element) order, make up the result.
-        The result is itself a pointer (``PointerType(type)``):
-        ``HirRunner.field_index_addr`` takes a place out of it, ``store`` writes
-        a place through it and ``load`` reads the whole aggregate (see
-        ``ComptimeAggregatePtr`` and ``ComptimeAggregate``)."""
+        element) gets a place of its own - a place whose storage the stores into
+        it decide, a box for a compile-time value and memory for a runtime one
+        (see ``_fresh_place``) - and the places, in declaration (or element)
+        order, make up the result.  The result is itself a pointer
+        (``PointerType(type)``): ``HirRunner.field_index_addr`` takes a place out
+        of it, ``store`` writes a place through it and ``load`` reads the whole
+        aggregate (see ``ComptimeAggregatePtr`` and ``ComptimeAggregate``)."""
         places: list[InterpVal] = []
         for place_type in _aggregate_place_types(type):
-            unit = place_type.get_unit_value()
-            initial = ComptimeVal(unit) if unit is not None else ComptimeVal(sval.Undefined(place_type))
-            places.append(self._fresh_place(place_type, initial))
+            places.append(self._fresh_place(place_type))
         return ComptimeAggregatePtr(type, tuple(places))
 
-    def _fresh_place(self, type: sval.Type, initial: InterpVal) -> InterpVal:
-        """A fresh compile-time place for a value of ``type``, used as the
-        field/element/payload/element of a compile-time aggregate, tuple, dict
-        or option: a nested aggregate/tuple/dict/option gets a pointer form of
-        its own, anything else a box.  ``initial`` is the value the place holds
-        before it is written (the type's unit value for a zero-sized one,
-        undefined otherwise)."""
+    def _fresh_place(self, type: sval.Type) -> InterpVal:
+        """A fresh place for a value of ``type``, used as the
+        field/element/payload of a compile-time aggregate, tuple, dict or
+        option: a nested aggregate/tuple/dict/option gets a pointer form of its
+        own, anything else a slot whose storage the stores into it decide - a
+        compile-time value stays a box, a runtime one lands in memory (see
+        ``PendingSlot``)."""
         if _is_aggregate(type):
             return self.init_inline_aggregate(type)
         if isinstance(type, sval.TupleType):
@@ -8547,7 +8617,7 @@ class HirRunner:
             return self.init_comptime_option(type)
         if isinstance(type, sval.TaggedUnionType):
             return self.init_comptime_tagged_union(type)
-        return ComptimeBox(type, initial)
+        return self.alloca(InlineMode.FULL, declared=type, commit_declared=False)
 
     def init_comptime_option(self, option: sval.OptionType) -> ComptimeOptionPtr:
         """Fresh compile-time storage for an option: the payload gets a place of
@@ -8556,7 +8626,7 @@ class HirRunner:
         if child.is_zst():
             payload: InterpVal = ComptimeVal(sval.Undefined(sval.PointerType(child, is_const=False)))
         else:
-            payload = self._fresh_place(child, ComptimeVal(sval.Undefined(child)))
+            payload = self._fresh_place(child)
         return ComptimeOptionPtr(ComptimeVal(True), payload)
 
     def finish_struct(
@@ -8685,6 +8755,10 @@ class HirRunner:
                 self._commit_pending_slot(place, field_type)
                 continue
             addr = self.field_index_addr(dest_ptr, _index_value(index), at=place.insertion)
+            if not isinstance(addr, RuntimeVal):
+                # the storage is a compile-time aggregate: the field place is the
+                # aggregate's own place, committed with it (see ``_commit_place_tree``)
+                continue
             assert isinstance(addr, RuntimeVal), 'a field with storage has an address'
             self._bind_slot(place, addr.value, field_type)
         for index, field0 in enumerate(fields.values()):
@@ -8727,6 +8801,8 @@ class HirRunner:
         for index0, field0 in enumerate(fields.values()):
             if index0 not in provided:
                 self._default_field_place(variant_ptr, index0, field0)
+        # TODO: no more manual commits
+        self._commit_place_tree(variant_ptr)
 
     def _default_field_place(self, dest: InterpVal, index: int, field: sval.StructField) -> InterpVal:
         """The place a left-out field's default is written through: the same
@@ -8849,21 +8925,33 @@ class HirRunner:
             raise CompileError(f'the tuple has no element at index {index}')
         return places[index]
 
-    def _commit_tuple_places(self, tuple_value: ComptimeTuplePtr) -> None:
-        # the element places of a tuple location are committed with the
-        # location: no ``hir.CommitSlot`` of its own names them
-        # (see ``init_tuple``)
-        todo: list[InterpVal] = [tuple_value]
+    def _commit_place_tree(self, place: InterpVal) -> None:
+        # the leaf places a composite place holds are committed with the place
+        # itself: no ``hir.CommitSlot`` of its own names them.  A tuple's element
+        # places are recorded by its construction (see ``init_tuple``), and a
+        # declared ``Comptime`` variable's place tree may still hold leaf places
+        # whose storage the stores decide (see ``_stores_decide_storage``)
+        todo: list[InterpVal] = [place]
         while todo:
             value = todo.pop()
-            match value:
-                case ComptimeTuplePtr():
-                    todo.extend(value.values)
-                case PendingSlot() if value.committed is None:
+            if isinstance(value, PendingSlot):
+                if value.committed is None:
                     self._commit_pending_slot(value)
+                continue
+            match value:
+                case ComptimeTuplePtr(values=values):
+                    todo.extend(values)
+                case ComptimeAggregatePtr(ptrs=ptrs):
+                    todo.extend(ptrs)
+                case ComptimeDictPtr(values=values):
+                    todo.extend(values.values())
+                case ComptimeOptionPtr(payload_ptr=payload):
+                    todo.append(payload)
+                case ComptimeTaggedUnionPtr(payload_ptr=payload):
+                    todo.append(payload)
                 case _:
-                    # an already materialized place (a box, a nested pointer
-                    # form): nothing to commit
+                    # an already materialized place (a box, a runtime location):
+                    # nothing to commit
                     pass
 
     def _method_of(self, struct: sval.StructType, method_name: str) -> sval.AnyValue | None:
@@ -9736,7 +9824,7 @@ class HirRunner:
         if isinstance(target, PendingSlot) and target.committed is None:
             self._record_pending_action(target, _PendingTuple(tree.values))
             return
-        self._commit_tuple_places(tree)
+        self._commit_place_tree(tree)
         self.store(target, self.load(tree))
 
     def _pair_places(

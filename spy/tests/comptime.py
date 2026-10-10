@@ -92,6 +92,41 @@ def comptime_marker_holds_a_runtime_value(x: i32) -> i32:
 
 
 @func()
+def comptime_scalar_written_in_a_runtime_loop(x: i32) -> i32:
+    # a compile-time scalar holding a runtime value is memory, so a runtime loop
+    # may write it (see pending-problems.md #3)
+    c: Comptime = x
+    y: i32 = 0
+    while y < 3:
+        c = c + 1
+        y = y + 1
+    return c
+
+
+@func()
+def comptime_declared_scalar_written_in_a_runtime_loop(x: i32) -> i32:
+    # ... likewise for a declared compile-time variable
+    c: Comptime[i32] = x
+    y: i32 = 0
+    while y < 3:
+        c = c + 1
+        y = y + 1
+    return c
+
+
+@func()
+def comptime_place_assigned_a_runtime_value(x: i32) -> i32:
+    # assigning a runtime value to a compile-time place whose storage an earlier
+    # compile-time store already fixed is rejected (see doc/issues.md #3)
+    c: Comptime[i32] = 5
+    y: i32 = 0
+    while y < 3:
+        c = x + y
+        y = y + 1
+    return c
+
+
+@func()
 def comptime_marker_without_a_value() -> i32:
     # the marker also marks a declaration that writes no value
     syntax.comptime()
@@ -277,6 +312,18 @@ class SpyComptimeMarkerTest(TestCase):
 
     def test_it_may_hold_a_runtime_value(self) -> None:
         self.assertEqual(comptime_marker_holds_a_runtime_value(5), 6)
+
+    def test_a_runtime_value_written_in_a_runtime_loop(self) -> None:
+        # the runtime value lands in memory, so a runtime loop can write it
+        self.assertEqual(comptime_scalar_written_in_a_runtime_loop(10), 13)
+        self.assertEqual(comptime_declared_scalar_written_in_a_runtime_loop(10), 13)
+
+    def test_assigning_a_runtime_value_to_a_comptime_place_is_rejected(self) -> None:
+        # the initial compile-time store fixed the place's storage as compile-time,
+        # so a later runtime value is rejected
+        with self.assertRaises(CompileError) as ctx:
+            comptime_place_assigned_a_runtime_value(10)
+        self.assertIn('runtime value into a compile-time place', str(ctx.exception))
 
     def test_a_declaration_without_a_value(self) -> None:
         self.assertEqual(comptime_marker_without_a_value(), 6)
