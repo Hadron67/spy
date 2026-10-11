@@ -3817,6 +3817,7 @@ class HirRunner:
         aggregate) still records the value, since the type of such a place may
         have no runtime representation at all."""
         value = _shallow_normalize(value)
+        ptr = _shallow_normalize(ptr)
         if isinstance(ptr, ComptimeTuplePtr):
             # a destructuring target: a tuple of element *places*, one per
             # element of the value it is stored with (a nested tuple target
@@ -3842,8 +3843,6 @@ class HirRunner:
             for target, source in stores:
                 self.store(target, source)
             return
-
-        ptr = _shallow_normalize(ptr)
 
         if isinstance(ptr, PendingSlot) and ptr.committed is None:
             value_type = _type_of(value)
@@ -4782,6 +4781,14 @@ class HirRunner:
                     # is built in place, its fields (or elements) being their own
                     # places
                     slot.committed = self.init_inline_aggregate(declared)
+                elif isinstance(declared, sval.TupleType):
+                    # a compile-time variable of a tuple type: one place per
+                    # element (a box never holds a tuple, see ``ComptimeTuplePtr``)
+                    slot.committed = self.init_comptime_tuple(declared)
+                elif isinstance(declared, sval.StrDictType):
+                    # and its ``**kwargs`` dictionary counterpart (a box never
+                    # holds one either, see ``ComptimeDictPtr``)
+                    slot.committed = self.init_comptime_dict(declared)
                 elif isinstance(declared, sval.OptionType):
                     # a compile-time variable of an option type: the option has
                     # its own place form, a tag value and a payload place (see
