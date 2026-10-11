@@ -238,6 +238,9 @@ def undefined() -> Any: ...
 @builtin_func
 def coerce[T](value: Any, typ: type[T]) -> T: ...
 
+def typed_undefined[T](typ: type[T]) -> T:
+    return coerce(undefined(), typ)
+
 # ``const_array(elem, length)``: an array of ``length`` (a compile-time integer)
 # elements, every element equal to ``elem`` (evaluated once, may be a runtime
 # value).  ``elem`` is written into each element place, so a compile-time one

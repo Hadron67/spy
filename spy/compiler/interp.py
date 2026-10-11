@@ -9427,10 +9427,14 @@ class HirRunner:
             # the concrete declared type of every positional parameter: an inlined
             # argument is declared with it, so a bare literal takes the
             # annotation's type instead of its own (untyped) one - a compiled
-            # call's specialization types its arguments the same way
+            # call's specialization types its arguments the same way.  A
+            # ``type[X]`` parameter's slot holds the spy type its argument
+            # denotes, so it is declared with ``type`` (``sval.TYPE_TYPE``); the
+            # formal's own ``type`` is the *bound* of ``X``, not the slot's type
             sub_sig = sig.substitute_type_vars(frame_values)
             param_types = tuple(
-                None if formal is None else formal.type
+                None if formal is None
+                else (sval.TYPE_TYPE if formal.is_type_value else formal.type)
                 for formal in sub_sig.positional.values()
             )
             return self._start_inline(
