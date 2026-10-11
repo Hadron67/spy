@@ -13,7 +13,7 @@ from unittest import TestCase
 
 from ..compiler import CompileError, i32, syntax
 from ..compiler.dsl import func, struct
-from ..compiler.syntax import Comptime
+from ..compiler.syntax import Comptime, array
 
 # ---------------------------------------------------------------------------
 # extending a tuple place in place
@@ -72,6 +72,78 @@ def sum_handles_via_tuple(x: i32, y: i32) -> i32:
     t += (h1,)
     t += (h2,)
     return t[0].id + t[1].id
+
+
+# ---------------------------------------------------------------------------
+# a block-local element place is copied, a stable one is aliased
+# ---------------------------------------------------------------------------
+
+
+@struct(copyable=True)
+class Two:
+    x: i32
+    y: i32
+
+
+@func()
+def append_runtime_indexed_element(n: i32) -> i32:
+    # a tuple element whose address is *block-local* - the subscript's ``Gep``
+    # with a runtime index, inside the branch - is copied into a place of its
+    # own, so reading the tuple after the join is dominated (the bug of a raw
+    # aliased register; see ``_tuple_extend_element``)
+    a = array(n, n + 1, n + 2, n + 3)
+    t: Comptime = ()
+    if n > 0:
+        t += (a[n - 1],)
+    return t[0]
+
+
+@func()
+def appended_variable_stays_aliased(x: i32) -> i32:
+    # a whole variable's address is stable (an ``Alloca``), so it is aliased: a
+    # later write to the variable is seen through the tuple
+    v: i32 = x
+    t: Comptime = ()
+    t += (v,)
+    v = 100
+    return t[0]
+
+
+@func()
+def appended_field_is_copied(x: i32) -> i32:
+    # a field's address is block-local (a ``Gep``), so the element is copied: a
+    # later write to the field is *not* seen through the tuple
+    val = Two(x, x + 1)
+    t: Comptime = ()
+    t += (val.x,)
+    val.x = 100
+    return t[0]
+
+
+# ---------------------------------------------------------------------------
+# a non-copyable block-local element place can be neither copied nor aliased
+# ---------------------------------------------------------------------------
+
+
+@struct(copyable=False)
+class Holder:
+    id: i32
+
+
+@struct(copyable=False)
+class HolderBox:
+    tag: i32
+    h: Holder
+
+
+@func()
+def append_noncopyable_block_local_place(x: i32) -> i32:
+    # a non-copyable field's address is block-local, so it has no copy to be
+    # made and is rejected (see ``_tuple_extend_element``)
+    w = HolderBox(0, Holder(x))
+    t: Comptime = ()
+    t += (w.h,)
+    return t[0].id
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +224,19 @@ class SpyTupleExtendTest(TestCase):
         # a successful compile is the assertion: a copy would be rejected
         self.assertEqual(sum_handles_via_tuple(9, 5), 14)
 
+    def test_a_block_local_place_is_copied(self) -> None:
+        # a runtime subscript's address is block-local, so the element is copied
+        # (the register-dominance fix): the tuple reads fine after the join
+        self.assertEqual(append_runtime_indexed_element(3), 5)
+
+    def test_a_whole_variable_element_stays_aliased(self) -> None:
+        # a stable address is aliased, not copied
+        self.assertEqual(appended_variable_stays_aliased(7), 100)
+
+    def test_a_field_element_is_copied(self) -> None:
+        # a field's address is block-local, so the element is copied
+        self.assertEqual(appended_field_is_copied(7), 7)
+
 
 class SpyTupleExtendRejectedTest(TestCase):
     """Only the augmented ``+=`` extends a tuple; everything else is rejected."""
@@ -165,6 +250,14 @@ class SpyTupleExtendRejectedTest(TestCase):
         with self.assertRaises(CompileError) as ctx:
             tuple_inplace_sub((1, 2))
         self.assertIn("only supports in-place extension with '+='", str(ctx.exception))
+
+    def test_a_noncopyable_block_local_place_is_rejected(self) -> None:
+        # a block-local place of a non-copyable type cannot be appended: it can
+        # be neither aliased (its address does not dominate later reads) nor
+        # copied
+        with self.assertRaises(CompileError) as ctx:
+            append_noncopyable_block_local_place(9)
+        self.assertIn('non-copyable type', str(ctx.exception))
 
 
 all_tests = [

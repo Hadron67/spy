@@ -6084,13 +6084,13 @@ class HirRunner:
 
         A tuple has no storage of its own - a tuple variable *is* its
         :class:`ComptimeTuplePtr`, the tuple of element places - so extending it
-        neither copies nor goes through ``store``: every element of ``u`` is
-        aliased onto ``t`` as the place it already is (``u``'s element places
-        when it is a tuple place, the element operand's own place when it is a
-        tuple value, a fresh place for a bare value), and the target is
-        *re-seated* to the concatenation by rebinding its ``values``.  That is
-        what makes an in-place accumulation over non-copyable elements possible:
-        no element is ever loaded out of a place.
+        neither copies nor goes through ``store`` in the common case: a
+        reference to a *stable* place (one whose address is defined in the entry
+        block, see ``_tuple_extend_element``) and the fresh place of a bare
+        value are aliased onto ``t``, and the target is *re-seated* to the
+        concatenation by rebinding its ``values``.  That is what makes an
+        in-place accumulation over non-copyable elements possible: such an
+        element is never loaded out of its place.
 
         Only a committed tuple place can be a target: an uncommitted slot has no
         element places yet (it is no operand, see ``PendingSlot``), and a box
@@ -6104,11 +6104,42 @@ class HirRunner:
             raise CompileError('a tuple ``+=`` needs a tuple on the right-hand side')
         places = list(target.values)
         for entry in _tuple_arg_entries(right):
-            # a place is aliased as it is; a bare value goes into a fresh place
-            # of its own (a store *into* a place, never a read *out* of one)
-            places.append(self._inline_arg_place(entry))
+            places.append(self._tuple_extend_element(entry))
         target.values = tuple(places)
         return PollResult.AGAIN
+
+    def _tuple_extend_element(self, entry: ArgEntry[InterpVal]) -> InterpVal:
+        """The place one element of ``t += u`` is aliased onto ``t`` as (see
+        ``_tuple_extend_in_place``).
+
+        A bare value goes into a fresh place of its own (a store *into* a place,
+        never a read *out* of one, see ``_inline_arg_place``).  A reference is
+        aliased as the place it already is only while its address is *defined in
+        the entry block* - an ``Alloca`` or a ``Param`` - so that it dominates
+        every later read or write through ``t``; a compile-time place is stable
+        too.  A reference to a block-local register address (a ``Gep``, whether
+        or not its index is constant, a ``BitCast``, an address derived from a
+        load or a call, ...) cannot be a tuple element place - reading it from
+        another block would not be dominated by its definition - so its value is
+        copied into a fresh place of its own; a non-copyable element has no such
+        copy and is rejected."""
+        if not entry.is_ref:
+            return self._inline_arg_place(entry)
+        place = _shallow_normalize(entry.value)
+        if not (
+            isinstance(place, RuntimeVal)
+            and not isinstance(place.value, (mir.Alloca, mir.Param))
+        ):
+            return entry.value
+        elem = _place_type(place)
+        if elem is None or not elem.is_copyable():
+            raise CompileError(
+                f'cannot append a reference to a block-local place of the '
+                f'non-copyable type {elem} to a tuple'
+            )
+        slot = self.alloca(InlineMode.NONE, declared=elem)
+        self.store(slot, self.load(place))
+        return slot
 
     # -- calls ----------------------------------------------------------------
 
