@@ -905,8 +905,8 @@ def catch_raises_never(n: i32) -> i32:
 
 @func()
 def returns_from_never(n: i32) -> Never:
-    # the return is rejected: the function has no value to return (and the
-    # store of its value into the empty result location is a no-op)
+    # the return is rejected: the function's result location has the empty type,
+    # which no value converts to
     return n  # pyright: ignore
 
 
@@ -1022,9 +1022,11 @@ class SpyNoReturnTest(TestCase):
         self.assertIs(ret, mir.NORETURN)
 
     def test_returning_from_a_never_function_is_rejected(self) -> None:
+        # the return value has no place to go: the result location of a ``Never``
+        # body is the empty type, and no value is a value of it
         with self.assertRaises(CompileError) as ctx:
             returns_from_never(5)
-        self.assertIn('cannot return', str(ctx.exception))
+        self.assertIn('cannot convert a i32 value to empty', str(ctx.exception))
 
     def test_falling_through_a_never_function_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:

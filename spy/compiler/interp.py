@@ -3906,8 +3906,9 @@ class HirRunner:
             # a compile-time pointer with no storage at all: the address of a
             # zero-sized field or element (see ``field_index_addr``), or of a
             # zero-sized exception's variant (see ``_union_variant_ptr``).
-            # Every value of the type it points at is the type's unit value, so
-            # a store into it records nothing
+            # There is no storage to write, but the value still has to be of
+            # the (single-valued) type the place points at
+            self._coerce(value, elem)
             return
 
         if _is_undefined_val(value):
@@ -3961,23 +3962,25 @@ class HirRunner:
                         aggregate = self.as_comptime_aggregate(value)
                     # an aggregate value is only ever its own type, exactly like a
                     # runtime one (see ``_convert_inst``): an aggregate of another
-                    # type of the same shape is not a copy of it.  A zero-sized
-                    # destination has no storage at all, so whatever is delivered
-                    # is a no-op
-                    if aggregate.type != elem and not elem.is_zst():
+                    # type of the same shape is not a copy of it - a zero-sized
+                    # destination is type-checked the same, it just has no storage
+                    # to write into
+                    if aggregate.type != elem:
                         raise CompileError(f'cannot convert a {aggregate.type} value to {elem}')
                     for index, field_value in enumerate(aggregate.values):
                         self.store(self.field_index_addr(ptr, _index_value(index)), field_value)
                 case RuntimeVal():
                     if elem.is_zst():
-                        # a zero-sized aggregate has no storage to write into
+                        # a zero-sized aggregate has no storage to write into,
+                        # but the value still has to be of its type
+                        self._coerce(value, elem)
                         return
                     if isinstance(value, RuntimeVal):
                         # a runtime aggregate value is written as a whole
                         self._emit(mir.Store(ptr.value, self._to_runtime(self._coerce(value, elem))))
                     else:
                         aggregate = _as_aggregate(value)
-                        if aggregate is None or (aggregate.type != elem and not elem.is_zst()):
+                        if aggregate is None or aggregate.type != elem:
                             raise CompileError(f'cannot store {value!r} into {elem}')
                         self._emit(mir.Store(ptr.value, self._aggregate_to_runtime(aggregate)))
                 case _:
@@ -4026,13 +4029,13 @@ class HirRunner:
                     raise CompileError(
                         f'cannot store through the const pointer {ptr.type}'
                     )
+                coerced = self._coerce(value, elem)
                 if unit is not None:
                     # a zero-sized type has one value - its unit value - which
-                    # is what a place of it holds whatever is stored into it (no
-                    # coercion: the value stored need not even be of the type)
+                    # is what a place of it holds; the value was still
+                    # type-checked above
                     ptr.value = ComptimeVal(unit)
                 else:
-                    coerced = self._coerce(value, elem)
                     if not _is_comptime_val(coerced):
                         # a box holds a compile-time value only: a runtime value
                         # that refers to a register (a load, a computation, a
@@ -4046,7 +4049,8 @@ class HirRunner:
             case RuntimeVal():
                 if unit is not None:
                     # a zero-sized type has no storage: nothing is emitted at
-                    # runtime (a compile-time place still records its value)
+                    # runtime, but the value still has to be of the type
+                    self._coerce(value, elem)
                     return
                 self._emit(mir.Store(ptr.value, self._to_runtime(self._coerce(value, elem))))
             case _:
@@ -4918,11 +4922,10 @@ class HirRunner:
 
     def _coerce_aggregate(self, aggregate: ComptimeAggregate, target: sval.Type) -> InterpVal:
         """A compile-time aggregate as a value of the aggregate type ``target``:
-        only the type is checked here - an aggregate is ever only its own type
-        (a zero-sized destination has no storage and takes anything) - and the
-        value is returned as it is; its runtime representation is built by
-        ``_to_runtime`` where one is actually needed."""
-        if not _is_aggregate(target) or (aggregate.type != target and not target.is_zst()):
+        only the type is checked here - an aggregate is ever only its own type -
+        and the value is returned as it is; its runtime representation is built
+        by ``_to_runtime`` where one is actually needed."""
+        if not _is_aggregate(target) or aggregate.type != target:
             raise CoerceError(f'cannot convert a {aggregate.type} value to {target}')
         return aggregate
 

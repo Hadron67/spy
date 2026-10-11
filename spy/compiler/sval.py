@@ -3658,6 +3658,11 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             if isinstance(value, (Void, Null)):
                 return Void()
             raise CompileError(f"cannot use {value!r} as a void constant")
+        case NullType():
+            # the null value's own type: only the null literal is a value of it
+            if isinstance(value, Null):
+                return Null()
+            raise CompileError(f"cannot use {value!r} as a null constant")
         case IntEnumType():
             # a value of the enumeration is one of its members: a typed member
             # value of this very enumeration, or one of its Python members (a

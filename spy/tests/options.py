@@ -20,6 +20,7 @@ from ..compiler.syntax import (
     Comptime,
     Option,
     Ptr,
+    array,
     ref,
 )
 from .structs import MIR_CACHE, Large, Small, spy_type, struct_type
@@ -335,7 +336,7 @@ class ZstArrayMixed:
 def maybe_zst_array(p: Ptr[i32], a: i32, c: spy_bool) -> Option[ZstArrayMixed]:
     # the zero-length array field is not a tag: the option tags on ``p``
     if c:
-        return ZstArrayMixed(None, a, p)  # pyright: ignore
+        return ZstArrayMixed(array(), a, p)
     return None
 
 
