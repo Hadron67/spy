@@ -2778,22 +2778,19 @@ class HirRunner:
         enclosing region's defer list (see ``_current_defers``), so that only the
         transfers leaving that region run it.  The walk continues in the
         detached block until the body's ``End`` emits ``mir.EndDefer`` and
-        restores the block the region was opened in (see ``_exec_end``).
-
-        A compile-time (``syntax.unroll``) loop has no transfer between its
-        unrolled iterations, so a defer declared inside one has no exit to be
-        deferred to; it is rejected for now.  ``inst.flags`` is evaluated here -
-        its instructions were run just before the ``Defer`` - and has to be a
-        compile-time integer."""
+        restores the block the region was opened in (see ``_exec_end``).  A
+        defer inside a compile-time (``syntax.unroll``) loop's body is registered
+        in the region that wraps that body - the compile-time ``if`` a ``while``
+        lowers to, or the ``try`` a ``for`` lowers to - so it runs at the end of
+        each unrolled iteration, not at the loop's own unrolling edge.
+        ``inst.flags`` is evaluated here - its instructions were run just before
+        the ``Defer`` - and has to be a compile-time integer."""
         flags_value = self.operand(inst.flags)
         flags_int = _comptime_int(flags_value)
         if flags_int is None:
             raise CompileError('the flags of syntax.defer must be known at compile time')
         flags = hir.DeferPath(flags_int)
         frame = self._frames[-1]
-        for bf in reversed(frame.block_stack):
-            if isinstance(bf.data, LoopBlockData) and bf.data.is_inline:
-                raise CompileError('a defer block inside a compile-time loop is not supported yet')
         entry = frame.pc - 1
         p_else, _p_end = self._scan_block(entry)
         assert p_else is None, 'a defer body has no else marker'

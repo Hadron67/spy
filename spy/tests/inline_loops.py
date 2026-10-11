@@ -8,7 +8,12 @@ from ..compiler import (
 from ..compiler.dsl import func
 from ..compiler.syntax import (
     Comptime,
+    Ptr,
+    defer,
+    errdefer,
+    ref,
 )
+from .errors import ErrorA
 
 # ---------------------------------------------------------------------------
 # compile-time loops: a loop preceded by the statement ``syntax.unroll()``
@@ -259,6 +264,168 @@ def unroll_for_runtime_iter(n: i32) -> i32:
     return total
 
 
+# ---------------------------------------------------------------------------
+# deferred bodies inside compile-time loops: a ``with syntax.defer():`` in the
+# body of an unrolled loop is registered in the region that wraps that body
+# (the compile-time ``if`` a ``while`` lowers to, the ``try`` a ``for`` lowers
+# to), so it runs at the end of every unrolled iteration - not once per loop.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def unroll_defer_body(p: Ptr[i32]) -> i32:
+    # the defer runs once per unrolled iteration
+    i: Comptime = 0
+    total: i32 = 0
+    syntax.unroll()
+    while i < 3:
+        with defer():
+            p[...] = p[...] + 1
+        total = total + i
+        i = i + 1
+    return total
+
+
+@func()
+def call_unroll_defer_body(x: i32) -> i32:
+    v = x
+    r: i32 = unroll_defer_body(ref(v))
+    return v * 100 + r
+
+
+@func()
+def unroll_defer_for(p: Ptr[i32]) -> i32:
+    # the desugared ``for`` wraps its body in a ``try``: the defer runs when
+    # each iteration's body falls through to the ``StopIteration`` clause
+    total: i32 = 0
+    syntax.unroll()
+    for i in range(3, 0, 1):
+        with defer():
+            p[...] = p[...] + 1
+        total = total + i
+    return total
+
+
+@func()
+def call_unroll_defer_for(x: i32) -> i32:
+    v = x
+    r: i32 = unroll_defer_for(ref(v))
+    return v * 100 + r
+
+
+@func()
+def unroll_defer_break(p: Ptr[i32], n: i32) -> i32:
+    # a runtime-conditional break runs the defer of the iteration it leaves
+    i: Comptime = 0
+    total: i32 = 0
+    syntax.unroll()
+    while i < 10:
+        with defer():
+            p[...] = p[...] + 1
+        i = i + 1
+        if i == n:
+            break
+        total = total + i
+    return total
+
+
+@func()
+def call_unroll_defer_break(x: i32, n: i32) -> i32:
+    v = x
+    r: i32 = unroll_defer_break(ref(v), n)
+    return v * 100 + r
+
+
+@func()
+def unroll_defer_continue(p: Ptr[i32], n: i32) -> i32:
+    # a ``continue`` leaves the iteration through the same region end, so the
+    # defer runs on it too
+    i: Comptime = 0
+    total: i32 = 0
+    syntax.unroll()
+    while i < 5:
+        with defer():
+            p[...] = p[...] + 1
+        i = i + 1
+        if i == n:
+            continue
+        total = total + i
+    return total
+
+
+@func()
+def call_unroll_defer_continue(x: i32, n: i32) -> i32:
+    v = x
+    r: i32 = unroll_defer_continue(ref(v), n)
+    return v * 100 + r
+
+
+@func()
+def unroll_defer_else(p: Ptr[i32]) -> i32:
+    # a defer in the ``else`` clause runs once, when the loop ends normally
+    i: Comptime = 0
+    syntax.unroll()
+    while i < 2:
+        i = i + 1
+    else:  # noqa: PLW0120 - the else clause is the point of the fixture
+        with defer():
+            p[...] = p[...] + 1
+    return i
+
+
+@func()
+def call_unroll_defer_else(x: i32) -> i32:
+    v = x
+    r: i32 = unroll_defer_else(ref(v))
+    return v * 100 + r
+
+
+@func()
+def unroll_defer_order(p: Ptr[i32]) -> i32:
+    # two defers of one iteration run in reverse declaration order
+    i: Comptime = 0
+    syntax.unroll()
+    while i < 2:
+        with defer():
+            p[...] = p[...] * 10 + 1
+        with defer():
+            p[...] = p[...] * 10 + 2
+        i = i + 1
+    return i
+
+
+@func()
+def call_unroll_defer_order(x: i32) -> i32:
+    v = x
+    r: i32 = unroll_defer_order(ref(v))
+    return v * 100 + r
+
+
+@func(exceptions=(ErrorA,))
+def unroll_errdefer(p: Ptr[i32], n: i32) -> i32:
+    # an ``errdefer`` runs only on the raise, which ends the whole loop
+    i: Comptime = 0
+    syntax.unroll()
+    while i < 5:
+        with errdefer():
+            p[...] = p[...] + 1
+        if i == n:
+            raise ErrorA(1)
+        i = i + 1
+    return i
+
+
+@func()
+def call_unroll_errdefer(x: i32, n: i32) -> i32:
+    v = x
+    r: i32 = 0
+    try:
+        r = unroll_errdefer(ref(v), n)
+    except ErrorA:
+        r = -1
+    return v * 100 + r
+
+
 class SpyInlineLoopTest(TestCase):
     """Compile-time loops: a loop preceded by ``syntax.unroll()`` unrolls its
     body once per compile-time iteration, ``break`` leaves the whole unrolled
@@ -353,7 +520,45 @@ class SpyUnrollForTest(TestCase):
             unroll_for_runtime_iter(3)
 
 
+class SpyUnrollDeferTest(TestCase):
+    """Deferred bodies in compile-time loops: a defer in the body of an
+    unrolled loop is registered in the region wrapping that body (the
+    compile-time ``if`` of a ``while``, the ``try`` of a ``for``), so it runs
+    at the end of every unrolled iteration - not once for the whole loop."""
+
+    def test_a_defer_runs_every_iteration(self) -> None:
+        # three iterations, so the counter is bumped three times
+        self.assertEqual(call_unroll_defer_body(0), 3 * 100 + 3)
+
+    def test_a_defer_in_a_for_body_runs_every_iteration(self) -> None:
+        self.assertEqual(call_unroll_defer_for(0), 3 * 100 + 3)
+
+    def test_a_break_runs_the_defer_of_its_iteration(self) -> None:
+        # the break happens on the third iteration (i == 3), after its defer
+        self.assertEqual(call_unroll_defer_break(0, 3), 3 * 100 + 3)
+        # a break never taken runs all ten iterations
+        self.assertEqual(call_unroll_defer_break(0, 0), 10 * 100 + 55)
+
+    def test_a_continue_runs_the_defer_of_its_iteration(self) -> None:
+        # the defer runs on every iteration, the continue just skips the total
+        self.assertEqual(call_unroll_defer_continue(0, 3), 5 * 100 + 12)
+
+    def test_a_defer_in_the_else_clause_runs_once(self) -> None:
+        self.assertEqual(call_unroll_defer_else(0), 1 * 100 + 2)
+
+    def test_iteration_defers_run_in_reverse_declaration_order(self) -> None:
+        self.assertEqual(call_unroll_defer_order(0), 2121 * 100 + 2)
+
+    def test_an_errdefer_runs_only_on_the_raise(self) -> None:
+        # the raise ends the whole loop, so only the raise iteration's errdefer
+        # runs; the exception is caught by the caller
+        self.assertEqual(call_unroll_errdefer(0, 2), 1 * 100 - 1)
+        # no raise: the errdefer never runs
+        self.assertEqual(call_unroll_errdefer(0, 10), 0 * 100 + 5)
+
+
 all_tests = [
     SpyInlineLoopTest,
     SpyUnrollForTest,
+    SpyUnrollDeferTest,
 ]
