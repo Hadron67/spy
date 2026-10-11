@@ -3949,6 +3949,12 @@ class HirRunner:
                     raise CompileError(f'cannot leave a {elem} undefined')
             return
 
+        # the value is converted to the place's element type once, up front - just
+        # like an ordinary assignment - so every destination form below (an
+        # aggregate, an option, a tagged union, a compile-time box, memory)
+        # writes a value that already is of its own type
+        value = self._coerce(value, elem)
+
         if _is_aggregate(elem):
             # an aggregate is held by its fields (or elements), never by a box: a
             # whole value is written place by place into a compile-time aggregate
@@ -3977,7 +3983,7 @@ class HirRunner:
                         return
                     if isinstance(value, RuntimeVal):
                         # a runtime aggregate value is written as a whole
-                        self._emit(mir.Store(ptr.value, self._to_runtime(self._coerce(value, elem))))
+                        self._emit(mir.Store(ptr.value, self._to_runtime(value)))
                     else:
                         aggregate = _as_aggregate(value)
                         if aggregate is None or aggregate.type != elem:
@@ -3988,10 +3994,10 @@ class HirRunner:
             return
 
         if isinstance(elem, sval.OptionType):
-            # an option (and the ``T``/``Null`` a store delivers) is coerced to
-            # its value form first, then written through the storage of ``elem``
-            # (see ``ComptimeOption``)
-            coerced = self._coerce(value, elem)
+            # an option value is written through the storage of ``elem`` (the
+            # value was already coerced to the option type above, see
+            # ``ComptimeOption``)
+            coerced = value
             match ptr:
                 case ComptimeOptionPtr():
                     option = self._as_comptime_option(coerced, elem)
@@ -4006,10 +4012,10 @@ class HirRunner:
             return
 
         if isinstance(elem, sval.TaggedUnionType):
-            # a tagged union (and the variant value a store delivers) is coerced
-            # to its value form first, then written through the storage of
-            # ``elem`` (see ``ComptimeTaggedUnionValue``)
-            coerced = self._coerce(value, elem)
+            # a tagged union value is written through the storage of ``elem`` (the
+            # value was already coerced to the union type above, see
+            # ``ComptimeTaggedUnionValue``)
+            coerced = value
             match ptr:
                 case ComptimeTaggedUnionPtr():
                     if not isinstance(coerced, ComptimeTaggedUnionValue):
@@ -4029,7 +4035,7 @@ class HirRunner:
                     raise CompileError(
                         f'cannot store through the const pointer {ptr.type}'
                     )
-                coerced = self._coerce(value, elem)
+                coerced = value
                 if unit is not None:
                     # a zero-sized type has one value - its unit value - which
                     # is what a place of it holds; the value was still
@@ -4049,10 +4055,9 @@ class HirRunner:
             case RuntimeVal():
                 if unit is not None:
                     # a zero-sized type has no storage: nothing is emitted at
-                    # runtime, but the value still has to be of the type
-                    self._coerce(value, elem)
+                    # runtime (the value was type-checked by the conversion above)
                     return
-                self._emit(mir.Store(ptr.value, self._to_runtime(self._coerce(value, elem))))
+                self._emit(mir.Store(ptr.value, self._to_runtime(value)))
             case _:
                 raise CompileError('cannot store through a compile-time pointer')
 
@@ -5453,7 +5458,15 @@ class HirRunner:
             lv = self._arg_value(lhs)
             rv = self._arg_value(rhs)
             assert isinstance(lv, ComptimeVal) and isinstance(rv, ComptimeVal)
-            self.store(ret, ComptimeVal(_comptime_py_op(op, lv.obj, rv.obj)))
+            obj = _comptime_py_op(op, lv.obj, rv.obj)
+            if (
+                lhs_type is not None and rhs_type is not None
+                and sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type)
+            ):
+                peer = lhs_type.resolve_peer_type(rhs_type)
+                if peer is not None:
+                    obj = sval.coerce_const(obj, peer)
+            self.store(ret, ComptimeVal(obj))
             return PollResult.AGAIN
 
         if lhs_type is None or rhs_type is None:
@@ -9404,6 +9417,15 @@ class HirRunner:
             frame_values: dict[sval.TypeVar, sval.AnyValue] = dict(zip(sig.generic_args, solved))
             if generic_var_values:
                 frame_values.update(generic_var_values)
+            # the concrete declared type of every positional parameter: an inlined
+            # argument is declared with it, so a bare literal takes the
+            # annotation's type instead of its own (untyped) one - a compiled
+            # call's specialization types its arguments the same way
+            sub_sig = sig.substitute_type_vars(frame_values)
+            param_types = tuple(
+                None if formal is None else formal.type
+                for formal in sub_sig.positional.values()
+            )
             return self._start_inline(
                 fn.hir.body, fn.hir.arg_is_ref, binded_args, ret,
                 fn.name_base,
@@ -9411,6 +9433,7 @@ class HirRunner:
                 value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
                 on_done=on_return,
                 closure_values=self._inline_capture_values(effective_captures),
+                param_types=param_types,
                 has_varargs=sig.varargs is not None,
                 has_kwargs=sig.kwargs is not None,
             )
@@ -9916,15 +9939,24 @@ class HirRunner:
                     tuple(self._fresh_places(child, places) for child in values)
                 )
 
-    def _inline_arg_place(self, arg: ArgEntry[InterpVal]) -> InterpVal:
+    def _inline_arg_place(self, arg: ArgEntry[InterpVal], declared: sval.Type | None = None) -> InterpVal:
         """The place an inlined callee's argument (a positional by-value
         argument, or a ``*args``/``**kwargs`` element) is bound to: a reference
         argument is the address it already carries, any other value is written
         into a fresh slot first (the copy a value parameter is, see
-        ``_start_inline``)."""
+        ``_start_inline``).
+
+        ``declared`` is the type the callee's parameter declares: the slot is
+        declared with it, so an argument is typed by the annotation rather than
+        by its own form (a bare literal takes the annotated type instead of the
+        untyped one).  Whether the storage is a compile-time place or memory is
+        left to the stores (see ``alloca``)."""
         if arg.is_ref:
             return arg.value
-        slot = self.alloca(InlineMode.FULL)
+        if declared is None:
+            slot = self.alloca(InlineMode.FULL)
+        else:
+            slot = self.alloca(InlineMode.FULL, declared, commit_declared=False)
         self.store(slot, arg.value)
         self._commit_pending_slot(slot)
         return slot
@@ -9940,6 +9972,7 @@ class HirRunner:
         value_is_empty: bool = False,
         on_done: Callable[[], None] | None = None,
         closure_values: tuple[InterpVal, ...] = (),
+        param_types: tuple[sval.Type | None, ...] | None = None,
         has_varargs: bool = False,
         has_kwargs: bool = False,
     ) -> PollResult:
@@ -9966,7 +9999,7 @@ class HirRunner:
                 f'{_MAX_INLINE_DEPTH} levels'
             )
         arg_values: list[InterpVal] = []
-        for (arg, by_ref) in zip(args.positional, arg_is_ref):
+        for index, (arg, by_ref) in enumerate(zip(args.positional, arg_is_ref)):
             # ``by_ref`` is the *callee's* HIR binding: a method's ``self`` is
             # bound directly to its argument (the address) even though the
             # caller passed it as a value; every other parameter is forwarded as
@@ -9976,7 +10009,11 @@ class HirRunner:
             if by_ref or arg.is_ref:
                 arg_values.append(arg.value)
             else:
-                arg_values.append(self._inline_arg_place(arg))
+                declared = (
+                    None if param_types is None or index >= len(param_types)
+                    else param_types[index]
+                )
+                arg_values.append(self._inline_arg_place(arg, declared))
         # the varargs/kwargs the call bound come after every positional
         # parameter, as one tuple/dict place tree (see ``hir.Arg`` and
         # ``_init_args_from_signature``, which does the same for a compiled

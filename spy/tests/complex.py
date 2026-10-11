@@ -99,6 +99,46 @@ def complex64_widen(z: c64) -> c128:
 
 
 @func()
+def complex_from_real_local(r: f64) -> c128:
+    # the implicit ``T -> Complex[T]`` conversion applies to a store: a real
+    # value assigned to a ``c128`` place becomes ``r + 0j``
+    z: c128 = r
+    return z
+
+
+@func()
+def complex_from_int_local(i: i32) -> c128:
+    z: c128 = i
+    return z
+
+
+@func()
+def complex_from_real_comptime() -> c128:
+    # the same conversion into a *compile-time* aggregate destination
+    z: Comptime[c128] = 1.5
+    return z
+
+
+@func()
+def complex_from_real_return(r: f64) -> c128:
+    # ... and on the way out: a real returned as a complex
+    return r
+
+
+@func()
+def complex64_from_real_local(r: f32) -> c64:
+    z: c64 = r
+    return z
+
+
+@func()
+def complex_widen_local(z: c64) -> c128:
+    # a complex of a narrower element type widens on a store
+    w: c128 = z
+    return w
+
+
+@func()
 def complex_typeof_elem(z: c128) -> spy_bool:
     info: Comptime = type_info(spy_typeof(z))
     if isinstance(v := info, ComplexType):
@@ -155,6 +195,26 @@ class SpyComplexTest(TestCase):
 
     def test_a_complex64_value_widens_to_complex128(self) -> None:
         self.assertEqual(complex64_widen(1 + 2j), 1 + 2j)
+
+    def test_a_real_is_converted_into_a_complex_local(self) -> None:
+        self.assertEqual(complex_from_real_local(2.5), 2.5 + 0j)
+
+    def test_an_integer_is_converted_into_a_complex_local(self) -> None:
+        self.assertEqual(complex_from_int_local(3), 3 + 0j)
+
+    def test_a_real_is_converted_into_a_compile_time_complex(self) -> None:
+        # the conversion also applies where the destination is a compile-time
+        # aggregate (the real part is the value, the imaginary part is zero)
+        self.assertEqual(complex_from_real_comptime(), 1.5 + 0j)
+
+    def test_a_real_is_converted_when_returned_as_complex(self) -> None:
+        self.assertEqual(complex_from_real_return(4.5), 4.5 + 0j)
+
+    def test_a_real_is_converted_into_a_complex64_local(self) -> None:
+        self.assertEqual(complex64_from_real_local(1.5), 1.5 + 0j)
+
+    def test_a_complex64_widens_into_a_complex128_local(self) -> None:
+        self.assertEqual(complex_widen_local(1 + 2j), 1 + 2j)
 
     def test_the_type_of_a_complex_value_reflects_its_element(self) -> None:
         self.assertTrue(complex_typeof_elem(0j))
