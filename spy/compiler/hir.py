@@ -9,18 +9,18 @@ There are no types anywhere in the HIR: typing happens only when the
 interpreter *runs* the instructions with the concrete argument types.
 
 Calls follow *result location semantics* (RLS): a call writes its
-result into the slot of its ``ret`` operand (:class:`CallInplace`) and
-produces no register of its own.  A caller that needs the value
+result into the place tree of its ``ret`` operand (:class:`CallInplace`)
+and produces no register of its own.  A caller that needs the value
 allocates a slot and loads it back.  The slot only becomes real memory
-when it is committed (``CommitSlot``): a slot whose stores may all be kept
-inline - an ``Alloca`` whose :class:`InlineMode` allows it and no store
-that crossed a runtime block - stays a compile-time value, a
-zero-sized slot only records its unit value, and
+when it is committed (``CommitSlot``): a slot whose stores may all be
+kept inline - an ``Alloca`` whose ``is_comptime``/store decision allows it
+and no store that crossed a runtime block - stays a compile-time value
+(in a ``Box``), a zero-sized slot only records its unit value, and
 anything else is materialized as memory.  The store/load round trip a
 runtime call result leaves behind is folded back into registers
 afterwards by ``opt`` (see ``interp``).  The return of a function is
 governed by the same semantics: each ``return`` writes into the
-function's result location (:class:`ResultLoc`) and is followed by a
+function's result location (:class:`ReturnLoc`) and is followed by a
 value-less :class:`Ret` terminator, and ``astgen`` appends a trailing
 :class:`StoreVoidRetloc` to every body - the store of the void unit
 value for a path that falls off the end; the interpreter turns the
@@ -29,14 +29,12 @@ store through the result pointer of a result-pointer function.
 
 ``astgen`` performs all name resolution: a read of a variable - a
 parameter or a block-local declaration - becomes a :class:`Load` of
-the variable's storage.  A global is an *immutable value*: in a
-value context the name becomes a :class:`Const` holding the resolved
-Python object (spy types, the ``spy`` module functions, functions to
-call/inline, ...), in a reference context it becomes a
-:class:`ConstRef` - a reference to that value (how callable callees
-are passed to :class:`CallInplace`).  Attribute access on such
-compile-time objects is evaluated there as well.  The HIR never
-carries a variable *name*.
+the variable's storage.  A global is an *immutable value*: the name
+becomes a :class:`Const` holding the resolved Python object (spy types,
+the ``spy`` module functions, functions to call/inline, ...); a place is
+made of it by ``_as_ref`` (which alloca's it into a compile-time box).
+Attribute access on such compile-time objects is evaluated there as
+well.  The HIR never carries a variable *name*.
 
 At HIR level a parameter is passed by reference (its address): the
 translated body binds the name of the i-th parameter directly to its
@@ -53,8 +51,6 @@ store executes, so the untyped HIR needs no type information.
 Operands of instructions are therefore either
 
 * :class:`Const` leaves - Python literals and the values of immutable
-  globals,
-* :class:`ConstRef` leaves - references (const pointers) to immutable
   globals,
 * :class:`Arg` leaves - the addresses of the arguments of the
   function (parameters are passed by reference),
@@ -78,36 +74,39 @@ leaves the loop (jumping to the code after its ``End``) and a
 """
 
 from dataclasses import dataclass
-from enum import IntEnum, IntFlag, auto
+from enum import IntFlag
 from typing import Any
 
 from .binop import BinaryOp, CompareOp, UnaryOp
-from .fn import ArgEntry, ArgNode, ClosureFunction, frozendict
+from .fn import ArgEntry, ClosureFunction, frozendict
 
 
 class Value:
     pass
 
 
-class InlineMode(IntEnum):
-    """How much of a slot's value may be kept inline (see :class:`Alloca`).
+class ReturnLoc:
+    """The *whole* result-location tree of the function whose body is being
+    executed (see ``FullResultLoc``).  Unlike the old ``ResultLoc`` it is not a
+    :class:`Value` and never a leaf of a tree: it stands for the outer
+    function's result location as a whole - the single place, or the tree a
+    declared return annotation fixed - which the interpreter resolves when a
+    value is delivered (see ``interp.store``)."""
 
-    ``NONE`` is a plain runtime location: the slot holds a value with a
-    runtime representation.  ``NON_AGGREGATE`` may keep any value inline
-    except an *aggregate* (a struct or an array), which has no inline storage
-    of its own here (see ``ComptimeAggregatePtr``).  ``FULL`` may keep
-    anything inline - it is what a ``Comptime`` variable declares, and an
-    aggregate in one is always held by its fields' places, whatever the
-    values of those fields are.  A delivery that needs the slot's own single
-    address (a result pointer a callee writes through), or a store that
-    crossed a runtime block boundary since the slot was created, forces it
-    into memory (see ``interp``).  A zero-sized value has no runtime
-    representation at all, so its slot only records its unit value whatever
-    the mode is."""
+    def __eq__(self, other: object, /) -> bool:
+        return isinstance(other, ReturnLoc)
 
-    NONE = auto()
-    NON_AGGREGATE = auto()
-    FULL = auto()
+    def __hash__(self) -> int:
+        return hash(ReturnLoc)
+
+
+# A *result-location tree*: a pure place tree whose leaves are ``Value`` s - the
+# destination a batch of result-location-semantics instructions write into (a
+# nested destructuring target, a multi-value result location).  ``ReturnLoc`` is
+# the *whole* tree of the outer function (it is not a ``Value`` and only ever a
+# root).
+type ResultLocTree = Value | tuple[ResultLocTree, ...]
+type FullResultLoc = ResultLocTree | ReturnLoc
 
 
 class DeferPath(IntFlag):
@@ -129,21 +128,9 @@ class DeferPath(IntFlag):
 @dataclass(frozen=True)
 class Const(Value):
     """A leaf holding a Python object: a literal, or the *value* of an
-    immutable global (see :class:`ConstRef` for a reference to one)."""
-
-    value: Any
-
-
-@dataclass(frozen=True)
-class ConstRef(Value):
-    """A *reference* to an immutable global object: ``value`` is the
-    resolved global (a function entry, a spy type, a captured constant,
-    ...) as embedded by ``astgen`` in a reference context (``is_ref``).
-    It denotes a const pointer to the global: the interpreter types a
-    ``ConstRef(expr)`` as ``sval.PointerType(sval.type_of(expr), True)``.  A
-    function value - whose type is a runtime DST that cannot be used by
-    value - is only ever referenced through such a reference (a
-    function pointer)."""
+    immutable global (a function entry, a spy type, a captured constant, ...).
+    It is always a *value*: a place is made of it by ``_as_ref`` (which alloca's
+    it into a compile-time box, see ``astgen``)."""
 
     value: Any
 
@@ -154,23 +141,6 @@ class Arg(Value):
     executed (parameters are passed by reference at HIR level)."""
 
     index: int
-
-
-@dataclass(frozen=True)
-class Closure(Value):
-    """The address (the place) of the index-th variable a closure captured
-    from the enclosing function (see :class:`MakeClosure` and ``interp``).
-    Unlike :class:`Arg` it does not name a declared parameter: a closure's
-    captures are carried by the frame's ``closure_values``, which the
-    interpreter fills from the capture pointers a call passes (a compiled
-    closure) or from the closure value itself (an inlined one)."""
-
-    index: int
-
-
-@dataclass(frozen=True)
-class ResultLoc(Value):
-    """The result location of the function whose body is being executed"""
 
 
 class Inst(Value):
@@ -190,17 +160,22 @@ class Alloca(Inst):
     ``CallInplace`` result under RLS) type it, and the ``CommitSlot``
     that follows then materializes it - a slot whose stores may all be
     kept inline stays a compile-time value instead of memory (see
-    :class:`InlineMode` and ``interp``).
+    ``interp``).
 
-    An annotated local variable (``x: T``/``x: Comptime[T]``) declares its
-    type here instead: ``type`` is the compile-time type value of the
-    annotation (``None`` for the bare ``Comptime``, whose type is left to
-    the stores), and the interpreter materializes the slot right away -
-    memory for a runtime type, a compile-time value for a ``Comptime`` or a
-    zero-sized one.  ``inline`` is how much of the value may be kept inline:
-    the default is a plain slot, ``NON_AGGREGATE`` an expression temporary
-    and ``FULL`` a ``Comptime`` variable."""
-    inline: InlineMode = InlineMode.NONE
+    An annotated local variable (``x: T``/``x: Comptime[T]``/
+    ``x: ConstComptime[T]``) declares its type here instead: ``type`` is the
+    compile-time type value of the annotation (``None`` for the bare
+    ``Comptime``/``ConstComptime``, whose type is left to the stores), and the
+    interpreter materializes the slot right away - memory for a runtime type, a
+    compile-time ``Box`` for a ``Comptime`` variable or a zero-sized one.
+    ``is_comptime`` is the three-state storage decision: ``True`` a
+    compile-time variable (a ``Comptime``/``ConstComptime``), ``False`` a
+    runtime location (an annotated ordinary variable), ``None`` inferred from
+    the stores (an unannotated declaration, a destructuring target, an
+    expression temporary).  ``is_const`` marks a ``ConstComptime`` whose box
+    becomes read-only after the commit."""
+    is_comptime: bool | None = None
+    is_const: bool = False
     type: Value | None = None
 
 @dataclass(eq=False)
@@ -212,15 +187,16 @@ class Load(Inst):
 
 @dataclass(eq=False)
 class Store(Inst):
-    """Write a value to a slot (or pointer)."""
+    """Write a value to a slot (or pointer), or deliver a value to the outer
+    function's result location (``ReturnLoc``, see ``interp``)."""
 
-    ptr: Value
+    ptr: Value | ReturnLoc
     value: Value
 
 
 @dataclass(eq=False)
 class StoreVoidRetloc(Inst):
-    """Equivalent to ``Store(ResultLoc(), Const(sval.Void()))``."""
+    """Equivalent to ``Store(ReturnLoc(), Const(sval.Void()))``."""
 
 
 @dataclass(eq=False)
@@ -268,7 +244,7 @@ class FieldIndexAddr(Inst):
 class FinishStruct(Inst):
     """Close the construction of the struct ``struct`` names in the
     storage ``dest``.  ``struct`` is a reference to the struct built - a
-    ``ConstRef`` of a ``@struct()`` class, or the ``Subscript`` that
+    ``Const`` of a ``@struct()`` class, or the ``Subscript`` that
     specializes a struct template - and ``dest`` is the storage the
     fields were generated into.  ``indices`` are the addresses the
     positional arguments were written into, in the order they were given,
@@ -281,7 +257,7 @@ class FinishStruct(Inst):
     was not given) from ``struct`` and the field addresses."""
 
     struct: Value
-    dest: Value
+    dest: FullResultLoc
     indices: tuple[Value, ...]
     names: frozendict[str, Value]
 
@@ -294,7 +270,7 @@ class FinishArray(Inst):
     array has no element omitted (there is no default for one), so an element
     that is left out is an error."""
 
-    array: Value
+    array: FullResultLoc
     elements: tuple[Value, ...]
 
 @dataclass(eq=False)
@@ -312,16 +288,15 @@ class CallMethodInplace(Inst):
     base: Value
     name: str
     args: CallArgs
-    ret: Value
+    ret: FullResultLoc
 
 
 @dataclass(frozen=True, slots=True)
 class Spread:
     """A ``*``/``**`` forwarding item of a call argument list: ``value``
-    evaluates to a :class:`~spy.compiler.interp.ComptimeTuplePtr` (``*``) or a
-    :class:`~spy.compiler.interp.ComptimeDictPtr` (``**``).  Only the
-    generated ``as_runtime_closure`` ``__call__`` body produces one (source
-    ``*``/``**`` call syntax is not implemented, see ``astgen``)."""
+    evaluates to the *place* of a struct (a ``**kwargs``/``*args`` synthetic
+    struct, or a closure struct) whose fields are spread into the argument list
+    - ``*`` by field order, ``**`` by field name (see ``interp``)."""
 
     value: Value
 
@@ -341,24 +316,15 @@ class CallArgs:
 @dataclass(eq=False)
 class CallInplace(Inst):
     """A call whose result is written into a *result location* (RLS),
-    like Zig: ``ret`` is the pointer the callee's result goes to and the
+    like Zig: ``ret`` is the place the callee's result goes to and the
     instruction itself produces no register.  The ``callee`` is a
     reference to the function value (see ``astgen``'s ``is_ref``
     context), the ``args`` are the (by-value) argument list.  A consumer
-    that needs the value loads it back from ``ret``.
-
-    ``captures`` are the capture places the call point explicitly provides
-    (aligned with ``fn.CallSignature.captures``): ``None`` (the default the
-    ``astgen`` construction points leave) means the call point provides no
-    capture and the callee's own ``fn.captures`` are used; a tuple (possibly
-    empty) means the call point provides them, overriding the callee's own -
-    only the ``as_runtime_closure`` ``__call__`` body sets one (see
-    ``interp``)."""
+    that needs the value loads it back from ``ret``."""
 
     callee: Value
     args: CallArgs
-    ret: Value
-    captures: tuple[Value, ...] | None = None
+    ret: FullResultLoc
 
 
 @dataclass(eq=False)
@@ -442,10 +408,12 @@ class TypeOfEnd(Inst):
 class MakeClosure(Inst):
     """Create a closure value: the nested ``def``/``lambda`` ``fn`` bound to
     the captured variables ``captures`` (the enclosing function's slots, or an
-    enclosing closure's :class:`Closure` - every capture is a place).  The
-    parameter annotations/default values/return annotation are value operands
-    evaluated here (in the enclosing frame); the interpreter assembles the
-    closure's concrete signature from them (see ``interp``).  ``fn`` is a
+    enclosing closure's capture - every capture is a place).  The parameter
+    annotations/default values/return annotation are value operands evaluated
+    here (in the enclosing frame); the interpreter assembles the closure's
+    concrete signature from them (see ``interp``).  The result is an *anonymous
+    struct value* whose fields are the captures and whose ``__call__`` is the
+    nested function (see ``interp.exec_make_closure``).  ``fn`` is a
     :class:`~spy.compiler.fn.ClosureFunction`, the parsed body of the nested
     function - its declared parameters stay separate from the captures, so
     ``*args``/``**kwargs`` can be added later without disturbing them."""
@@ -460,50 +428,30 @@ class MakeClosure(Inst):
     vararg_annotation: Value | None
     kwarg_annotation: Value | None
     captures: tuple[Value, ...]
-
-
-@dataclass(eq=False)
-class RebuildCapture(Inst):
-    """Rebuild one capture place from the field(s) of a runtime closure struct
-    (see ``std.core.as_runtime_closure``).  ``base`` is the address of the
-    struct; ``node`` is the capture's :data:`~spy.compiler.fn.ArgNode` (the one
-    ``_val_to_node`` gave at conversion time), ``field_base`` the index of its
-    first runtime leaf among the struct's fields and ``as_copy`` whether the
-    top-level capture is held by value (see ``interp._rebuild_capture``)."""
-
-    node: ArgNode
-    as_copy: bool
-    field_base: int
-    base: Value
+    # whether the captures are taken by value (``move=True``) instead of by
+    # reference (the default)
+    move: bool = False
 
 
 @dataclass(eq=False)
 class InitTuple(Inst):
-    tuple_ptr: Value
+    result_loc: FullResultLoc
     length: int
 
 
 @dataclass(eq=False)
 class TuplePtrElement(Inst):
-    tuple_ptr: Value
+    tuple_ptr: FullResultLoc
     index: int
 
 
 @dataclass(eq=False)
 class Tuple(Inst):
     """A tuple *value*: the operands (a value or a reference to one) the shape
-    of a ``tuple`` expression is made of (see ``interp.ComptimeTuple``)."""
+    of a ``tuple`` expression is made of (see ``interp.HirRunner._build_tuple_value``)."""
 
     values: tuple[ArgEntry[Value], ...]
 
-
-@dataclass(eq=False)
-class TuplePtr(Inst):
-    """A tuple *place*: one address per element, the destructuring target
-    ``a, b = ...`` is built as (a nested target nests; see
-    ``interp.ComptimeTuplePtr`` and ``astgen._gen_target_tuple``)."""
-
-    values: tuple[Value, ...]
 
 @dataclass(eq=False)
 class Dict(Inst):
@@ -520,7 +468,7 @@ class Binary(Inst):
     op: BinaryOp
     lhs: ArgEntry[Value]
     rhs: ArgEntry[Value]
-    ret: Value
+    ret: FullResultLoc
 
 @dataclass(eq=False, slots=True)
 class BinaryAssign(Inst):
@@ -555,7 +503,7 @@ class Unary(Inst):
 
     op: UnaryOp
     operand: ArgEntry[Value]
-    ret: Value
+    ret: FullResultLoc
 
 @dataclass(eq=False)
 class Ord(Inst):
@@ -565,14 +513,14 @@ class Ord(Inst):
     result is an *untyped* integer, so the destination gives it its type."""
 
     operand: Value
-    ret: Value
+    ret: FullResultLoc
 
 
 @dataclass(eq=False)
 class Ret(Inst):
     """End one path of the function; a path is terminated by a ``return``
     statement, whose expression was already evaluated into the function's
-    result location (:class:`ResultLoc`).  The value itself is carried by
+    result location (:class:`ReturnLoc`).  The value itself is carried by
     the result location - the interpreter turns it into the function's
     return value (a direct-return function) or leaves it in the result
     pointer (a result-pointer function)."""
@@ -607,9 +555,8 @@ class AsBool(Inst):
 class Len(Inst):
     """``len(x)``: the number of elements of ``x``, as a register holding an
     *untyped* integer (the destination gives it its type, like an integer
-    literal).  The operand is logically a *value*: a tuple (``ComptimeTuple``,
-    or its ``ComptimeTuplePtr`` place form when passed by reference) yields its
-    length directly, and a struct is asked through its ``__len__`` method (see
+    literal).  The operand is logically a *value*: a tuple yields its length
+    directly, and a struct is asked through its ``__len__`` method (see
     ``interp``)."""
 
     value: ArgEntry[Value]

@@ -252,32 +252,21 @@ def const_array[T, Len: int](elem: T, length: Len) -> Array[T, Len]: ...
 @builtin_func
 def compile_error(msg: str | bytes) -> Never: ...
 
-# ``gstr(s)``: the compile-time byte string ``s`` as a global static constant,
-# the result a ``ConstMultiPtr[u8]`` to its bytes (see ``interp``).
-@builtin_func
-def gstr(s: bytes) -> ConstMultiPtr[u8]: ...
-
 # ``sstr(s)``: the compile-time byte string ``s`` as a ``ConstSlicePtr[u8]`` -
-# the pointer ``gstr(s)`` returns and the number of bytes.
-@builtin_func
-def sstr(s: bytes) -> ConstSlicePtr[u8]: ...
+# a pointer to its bytes (lowered into a global constant automatically, see the
+# behaviour doc §4.3) and the number of bytes (no trailing NUL is counted).
+def sstr(s: bytes) -> ConstSlicePtr[u8]:
+    return ConstSlicePtr(ptr_cast(s, ConstMultiPtr[u8]), len(s))
 
+# ``compile(fn)``: manually compile a *non-generic* function value - build its
+# default ``CallSignature`` and request its compilation (see ``interp``), so that
+# it can be lowered to a ``mir.Function`` where a function pointer is needed.  A
+# generic function is not accepted (it needs explicit type arguments).
 @builtin_func
-def as_static_ptr[T](value: T) -> ConstPtr[T]: ...
+def compile[T: Callable](fn: T) -> T: ...
 
 @builtin_func
 def bitcast[T](value: Any, typ: type[T]) -> T: ...
-
-# ``as_runtime_closure(closure, as_copy=False)``: turn a compile-time closure
-# into an ordinary spy struct value (fields = its runtime captures, ``__call__``
-# = a generated function that rebuilds the captures and calls the closure), so
-# it can be stored, passed, returned and called (see ``interp``).  ``as_copy``
-# selects whether a top-level runtime capture is held by reference (``False``)
-# or copied into the struct (``True``).  The annotation does not take part in
-# compilation (``@builtin_func`` binds only the name); the result is an anonymous
-# struct type.
-@builtin_func
-def as_runtime_closure[T: Callable](closure: T, as_copy: bool = False) -> T: ...
 
 @func_type()
 class DestructorFn:

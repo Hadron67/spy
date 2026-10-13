@@ -73,6 +73,7 @@ class Array[T, L: int | None]:
         ...
 
 type Comptime[T = Any] = T
+type ConstComptime[T = Any] = T
 type Option[T] = T | None
 
 def ref[T](val: T) -> Ptr[T]:
@@ -82,6 +83,12 @@ def array[T, Len: int](*elems: T, length: Len = 0) -> Array[T, Len]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
 def comptime():
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+def const_comptime():
+    """Mark the statement that follows as a compile-time *constant*
+    declaration (``x: ConstComptime = e``): the box it reserves is read-only
+    after it is committed.  Recognized by identity in ``astgen``."""
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
 def unroll():
@@ -167,7 +174,7 @@ def errdefer():
 def as_func_ptr[T](type: type[T], obj: T) -> ConstPtr[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
-def closure(*, inline: bool = True, exceptions=None, callconv: str = 'default', may_panic: bool = True):
+def closure(*, inline: bool = True, exceptions=None, callconv: str = 'default', may_panic: bool = True, move: bool = False):
     """The decorator of a nested ``def`` inside a spy function (a *closure*).
     It only exists at parse time - the nested function is never executed by
     Python - so ``astgen`` recognizes it by identity and reads its arguments
@@ -175,7 +182,8 @@ def closure(*, inline: bool = True, exceptions=None, callconv: str = 'default', 
     closure cannot carry (see ``dsl.func``): ``exceptions`` is the exceptions
     it may raise (``None``, the default, means it raises nothing, ``"infer"``
     that they are inferred from the body), ``inline`` whether it is forced to
-    be inlined (the default) or compiled into a runtime function, and
+    be inlined (the default) or compiled into a runtime function, ``move``
+    whether the captures are taken by value instead of by reference, and
     ``callconv``/``may_panic`` as in ``@func``."""
     def wrapper[T](func: T) -> T:
         raise RuntimeError("Cannot call directly: this is a spy closure decorator")

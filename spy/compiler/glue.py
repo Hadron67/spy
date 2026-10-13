@@ -39,7 +39,6 @@ from .fn import (
     ArgNode,
     CallSignature,
     CompoundArgNode,
-    ComptimePtrArg,
     FunctionInstance,
     RuntimeArgNode,
 )
@@ -48,6 +47,7 @@ from .sval import (
     AnyValue,
     CompileContext,
     MirLowerCache,
+    RetComptime,
     RetSpec,
     RetTuple,
     RetValue,
@@ -629,10 +629,8 @@ def invoke(
     def marshal(targ: ArgNode, value: Any) -> None:
         if not isinstance(targ, RuntimeArgNode):
             # a compound argument: its elements are marshaled separately, in
-            # their own order (see ``ArgNode``); a compile-time leaf is not
-            # marshaled at all.  A ``ComptimePtrArg`` is never provided by a
-            # Python-boundary call (``provided_node`` only makes runtime
-            # pointers); it is handled here for symmetry with ``_thunk_call_sig``.
+            # their own order (see ``ArgNode``); a compile-time leaf (a plain
+            # ``sval`` value, a ``ComptimePtr``) is not marshaled at all.
             if isinstance(targ, tuple):
                 for sub, item in zip(targ, value):
                     marshal(sub, item)
@@ -644,9 +642,6 @@ def invoke(
             if isinstance(targ, CompoundArgNode):
                 for sub, item in zip(targ.elems, value):
                     marshal(sub, item)
-                return
-            if isinstance(targ, ComptimePtrArg):
-                marshal(targ.content, value)
                 return
             return
         argument, buffer = _marshal_arg(targ.type, value, targ.is_ref, context)
@@ -703,7 +698,10 @@ def _marshal_arg(type: Type, value: Any, is_ref: bool, context: CompileContext) 
 
 
 def _storage_leaves(spec: RetSpec) -> list[RetValue]:
-    return [leaf for leaf in iter_ret_leaves(spec) if leaf.type.get_unit_value() is None]
+    return [
+        leaf for leaf in iter_ret_leaves(spec)
+        if isinstance(leaf, RetValue) and leaf.type.get_unit_value() is None
+    ]
 
 
 def _read_result(
@@ -731,6 +729,10 @@ def _read_result(
                 return _read(spec.type, buffer, 0, context)
             case RetTuple():
                 return tuple(read(value) for value in spec.values)
+            case RetComptime():
+                # a compile-time result leaf never crosses the call boundary (its
+                # value lives on the ``FunctionInstance``, see §7.3)
+                return None
 
     # the value part first, then the error code and the payload
     if not _value_is_empty(value_spec):

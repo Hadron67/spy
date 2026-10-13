@@ -489,8 +489,8 @@ class GlobalConstant(GlobalValue):
 class GlobalStringValue(GlobalValue):
     """A global static constant holding a byte string: the pointer to a static
     read-only location the bytes are emitted into (see ``lower``).  ``data``
-    already carries the trailing NUL the ``std.core.gstr``/``sstr`` builtins
-    append; the pointer type is always ``*u8`` - the constness/variant are the
+    already carries the trailing NUL the string lowering appends; the pointer
+    type is always ``*u8`` - the constness/variant are the
     expression's own, carried by the sval type the interpreter types a value
     with (LLVM lowers every pointer to the same opaque ``ptr``).  Two byte
     strings are deduplicated by their content (see ``interp``), so the same

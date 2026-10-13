@@ -36,14 +36,11 @@ from ..compiler import (
     u32,
     u64,
 )
-from ..compiler.syntax import Opaque, as_func_ptr, closure, comptime, ptr_cast, ref
+from ..compiler.syntax import ConstComptime, Opaque, as_func_ptr, closure, comptime, ptr_cast, ref
 from .core import (
     Numeric,
-    as_runtime_closure,
-    as_static_ptr,
     coerce,
     compile_error,
-    gstr,
 )
 
 # the ``kmp_sch_static`` schedule kind the runtime entry points take (see
@@ -110,12 +107,14 @@ class _Ident:
 
 
 def _ident() -> ConstPtr[_Ident]:
-    # the ``comptime()`` marker keeps the construction a compile-time value, so
-    # ``as_static_ptr`` can lower it into a global (like ``DynamicAllocator``'s
-    # vtable)
+    # the ``comptime()`` marker keeps the construction compile-time, so a
+    # read-only compile-time variable holds it and its pointer lowers into a
+    # global automatically (see the behaviour doc §4.3, replacing
+    # ``as_static_ptr``); the source is a byte string lowered the same way
     comptime()
-    ident = _Ident(0, 514, 0, 22, gstr(b'spy'))
-    return as_static_ptr(ident)
+    ident = _Ident(0, 514, 0, 22, ptr_cast(b'spy', ConstMultiPtr[u8]))
+    const_value: ConstComptime[_Ident] = ident
+    return ref(const_value)
 
 
 @func_type(callconv='c')
@@ -169,7 +168,7 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
     point.  The exit of the last ``__kmpc_fork_call`` joins the team, so no
     barrier is needed after the loop.
     """
-    rtc = as_runtime_closure(kernel)
+    rtc = kernel
     comptime()
     K = typeof(rtc)
     # ``LT``/``ST`` are *type values* kept in compile-time variables; ``Any`` is

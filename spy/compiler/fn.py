@@ -12,7 +12,6 @@ from .sval import (
     AnyFunction,
     AnyIntType,
     AnyValue,
-    ClosureType,
     FloatType,
     FormalArg,
     FunctionType,
@@ -20,6 +19,7 @@ from .sval import (
     MirLowerCache,
     PointerType,
     ResultType,
+    RetComptime,
     RetSpec,
     RetTuple,
     RetValue,
@@ -120,8 +120,8 @@ class ArgList[T]:
 # The argument tree of one call.  A *leaf* is either a compile-time value
 # (``sval.AnyValue`` - an ``sval.Value`` or a plain Python scalar, carried as
 # the value itself, never passed in MIR), a :class:`RuntimeArgNode` (one
-# runtime value of a spy type) or a :class:`ComptimePtrArg` (a compile-time
-# pointer, whose pointee is carried losslessly and copied at every call).  A
+# runtime value of a spy type) or an ``sval.ComptimePtr`` (a compile-time
+# pointer, carried as its own value).  A
 # *compound* node records a "shape": a tuple has no runtime representation of
 # its own (see ``sval.TupleType``), so its elements are passed separately and
 # rebound as one place tree at the callee, and a ``dict[str, T]``
@@ -130,7 +130,7 @@ class ArgList[T]:
 # is the *provided* argument of a call (see ``Signature.solve_param_types``): a
 # runtime leaf there carries the argument's spy type, a compile-time leaf its
 # value.
-type ArgNode = AnyValue | RuntimeArgNode | CompoundArgNode | ComptimePtrArg | tuple[ArgNode, ...] | frozendict[str, ArgNode]
+type ArgNode = AnyValue | RuntimeArgNode | CompoundArgNode | tuple[ArgNode, ...] | frozendict[str, ArgNode]
 
 @dataclass(frozen=True, slots=True)
 class RuntimeArgNode:
@@ -143,9 +143,9 @@ class RuntimeArgNode:
 @dataclass(frozen=True, slots=True)
 class CompoundArgNode:
     """A *container place* described by its parts: the container spy type and
-    one node per part.  It is the content of a :class:`ComptimePtrArg` whose
-    pointee is an aggregate (struct, array or complex - one node per field or
-    element), an ``Option[T]`` (the tag node and the payload node) or a tagged
+    one node per part.  It is the shape of a flattened aggregate argument (struct,
+    array or complex - one node per field or element), an ``Option[T]`` (the tag
+    node and the payload node) or a tagged
     union (likewise); the container type decides which place the callee rebuilds
     (see ``interp._init_ptr_target``).  A struct *argument* is never flattened
     this way - it is a single :class:`RuntimeArgNode` whether it stands on its
@@ -156,26 +156,6 @@ class CompoundArgNode:
 
     def __str__(self) -> str:
         return f"({self.container_type}: {', '.join(str(e) for e in self.elems)})"
-
-@dataclass(frozen=True, slots=True)
-class ComptimePtrArg:
-    """A compile-time pointer passed as a compile-time argument: the pointer
-    type the callee sees (``type``) and the pointee the pointer refers to
-    (``content``), carried losslessly so that the callee can rebuild an
-    equivalent compile-time place.  No MIR argument is passed for the pointer
-    itself; the runtime leaves of ``content`` - a pointee that holds runtime
-    values - are the runtime arguments of the call, in depth-first order.
-
-    A compile-time pointer cannot be aliased across a non-inline call, so its
-    pointee is *copied* into the callee on every call; the identity of the
-    pointer is therefore irrelevant and two pointers with equal content denote
-    the same argument - ``content`` alone fixes the specialization key."""
-
-    type: Type
-    content: ArgNode
-
-    def __str__(self) -> str:
-        return f"&({self.type}: {self.content})"
 
 @dataclass(frozen=True, slots=True)
 class PartialReturnSignature:
@@ -273,10 +253,6 @@ class CallSignature:
     positional: tuple[tuple[str, ArgNode], ...]
     varargs: tuple[ArgNode, ...] | None
     kwargs: frozendict[str, ArgNode] | None
-    # the hidden capture parameters of a closure (see ``ClosureFunction``):
-    # independent of ``positional``/``varargs``/``kwargs``, so the declared
-    # argument layout can grow ``*args``/``**kwargs`` without disturbing them
-    captures: tuple[ArgNode, ...] = ()
     # whether the callee may panic (see ``Signature.may_panic``): a call of it
     # may unwind through the enclosing deferred bodies (see ``interp``)
     may_panic: bool = True
@@ -292,9 +268,6 @@ class CallSignature:
         if self.kwargs is not None:
             s = ", ".join(f"{k}={v}" for k, v in self.kwargs.items())
             parts.append(f"**{{{s}}}")
-        if len(self.captures) > 0:
-            s = ", ".join(str(a) for a in self.captures)
-            parts.append(f"@({s})")
         return f"[{generic}]({', '.join(parts)})"
 
 
@@ -457,9 +430,8 @@ class Signature:
             # argument is converted to
             if not any(declared.contains(tv) for tv in self.generic_args):
                 return
-            if isinstance(node, (RuntimeArgNode, ComptimePtrArg)):
-                # a runtime leaf or a compile-time pointer: the node's own type is
-                # the bound (a ``ComptimePtrArg`` carries the whole pointer type)
+            if isinstance(node, RuntimeArgNode):
+                # a runtime leaf: the node's own type is the bound
                 solver.add_constraint(node.type, declared, True)
             else:
                 # a compile-time leaf: its value's type is the bound (a plain
@@ -635,23 +607,6 @@ class Signature:
                     )
                     for key, child in node.items()
                 )
-            # a compile-time pointer: its pointee is resolved against the
-            # pointer's element type and carried losslessly (see ``ComptimePtrArg``)
-            if isinstance(node, ComptimePtrArg):
-                ptr_type: Type
-                if declared is None:
-                    ptr_type = node.type
-                elif isinstance(declared, PointerType):
-                    ptr_type = declared
-                else:
-                    raise TypeMismatchError(
-                        f"parameter '{name}' takes a {declared}, not a pointer"
-                    )
-                assert isinstance(ptr_type, PointerType)
-                content = resolve_type(
-                    name, ptr_type.elem, node.content, TriState.UNKNOWN, False, True,
-                )
-                return ComptimePtrArg(ptr_type, content)
             # a flattened aggregate whose container type is known
             if isinstance(node, CompoundArgNode):
                 return CompoundArgNode(
@@ -751,6 +706,8 @@ class Signature:
             )
             if ret_type_spec is not None:
                 for leaf in iter_ret_leaves(ret_type_spec):
+                    if not isinstance(leaf, RetValue):
+                        continue
                     if not leaf.type.is_copyable():
                         # a C convention returns the result by value, which would
                         # copy it: a non-copyable value cannot be returned
@@ -877,6 +834,11 @@ class FunctionInstance:
     # storage leaf delivered through a result pointer (the thunk returns void)
     thunk_call_sig: CallSignature | None = None
     thunk_ret: RetSpec | None = None
+    # the compile-time result values of this specialization (see §7.3): one entry
+    # per ``RetComptime`` leaf, indexed by the leaf's ``index`` - the value the
+    # *last* analysed ``return`` delivered (later writes win), which the call site
+    # reads and stores into its own result place
+    ret_comptime_values: list[sval.AnyValue | None] | None = None
 
 class FunctionValue(Value):
     """The function value of a registered function: only compiled - and
@@ -891,16 +853,12 @@ class FunctionValue(Value):
     and the host, not here.
     """
 
-    def __init__(self, name_base: str, hir: FunctionIR, force_inline: bool = False, captures: tuple[Any, ...] = ()) -> None:
+    def __init__(self, name_base: str, hir: FunctionIR, force_inline: bool = False) -> None:
         # the context-unique base name of the native symbols
         self.name_base = name_base
         # the parsed HIR of the function (see ``astgen.parse_function``)
         self.hir = hir
         self.force_inline = force_inline
-        # the capture places of a closure (see :class:`ClosureValue`); empty for
-        # an ordinary function value.  A call substitutes its own captures here
-        # (see ``interp._call_function_entry``).
-        self.captures = captures
         # specialized call signatures -> the compiled artifacts of the
         # specialization
         self.specs: dict[CallSignature, FunctionInstance] = {}
@@ -916,7 +874,10 @@ class FunctionValue(Value):
 
     @override
     def get_type(self) -> Type:
-        return self.hir.signature.as_non_generic_fn_type() or AnyFunction()
+        # a function value is a *const function pointer* (see the comptime
+        # refactor): an unknown signature is an untyped function pointer
+        fn_type = self.hir.signature.as_non_generic_fn_type() or AnyFunction()
+        return PointerType(fn_type, is_const=True)
 
 @dataclass
 class ClosureFunction:
@@ -924,13 +885,12 @@ class ClosureFunction:
     :class:`~spy.compiler.hir.MakeClosure`).  It is shared by every closure
     value the statement creates.  The declared parameters and the captures are
     kept separate: ``arg_is_ref`` describes the declared ones only, while the
-    captures are named by :class:`~spy.compiler.hir.Closure` and passed as the
-    ``captures`` of a :class:`CallSignature`.
+    captures become the fields of the closure's anonymous struct (see §9).
 
     It carries only a *local* name (``name``/``local_name``); the native symbol
     of a compiled closure is prefixed at creation with the name of the function
     the closure is created in (the specialization's name, which is only known
-    when that function is compiled - see ``ClosureValue``)."""
+    when that function is compiled)."""
 
     # the bare name of the nested function (``add``, ``<lambda>``), for error
     # messages
@@ -970,35 +930,6 @@ class ClosureFunction:
     exceptions: ArraySet[Type] | None
     callconv: str = 'default'
     may_panic: bool = True
-
-class ClosureValue(FunctionValue):
-    """One closure value: the parsed :class:`ClosureFunction` together with
-    the capture places the creating statement resolved and the concrete
-    signature its annotations evaluated to (an annotation may name a type
-    argument of the enclosing function, which is concrete per creation).
-
-    It is a :class:`FunctionValue` so the call/compile machinery treats it
-    like any other function entry; a call dispatches through
-    ``interp._call_function_entry``, which inlines a forced-inline closure and
-    compiles the others.  ``name_base`` is built by the ``hir.MakeClosure``
-    that creates it, from the *creating frame's* function name (the
-    specialization's name, with its signature) and the closure's local name -
-    so a closure compiled inside ``foo(i32)`` is named ``foo(i32).add#1(...)``.
-    Every creation caches its own specializations: two creations of one ``def``
-    may have different concrete signatures (an annotation naming an enclosing
-    type argument), which a shared cache keyed by the call signature alone
-    could not tell apart."""
-
-    def __init__(self, fn: ClosureFunction, hir_ir: FunctionIR, captures: tuple[Any, ...], name_base: str) -> None:
-        super().__init__(name_base, hir_ir, force_inline=fn.force_inline, captures=captures)
-        self.closure_fn = fn
-
-    @override
-    def get_type(self) -> Type:
-        return ClosureType(self.hir.signature.as_non_generic_fn_type())
-
-    def __repr__(self) -> str:
-        return f'ClosureValue({self.hir.name})'
 
 class SymbolTable:
     """The link names of every compiled function of the process, and the
@@ -1046,10 +977,14 @@ def _must_pass_by_ref(type: mir.ReturnType) -> bool:
     return isinstance(type, (mir.StructType, mir.ArrayType, mir.UnionType))
 
 def _storage_leaves(spec: RetSpec) -> list[RetValue]:
-    """The leaves of ``spec`` that have storage, in depth-first declaration
-    order: a zero-sized leaf is delivered as its unit value and needs no result
-    location of its own."""
-    return [leaf for leaf in iter_ret_leaves(spec) if leaf.type.get_unit_value() is None]
+    """The ``RetValue`` leaves of ``spec`` that have storage, in depth-first
+    declaration order: a zero-sized leaf is delivered as its unit value and needs
+    no result location of its own, and a compile-time leaf (``RetComptime``) is
+    delivered at compile time and needs none either."""
+    return [
+        leaf for leaf in iter_ret_leaves(spec)
+        if isinstance(leaf, RetValue) and leaf.type.get_unit_value() is None
+    ]
 
 
 def _make_thunk(fn: mir.Function, ret_spec: RetSpec, cache: MirLowerCache) -> mir.Function:
@@ -1070,7 +1005,7 @@ def _make_thunk(fn: mir.Function, ret_spec: RetSpec, cache: MirLowerCache) -> mi
     storage_leaves = _storage_leaves(ret_spec)
     result_ptr_count = sum(
         1 for leaf in all_leaves
-        if leaf.type.get_unit_value() is None and leaf.via_result_ptr
+        if isinstance(leaf, RetValue) and leaf.type.get_unit_value() is None and leaf.via_result_ptr
     )
     n_declared = len(fn.args) - result_ptr_count
     assert n_declared >= 0
@@ -1148,6 +1083,9 @@ def _thunk_ret(ret_spec: RetSpec) -> RetSpec:
     match ret_spec:
         case RetValue():
             return RetValue(ret_spec.type, ret_spec.type.get_unit_value() is None)
+        case RetComptime():
+            # a compile-time leaf is not delivered through the native boundary
+            return ret_spec
         case RetTuple():
             return RetTuple(
                 ret_spec.type, tuple(_thunk_ret(value) for value in ret_spec.values),
@@ -1181,11 +1119,6 @@ def _thunk_call_sig(call_sig: CallSignature, fn: mir.Function) -> CallSignature:
                     child, index = convert(child, index)
                     elems.append(child)
                 return CompoundArgNode(arg.container_type, tuple(elems)), index
-            case ComptimePtrArg():
-                # no MIR argument for the pointer itself, but its content's
-                # runtime leaves are the runtime arguments of the call
-                content, index = convert(arg.content, index)
-                return ComptimePtrArg(arg.type, content), index
         # a compile-time leaf carries no MIR argument
         return arg, index
 

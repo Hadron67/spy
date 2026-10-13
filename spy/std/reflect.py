@@ -27,6 +27,11 @@ class StructField:
     name: bytes
     type: type
     default_value: Option[Any]
+    # whether the field is compile-time known, and whether it is held by
+    # reference (see ``sval.StructField``): the reported ``type`` is the logical
+    # type ``T``, not the ``*const T`` an ``is_ref`` field stores
+    is_comptime: bool
+    is_ref: bool
 
 @struct()
 class StructType:

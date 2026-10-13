@@ -19,6 +19,7 @@ the compile-time comparisons in ``spy.typeof(a) == spy.u64`` work.
 
 from __future__ import annotations
 
+import functools
 import typing
 from abc import abstractmethod
 from collections.abc import Callable, Iterator, Mapping
@@ -49,6 +50,17 @@ class Value:
         ...
 
 type AnyValue = Value | int | float | complex | bytes | bool
+
+type ScalarValue = (
+    Type | Void | Null | Int | Float | IntEnumValue | UndefinedScalar
+    | UntypedUndefined | DeclareFunction | BoundMethod | BuiltinFn
+    | ComptimePtr | CastedPtr
+    | int | float | complex | bytes | bool
+)
+"""The value union of the scalar types: every compile-time value that may
+occupy one cell of a ``Box`` (see :func:`scalar_leaves`).  The values of the
+aggregate types - ``AggregateValue``, ``TaggedUnionValue``, ``UnionValue``,
+``OptionValue``, ``TypedNull``, ``UndefinedAggregate`` - are not scalar."""
 
 class SpecialTypeKind(IntEnum):
     """How a spy type maps onto runtime code (see ``Type.classify``).
@@ -82,6 +94,36 @@ class MirLowerCache:
         self._option_struct_mirs: dict[Type, mir.StructType] = {}
         self._tagged_union_mirs: dict[TaggedUnionType, mir.StructType] = {}
         self._complex_mirs: dict[ComplexType, mir.StructType] = {}
+        # a ``TupleType``/``StrDictType`` mirrors to an equivalent synthesised
+        # ``StructType`` (see ``TupleType.to_mir_type``); the synthesised struct
+        # is cached here so that its layout is interned and the aggregate
+        # element accessors can be reached through it
+        self._tuple_structs: dict[TupleType, StructType] = {}
+        self._strdict_structs: dict[StrDictType, StructType] = {}
+
+    def tuple_struct(self, type: TupleType) -> StructType:
+        """The synthesised ``StructType`` a ``TupleType`` mirrors to: positional
+        fields, in element order (created once and cached)."""
+        ret = self._tuple_structs.get(type)
+        if ret is None:
+            head = StructTypeHead('tuple')
+            for index, elem in enumerate(type.types):
+                head.add_field(f'_{index}', elem)
+            ret = head.specialize(())
+            self._tuple_structs[type] = ret
+        return ret
+
+    def strdict_struct(self, type: StrDictType) -> StructType:
+        """The synthesised ``StructType`` a ``StrDictType`` mirrors to: one
+        named field per entry, in entry order (created once and cached)."""
+        ret = self._strdict_structs.get(type)
+        if ret is None:
+            head = StructTypeHead('dict')
+            for name, elem in type.values.items():
+                head.add_field(name, elem)
+            ret = head.specialize(())
+            self._strdict_structs[type] = ret
+        return ret
 
     def union_mir(self, type: UnionType, payload: mir.Type) -> mir.UnionType:
         """The (interned) MIR mirror of the payload union ``type``."""
@@ -264,8 +306,25 @@ class Type(Value):
     def __ror__(self, other: Any) -> TaggedUnionApplication:
         return union_application(other, self)
 
+
+class ScalarType(Type):
+    """Base of the *scalar* spy types: the types whose values are the atomic
+    compile-time values - integers, floats, booleans, bytes, type values,
+    function values, pointers, ....  A value of a scalar type occupies exactly
+    one cell when a compile-time aggregate is flattened into a ``Box`` (see
+    ``scalar_count``), including the zero-sized scalar types (whose value is
+    the unit value)."""
+
+
+class AggregateType(Type):
+    """Base of the *aggregate* spy types: structs, arrays, tuples, string
+    dictionaries, complex numbers, options, tagged unions and payload unions.
+    A value of an aggregate type is flattened into one cell per scalar leaf
+    when it is stored in a ``Box`` (see ``scalar_count``)."""
+
+
 @dataclass(frozen=True)
-class TypeType(Type):
+class TypeType(ScalarType):
     """The type of every spy type: the values of this type are the compile-time
     types themselves (``spy.typeof(a) == spy.i32``), so it is what the ``type``
     annotation of a parameter that takes a type stands for."""
@@ -286,7 +345,7 @@ class TypeType(Type):
         return 'type'
 
 @dataclass(frozen=True)
-class AnyType(Type):
+class AnyType(ScalarType):
     """The type of an arbitrary compile-time value (the ``Any`` annotation):
     it has no runtime representation and takes any value as it is, so it is what
     a reflective field that names a value of no fixed type - a struct field's
@@ -307,7 +366,7 @@ class AnyType(Type):
     def __str__(self) -> str:
         return 'any'
 
-class TypeVar(Type):
+class TypeVar(ScalarType):
     def __init__(self, name: str) -> None:
         self.name = name
 
@@ -336,7 +395,7 @@ class TypeVar(Type):
         return self.name
 
 @dataclass(frozen=True)
-class TupleType(Type):
+class TupleType(AggregateType):
     """A Python ``tuple[T1, T2, ...]``: the return annotation of a function
     that returns several values.  It is a compile-time type only - a tuple
     of values has no runtime representation of its own; every function that
@@ -363,7 +422,25 @@ class TupleType(Type):
 
     @override
     def classify(self) -> SpecialTypeKind:
-        return SpecialTypeKind.COMPTIME
+        if self.has_ellipsis:
+            # a varying-length tuple has no fixed runtime layout
+            return SpecialTypeKind.COMPTIME
+        dst = False
+        zst = True
+        for t in self.types:
+            match t.classify():
+                case SpecialTypeKind.COMPTIME:
+                    return SpecialTypeKind.COMPTIME
+                case SpecialTypeKind.DST:
+                    dst = True
+                    zst = False
+                case SpecialTypeKind.ZST:
+                    pass
+                case _:
+                    zst = False
+        if dst:
+            return SpecialTypeKind.DST
+        return SpecialTypeKind.ZST if zst else SpecialTypeKind.NONE
 
     @override
     def is_copyable(self) -> bool:
@@ -371,14 +448,24 @@ class TupleType(Type):
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
-        return None
+        if self.classify() == SpecialTypeKind.COMPTIME:
+            return None
+        # a tuple mirrors to an equivalent synthesised struct (see
+        # ``MirLowerCache.tuple_struct``), reusing every struct layout rule
+        return cache.tuple_struct(self).to_mir_type(cache)
+
+    def get_field_mir_indices(self, cache: MirLowerCache) -> tuple[int | None, ...]:
+        return cache.tuple_struct(self).get_field_mir_indices(cache)
+
+    def mirror_is_a_field(self, cache: MirLowerCache) -> bool:
+        return cache.tuple_struct(self).mirror_is_a_field(cache)
 
     def __str__(self) -> str:
         return f'tuple[{", ".join(str(t) for t in self.types)}{", ..." if self.has_ellipsis else ""}]'
 
 
 @dataclass(frozen=True)
-class UnionType(Type):
+class UnionType(AggregateType):
     """The payload of an error union: an untagged union that holds exactly one
     of ``types`` (the exception structs), the largest one occupying the
     storage.  It has no tag of its own - the error code next to it *is* the
@@ -492,7 +579,7 @@ class UnionValue(Value):
 
 
 @dataclass(frozen=True, slots=True)
-class TaggedUnionType(Type):
+class TaggedUnionType(AggregateType):
     """A tagged union ``A | B | C``: a value of exactly one of ``types`` (the
     variants, in the order written) together with the tag that says which one.
     The tag is the variant's position, so the order of the variants is part of
@@ -639,9 +726,8 @@ def tagged_union_of(types: tuple[Type, ...]) -> TaggedUnionType:
 @dataclass(frozen=True, slots=True)
 class TaggedUnionValue(Value):
     """The compile-time constant of a tagged union: the value ``value`` of the
-    variant ``index`` (see :func:`coerce_const`).  The interpreter's own
-    compile-time value is ``interp.ComptimeTaggedUnionValue``, exactly like the
-    option's is ``interp.ComptimeOption``: this one is what the type rules can
+    variant ``index`` (see :func:`coerce_const`).  It is what the interpreter
+    holds for a fully compile-time tagged union, and what the type rules can
     build on (a default field value, e.g.)."""
 
     type: TaggedUnionType
@@ -817,29 +903,60 @@ class Success(Value):
 
 
 @dataclass(frozen=True)
-class StrDictType(Type):
+class StrDictType(AggregateType):
     values: frozendict[str, Type]
 
     @override
+    def get_type_children(self) -> tuple[Type, ...]:
+        return tuple(self.values.values())
+
+    @override
     def classify(self) -> SpecialTypeKind:
-        return SpecialTypeKind.COMPTIME
+        dst = False
+        zst = True
+        for t in self.values.values():
+            match t.classify():
+                case SpecialTypeKind.COMPTIME:
+                    return SpecialTypeKind.COMPTIME
+                case SpecialTypeKind.DST:
+                    dst = True
+                    zst = False
+                case SpecialTypeKind.ZST:
+                    pass
+                case _:
+                    zst = False
+        if dst:
+            return SpecialTypeKind.DST
+        return SpecialTypeKind.ZST if zst else SpecialTypeKind.NONE
+
+    @override
+    def is_copyable(self) -> bool:
+        return super().is_copyable() and all(t.is_copyable() for t in self.values.values())
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
-        return None
+        if self.classify() == SpecialTypeKind.COMPTIME:
+            return None
+        return cache.strdict_struct(self).to_mir_type(cache)
+
+    def get_field_mir_indices(self, cache: MirLowerCache) -> tuple[int | None, ...]:
+        return cache.strdict_struct(self).get_field_mir_indices(cache)
+
+    def mirror_is_a_field(self, cache: MirLowerCache) -> bool:
+        return cache.strdict_struct(self).mirror_is_a_field(cache)
 
     def __str__(self) -> str:
-        return f'{{{", ".join(f"{k}: {v}" for k, v in self.values.items())}}}'
+        return f'{{", ".join(f"{k}: {v}" for k, v in self.values.items())}}'
 
 TYPE_TYPE = TypeType()
 
 @dataclass(frozen=True)
-class BytesType(Type):
+class BytesType(ScalarType):
     """A compile-time byte string: the spy type of a ``bytes`` literal/value.
     A byte string only exists at compile time - it has no MIR mirror of its own
-    - and is turned into a runtime pointer/slice by the ``std.core.gstr`` /
-    ``std.core.sstr`` builtins (see ``interp``).  Its compile-time value is the
-    raw Python ``bytes`` object."""
+    - and lowers into a runtime pointer/slice automatically (``sstr``, or a
+    ``ptr_cast`` to a pointer type; see ``interp``).  Its compile-time value is
+    the raw Python ``bytes`` object."""
 
     @override
     def get_type(self) -> Type:
@@ -857,7 +974,7 @@ class BytesType(Type):
         return 'bytes'
 
 @dataclass(frozen=True)
-class BoolType(Type):
+class BoolType(ScalarType):
     """The boolean type; values are ``i1`` at the LLVM level."""
 
     @override
@@ -872,7 +989,7 @@ class BoolType(Type):
         return 'bool'
 
 @dataclass(frozen=True)
-class EmptyType(Type):
+class EmptyType(ScalarType):
     """The *empty* type: no value of it exists at all, so a location of it
     (a function's result location of a body that never delivers a result) can
     never be written.  It is what marks a function that never returns a value:
@@ -910,7 +1027,7 @@ class EmptyType(Type):
         return 'empty'
 
 @dataclass(frozen=True)
-class VoidType(Type):
+class VoidType(ScalarType):
     """The unit type: a zero-sized type (ZST) whose unique value is
     :class:`Void` (``sval.Void()``).  It is the declared return type of a
     function that returns no value (``-> None``, or one inferred for a body
@@ -959,7 +1076,7 @@ class Void(Value):
         return 'void{{}}'
 
 @dataclass(frozen=True)
-class NullType(Type):
+class NullType(ScalarType):
     """The type of the :class:`Null` value - what the Python literal
     ``None`` evaluates to: no value of any particular type, which is exactly
     what a value of an ``Option[T]`` may be.  It is a zero-sized type (its
@@ -1020,9 +1137,9 @@ class TypedNull(Value):
     """The absent value of an ``Option[T]``, *typed*: the compile-time form of
     a missing option value, where the untyped :class:`Null` is what the Python
     literal ``None`` evaluates to and peers with every type.  A compile-time
-    option value is either this - absent - or an ``interp.ComptimeOption`` -
-    present; a compile-time aggregate field of an option type holds one of the
-    two (see ``std.slice``).
+    option value is either this - absent - or an :class:`OptionValue` - present;
+    a compile-time aggregate field of an option type holds one of the two (see
+    ``std.slice``).
 
     The type argument is the option's *child*, so the absent value of an option
     of an option is expressible as well (its static type is
@@ -1038,7 +1155,7 @@ class TypedNull(Value):
         return f'null[{self.child}]'
 
 @dataclass(frozen=True)
-class OptionType(Type):
+class OptionType(AggregateType):
     """The optional type ``Option[T]``: a value of the type ``T``, or the
     :class:`Null` value.  Both ``T`` and :class:`NullType` convert to it (see
     :meth:`resolve_peer_type` and :func:`coerce_const`), so a ``T`` and a
@@ -1239,16 +1356,127 @@ def aggregate_type_length(type: Type) -> int:
         return 2
     raise CompileError(f'{type} is not an aggregate')
 
-@dataclass
-class ConstRef(Value):
-    value: AnyValue
 
-    @override
-    def get_type(self) -> Type:
-        return PointerType(type_of(self.value), is_const=True)
+def _widest_variant_by_cells(types: frozenset[Type] | tuple[Type, ...] | FrozenArraySet[Type]) -> Type | None:
+    """The variant that occupies the most cells when flattened (``None`` for an
+    empty variant set), i.e. the variant that widens the payload union."""
+    best: Type | None = None
+    best_count = -1
+    for variant in types:
+        count = len(scalar_leaves(variant))
+        if count > best_count:
+            best = variant
+            best_count = count
+    return best
 
-    def __str__(self) -> str:
-        return '&' + str(self.value)
+
+@functools.lru_cache(maxsize=None)
+def scalar_leaves(type: Type) -> tuple[ScalarType, ...]:
+    """The scalar *leaf* types of ``type``, in flattened (depth-first) order:
+    the cells a value of ``type`` occupies in a :class:`Box`.  A scalar type
+    occupies exactly one cell (including a zero-sized scalar type); an aggregate
+    is flattened by its structure - a struct by its fields (an ``is_ref``
+    field's cell is the ``*const T`` pointer it stores), an array/tuple by its
+    elements, a string dictionary by its entries, a complex by ``(re, im)``, an
+    option by ``[tag, payload...]`` and a union/tagged union by its widest
+    variant (with the tag cell in front for a tagged union).  Iterative (an
+    explicit stack), so nesting costs no Python stack."""
+    out: list[ScalarType] = []
+    stack: list[Type] = [type]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ScalarType):
+            out.append(current)
+            continue
+        if isinstance(current, StructType):
+            children: list[Type] = []
+            for field in current.fields().values():
+                children.append(
+                    PointerType(field.type, is_const=True) if field.is_ref else field.type
+                )
+            stack.extend(reversed(children))
+            continue
+        if isinstance(current, TupleType):
+            if current.has_ellipsis:
+                raise CompileError('a varying-length tuple has no fixed flattened layout')
+            stack.extend(reversed(current.types))
+            continue
+        if isinstance(current, ArrayType):
+            length = current.length_int
+            if length is None:
+                raise CompileError(f'cannot flatten the unsized array {current}')
+            stack.extend([current.elem] * length)
+            continue
+        if isinstance(current, StrDictType):
+            stack.extend(reversed(list(current.values.values())))
+            continue
+        if isinstance(current, ComplexType):
+            stack.append(current.elem)
+            stack.append(current.elem)
+            continue
+        if isinstance(current, OptionType):
+            stack.append(current.child)
+            stack.append(BoolType())
+            continue
+        if isinstance(current, TaggedUnionType):
+            # a tagged union is always ``[tag, payload...]``, a single variant
+            # included (the tag still occupies one cell, even when ``tag_bits``
+            # is 0)
+            stack.append(current.payload_type())
+            stack.append(current.tag_type())
+            continue
+        if isinstance(current, UnionType):
+            widest = _widest_variant_by_cells(current.types)
+            if widest is None:
+                continue
+            leaves = scalar_leaves(widest)
+            width = _union_cell_width(current.types)
+            out.extend(leaves)
+            out.extend([VoidType()] * (width - len(leaves)))
+            continue
+        raise CompileError(f'cannot flatten {current} into compile-time storage')
+    return tuple(out)
+
+
+def _union_cell_width(types: frozenset[Type] | tuple[Type, ...] | FrozenArraySet[Type]) -> int:
+    """The cell width of a payload union: the width of its widest variant."""
+    width = 0
+    for variant in types:
+        width = max(width, len(scalar_leaves(variant)))
+    return width
+
+
+def scalar_count(type: Type) -> int:
+    """The number of cells a value of ``type`` occupies in a ``Box`` (see
+    :func:`scalar_leaves`)."""
+    return len(scalar_leaves(type))
+
+
+def field_scalar_offset(type: AggregateType, index: int) -> int:
+    """The offset of the ``index``-th field/element/entry of the aggregate
+    ``type`` in the flattened cell sequence (see :func:`scalar_leaves`).  For an
+    option a tagged union, index ``0`` is the tag and the payload starts at
+    ``1``; for a payload union index ``0`` is the payload itself (the tag next
+    to it is not stored in a ``Box``)."""
+    if isinstance(type, StructType):
+        offset = 0
+        for i, field in enumerate(type.fields().values()):
+            if i == index:
+                return offset
+            offset += 1 if field.is_ref else scalar_count(field.type)
+    elif isinstance(type, TupleType):
+        return sum(scalar_count(t) for t in type.types[:index])
+    elif isinstance(type, ArrayType):
+        return index * scalar_count(type.elem)
+    elif isinstance(type, StrDictType):
+        return sum(scalar_count(t) for t in list(type.values.values())[:index])
+    elif isinstance(type, ComplexType):
+        return index
+    elif isinstance(type, (OptionType, TaggedUnionType)):
+        return 0 if index == 0 else 1
+    elif isinstance(type, UnionType):
+        return 0
+    raise CompileError(f'{type} has no field {index}')
 
 @dataclass(frozen=True, slots=True)
 class BuiltinSignature:
@@ -1335,7 +1563,7 @@ class BuiltinFn(Value):
         return f'spy.{self.name}'
 
 @dataclass(frozen=True)
-class AnyIntType(Type):
+class AnyIntType(ScalarType):
     def get_type(self) -> Type:
         return TYPE_TYPE
 
@@ -1362,7 +1590,7 @@ class AnyIntType(Type):
         return None
 
 @dataclass(frozen=True)
-class IntType(Type):
+class IntType(ScalarType):
     bits: int
     signed: bool
 
@@ -1438,7 +1666,7 @@ class Int(Value):
         return str(self.value) + str(self.type)
 
 
-class IntEnumType(Type, IdentityObj):
+class IntEnumType(ScalarType, IdentityObj):
     """A spy integer enumeration: the type an ``enum.Enum`` class with integer
     member values declares.  It is *not* an integer - it never takes part in
     arithmetic, implicit conversion or comparison with an ``int`` - and its
@@ -1563,7 +1791,7 @@ def int_enum_type(name: str, cls: type) -> IntEnumType:
     return IntEnumType(name, members)
 
 @dataclass(frozen=True)
-class FloatType(Type):
+class FloatType(ScalarType):
     bits: int
 
     def __post_init__(self) -> None:
@@ -1598,7 +1826,7 @@ class Float(Value):
         return f"{self.value}{self.type}"
 
 @dataclass(frozen=True, slots=True)
-class ComplexType(Type):
+class ComplexType(AggregateType):
     """A complex number type ``Complex[T]``: a value of a real part and an
     imaginary part, each of the float type ``elem``.  A real (float or integer)
     value converts to it implicitly with a zero imaginary part (the ``T ->
@@ -1693,7 +1921,7 @@ def _points_at_elements_of(ptr: PointerType, other: PointerType) -> bool:
 
 
 @dataclass(frozen=True)
-class PointerType(Type):
+class PointerType(ScalarType):
     elem: Type
     is_const: AnyValue = False # bool
     variant: PointerVariant = PointerVariant.SINGLE
@@ -1793,8 +2021,104 @@ class PointerType(Type):
             variant = 'c' + variant
         return f"{variant}({self.elem})"
 
+
+class Box(IdentityObj):
+    """A compile-time *storage box*: the storage a comptime alloca
+    (``syntax.Comptime``/``ConstComptime``) reserves.  Its identity is its
+    object identity, so two :class:`ComptimePtr`\\ s into the same box compare
+    equal exactly when they also share their ``offset`` and their view type.
+
+    A box **flattens** the value it stores into a sequence of scalar cells
+    (``cells``, see :func:`scalar_leaves`); the value of the whole object starts
+    at cell ``0``.  ``type`` is the declared (or committed) spy type of the
+    whole object, and ``is_const`` makes the box read-only once a
+    ``ConstComptime`` commits.  A cell that was never written reads as an
+    ``UndefinedScalar`` of its leaf type."""
+
+    def __init__(self, name_base: str, type: Type | None = None, is_const: bool = False) -> None:
+        self.name_base = name_base
+        self.type = type
+        self.is_const = is_const
+        self.cells: list[ScalarValue] = []
+
+    def reset(self, type: Type) -> None:
+        """Declare ``type`` as the box's type and (re)initialize its flattened
+        cells to the flattened undefined of that type."""
+        self.type = type
+        self.cells = [UndefinedScalar(leaf) for leaf in scalar_leaves(type)]
+
+    def __repr__(self) -> str:
+        return f'<box {self.name_base} {self.type}>'
+
+
 @dataclass(frozen=True, slots=True)
-class ArrayType(Type):
+class ComptimePtr(Value):
+    """A pointer into compile-time storage: ``box`` (a :class:`Box`, or a raw
+    ``bytes`` byte string - a read-only, cell-less store) together with the
+    ``offset`` of the pointed object's first scalar in ``box.cells`` (``0`` is
+    the object itself), viewed through the pointer type ``type``.  Equality and
+    hashing are structural (``box`` is an identity object, ``bytes`` compares by
+    content), so a ``ComptimePtr`` is its own specialization key: the same box,
+    offset and view type."""
+
+    box: Box | bytes
+    offset: int
+    type: PointerType
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def is_writable(self) -> bool:
+        """Whether the pointee may be written through this pointer: both the
+        view (``type.is_const``) and the box (``Box.is_const``) have to allow it
+        (a ``bytes`` box is never writable)."""
+        if self.type.is_const is not False:
+            return False
+        if isinstance(self.box, bytes):
+            return False
+        return not self.box.is_const
+
+    def __str__(self) -> str:
+        return f'&box[{self.offset}]({self.type.elem})'
+
+
+@dataclass(frozen=True, slots=True)
+class CastedPtr(Value):
+    """A compile-time pointer reinterpreted by ``syntax.ptr_cast``: the
+    underlying :class:`ComptimePtr` together with the pointer type it is now
+    viewed through.  The pointee cannot be read or written through it - a cast
+    back to a readable type is needed first (see ``interp``)."""
+
+    ptr: ComptimePtr
+    type: PointerType
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def __str__(self) -> str:
+        return f'cast_ptr({self.ptr} as {self.type})'
+
+
+@dataclass(frozen=True, slots=True)
+class OptionValue(Value):
+    """The *present* value of an ``Option[T]``: the child value ``value``.
+    (The absent value is :class:`Null`/``TypedNull``.)  It is a value form - like
+    :class:`AggregateValue` - and does not enter :data:`ScalarValue`."""
+
+    value: AnyValue
+
+    @override
+    def get_type(self) -> Type:
+        return OptionType(type_of(self.value))
+
+    def __str__(self) -> str:
+        return f'some({self.value})'
+
+
+@dataclass(frozen=True, slots=True)
+class ArrayType(AggregateType):
     """A spy array type: ``length`` values of the element type ``elem``, in a
     row.  The length is a *value* (a Python ``int``, or an ``Int``), or ``None``
     for an *unsized* array - a dynamically-sized type whose length is not part
@@ -1926,7 +2250,7 @@ class ArrayType(Type):
         return f"{self.elem}[{length}]"
 
 @dataclass(frozen=True, slots=True)
-class OpaqueType(Type):
+class OpaqueType(ScalarType):
     """An opaque type (``syntax.Opaque``): a dynamically-sized type of unknown
     layout.  It has no value of its own - only a pointer to it is one, and that
     pointer is a ``void*`` (see ``PointerType.to_mir_type``).  As the last field
@@ -1958,8 +2282,32 @@ class OpaqueType(Type):
         return 'Opaque'
 
 @dataclass(frozen=True, slots=True)
-class Undefined(Value):
-    type: Type
+class UndefinedScalar(Value):
+    """The *undefined* value of a **scalar** type ``type``: the value a place
+    of that type holds when nothing has been written to it yet.  It is a legal
+    cell value of a ``Box``.  (A *typed* undefined - the coercion of
+    ``UntypedUndefined`` - of an aggregate type is an
+    :class:`UndefinedAggregate` instead.)"""
+
+    type: ScalarType
+
+    @override
+    def get_type(self) -> Type:
+        return self.type
+
+    def __str__(self) -> str:
+        return "undefined"
+
+
+@dataclass(frozen=True, slots=True)
+class UndefinedAggregate(Value):
+    """The *undefined* value of an **aggregate** type ``type``: the value form
+    of an aggregate that was never written.  It is not a cell value - it does
+    not enter :data:`ScalarValue` - so storing it into a ``Box`` expands it by
+    the type's structure and every scalar leaf cell becomes an
+    ``UndefinedScalar`` of the leaf's type (see :func:`scalar_count`)."""
+
+    type: AggregateType
 
     @override
     def get_type(self) -> Type:
@@ -1983,7 +2331,7 @@ class UntypedUndefined(Value):
         return 'undefined'
 
 @dataclass(frozen=True, slots=True)
-class UndefinedType(Type):
+class UndefinedType(ScalarType):
     """The type of :class:`UntypedUndefined` - the undefined value
     ``std.core.undefined`` evaluates to.  It is a zero-sized type whose only
     value is :class:`UntypedUndefined`, and it converts to any other type: a
@@ -2021,7 +2369,7 @@ class UndefinedType(Type):
         return 'undefined'
 
 @dataclass(frozen=True)
-class ValueType(Type):
+class ValueType(ScalarType):
     value: AnyValue
 
     @staticmethod
@@ -2070,7 +2418,7 @@ _NO_EXCEPTIONS: FrozenArraySet[Type] = FrozenArraySet()
 
 
 @dataclass(frozen=True)
-class FunctionType(Type):
+class FunctionType(ScalarType):
     args: tuple[FormalArg, ...]
     # the spy type of the values the function returns: the type of a single
     # result, or a ``tuple[...]`` when it returns several (see
@@ -2144,6 +2492,9 @@ class FunctionType(Type):
                 args.append(mir_type)
         ret_type: mir.MayBeVoidType = mir.VOID
         for leaf in iter_ret_leaves(self.ret_spec(cache)):
+            if not isinstance(leaf, RetValue):
+                # a compile-time leaf takes no MIR result slot
+                continue
             if leaf.type.is_zst():
                 # a zero-sized result is delivered as its unit value, not
                 # through the by-value slot
@@ -2204,6 +2555,13 @@ class StructField:
     # assigned to the annotated attribute (see ``dsl``), as a spy value, which
     # a construction coerces to the field's type (see ``interp.finish_struct``)
     default: AnyValue | None = None
+    # whether the field is compile-time known (Zig semantics): it does not enter
+    # the MIR layout and reading it on a runtime struct gives its default value
+    is_comptime: bool = False
+    # whether the field is logically a reference: it stores a ``*const T`` (or
+    # nothing when ``T`` is zero-sized), a read goes through an extra load and a
+    # write through it is an error (see ``interp.field_index_addr``)
+    is_ref: bool = False
 
 @dataclass(frozen=True)
 class AggregateValue(Value):
@@ -2229,6 +2587,9 @@ class StructTypeHead(Type, IdentityObj):
     is a specialization of a head (:class:`StructType`), so a non-generic
     struct has exactly one, and the head itself is only ever an annotation
     of a generic struct (a template is not a type of any value yet).
+
+    A struct head is neither a scalar nor an aggregate type: it denotes no
+    value of its own (only a specialization does).
     """
 
     def __init__(self, name_base: str, generic_args: tuple[TypeVar, ...] = (), modifiers: StructModifiers | None = None, generic_defaults: tuple[AnyValue | None, ...] = ()) -> None:
@@ -2258,11 +2619,11 @@ class StructTypeHead(Type, IdentityObj):
         # ``std.reflect.StructType.head``)
         return TYPE_TYPE
 
-    def add_field(self, name: str, type: Type, default: AnyValue | None = None) -> None:
+    def add_field(self, name: str, type: Type, default: AnyValue | None = None, is_comptime: bool = False, is_ref: bool = False) -> None:
         """Declare one field, appended after the fields declared so far, with
         the spy value a construction leaves it at when it is not given."""
         assert name not in self.fields.by_key, f'{self.name_base} already has a field {name!r}'
-        self.fields.add(name, StructField(name, type, default))
+        self.fields.add(name, StructField(name, type, default, is_comptime, is_ref))
 
     def specialize(self, generic_args: tuple[AnyValue, ...]) -> StructType:
         """The struct type this head declares for ``generic_args``: the one
@@ -2313,7 +2674,7 @@ class StructTypeHead(Type, IdentityObj):
             return self.name_base
         return f'{self.name_base}[{", ".join(str(a) for a in self.generic_args)}]'
 
-class StructType(Type):
+class StructType(AggregateType):
     """A spy struct *type*: one specialization of a :class:`StructTypeHead`,
     which is what a value, an annotation or ``spy.typeof(x) == Foo`` names.
 
@@ -2366,6 +2727,8 @@ class StructType(Type):
                     f.name,
                     replace_type_vars_type(f.type, reps),
                     replace_type_vars_value(f.default, reps),
+                    f.is_comptime,
+                    f.is_ref,
                 )
             )
         return self._fields
@@ -2400,6 +2763,11 @@ class StructType(Type):
     def get_unit_value(self) -> AnyValue | None:
         values: list[AnyValue] = []
         for field in self.fields().values():
+            if field.is_comptime:
+                if field.default is None:
+                    return None
+                values.append(field.default)
+                continue
             val = field.type.get_unit_value()
             if val is None:
                 return None
@@ -2415,7 +2783,11 @@ class StructType(Type):
             return False
         match self.modifiers.copyable:
             case 'inherit':
-                return all(f.type.is_copyable() for f in self.fields().values())
+                return all(
+                    True if f.is_ref else f.type.is_copyable()
+                    for f in self.fields().values()
+                    if not f.is_comptime
+                )
             case copyable:
                 return copyable
 
@@ -2428,6 +2800,22 @@ class StructType(Type):
         dst = False
         zst = True
         for field in self.fields().values():
+            if field.is_comptime:
+                if field.default is None:
+                    # a compile-time field with no default: the struct is
+                    # compile-time-only (there is no value to store)
+                    return SpecialTypeKind.COMPTIME
+                # a compile-time field does not take part in the ZST decision
+                continue
+            if field.is_ref:
+                # a reference field stores a ``*const T`` (nothing when ``T`` is
+                # zero-sized): it takes part by the pointer, not by ``T``
+                if field.type.is_zst():
+                    continue
+                if field.type.classify() == SpecialTypeKind.COMPTIME:
+                    return SpecialTypeKind.COMPTIME
+                zst = False
+                continue
             match field.type.classify():
                 case SpecialTypeKind.COMPTIME:
                     # a compile-time-only field leaves the struct with no runtime
@@ -2467,6 +2855,21 @@ class StructType(Type):
         fam_type: mir.MayBeVoidType | None = None
         fam_index: int | None = None
         for index, field in enumerate(fields):
+            if field.is_comptime:
+                # a compile-time field does not enter the MIR layout at all
+                continue
+            if field.is_ref:
+                if field.type.is_zst():
+                    # the pointee holds no storage: neither does the field
+                    continue
+                field_mir = PointerType(field.type, is_const=True).to_mir_type(cache)
+                if field_mir is None:
+                    raise CompileError(
+                        f"reference field '{field.name}' of {self} has no pointer "
+                        f"representation"
+                    )
+                mirrored.append((index, field, field_mir))
+                continue
             if field.type.is_zst():
                 continue
             if field.type.classify() == SpecialTypeKind.DST:
@@ -2583,7 +2986,7 @@ class StructType(Type):
 
 
 @dataclass(frozen=True)
-class AnyFunction(Type):
+class AnyFunction(ScalarType):
     """The type of a function value whose signature is not known: a
     lazily compiled ``@func()`` function is only typed when a call
     specializes it.  It has no MIR mirror - such a value never crosses
@@ -2603,33 +3006,6 @@ class AnyFunction(Type):
 
     def __str__(self) -> str:
         return "anyfn"
-
-@dataclass(frozen=True, slots=True)
-class ClosureType(Type):
-    """The type of a *closure* value: a nested ``def``/``lambda`` that
-    captures variables of an enclosing spy function.  A closure only exists
-    at compile time - only an inline function can take one as an argument -
-    so it has no MIR mirror (see ``SpecialTypeKind.COMPTIME``).  ``fn_type``
-    is the closure's declared signature as a function type when it is
-    complete, and ``None`` otherwise."""
-
-    fn_type: FunctionType | None = None
-
-    @override
-    def get_type(self) -> Type:
-        return TYPE_TYPE
-
-    @override
-    def classify(self) -> SpecialTypeKind:
-        return SpecialTypeKind.COMPTIME
-
-    @override
-    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
-        return None
-
-    def __str__(self) -> str:
-        return 'closure' if self.fn_type is None else f'closure({self.fn_type})'
-
 
 @dataclass(frozen=True, slots=True)
 class BoundMethod(Value):
@@ -2716,7 +3092,7 @@ def returns_via_result_ptr(type: Type, cache: MirLowerCache) -> bool:
         # ``HirRunner._ret_leaf_ptr``)
         return True
     match type:
-        case StructType() | ArrayType() | OptionType() | UnionType() | TaggedUnionType() | ComplexType():
+        case StructType() | ArrayType() | TupleType() | StrDictType() | OptionType() | UnionType() | TaggedUnionType() | ComplexType():
             if _mentions_type_var(type):
                 # the layout is not known until the call substitutes the
                 # type parameter: assumed small now, re-decided on substitution
@@ -2767,16 +3143,31 @@ class RetTuple:
     values: tuple[RetSpec, ...]
 
 
-type RetSpec = RetValue | RetTuple
+@dataclass(frozen=True, slots=True)
+class RetComptime:
+    """A leaf result value that is fully compile-time known
+    (``classify() == COMPTIME``): it takes neither a by-value slot nor a MIR
+    result argument.  Its value is delivered at compile time - through the
+    caller's result location for an inline call, or through a per-callee list
+    for a non-inline one (see ``interp``).  ``index`` is its position among the
+    :class:`RetComptime` leaves, in depth-first declaration order."""
+
+    type: Type
+    index: int
 
 
-def iter_ret_leaves(spec: RetSpec) -> Iterator[RetValue]:
-    """The leaf values of a return spec, in declaration order (depth first)."""
+type RetSpec = RetValue | RetTuple | RetComptime
+
+
+def iter_ret_leaves(spec: RetSpec) -> Iterator[RetValue | RetComptime]:
+    """The leaf values of a return spec, in declaration order (depth first),
+    including the :class:`RetComptime` leaves (so that a spec leaf aligns with
+    one reserved place, see ``interp._deliver_result``)."""
     work: list[RetSpec] = [spec]
     while work:
         node = work.pop()
         match node:
-            case RetValue():
+            case RetValue() | RetComptime():
                 yield node
             case RetTuple(values=values):
                 work.extend(reversed(values))
@@ -2785,9 +3176,9 @@ def iter_ret_leaves(spec: RetSpec) -> Iterator[RetValue]:
 def ret_returned_type(spec: RetSpec) -> Type | None:
     """The spy type of the value the lowered function returns directly (the
     by-value result), or ``None`` when it returns void - every value then goes
-    through a result pointer, or is zero-sized."""
+    through a result pointer, is zero-sized or is compile-time known."""
     for leaf in iter_ret_leaves(spec):
-        if not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
+        if isinstance(leaf, RetValue) and not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
             return leaf.type
     return None
 
@@ -2795,9 +3186,11 @@ def ret_returned_type(spec: RetSpec) -> Type | None:
 def ret_by_value_index(spec: RetSpec) -> int | None:
     """The position of the one leaf returned by value (its value has storage
     and fits in registers) among all the leaves, in depth-first declaration
-    order, or ``None`` when the lowered function returns void."""
+    order, or ``None`` when the lowered function returns void.  The count
+    includes the :class:`RetComptime` leaves (a compile-time leaf takes no
+    by-value slot)."""
     for index, leaf in enumerate(iter_ret_leaves(spec)):
-        if not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
+        if isinstance(leaf, RetValue) and not leaf.via_result_ptr and leaf.type.get_unit_value() is None:
             return index
     return None
 
@@ -2860,6 +3253,10 @@ def make_ret_spec(type: Type, cache: MirLowerCache, force_by_value: bool = False
     leaves = result_leaves(type)
     chosen: int | None = None
     for index, leaf_type in enumerate(leaves):
+        if leaf_type.classify() == SpecialTypeKind.COMPTIME:
+            # a compile-time leaf is delivered at compile time: it takes no
+            # by-value slot
+            continue
         if leaf_type.get_unit_value() is not None:
             # a zero-sized value is delivered as its unit value, not
             # through the by-value slot
@@ -2868,7 +3265,9 @@ def make_ret_spec(type: Type, cache: MirLowerCache, force_by_value: bool = False
             chosen = index
             break
     via = tuple(
-        leaf_type.get_unit_value() is None and index != chosen
+        leaf_type.classify() != SpecialTypeKind.COMPTIME
+        and leaf_type.get_unit_value() is None
+        and index != chosen
         for index, leaf_type in enumerate(leaves)
     )
     # rebuild the tree of the annotation, marking every leaf with how it is
@@ -2876,6 +3275,7 @@ def make_ret_spec(type: Type, cache: MirLowerCache, force_by_value: bool = False
     # whole type is itself a group when it is a ``tuple[...]`` or a
     # ``ResultType[...]``)
     index = 0
+    comptime_index = 0
     groups: list[list[RetSpec]] = [[]]
     group_types: list[Type] = []
     if isinstance(type, TupleType):
@@ -2903,7 +3303,11 @@ def make_ret_spec(type: Type, cache: MirLowerCache, force_by_value: bool = False
                 groups.append([])
                 group_types.append(item)
             case _:
-                groups[-1].append(RetValue(item, via[index]))
+                if item.classify() == SpecialTypeKind.COMPTIME:
+                    groups[-1].append(RetComptime(item, comptime_index))
+                    comptime_index += 1
+                else:
+                    groups[-1].append(RetValue(item, via[index]))
                 index += 1
     assert index == len(leaves) and len(groups) == 1
     if isinstance(type, TupleType):
@@ -3276,6 +3680,22 @@ def unwrap_comptime(annotation: Any) -> tuple[bool, Any]:
         return True, args[0]
     return False, annotation
 
+
+def unwrap_const_comptime(annotation: Any) -> tuple[bool, Any]:
+    """Like :func:`unwrap_comptime`, for the ``syntax.ConstComptime`` marker:
+    ``(True, None)`` for the bare ``ConstComptime``, ``(True, T)`` for
+    ``ConstComptime[T]`` and ``(False, annotation)`` for anything else."""
+    if annotation is None:
+        return False, None
+    if annotation is syntax.ConstComptime:
+        return True, None
+    if typing.get_origin(annotation) is syntax.ConstComptime:
+        args = typing.get_args(annotation)
+        if len(args) != 1:
+            raise TypeError(f'ConstComptime takes exactly one type argument, got {annotation!r}')
+        return True, args[0]
+    return False, annotation
+
 def negate(value: AnyValue) -> AnyValue | None:
     if isinstance(value, (int, float)):
         return -value
@@ -3538,6 +3958,20 @@ def coerce_const_tagged_union(value: AnyValue, type: TaggedUnionType) -> AnyValu
     return TaggedUnionValue(type, index, coerce_const(value, type.types[index]))
 
 
+def _typed_undefined(type: Type) -> AnyValue:
+    """The typed undefined value of ``type``: the unit value of a zero-sized
+    type, an :class:`UndefinedScalar` of a scalar type, or an
+    :class:`UndefinedAggregate` of an aggregate type."""
+    unit = type.get_unit_value()
+    if unit is not None:
+        return unit
+    if isinstance(type, ScalarType):
+        return UndefinedScalar(type)
+    if isinstance(type, AggregateType):
+        return UndefinedAggregate(type)
+    raise CompileError(f'cannot create an undefined value of {type}')
+
+
 def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     """Turn a Python value into the typed spy value of the spy type
     ``type`` (an ``Int``/``Float``/``Void``/``Type``/``bool``, or the value
@@ -3546,13 +3980,12 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     if isinstance(value, UntypedUndefined):
         # the undefined literal is the value of any type: of a zero-sized type it
         # is that type's unit value, of any other the typed undefined of it
-        unit = type.get_unit_value()
-        return unit if unit is not None else Undefined(type)
-    if isinstance(value, Undefined):
+        return _typed_undefined(type)
+    if isinstance(value, (UndefinedScalar, UndefinedAggregate)):
         # an *undetermined* value - the value of a place that holds nothing yet,
         # or of one that holds no storage at all - is a value of any type, so
         # the coercion only re-tags it with the type of its new location
-        return Undefined(type)
+        return _typed_undefined(type)
     if isinstance(value, (Int, Float)):
         # an already-typed constant (the value a compile-time location holds):
         # the target type governs, like the constant of any other location
@@ -3638,7 +4071,9 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
                 return value
             if isinstance(value, Null):
                 return value
-            return coerce_const(value, type.child)
+            if isinstance(value, OptionValue):
+                return OptionValue(coerce_const(value.value, type.child))
+            return OptionValue(coerce_const(value, type.child))
         case TaggedUnionType():
             return coerce_const_tagged_union(value, type)
         case UnionType():

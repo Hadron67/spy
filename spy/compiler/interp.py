@@ -14,24 +14,17 @@ Values in the register table are either
 
 * :class:`ComptimeVal` - a compile-time value of the ``spy`` domain
   (an ``sval.AnyValue``: a Python scalar, a spy type descriptor, a
-  function to call/inline, ...).  "No value" is the unit value
+  compile-time aggregate snapshot, a ``sval.ComptimePtr`` into compile-time
+  storage, a function to call/inline, ...).  "No value" is the unit value
   ``sval.Void()`` - the unique value of the zero-sized void type - never
   Python ``None``, and the ``None`` the source writes is the absent value
   of an option, ``sval.Null()``,
-* :class:`ComptimeTuple`/:class:`ComptimeDict` - a compile-time
-  aggregate whose elements are themselves interpreter values, and
-  :class:`ComptimeTuplePtr`/:class:`ComptimeDictPtr` - their pointer
-  forms, one place per element (a tuple/dict variable or a destructuring
-  target),
 * :class:`RuntimeVal` - the object of an already emitted MIR
   instruction (a typed runtime value),
 * :class:`PendingSlot` - an executed ``Alloca`` that is only committed
-  (into real memory, or into a :class:`ComptimeBox`) when
-  ``hir.CommitSlot`` runs; a slot whose content type is zero-sized never
-  gets memory: it only records its unit value, or
-* :class:`ComptimeBox` - the compile-time memory a committed
-  compile-time slot materializes into (a pointer to a compile-time
-  value), or
+  (into real memory, or into the ``sval.Box`` a comptime alloca reserves)
+  when ``hir.CommitSlot`` runs; a slot whose content type is zero-sized
+  never gets memory: it only records its unit value, or
 * :class:`ComptimeResultPtr` - the result location of a function: the
   places its normal value, its error code and its payload union are
   delivered into (the interpreter's form of a :class:`sval.ResultType`).
@@ -105,10 +98,8 @@ from .fn import (
     ArgList,
     ArgNode,
     CallSignature,
-    ClosureValue,
     CompileBatch,
     CompoundArgNode,
-    ComptimePtrArg,
     FunctionInstance,
     FunctionIR,
     FunctionValue,
@@ -121,9 +112,9 @@ from .fn import (
     SignatureFormalArg,
     signature_of_fn_type,
 )
-from .hir import InlineMode
 from .sval import (
     CompileContext,
+    RetComptime,
     RetSpec,
     RetTuple,
     RetValue,
@@ -312,25 +303,6 @@ class RuntimeVal(InterpVal):
 
 
 @dataclass
-class ComptimeBox(InterpVal):
-    """A compile-time writable box for non-aggregate values.  A box holds a
-    *compile-time* value only: a runtime value that refers to a register (a
-    load, a computation, a parameter) is never written into one - such a place
-    holds it in memory instead (see ``HirRunner._record_pending_store``).  A
-    runtime value that refers to no register (a global constant, a string, a
-    null pointer) is still held inline.  Supports non-aggregate values only,
-    for aggregate values, use :class:`ComptimeAggregate` or
-    :class:`ComptimeAggregatePtr` instead.
-
-    A box may be ``is_const``: the value it holds is read through it, but no
-    store may write through it (the fields of the ``SlicePtr`` a slice subscript
-    builds are such boxes, see ``HirRunner.slice_ptr``)."""
-
-    type: sval.Type
-    value: InterpVal
-    is_const: bool = False
-
-
 class _PendingActionData:
     """One action recorded by a :class:`PendingSlot`: how it is delivered
     once the slot has an address is decided by the runner (see
@@ -341,6 +313,12 @@ class _PendingActionData:
     def info(self) -> tuple[sval.Type, bool]:
         """Returns (type, may_be_inlined) of the value the action delivers."""
         ...
+
+    def is_comptime(self) -> bool:
+        """Whether the action delivers its value entirely at compile time - what
+        a slot whose storage is still inferred reads to decide between a ``Box``
+        and memory (see ``PendingSlot.use_comptime_storage``)."""
+        return False
 
 @dataclass
 class _PendingAction:
@@ -366,6 +344,10 @@ class _PendingStore(_PendingActionData):
     def info(self) -> tuple[sval.Type, bool]:
         return self.type, self.is_inline
 
+    @override
+    def is_comptime(self) -> bool:
+        return self.is_inline
+
 @dataclass
 class _PendingPtrConvertion(_PendingActionData):
     type: sval.Type
@@ -379,9 +361,8 @@ class _PendingPtrConvertion(_PendingActionData):
 @dataclass
 class _PendingTuple(_PendingActionData):
     # one tuple initialization recorded by a PendingSlot (see ``init_tuple``):
-    # the places the tuple's elements are written into.  A tuple has no
-    # representation of its own, so the slot holds the tuple of places itself
-    # (see ``ComptimeTuple``), and its type - the tuple of the types of those
+    # the places the tuple's elements are written into.  The slot holds the tree
+    # of element places itself, and its type - the tuple of the types of those
     # places - is read when the slot is committed, once the elements have been
     # written.  Recording it as an action (rather than committing the slot
     # right away) keeps the slot's type resolution - and the conflict it
@@ -392,22 +373,27 @@ class _PendingTuple(_PendingActionData):
     def info(self) -> tuple[sval.Type, bool]:
         return _tuple_places_type(self.places), True
 
+    @override
+    def is_comptime(self) -> bool:
+        return all(_place_is_comptime(place) for place in self.places)
+
 @dataclass
 class _PendingAggregate(_PendingActionData):
-    # one compile-time aggregate initialization recorded by a PendingSlot (see
+    # one aggregate initialization recorded by a PendingSlot (see
     # ``HirRunner.finish_array``/``HirRunner.finish_struct``): the places of its
-    # fields, in declaration order, or of its elements.  Like a tuple, an
-    # aggregate has no representation of its own that a slot could hold: the
-    # slot holds the aggregate pointer itself (see ``ComptimeAggregatePtr``),
-    # which is why the type recorded here is the struct or array type the
-    # construction resolved, and the places are committed together with the slot
-    # (see ``HirRunner.init_inline_aggregate``).
+    # fields, in declaration order, or of its elements.  The type recorded here
+    # is the struct or array type the construction resolved, and the places are
+    # committed together with the slot (see ``HirRunner.init_inline_aggregate``).
     type: sval.Type
     places: tuple[InterpVal, ...]
 
     @override
     def info(self) -> tuple[sval.Type, bool]:
         return self.type, True
+
+    @override
+    def is_comptime(self) -> bool:
+        return all(_place_is_comptime(place) for place in self.places)
 
 @dataclass(slots=True)
 class PendingSlot(InterpVal):
@@ -416,13 +402,12 @@ class PendingSlot(InterpVal):
     :class:`_PendingAction`; the slot acquires its final type (the
     pairwise ``resolve_peer_type`` of the action types) and its storage
     when ``hir.CommitSlot`` runs, which materializes it into a
-    :class:`RuntimeVal` (a pointer to real memory), a :class:`ComptimeBox`
-    or - for an aggregate - a :class:`ComptimeAggregatePtr` (see
-    ``HirRunner._commit_pending_slot``).
+    :class:`RuntimeVal` (a pointer to real memory) or into the ``sval.Box``
+    a comptime alloca reserves (see ``HirRunner._commit_pending_slot``).
 
-    ``inline_mode`` says how much of the value may be kept inline: nothing (a
-    plain slot), anything but an aggregate (an expression temporary), or
-    anything (a ``Comptime`` variable) - see ``InlineMode``.
+    ``is_comptime`` says where the value is kept: ``True``/``False`` when it is
+    fixed, ``None`` when it is still inferred from the stores (see
+    ``use_comptime_storage``).
 
     ``runtime_pos`` is the *runtime* block the ``Alloca`` ran in - the MIR block
     the walk was building, recorded so that a store into the slot knows whether
@@ -436,7 +421,8 @@ class PendingSlot(InterpVal):
     ``Gep`` addressing it, see ``finish_array``/``finish_struct``)."""
 
     insertion: mir.Insertion
-    inline_mode: InlineMode
+    is_comptime: bool | None
+    is_const: bool = False
     runtime_pos: mir.BasicBlock | None = None
     stores: list[_PendingAction] = field(default_factory=list)
     committed: InterpVal | None = None
@@ -461,23 +447,15 @@ class PendingSlot(InterpVal):
             type = sval.EmptyType()
         return type
 
-    def is_inline(self, type: sval.Type) -> bool:
-        """Whether the slot may hold the value of type ``type`` inline (in a
-        :class:`ComptimeBox`, or as a :class:`ComptimeAggregatePtr` for an
-        aggregate) rather than in memory.  The mode has to allow it (see
-        ``InlineMode``), every store into the slot has to be an inline one - a
-        store that crossed a runtime block boundary since the slot's own
-        position cannot be inlined (see ``_record_pending_store``), and a
-        delivery that needs the slot's own single address (a result pointer a
-        callee writes through, see ``_defer_ptr_convertion``) forces it into
-        memory too - and a ``NON_AGGREGATE`` slot holds no aggregate at all.
-        A zero-sized value has no runtime representation, so any mode keeps
-        its unit value."""
-        if self.inline_mode == InlineMode.NONE:
-            return False
-        if not all(store.data.info()[1] for store in self.stores):
-            return False
-        return not (self.inline_mode == InlineMode.NON_AGGREGATE and _is_aggregate(type))
+    def use_comptime_storage(self) -> bool:
+        """Whether the slot holds its value in compile-time storage (a
+        ``sval.Box``) rather than memory: ``True``/``False`` when ``is_comptime``
+        fixes it, otherwise inferred - compile-time when *every* store into it is
+        an inline compile-time one (a store that crossed a runtime block boundary
+        since the slot's own position is not, see ``_record_pending_store``)."""
+        if self.is_comptime is not None:
+            return self.is_comptime
+        return all(store.data.is_comptime() for store in self.stores)
 
 @dataclass(frozen=True, slots=True)
 class ComptimeResultPtr:
@@ -486,8 +464,7 @@ class ComptimeResultPtr:
     error code and the place of its payload union, in that order.  The places
     are :class:`PendingSlot`s while the location is not committed yet (the code
     and payload widths follow from the exception set at the commit, see
-    ``_commit_error_space``), and the materialized places afterwards (a
-    ``ComptimeBox`` for a zero-sized one).
+    ``_commit_error_space``), and the materialized places afterwards.
 
     Unlike every other interpreter value, a result location is *not* an
     :class:`InterpVal`: it is a composite place that only ever occurs as the
@@ -496,144 +473,9 @@ class ComptimeResultPtr:
     world.  A call hands its own result location over as the separate
     ``ret_loc``/``err_loc`` places (see ``_deliver_result``)."""
 
-    value: InterpVal
+    value: ResultLocTree | None
     code: InterpVal
     payload: InterpVal
-
-@dataclass(frozen=True, slots=True)
-class ComptimeTuple(InterpVal):
-    """The value form of a tuple: a tuple of *operands* (a value or a
-    reference to one, see :class:`ArgEntry`), the shape a ``tuple`` expression
-    or a multi-value result has.  A tuple has no runtime representation of its
-    own; its pointer form is :class:`ComptimeTuplePtr`."""
-
-    values: tuple[ArgEntry[InterpVal], ...]
-
-@dataclass
-class ComptimeDict(InterpVal):
-    """The value form of a ``**kwargs`` dictionary: one operand per name (see
-    :class:`ComptimeDictPtr` for its pointer form)."""
-
-    values: dict[str, ArgEntry[InterpVal]]
-
-@dataclass(slots=True)
-class ComptimeTuplePtr(InterpVal):
-    """The pointer form of a tuple: one *place* per element, in order - the
-    storage a tuple variable or a multi-value result location is held as (a
-    tuple has no representation of its own, so the tuple of places is the
-    storage).  It is the tuple counterpart of :class:`ComptimeAggregatePtr`:
-    ``HirRunner.load`` reads the tuple value out of it, ``HirRunner.store``
-    distributes a value into the element places, and a destructuring target is
-    one of these (see ``_gen_target_tuple``/``hir.TuplePtr``).
-
-    Unlike the other value forms it is *mutable*: a tuple variable grows in
-    place through ``t += u`` by rebinding :attr:`values` (see
-    ``HirRunner._tuple_extend_in_place``), which is the only place the field is
-    written after the tuple is built - that is why it is not frozen.  Nothing
-    else holds the tuple of places as a *value* (``HirRunner.load`` snapshots
-    it into a :class:`ComptimeTuple`), so the mutation only ever means "the
-    variable's storage grew"."""
-
-    values: tuple[InterpVal, ...]
-
-@dataclass
-class ComptimeDictPtr(InterpVal):
-    """The pointer form of a ``**kwargs`` dictionary: one place per name (the
-    storage a ``**kwargs`` parameter is bound to; see :class:`ComptimeDict`)."""
-
-    values: dict[str, InterpVal]
-
-@dataclass(frozen=True, slots=True)
-class ComptimeAggregate(InterpVal):
-    type: sval.Type
-    values: tuple[InterpVal, ...]
-
-@dataclass(frozen=True, slots=True)
-class ComptimeAggregatePtr(InterpVal):
-    type: sval.Type
-    ptrs: tuple[InterpVal, ...]
-
-@dataclass(frozen=True, slots=True)
-class ComptimeCastedPtr(InterpVal):
-    """A compile-time pointer ``syntax.ptr_cast`` reinterpreted as another
-    pointer type: the place it points at (a :class:`ComptimeBox` or a
-    :class:`ComptimeAggregatePtr`) and the pointer type it is viewed as.  The
-    place keeps its own storage type, so reading or writing *through* the cast
-    pointer is not supported yet (the cast only changes what the pointer is
-    typed as); a cast whose target the place converts to is materialized with
-    ``_coerce`` instead and never produces one of these."""
-
-    place: InterpVal
-    type: sval.PointerType
-
-@dataclass(frozen=True, slots=True)
-class ComptimeOption(InterpVal):
-    """The value form of an ``Option[T]``: a compile-time option, holding
-    whether it is *absent* (``is_null``, a ``bool`` value) and the value it
-    wraps (``value``, which may itself be a runtime value or a nested
-    aggregate).  It is the option counterpart of :class:`ComptimeAggregate`; an
-    option that is absent is still this form (its ``is_null`` is true), with the
-    payload there only to be discarded.  The untyped ``sval.Null``/typed
-    ``sval.TypedNull`` a Python expression evaluates to still occur as
-    ``ComptimeVal``s, but any option *place* holds one of these."""
-
-    is_null: InterpVal
-    value: InterpVal
-
-
-@dataclass
-class ComptimeOptionPtr(InterpVal):
-    """The compile-time storage of an ``Option[T]``: a pointer ``*Option[T]``
-    whose tag is a *value* (``is_null``, a ``bool``) rather than an addressable
-    place - the tag has no address of its own, only the payload does - and
-    whose payload is a place (``payload_ptr``), of the child type.  It is the
-    option counterpart of :class:`ComptimeAggregatePtr`: ``HirRunner.load``
-    reads the option out of it, ``HirRunner.store`` splits a value into the tag
-    and the payload, and ``HirRunner._option_payload_ptr`` hands the payload
-    place over.  Both the tag and the payload may be runtime values."""
-
-    is_null: InterpVal
-    payload_ptr: InterpVal
-
-
-@dataclass(frozen=True, slots=True)
-class ComptimeTaggedUnionValue(InterpVal):
-    """The value form of a tagged union: a compile-time tagged union holding
-    the variant it is (``tag``, the position of the variant in the union) and
-    that variant's value (``value``, which may itself be a runtime value or a
-    nested aggregate).  It is the tagged-union counterpart of
-    :class:`ComptimeAggregate`.
-
-    The tag may be only known at runtime (a value read out of a runtime union);
-    then ``value`` is not the variant but the (untagged) payload union storage
-    of the type (``type.payload_type()``), and the tag picks the variant it
-    holds - see ``_tagged_union_parts_to_runtime``."""
-
-    type: sval.TaggedUnionType
-    tag: InterpVal
-    value: InterpVal
-
-
-@dataclass
-class ComptimeTaggedUnionPtr(InterpVal):
-    """The compile-time storage of a tagged union: a pointer ``*Union`` whose
-    tag is a *value* (``tag``, the position of the current variant) rather than
-    an addressable place, and whose payload is a place (``payload_ptr``) of the
-    current variant's type.  It is the tagged-union counterpart of
-    :class:`ComptimeAggregatePtr`: ``HirRunner.load`` reads the union out of it,
-    ``HirRunner.store`` splits a value into the tag and the payload, and
-    ``HirRunner._tagged_union_payload_ptr`` hands the payload place over.  When
-    the variant changes the payload place is rebuilt.
-
-    When the tag is only known at runtime, ``payload_ptr`` points at the
-    (untagged) payload union storage of the type rather than at a variant's own
-    place, and a variant is read/written through it by reinterpreting its
-    address (see ``HirRunner._store_comptime_tagged_union``)."""
-
-    type: sval.TaggedUnionType
-    tag: InterpVal
-    payload_ptr: InterpVal
-
 
 @dataclass
 class _PendingErrorCodeWrite:
@@ -648,94 +490,60 @@ class _PendingErrorCodeWrite:
     exception: sval.Type
     insertion: mir.Insertion
 
-# The interpreter value forms that *are* a compile-time pointer: the place a
-# compile-time value or aggregate is held in (see ``ComptimeBox`` and the
-# aggregate/tuple/dict/option/union place forms).  Passing one to a non-inline
-# function carries it as a ``ComptimePtrArg`` (see ``HirRunner._val_to_node``).
-_COMPTIME_PTR_FORMS = (
-    ComptimeBox,
-    ComptimeAggregatePtr,
-    ComptimeOptionPtr,
-    ComptimeTaggedUnionPtr,
-    ComptimeTuplePtr,
-    ComptimeDictPtr,
-)
-
 def _is_comptime_val(val: InterpVal) -> bool:
-    """Whether the value is *deeply* compile-time: it is known in full while
-    the HIR runs, so a computation over it can be folded in Python (see
-    ``_eval_binary`` and friends) and a call may take it for a compile-time
-    parameter.  A container is deeply compile-time when everything it holds
-    is.  A runtime value is compile-time when it refers to no register - a
-    global constant, a string, a function, a null pointer (see
-    ``_references_register``); one that refers to a register (a load, a
-    computation, a parameter) is not, and a container holding one is not
-    either."""
+    """Whether the value is a *compile-time* value: one the interpreter holds
+    fully in Python.  A ``ComptimeVal`` always is (its ``sval`` value - a
+    scalar, an aggregate snapshot, an ``sval.ComptimePtr``/``sval.CastedPtr`` -
+    is known in full); a ``RuntimeVal`` **never** is, whatever it refers to (the
+    old "a runtime value that refers to no register" relaxation is gone, see
+    §1 of the behaviour doc); an uncommitted slot is decided by its stores."""
     todo = [val]
     while todo:
         val = todo.pop()
         match val:
+            case ComptimeVal():
+                # an sval value (a scalar, an aggregate snapshot, a
+                # ComptimePtr/CastedPtr) is compile-time in full
+                continue
             case RuntimeVal():
-                # a runtime value that refers to no register - a global
-                # constant, a string, a function, a null pointer - is known in
-                # full at compile time; one that does (a load, a computation, a
-                # parameter) is not (see ``_references_register``)
-                if _references_register(val.value):
-                    return False
+                return False
             case PendingSlot():
                 if val.committed is not None:
                     todo.append(val.committed)
-                elif val.declared is not None:
+                elif val.declared is not None or val.stores:
                     # a declared-but-uncommitted slot is compile-time when every
                     # store into it is an inline compile-time one
                     for action in val.stores:
-                        if not isinstance(action.data, _PendingStore) or not action.data.is_inline:
+                        if not action.data.is_comptime():
                             return False
-                        todo.append(action.data.value)
+                        if isinstance(action.data, _PendingStore):
+                            todo.append(action.data.value)
                 else:
                     return False
-            case ComptimeBox():
-                # a compile-time box is comptime only when the value it holds
-                # is (it may hold a runtime value, see ``ComptimeBox``)
-                todo.append(val.value)
-            case ComptimeOption():
-                # likewise for an option value form (see ``ComptimeOption``)
-                todo.append(val.is_null)
-                todo.append(val.value)
-            case ComptimeOptionPtr():
-                # and its place form (see ``ComptimeOptionPtr``)
-                todo.append(val.is_null)
-                todo.append(val.payload_ptr)
-            case ComptimeTaggedUnionValue():
-                # a tagged union held compile-time is comptime when both its tag
-                # and the variant value it holds are (see
-                # ``ComptimeTaggedUnionValue``)
-                todo.append(val.tag)
-                todo.append(val.value)
-            case ComptimeTaggedUnionPtr():
-                # and its place form (see ``ComptimeTaggedUnionPtr``)
-                todo.append(val.tag)
-                todo.append(val.payload_ptr)
-            case ComptimeTuple():
-                todo.extend(a.value for a in val.values)
-            case ComptimeTuplePtr():
-                # a tuple place tree is comptime when every element place is (see
-                # ``ComptimeTuplePtr``)
-                todo.extend(val.values)
-            case ComptimeDict():
-                todo.extend(a.value for a in val.values.values())
-            case ComptimeDictPtr():
-                # and its dict place form (see ``ComptimeDictPtr``)
-                todo.extend(val.values.values())
-            case ComptimeAggregate():
-                # a compile-time aggregate is comptime when everything it holds
-                # is, like a tuple or a box (see ``ComptimeAggregate``)
-                todo.extend(val.values)
-            case ComptimeAggregatePtr():
-                todo.extend(val.ptrs)
-            case ComptimeCastedPtr():
-                # a cast pointer is as compile-time as the place it wraps
-                todo.append(val.place)
+            case _:
+                return False
+    return True
+
+def _place_is_comptime(place: InterpVal) -> bool:
+    """Whether the place ``place`` holds its value at compile time - the
+    storage decision a slot's aggregate action reads for its field/element
+    places (see ``_PendingAggregate``/``_PendingTuple``)."""
+    todo = [place]
+    while todo:
+        value = todo.pop()
+        if isinstance(value, ComptimeVal):
+            continue
+        if isinstance(value, RuntimeVal):
+            return False
+        if isinstance(value, PendingSlot):
+            if value.committed is not None:
+                todo.append(value.committed)
+            else:
+                for action in value.stores:
+                    if not action.data.is_comptime():
+                        return False
+            continue
+        return False
     return True
 
 def _references_register(value: mir.Value) -> bool:
@@ -758,32 +566,12 @@ def _references_register(value: mir.Value) -> bool:
             todo.extend(children)
     return False
 
-def _stores_decide_storage(type: sval.Type) -> bool:
-    """Whether a declared ``Comptime`` variable of ``type`` leaves its storage
-    to the stores into it (see ``alloca``): a scalar leaf, or a struct whose
-    fields all do - the construction records a place per field (see
-    ``finish_struct``).  An array, a tuple, a ``dict``, an ``Option`` or a
-    tagged union has a construction path that builds its place form up front, so
-    it is left as it is."""
-    if isinstance(type, sval.StructType):
-        return all(_stores_decide_storage(field.type) for field in type.fields().values())
-    return not (
-        _is_aggregate(type)
-        or isinstance(
-            type, (sval.TupleType, sval.StrDictType, sval.OptionType, sval.TaggedUnionType)
-        )
-    )
-
-
 def _is_aggregate(type: sval.Type) -> bool:
-    """Whether ``type`` is an *aggregate*: a struct or an array.  An aggregate
-    has no storage of its own here - an inline slot holds it as a
-    :class:`ComptimeAggregatePtr`, whose fields or elements are their own
-    places - so a :class:`ComptimeBox` never holds one (see ``InlineMode``).
-
-    A union is not one: its storage is a single variant, not a field per
-    place."""
-    return isinstance(type, (sval.StructType, sval.ArrayType, sval.ComplexType))
+    """Whether ``type`` is an *aggregate* type (a struct, array, tuple, string
+    dictionary, complex, option, tagged union or payload union): a value of one
+    is flattened into a cell per scalar leaf when it is stored in a ``Box`` (see
+    ``sval.scalar_leaves``)."""
+    return isinstance(type, sval.AggregateType)
 
 def _is_union_unit(val: InterpVal) -> bool:
     """Whether ``val`` is a union value that carries no storage
@@ -795,24 +583,31 @@ def _is_union_unit(val: InterpVal) -> bool:
 def _is_undefined_val(val: InterpVal) -> bool:
     """Whether the value is the undefined literal - the untyped
     ``sval.UntypedUndefined`` ``std.core.undefined`` evaluates to, or the typed
-    ``sval.Undefined`` it becomes once it is coerced to a type: a store of one
-    leaves its destination undefined (see ``HirRunner.store``).
+    ``sval.UndefinedScalar``/``sval.UndefinedAggregate`` it becomes once it is
+    coerced to a type: a store of one leaves its destination undefined (see
+    ``HirRunner.store``).
 
-    A typed ``sval.Undefined`` of a *pointer* type is not one: null is not a
-    legal value of a non-null pointer, so it stands for a dangling - but
-    defined - pointer, and a store of it writes that pointer (see
-    ``mir.Dangling``)."""
+    A typed undefined of a *pointer* type is not one: null is not a legal value
+    of a non-null pointer, so it stands for a dangling - but defined - pointer,
+    and a store of it writes that pointer (see ``mir.Dangling``)."""
     obj = _to_comptime(_shallow_normalize(val))
-    if isinstance(obj, sval.Undefined):
+    if isinstance(obj, sval.UndefinedAggregate):
+        return True
+    if isinstance(obj, sval.UndefinedScalar):
         return not isinstance(obj.type, sval.PointerType)
     return isinstance(obj, sval.UntypedUndefined)
 
 def _aggregate_place_types(type: sval.Type) -> tuple[sval.Type, ...]:
     """The type of every place of the aggregate ``type``, in place order: the
-    fields of a struct in declaration order, the elements of an array, the real
-    and imaginary parts of a complex number."""
+    fields of a struct in declaration order, the elements of a tuple/array, the
+    entries of a ``dict[str, T]``, the real and imaginary parts of a complex
+    number."""
     if isinstance(type, sval.StructType):
         return tuple(field0.type for field0 in type.fields().values())
+    if isinstance(type, sval.TupleType):
+        return type.types
+    if isinstance(type, sval.StrDictType):
+        return tuple(type.values.values())
     if isinstance(type, sval.ArrayType):
         length = type.length_int
         if length is None:
@@ -822,15 +617,12 @@ def _aggregate_place_types(type: sval.Type) -> tuple[sval.Type, ...]:
         return (type.elem, type.elem)
     raise CompileError(f'{type} is not an aggregate')
 
-def _as_aggregate(ev: InterpVal) -> ComptimeAggregate | None:
-    """The aggregate value an interpreter value denotes, when it denotes one:
-    the aggregate value form itself, or an ``sval.AggregateValue`` a
-    compile-time value holds - the unit value of a zero-sized aggregate, or an
-    aggregate whose field values are all known (see ``ComptimeAggregate``)."""
-    if isinstance(ev, ComptimeAggregate):
-        return ev
+def _as_aggregate(ev: InterpVal) -> sval.AggregateValue | None:
+    """The ``sval.AggregateValue`` the interpreter value denotes, when it
+    denotes one (a compile-time aggregate value - the unit value of a zero-sized
+    aggregate, or one whose field values are all known)."""
     if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.AggregateValue):
-        return ComptimeAggregate(ev.obj.type, tuple(ComptimeVal(value) for value in ev.obj.values))
+        return ev.obj
     return None
 
 class BlockFrameData:
@@ -1093,7 +885,7 @@ def _sval_to_runtime(value: sval.AnyValue, cache: sval.MirLowerCache) -> mir.Val
             mir_type = value.get_type().to_mir_type(cache)
             assert isinstance(mir_type, mir.PointerType)
             return mir.ExternSymbol(value.linkname, mir_type)
-        case sval.Undefined():
+        case sval.UndefinedScalar():
             # an undefined value has no defined content.  For a pointer it may
             # not be LLVM's ``undef``: null is not a legal value of a non-null
             # ``Ptr[T]``, so an undefined pointer is a dangling (non-null,
@@ -1109,6 +901,189 @@ def _sval_to_runtime(value: sval.AnyValue, cache: sval.MirLowerCache) -> mir.Val
             raise CompileError(f"cannot return the compile-time value {value!r}")
 
 
+def _flatten_natural(value: sval.AnyValue, type: sval.Type) -> list[sval.ScalarValue]:
+    """The natural (unpadded) flattened cells of the compile-time ``value`` of
+    ``type`` (see :func:`_flatten_value`)."""
+    if isinstance(type, sval.ScalarType):
+        return [value]
+    if isinstance(value, sval.AggregateValue):
+        values = value.values
+    else:
+        raise CompileError(f'cannot flatten {value!r} as {type}')
+    if isinstance(type, sval.StructType):
+        cells: list[sval.ScalarValue] = []
+        for index, field in enumerate(type.fields().values()):
+            if field.is_ref:
+                # the cell holds the compile-time pointer itself
+                cells.append(values[index])
+            else:
+                cells.extend(_flatten_value(values[index], field.type))
+        return cells
+    if isinstance(type, sval.TupleType):
+        cells = []
+        for index, elem in enumerate(type.types):
+            cells.extend(_flatten_value(values[index], elem))
+        return cells
+    if isinstance(type, sval.StrDictType):
+        cells = []
+        for index, elem in enumerate(type.values.values()):
+            cells.extend(_flatten_value(values[index], elem))
+        return cells
+    if isinstance(type, sval.ArrayType):
+        cells = []
+        for elem_value in values:
+            cells.extend(_flatten_value(elem_value, type.elem))
+        return cells
+    if isinstance(type, sval.ComplexType):
+        return [values[0], values[1]]
+    raise CompileError(f'cannot flatten {value!r} as {type}')
+
+
+def _flatten_value(value: sval.AnyValue, type: sval.Type) -> list[sval.ScalarValue]:
+    """The flattened cell sequence of the compile-time ``value`` of ``type``
+    (see ``sval.scalar_leaves``), padded to the type's width with an
+    ``UndefinedScalar`` of each remaining leaf type."""
+    if isinstance(value, (sval.UndefinedAggregate, sval.UndefinedScalar, sval.UntypedUndefined)):
+        # an undefined value flattens to undefined cells (one per leaf)
+        return [sval.UndefinedScalar(leaf) for leaf in sval.scalar_leaves(type)]
+    if isinstance(type, sval.OptionType):
+        if isinstance(value, sval.OptionValue):
+            cells: list[sval.ScalarValue] = [True]
+            cells.extend(_flatten_value(value.value, type.child))
+        elif isinstance(value, (sval.Null, sval.TypedNull)):
+            cells = [False]
+        else:
+            raise CompileError(f'cannot flatten the option value {value!r}')
+    elif isinstance(type, sval.TaggedUnionType):
+        if not isinstance(value, sval.TaggedUnionValue):
+            raise CompileError(f'cannot flatten the tagged union value {value!r}')
+        cells = [sval.Int(value.index, type.tag_type())]
+        cells.extend(_flatten_value(value.value, type.types[value.index]))
+    else:
+        cells = _flatten_natural(value, type)
+    leaves = sval.scalar_leaves(type)
+    while len(cells) < len(leaves):
+        cells.append(sval.UndefinedScalar(leaves[len(cells)]))
+    if len(cells) != len(leaves):
+        raise CompileError(f'cannot flatten {value!r} as {type}')
+    return cells
+
+
+def _unflatten_cells(cells: list[sval.ScalarValue], offset: int, type: sval.Type) -> sval.AnyValue:
+    """Reconstruct a compile-time value of ``type`` from the flattened cells at
+    ``offset`` (the inverse of :func:`_flatten_value`)."""
+    if isinstance(type, sval.ScalarType):
+        return cells[offset]
+    if isinstance(type, sval.StructType):
+        values: list[sval.AnyValue] = []
+        for index, field in enumerate(type.fields().values()):
+            field_offset = offset + sval.field_scalar_offset(type, index)
+            if field.is_ref:
+                values.append(cells[field_offset])
+            elif field.is_comptime:
+                cell = cells[field_offset]
+                # an unset compile-time field reads its default
+                values.append(field.default if isinstance(cell, sval.UndefinedScalar) else cell)
+            else:
+                values.append(_unflatten_cells(cells, field_offset, field.type))
+        return sval.AggregateValue(tuple(values), type)
+    if isinstance(type, sval.TupleType):
+        return sval.AggregateValue(
+            tuple(
+                _unflatten_cells(cells, offset + sval.field_scalar_offset(type, index), elem)
+                for index, elem in enumerate(type.types)
+            ),
+            type,
+        )
+    if isinstance(type, sval.StrDictType):
+        return sval.AggregateValue(
+            tuple(
+                _unflatten_cells(cells, offset + sval.field_scalar_offset(type, index), elem)
+                for index, elem in enumerate(type.values.values())
+            ),
+            type,
+        )
+    if isinstance(type, sval.ArrayType):
+        length = type.length_int
+        if length is None:
+            raise CompileError(f'cannot flatten the unsized array {type}')
+        step = sval.scalar_count(type.elem)
+        return sval.AggregateValue(
+            tuple(
+                _unflatten_cells(cells, offset + index * step, type.elem)
+                for index in range(length)
+            ),
+            type,
+        )
+    if isinstance(type, sval.ComplexType):
+        return sval.AggregateValue((cells[offset], cells[offset + 1]), type)
+    if isinstance(type, sval.OptionType):
+        if cells[offset] is True:
+            return sval.OptionValue(_unflatten_cells(cells, offset + 1, type.child))
+        return sval.TypedNull(type.child)
+    if isinstance(type, sval.TaggedUnionType):
+        tag = cells[offset]
+        index = tag.value if isinstance(tag, sval.Int) else 0
+        return sval.TaggedUnionValue(
+            type, index, _unflatten_cells(cells, offset + 1, type.types[index]),
+        )
+    if isinstance(type, sval.UnionType):
+        unit = type.get_unit_value()
+        if unit is None:
+            raise CompileError(f'cannot build a value of the union {type}')
+        return unit
+    raise CompileError(f'cannot unflatten {type}')
+
+
+def _fill_comptime_defaults(box: sval.Box, type: sval.Type, offset: int) -> None:
+    """Fill the cell of every ``is_comptime`` struct field reachable from
+    ``(type, offset)`` with that field's declared default: a box's cells start as
+    the flattened undefined, so a compile-time field would otherwise read
+    undefined instead of its default (see ``_comptime_field_place``).  Iterative
+    (an explicit stack), so type nesting costs no Python stack."""
+    stack: list[tuple[sval.Type, int]] = [(type, offset)]
+    while stack:
+        current, base = stack.pop()
+        if isinstance(current, sval.StructType):
+            for index, field0 in enumerate(current.fields().values()):
+                field_offset = base + sval.field_scalar_offset(current, index)
+                if field0.is_comptime:
+                    if field0.default is not None:
+                        decl = (
+                            sval.PointerType(field0.type, is_const=True)
+                            if field0.is_ref else field0.type
+                        )
+                        cells = _flatten_value(field0.default, decl)
+                        box.cells[field_offset:field_offset + len(cells)] = cells
+                elif not field0.is_ref:
+                    stack.append((field0.type, field_offset))
+        elif isinstance(current, sval.TupleType):
+            for index, elem in enumerate(current.types):
+                stack.append((elem, base + sval.field_scalar_offset(current, index)))
+        elif isinstance(current, sval.StrDictType):
+            for index, elem in enumerate(current.values.values()):
+                stack.append((elem, base + sval.field_scalar_offset(current, index)))
+        elif isinstance(current, sval.ArrayType):
+            length = current.length_int
+            if length is None:
+                continue
+            step = sval.scalar_count(current.elem)
+            for index in range(length):
+                stack.append((current.elem, base + index * step))
+
+def _load_box_cells(box: sval.Box | bytes, offset: int, type: sval.Type) -> sval.AnyValue:
+    """Read a compile-time value of ``type`` out of the compile-time storage
+    ``box`` at ``offset`` (a byte-string store holds raw bytes)."""
+    if isinstance(box, bytes):
+        if isinstance(type, sval.BytesType):
+            # a byte-string store holds the bytes themselves
+            return box[offset:]
+        if isinstance(type, sval.IntType):
+            return sval.Int(box[offset], type)
+        raise CompileError(f'cannot read {type} out of a byte string')
+    return _unflatten_cells(box.cells, offset, type)
+
+
 def _to_comptime(value: InterpVal) -> sval.AnyValue | None:
     match value:
         case ComptimeVal():
@@ -1119,8 +1094,9 @@ def _to_comptime(value: InterpVal) -> sval.AnyValue | None:
 def _shallow_normalize(ev: InterpVal) -> InterpVal:
     """Follow a committed :class:`PendingSlot` to the pointer value it was
     materialized into (a :class:`RuntimeVal` pointer or a
-    :class:`ComptimeBox`), so that pointer operations see one shape.  An
-    uncommitted slot is left alone for ``load``/``store`` to handle."""
+    :class:`ComptimeVal` wrapping a :class:`sval.ComptimePtr`), so that pointer
+    operations see one shape.  An uncommitted slot is left alone for
+    ``load``/``store`` to handle."""
     if isinstance(ev, PendingSlot) and ev.committed is not None:
         return ev.committed
     return ev
@@ -1136,87 +1112,14 @@ def _type_of(ev: InterpVal, allow_value_type: bool = False) -> sval.Type | None:
             if ev.declared is not None:
                 return sval.PointerType(ev.declared, is_const=False)
             return None
-        case ComptimeBox():
-            # a compile-time writable pointer: const when its box is (a field of
-            # a slice, see ``ComptimeBox``)
-            return sval.PointerType(ev.type, is_const=ev.is_const)
-        case ComptimeOption(_, value):
-            # an option held compile-time: the option of the type of the value
-            # it wraps (see ``ComptimeOption``)
-            child = _type_of(value)
-            return None if child is None else sval.OptionType(child)
-        case ComptimeOptionPtr(_, payload_ptr):
-            # the compile-time place of an option: a pointer to it, its child
-            # read off the payload place (see ``ComptimeOptionPtr``)
-            payload_type = _type_of(payload_ptr)
-            if not isinstance(payload_type, sval.PointerType):
-                return None
-            return sval.PointerType(sval.OptionType(payload_type.elem), is_const=False)
-        case ComptimeTaggedUnionValue(type):
-            # a tagged union held compile-time: the union type (see
-            # ``ComptimeTaggedUnionValue``)
-            return type
-        case ComptimeTaggedUnionPtr(type):
-            # the compile-time storage of a tagged union: a pointer to it
-            return sval.PointerType(type, is_const=False)
-        case ComptimeAggregate(type):
-            # a struct value held compile-time: the struct type (see
-            # ``ComptimeAggregate``)
-            return type
-        case ComptimeAggregatePtr(type):
-            # the compile-time storage of a struct: a pointer to it
-            return sval.PointerType(type, is_const=False)
-        case ComptimeCastedPtr(_, type):
-            # a pointer reinterpreted by ``ptr_cast``: the pointer type it is
-            # viewed as (see ``ComptimeCastedPtr``)
-            return type
         case RuntimeVal(_, type):
             if isinstance(type, sval.ValueType) and not allow_value_type:
                 return sval.type_of(type.value)
             return type
         case ComptimeVal(obj):
+            # an sval value; a ``ComptimePtr``/``CastedPtr`` reports its pointer
+            # type through ``get_type`` (see ``sval.type_of``)
             return sval.type_of(obj) if not allow_value_type else sval.ValueType(obj)
-        case ComptimeTuple():
-            # a tuple of values: its type is the tuple of the types of the
-            # values its entries denote, with no runtime representation of
-            # its own (see ``sval.TupleType``)
-            types: list[sval.Type] = []
-            for entry in ev.values:
-                entry_type = _arg_type_of(entry)
-                if entry_type is None:
-                    return None
-                types.append(entry_type)
-            return sval.TupleType(tuple(types), False)
-        case ComptimeTuplePtr():
-            # the storage of a tuple: a pointer to the tuple of the types of the
-            # element places (see ``ComptimeTuplePtr``)
-            element_types: list[sval.Type] = []
-            for place in ev.values:
-                place_type = _place_type(place)
-                if place_type is None:
-                    return None
-                element_types.append(place_type)
-            return sval.PointerType(sval.TupleType(tuple(element_types), False), is_const=False)
-        case ComptimeDict():
-            # a dictionary of values: its type is the ``{name: type}`` of the
-            # types of the values its entries denote (see ``sval.StrDictType``)
-            values: dict[str, sval.Type] = {}
-            for name, entry in ev.values.items():
-                entry_type = _arg_type_of(entry)
-                if entry_type is None:
-                    return None
-                values[name] = entry_type
-            return sval.StrDictType(frozendict(values))
-        case ComptimeDictPtr():
-            # the storage of a dictionary: a pointer to the ``{name: type}`` of
-            # the types of the element places (see ``ComptimeDictPtr``)
-            name_types: dict[str, sval.Type] = {}
-            for name, place in ev.values.items():
-                place_type = _place_type(place)
-                if place_type is None:
-                    return None
-                name_types[name] = place_type
-            return sval.PointerType(sval.StrDictType(frozendict(name_types)), is_const=False)
         case _:
             return None
 
@@ -1236,9 +1139,6 @@ def _enum_member_index(enum_type: sval.IntEnumType, value: sval.AnyValue) -> int
 def _comptime_int(ev: InterpVal) -> int | None:
     """The Python integer a compile-time integer value denotes, or None when
     the value is not one at all (a runtime value, or no integer)."""
-    if isinstance(ev, ComptimeOption):
-        # a present option holds its value (see ``ComptimeOption``)
-        ev = ev.value
     if isinstance(ev, ComptimeVal):
         if isinstance(ev.obj, sval.Int):
             return ev.obj.value
@@ -1271,50 +1171,39 @@ def _arg_type_of(arg: ArgEntry[InterpVal]) -> sval.Type | None:
     return type.elem
 
 
-def _tuple_arg_entries(ev: ArgEntry[InterpVal]) -> tuple[ArgEntry[InterpVal], ...]:
-    """One operand per element of a tuple argument (the value or pointer form,
-    see ``ComptimeTuple``/``ComptimeTuplePtr``), for a call that passes the
-    elements separately (see ``ArgNode``).  An element of the pointer form is a
-    *place*, so its operand is a reference."""
-    value = _shallow_normalize(ev.value)
-    match value:
-        case ComptimeTuple(values=values):
-            assert not ev.is_ref
-            return values
-        case ComptimeTuplePtr(values=values):
-            assert ev.is_ref
-            return tuple(ArgEntry(place, True) for place in values)
-    raise CompileError(f'cannot take the elements of the argument value {ev!r}')
+def _vararg_field(child: ArgNode) -> tuple[sval.Type, sval.AnyValue | None, bool, bool]:
+    """The ``(type, default, is_comptime, is_ref)`` a flattened ``tuple``/
+    ``dict`` element contributes to the synthesized struct field that carries it
+    at the callee (see §8.1): a runtime element its spy type (``is_ref`` mirroring
+    how it is passed), a nested ``tuple``/``dict`` the nested synthetic struct,
+    and a compile-time value its type with the value baked into the field (an
+    ``is_comptime`` field with a default)."""
+    if isinstance(child, RuntimeArgNode):
+        return child.type, None, False, child.is_ref
+    if isinstance(child, (tuple, frozendict)):
+        return _vararg_struct_type(child), None, False, False
+    type = child.type if isinstance(child, sval.ComptimePtr) else sval.type_of(child)
+    if type is None:
+        raise CompileError(f'cannot rebuild the compile-time argument {child!r}')
+    return type, child, True, False
 
 
-def _dict_arg_entries(ev: ArgEntry[InterpVal]) -> dict[str, ArgEntry[InterpVal]]:
-    """One operand per name of a ``dict[str, T]`` argument (the value or
-    pointer form, see ``ComptimeDict``/``ComptimeDictPtr``); an entry of the
-    pointer form is a place, so its operand is a reference."""
-    value = _shallow_normalize(ev.value)
-    match value:
-        case ComptimeDict(values=values):
-            assert not ev.is_ref
-            return values
-        case ComptimeDictPtr(values=values):
-            assert ev.is_ref
-            return {key: ArgEntry(place, True) for key, place in values.items()}
-    raise CompileError(f'cannot take the values of the argument value {ev!r}')
-
-
-def _aggregate_arg_entries(ev: ArgEntry[InterpVal]) -> tuple[ArgEntry[InterpVal], ...]:
-    """One operand per field/element of a flattened aggregate argument (the
-    value or pointer form, see ``ComptimeAggregate``/``ComptimeAggregatePtr``);
-    a place of the pointer form is a reference."""
-    value = _shallow_normalize(ev.value)
-    match value:
-        case ComptimeAggregate(values=values):
-            assert not ev.is_ref
-            return tuple(ArgEntry(value, False) for value in values)
-        case ComptimeAggregatePtr(ptrs=ptrs):
-            assert ev.is_ref
-            return tuple(ArgEntry(place, True) for place in ptrs)
-    raise CompileError(f'cannot take the fields of the argument value {ev!r}')
+def _vararg_struct_type(elems: tuple[ArgNode, ...] | frozendict[str, ArgNode]) -> sval.StructType:
+    """The synthesized ``StructType`` a flattened ``tuple``/``dict`` argument is
+    rebuilt as at the callee (see §8.1): one positional field per element (``_i``)
+    or one field per entry (its name).  The head is marked ``$args``/``$kwargs`` so
+    a subscript of the struct is read as a tuple/dict element (see
+    ``HirRunner.subscript``)."""
+    is_named = isinstance(elems, frozendict)
+    head = sval.StructTypeHead('$kwargs' if is_named else '$args')
+    if is_named:
+        items: list[tuple[str, ArgNode]] = list(elems.items())
+    else:
+        items = [(f'_{index}', child) for index, child in enumerate(elems)]
+    for name, child in items:
+        field_type, default, is_comptime, is_ref = _vararg_field(child)
+        head.add_field(name, field_type, default, is_comptime, is_ref)
+    return head.specialize(())
 
 
 def _arg_node_types(node: ArgNode) -> Iterator[sval.Type]:
@@ -1323,12 +1212,6 @@ def _arg_node_types(node: ArgNode) -> Iterator[sval.Type]:
     a call reads (see ``_call_function_entry``)."""
     if isinstance(node, RuntimeArgNode):
         yield node.type
-    elif isinstance(node, ComptimePtrArg):
-        # a compile-time pointer: its own pointer type and, recursively, the
-        # types of its pointee (a closure inside a pointer's content is rejected
-        # just like one passed directly)
-        yield node.type
-        yield from _arg_node_types(node.content)
     elif isinstance(node, tuple):
         for child in node:
             yield from _arg_node_types(child)
@@ -1346,13 +1229,10 @@ def _arg_node_types(node: ArgNode) -> Iterator[sval.Type]:
 
 def _arg_node_needs_mir(node: ArgNode) -> bool:
     """Whether the argument tree ``node`` consumes a MIR argument: it holds a
-    runtime leaf anywhere (a ``RuntimeArgNode``), including inside the content of
-    a :class:`ComptimePtrArg`.  It is what a caller that can only take a
-    runtime-pointer-free argument reads (see ``exec_as_func_ptr``)."""
+    runtime leaf anywhere (a ``RuntimeArgNode``).  It is what a caller that can
+    only take a runtime-pointer-free argument reads (see ``exec_as_func_ptr``)."""
     if isinstance(node, RuntimeArgNode):
         return True
-    if isinstance(node, ComptimePtrArg):
-        return _arg_node_needs_mir(node.content)
     if isinstance(node, tuple):
         return any(_arg_node_needs_mir(child) for child in node)
     if isinstance(node, frozendict):
@@ -1364,8 +1244,7 @@ def _arg_node_needs_mir(node: ArgNode) -> bool:
 
 def _union_variant_type(union_type: sval.TaggedUnionType, tag: InterpVal) -> sval.Type:
     """The variant type the tag value ``tag`` selects in ``union_type`` - or the
-    payload union storage type when the tag is only known at runtime (see
-    ``ComptimeTaggedUnionPtr``)."""
+    payload union storage type when the tag is only known at runtime."""
     obj = _to_comptime(_shallow_normalize(tag))
     if isinstance(obj, sval.Int):
         return union_type.types[obj.value]
@@ -1428,9 +1307,7 @@ def _callee_object(callee: InterpVal) -> sval.AnyValue | None:
         ev = todo.pop()
         match ev:
             case ComptimeVal(obj):
-                return obj.value if isinstance(obj, sval.ConstRef) else obj
-            case ComptimeBox():
-                todo.append(ev.value)
+                return obj
             case PendingSlot() if ev.committed is not None:
                 todo.append(ev.committed)
             case _:
@@ -1474,23 +1351,17 @@ def _union_contains(superset: sval.UnionType, subset: sval.UnionType) -> bool:
     return all(exception in superset.types for exception in subset.types)
 
 
-def _result_places(location: ComptimeResultPtr) -> tuple[InterpVal, ...]:
-    """The leaf places one result value each is delivered into, in depth-first
-    declaration order: the result location's value may itself be a tuple of
-    slots (nested exactly like the results, followed by the error code and the
-    payload union, see ``sval.make_ret_spec``)."""
-    places: list[InterpVal] = []
-    # the result spreads into its value, its error code and its payload, in that
-    # order (the stack is popped last-in-first-out, so it is pushed in reverse)
-    work: list[InterpVal] = [location.payload, location.code, location.value]
+def _flatten_result_tree(tree: InterpVal | tuple) -> tuple[InterpVal, ...]:
+    """The leaf places of a (nested) result-location tree, in depth-first order."""
+    out: list[InterpVal] = []
+    work: list[InterpVal | tuple] = [tree]
     while work:
-        place = _shallow_normalize(work.pop())
-        if isinstance(place, ComptimeTuplePtr):
-            work.extend(reversed(list(place.values)))
+        item = work.pop()
+        if isinstance(item, tuple):
+            work.extend(reversed(item))
         else:
-            places.append(place)
-    return tuple(places)
-
+            out.append(item)
+    return tuple(out)
 
 def _array_elem_type_of(value: InterpVal) -> sval.ArrayType | None:
     """The array type ``value`` points at, or None when it points at
@@ -1796,24 +1667,6 @@ class PollResult(IntEnum):
     DONE = auto()
 
 
-@dataclass(slots=True)
-class RuntimeClosurePlan:
-    """The struct type and generated ``__call__`` ``std.core.as_runtime_closure``
-    builds for one closure value (see ``_build_runtime_closure``).  The struct's
-    fields are its runtime captures (a leaf each, in canonical order); the fields
-    are named ``_cap0``, ``_cap1``, ... and typed per 2.7 of the spec (a
-    top-level capture is a pointer, or its pointee under ``as_copy``; a nested
-    leaf is the leaf's own type)."""
-
-    struct_type: sval.StructType
-    call_fn: FunctionValue
-    as_copy: bool
-    field_names: tuple[str, ...]
-    field_types: tuple[sval.Type, ...]
-    captures: tuple[ArgNode, ...]
-    capture_places: tuple[InterpVal, ...]
-    leaf_bases: tuple[int, ...]
-
 class HirRunner:
     """Runs one function body (and everything it inlines) at compile
     time, filling the pre-created typed :class:`mir.Function` of one
@@ -1879,12 +1732,6 @@ class HirRunner:
         # ``_unroll_inline_loop``)
         self._loop_unrolls: int = 0
         self.max_loop_unroll: int = 1024
-        # the ids handed out to the anonymous struct types and ``__call__``
-        # functions ``std.core.as_runtime_closure`` generates (see
-        # ``_builtin_as_runtime_closure``); a counter on the runner keeps the
-        # symbols unique within it (the enclosing function name, already part of
-        # ``closure.name_base``, separates different runners)
-        self._runtime_closure_counter: int = 0
 
     @property
     def _special_type(self) -> sval.SpecialTypes:
@@ -1946,9 +1793,9 @@ class HirRunner:
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
         args = self._init_args_from_signature(sig, mir_args, arg_is_ref)
-        # the closure captures a call passed become the frame's capture places,
-        # bound after the declared arguments (see ``hir.Closure``)
-        frame.closure_values = self._init_capture_values(sig.captures, mir_args)
+        # a closure's captures are its anonymous struct's fields now (§9): a
+        # body reached from a call has no separate capture places
+        frame.closure_values = ()
         for arg in mir_args:
             assert arg is not None
         frame.arg_values = args
@@ -1972,7 +1819,7 @@ class HirRunner:
             assert isinstance(spec, RetTuple) and isinstance(spec.type, sval.ResultType)
             value_loc = self._ret_spec_place(spec.values[0])
             return ComptimeResultPtr(
-                value_loc, self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE),
+                value_loc, self.alloca(False), self.alloca(False),
             )
         if declared_value is not None:
             value_loc = self._ret_spec_place(declared_value)
@@ -1981,30 +1828,20 @@ class HirRunner:
             # to be able to hold a *tuple* of places (a multi-value return, see
             # ``init_tuple``/``_deliver_packed_tuple``), which is only possible
             # for an inline slot (``_finish_function`` materializes the tree)
-            value_loc = self.alloca(InlineMode.FULL)
+            value_loc = self.alloca(True)
         return ComptimeResultPtr(
-            value_loc, self.alloca(InlineMode.NONE), self.alloca(InlineMode.NONE),
+            value_loc, self.alloca(False), self.alloca(False),
         )
 
-    def _init_arg_node(self, node: ArgNode, mir_args: list[mir.Type], arg_is_ref: bool, leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None) -> InterpVal:
+    def _init_arg_node(self, node: ArgNode, mir_args: list[mir.Type], arg_is_ref: bool) -> InterpVal:
         """The place one specialized formal argument is bound to: one form of
         the argument tree (see :class:`~spy.compiler.fn.ArgNode`).  A
-        compile-time leaf is a const reference to its value and consumes no MIR
+        compile-time leaf is a const box holding its value and consumes no MIR
         argument; a runtime leaf consumes one and becomes a slot (or the
-        argument itself when it is passed by address); a compound (a tuple, a
-        ``dict`` or a flattened aggregate) is the place tree of its
-        elements.
-
-        ``leaf_source`` (see ``_rebuild_capture``) overrides where a runtime
-        leaf's place comes from: when it is not None, every ``RuntimeArgNode``
-        leaf is taken from ``leaf_source(node)`` directly instead of consuming a
-        MIR formal (no MIR argument is appended)."""
+        argument itself when it is passed by address); a ``tuple``/``dict`` is
+        rebuilt as the synthesized struct of its elements (see §8.1)."""
         match node:
             case RuntimeArgNode():
-                if leaf_source is not None:
-                    # the leaf comes from a struct field, not a MIR formal (see
-                    # ``_rebuild_capture``)
-                    return leaf_source(node)
                 index = len(mir_args)
                 if node.is_ref:
                     # the signature passes the address of the value as a const
@@ -2035,136 +1872,129 @@ class HirRunner:
                 self._commit_pending_slot(slot, node.type)
                 self.store(slot, RuntimeVal(mir.Param(index, arg_mir), node.type))
                 return slot
-            case tuple():
-                # a tuple has no representation of its own: its elements are
-                # their own places, and each is passed separately
-                return ComptimeTuplePtr(
-                    tuple(self._init_arg_node(child, mir_args, False, leaf_source) for child in node)
-                )
-            case frozendict():
-                # the named counterpart of a tuple (a ``dict[str, T]``)
-                return ComptimeDictPtr(
-                    {key: self._init_arg_node(child, mir_args, False, leaf_source) for key, child in node.items()}
-                )
-            case CompoundArgNode():
-                # an aggregate whose fields/elements are their own places
-                return ComptimeAggregatePtr(
-                    node.container_type,
-                    tuple(self._init_arg_node(child, mir_args, False, leaf_source) for child in node.elems),
-                )
-            case ComptimePtrArg(type=type, content=content):
-                # a compile-time pointer: the callee gets a fresh, writable place
-                # holding a copy of the pointee (see ``_init_ptr_target``)
-                assert isinstance(type, sval.PointerType)
-                place = self._init_ptr_target(content, type.elem, mir_args, leaf_source)
-                if arg_is_ref:
-                    # the parameter is a place: the pointer itself is the place
-                    return place
-                # the parameter is a pointer passed by value: its HIR place holds
-                # the pointer value, so wrap the place in a slot of the pointer type
-                return self._inline_arg_place(ArgEntry(place, False))
+            case tuple() | frozendict():
+                # a flattened ``*args``/``**kwargs``: the callee rebuilds it as a
+                # synthesized struct, one field per element/entry (see §8.1)
+                return self._build_vararg_struct(node, mir_args)
             case _:
-                # a compile-time leaf (an ``sval.Value``, or a plain Python
-                # scalar): a const reference to it, no MIR argument
-                return ComptimeVal(sval.ConstRef(node))
+                # a compile-time leaf (an ``sval.Value`` or a plain Python
+                # scalar): a const box holding the value, which is its place (no
+                # MIR argument is consumed)
+                type = node.type if isinstance(node, sval.ComptimePtr) else sval.type_of(node)
+                if type is None:
+                    raise CompileError(
+                        f'cannot determine the type of the compile-time argument {node!r}'
+                    )
+                return self._const_box_place(node, type)
 
-    def _init_ptr_target(self, node: ArgNode, type: sval.Type, mir_args: list[mir.Type], leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None) -> InterpVal:
-        """A fresh, writable compile-time place of spy type ``type`` holding a
-        copy of the pointee ``node``: what a compile-time pointer argument's
-        pointee is rebuilt as at the callee (see :class:`~spy.compiler.fn.ComptimePtrArg`).
-        A runtime leaf consumes one MIR argument, in depth-first order (the order
-        the caller passed them, see ``_convert_content``) - or is taken from
-        ``leaf_source`` when one is given (see ``_rebuild_capture``)."""
-        match node:
-            case RuntimeArgNode():
-                # a runtime leaf of the pointee: a fresh slot seeded with the
-                # value passed by value
-                return self._init_arg_node(node, mir_args, False, leaf_source)
-            case ComptimePtrArg(inner_type, inner_content):
-                # a pointer inside the pointee: rebuild the place it points at,
-                # then hold the pointer in a fresh place of its own
-                assert isinstance(inner_type, sval.PointerType)
-                inner = self._init_ptr_target(inner_content, inner_type.elem, mir_args, leaf_source)
-                return self._declared_comptime_place(type, inner)
-            case tuple():
-                assert isinstance(type, sval.TupleType)
-                return ComptimeTuplePtr(tuple(
-                    self._init_ptr_target(child, elem_type, mir_args, leaf_source)
-                    for child, elem_type in zip(node, type.types)
-                ))
-            case frozendict():
-                assert isinstance(type, sval.StrDictType)
-                return ComptimeDictPtr({
-                    name: self._init_ptr_target(child, type.values[name], mir_args, leaf_source)
-                    for name, child in node.items()
-                })
-            case CompoundArgNode(container_type, elems):
-                return self._init_container_target(container_type, elems, mir_args, leaf_source)
-            case _:
-                # a compile-time value leaf: the place of the declared type
-                # holding a copy of the value - a box for a compile-time value,
-                # memory for a runtime one (see ``_declared_comptime_place``)
-                value = self._coerce(ComptimeVal(node), type)
-                return self._declared_comptime_place(type, value)
-
-    def _declared_comptime_place(self, type: sval.Type, value: InterpVal) -> InterpVal:
-        """The storage a rebuilt compile-time pointer's pointee lives in (see
-        ``_init_ptr_target``): a compile-time box holding ``value`` when it is a
-        compile-time value, real memory when it is a runtime one - a runtime
-        value cannot be held in a box (see ``ComptimeBox``)."""
-        unit = type.get_unit_value()
-        if unit is not None:
-            return ComptimeBox(type, ComptimeVal(unit))
-        if _is_comptime_val(value):
-            return ComptimeBox(type, value)
-        slot = self.alloca(InlineMode.NONE)
-        self._commit_pending_slot(slot, type)
-        self.store(slot, value)
-        return slot
-
-    def _init_container_target(
-        self, container_type: sval.Type, elems: tuple[ArgNode, ...], mir_args: list[mir.Type], leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None
+    def _vararg_struct_from_entries(
+        self, entries: tuple[ArgEntry[InterpVal], ...] | frozendict[str, ArgEntry[InterpVal]]
     ) -> InterpVal:
-        """A fresh place of the container type ``container_type`` (an aggregate,
-        an ``Option[T]`` or a tagged union) built from the content parts ``elems``
-        (see ``CompoundArgNode`` and ``_init_ptr_target``).  The parts are
-        consumed in the canonical order (see ``_val_to_node``/``convert_content``):
-        an ``Option``/tagged union's tag first, then its payload."""
-        if isinstance(container_type, sval.OptionType):
-            tag, payload = elems
-            # tag first (the canonical order, matching ``_val_to_node`` and
-            # ``convert_content``), then the payload
-            tag_value = self._init_value(tag, mir_args, leaf_source)
-            child = container_type.child
-            if child.is_zst():
-                # a zero-sized child has no payload storage
-                payload_place: InterpVal = ComptimeVal(sval.Undefined(sval.PointerType(child, is_const=False)))
+        """The synthesized struct an *inlined* callee's ``*args``/``**kwargs`` is
+        bound to, from the already-evaluated argument places (the mirror of
+        ``_build_vararg_struct``, see §8.1)."""
+        is_named = isinstance(entries, frozendict)
+        items: list[tuple[str, ArgEntry[InterpVal]]] = (
+            list(entries.items()) if is_named
+            else [(f'_{index}', entry) for index, entry in enumerate(entries)]
+        )
+        head = sval.StructTypeHead('$kwargs' if is_named else '$args')
+        for name, entry in items:
+            if entry.is_ref:
+                head.add_field(name, _arg_type_of(entry), is_ref=True)
+                continue
+            obj = _to_comptime(entry.value)
+            if obj is not None:
+                type = sval.type_of(obj)
+                if type is None:
+                    raise CompileError(f'cannot rebuild the compile-time argument {obj!r}')
+                head.add_field(name, type, default=obj, is_comptime=True)
+                continue
+            type = _type_of(entry.value)
+            if type is None:
+                raise CompileError('cannot determine the type of an argument of a call')
+            head.add_field(name, type)
+        struct_type = head.specialize(())
+        is_comptime = struct_type.classify() != sval.SpecialTypeKind.NONE
+        place = self._aggregate_place(struct_type, is_comptime=is_comptime)
+        for index, (_name, entry) in enumerate(items):
+            field0 = struct_type.fields().get_by_id(index)
+            if field0.is_comptime:
+                continue
+            if field0.is_ref:
+                self.store(self._field_storage_addr(place, struct_type, index), entry.value)
             else:
-                payload_place = self._init_ptr_target(payload, child, mir_args, leaf_source)
-            return ComptimeOptionPtr(tag_value, payload_place)
-        if isinstance(container_type, sval.TaggedUnionType):
-            tag, payload = elems
-            tag_value = self._init_value(tag, mir_args, leaf_source)
-            variant = container_type.types[self._tagged_union_int(tag_value)]
-            if variant.get_unit_value() is not None:
-                # a zero-sized variant has no payload storage
-                payload_place = ComptimeVal(sval.Undefined(sval.PointerType(variant, is_const=False)))
-            else:
-                payload_place = self._init_ptr_target(payload, variant, mir_args, leaf_source)
-            return ComptimeTaggedUnionPtr(container_type, tag_value, payload_place)
-        if _is_aggregate(container_type):
-            elem_types = _aggregate_place_types(container_type)
-            return ComptimeAggregatePtr(container_type, tuple(
-                self._init_ptr_target(child, elem_type, mir_args, leaf_source)
-                for child, elem_type in zip(elems, elem_types)
-            ))
-        raise CompileError(f'cannot rebuild the content of a {container_type} place')
+                value = self.load(entry.value) if entry.is_ref else entry.value
+                self.store(self.field_index_addr(place, _index_value(index)), value)
+        return place
 
-    def _init_value(self, node: ArgNode, mir_args: list[mir.Type], leaf_source: Callable[[RuntimeArgNode], InterpVal] | None = None) -> InterpVal:
-        """The *value* a value leaf ``node`` denotes (see ``_init_container_target``):
-        a compile-time value as itself, a runtime one read back out of the fresh
-        slot it is passed in."""
-        return self.load(self._init_arg_node(node, mir_args, False, leaf_source))
+    def _build_vararg_struct(
+        self, elems: tuple[ArgNode, ...] | frozendict[str, ArgNode], mir_args: list[mir.Type]
+    ) -> InterpVal:
+        """The place a flattened ``*args``/``**kwargs`` is bound to at the callee:
+        a single synthesized struct (see §8.1), its fields written from the MIR
+        arguments the elements consumed (one ``alloca`` plus recursive writes)."""
+        struct_type = _vararg_struct_type(elems)
+        is_comptime = struct_type.classify() != sval.SpecialTypeKind.NONE
+        place = self._aggregate_place(struct_type, is_comptime=is_comptime)
+        if isinstance(elems, frozendict):
+            items: list[tuple[str, ArgNode]] = list(elems.items())
+        else:
+            items = [(f'_{index}', child) for index, child in enumerate(elems)]
+        for index, (_name, child) in enumerate(items):
+            self._write_vararg_field(place, struct_type, index, child, mir_args)
+        return place
+
+    def _write_vararg_field(
+        self, place: InterpVal, struct_type: sval.StructType, index: int, child: ArgNode, mir_args: list[mir.Type]
+    ) -> None:
+        """Write one field of the synthesized varargs struct ``place`` from the
+        element ``child``: a compile-time value is baked into the field's type (no
+        write), a ``is_ref`` element writes the pointer itself into the field's
+        storage, and any other runtime element writes the value the MIR argument
+        delivers."""
+        field0 = struct_type.fields().get_by_id(index)
+        if field0.is_comptime:
+            return
+        if isinstance(child, (tuple, frozendict)):
+            # a nested ``tuple``/``dict``: embedded by value, so its fields are
+            # written at their offset in the outer field
+            assert isinstance(field0.type, sval.StructType)
+            field_place = self.field_index_addr(place, _index_value(index))
+            if isinstance(child, frozendict):
+                items: list[tuple[str, ArgNode]] = list(child.items())
+            else:
+                items = [(f'_{sub_index}', sub) for sub_index, sub in enumerate(child)]
+            for sub_index, (_name, sub) in enumerate(items):
+                self._write_vararg_field(field_place, field0.type, sub_index, sub, mir_args)
+            return
+        if field0.is_ref:
+            pointer = self._init_arg_node(child, mir_args, True)
+            self.store(self._field_storage_addr(place, struct_type, index), pointer)
+            return
+        src = self._init_arg_node(child, mir_args, False)
+        self.store(self.field_index_addr(place, _index_value(index)), self.load(src))
+
+    def _field_storage_addr(self, place: InterpVal, struct_type: sval.StructType, index: int) -> InterpVal:
+        """The storage of the ``index``-th field of the struct place ``place``,
+        typed as the field's own storage (``*const T`` for an ``is_ref`` field) -
+        what a construction writes the field's value through, without the extra
+        load an ``is_ref`` read takes (see ``field_index_addr``)."""
+        place = _shallow_normalize(place)
+        ptype = _type_of(place)
+        assert isinstance(ptype, sval.PointerType)
+        field0 = struct_type.fields().get_by_id(index)
+        base_type = (
+            sval.PointerType(sval.PointerType(field0.type, is_const=True), ptype.is_const)
+            if field0.is_ref else sval.PointerType(field0.type, ptype.is_const)
+        )
+        if isinstance(place, ComptimeVal) and isinstance(place.obj, sval.ComptimePtr):
+            offset = place.obj.offset + sval.field_scalar_offset(struct_type, index)
+            return ComptimeVal(sval.ComptimePtr(place.obj.box, offset, base_type))
+        if isinstance(place, RuntimeVal):
+            mir_index = struct_type.get_field_mir_indices(self._mir_cache)[index]
+            return RuntimeVal(self._emit(mir.Gep(place.value, mir_index)), base_type)
+        raise CompileError(f'cannot take the field storage of {place!r}')
 
     def _init_args_from_signature(
         self,
@@ -2178,36 +2008,28 @@ class HirRunner:
             arg_values.append(self._init_arg_node(arg, mir_args, is_ref))
 
         if signature.varargs is not None:
-            arg_values.append(ComptimeTuplePtr(tuple(self._init_arg_node(a, mir_args, False) for a in signature.varargs)))
+            arg_values.append(self._build_vararg_struct(signature.varargs, mir_args))
         if signature.kwargs is not None:
-            arg_values.append(ComptimeDictPtr({k: self._init_arg_node(v, mir_args, False) for k, v in signature.kwargs.items()}))
+            arg_values.append(self._build_vararg_struct(signature.kwargs, mir_args))
 
         return tuple(arg_values)
 
-    def _init_capture_values(
-        self, captures: tuple[ArgNode, ...], mir_args: list[mir.Type]
-    ) -> tuple[InterpVal, ...]:
-        """The capture places a body is run with, from the captures a call
-        passed (see ``hir.Closure``/``CallSignature.captures``).  A runtime
-        capture is a by-value pointer parameter (the address of the captured
-        variable); a compile-time capture carries no runtime argument - it
-        becomes a const reference to its value, so reading it loads the value."""
-        return tuple(self._init_arg_node(capture, mir_args, True) for capture in captures)
-
-    def _ret_spec_place(self, node: RetSpec) -> InterpVal:
+    def _ret_spec_place(self, node: RetSpec) -> InterpVal | tuple:
         """The result place the *value* part ``node`` of a declared result is
-        delivered into: a fresh slot for a value, a tuple of the places of its
-        elements for a group.  A result-type group is not a value part - the
+        delivered into: a fresh slot for a value (a compile-time one for a
+        ``RetComptime`` leaf, see §7.3), a (nested) Python tuple of the places of
+        its elements for a group.  A result-type group is not a value part - the
         function's result location is built around it (see
         ``_reserve_result_loc``/``ComptimeResultPtr``)."""
         match node:
+            case RetComptime():
+                return self.alloca(True)
             case RetValue():
-                return self.alloca(InlineMode.NONE)
+                return self.alloca(False)
             case RetTuple(type=type, values=values):
                 assert not isinstance(type, sval.ResultType)
-                return ComptimeTuplePtr(
-                    tuple(self._ret_spec_place(child) for child in values)
-                )
+                return tuple(self._ret_spec_place(child) for child in values)
+        raise CompileError(f'cannot reserve a result place for {node!r}')
 
     def _materialize_ret_sig(
         self, sig: ReturnSignature
@@ -2269,12 +2091,16 @@ class HirRunner:
         it.  The root result-type group is handled by ``_materialize_ret_sig``,
         so ``node`` is never one here."""
         match node:
+            case RetComptime():
+                # a compile-time result leaf: the place is a compile-time box of
+                # the leaf's type, committed so its value can be read back (§7.3)
+                self._commit_pending_slot(place, node.type)
             case RetValue():
                 self._commit_pending_slot(place, node.type, ptr=self._ret_leaf_ptr(node))
             case RetTuple(type=type, values=values):
                 assert not isinstance(type, sval.ResultType)
-                assert isinstance(place, ComptimeTuplePtr)
-                for child, sub in zip(values, place.values):
+                assert isinstance(place, tuple)
+                for child, sub in zip(values, place):
                     self._commit_ret_places(child, sub)
 
     def _ret_leaf_ptr(self, leaf: RetSpec) -> mir.Value | None:
@@ -2332,6 +2158,32 @@ class HirRunner:
         ret = self._frames[0].ret_loc
         assert isinstance(ret, ComptimeResultPtr)
         return ret
+
+    def _result_places(self, location: ComptimeResultPtr) -> tuple[InterpVal, ...]:
+        """The leaf places one result value each is delivered into, in depth-first
+        declaration order: the result location's value may itself be a tree of
+        slots (a Python tuple, nested exactly like the results - see §7.2 -
+        followed by the error code and the payload union, see ``sval.make_ret_spec``).
+        An untyped multi-value location (a ``_PendingTuple``) spreads into its
+        element places."""
+        places: list[InterpVal] = []
+        # the result spreads into its value, its error code and its payload, in
+        # that order (the stack is popped last-in-first-out, so it is pushed in
+        # reverse)
+        work: list[object] = [location.payload, location.code, location.value]
+        while work:
+            place = work.pop()
+            if isinstance(place, tuple):
+                work.extend(reversed(place))
+                continue
+            place = _shallow_normalize(place)
+            if isinstance(place, PendingSlot):
+                recorded = self._pending_tuple(place)
+                if recorded is not None:
+                    work.extend(reversed(recorded.places))
+                    continue
+            places.append(place)
+        return tuple(places)
 
     def _current_value_is_empty(self) -> bool:
         """Whether the body being executed has no value to return, so that no
@@ -2392,7 +2244,19 @@ class HirRunner:
         sig = self.ret_sig
         assert sig is not None
         spec = sig.ret_spec(self._mir_cache)
-        places = _result_places(self._frames[0].ret_loc)
+        places = self._result_places(self._frames[0].ret_loc)
+        # record the compile-time result leaves (see §7.3): each ``RetComptime``
+        # leaf's place holds the value this path returns - the last path's wins
+        for leaf, place in zip(iter_ret_leaves(spec), places):
+            if not isinstance(leaf, RetComptime):
+                continue
+            value = _to_comptime(self.load(place))
+            values = self._fn_instance.ret_comptime_values
+            if values is None:
+                values = self._fn_instance.ret_comptime_values = []
+            while len(values) <= leaf.index:
+                values.append(None)
+            values[leaf.index] = value
         index = ret_by_value_index(spec)
         if index is None:
             self._cur_block.emit(mir.Ret(None, defer_blocks))
@@ -2435,7 +2299,7 @@ class HirRunner:
                 hir.DeferPath.RAISE, data, inclusive=True, current_frame_only=False,
             )
             if exception.is_zst():
-                incoming = ComptimeVal(sval.Undefined(sval.PointerType(exception, is_const=False)))
+                incoming = ComptimeVal(sval.UndefinedScalar(sval.PointerType(exception, is_const=False)))
             else:
                 self._commit_pending_slot(slot, exception)
                 incoming = _shallow_normalize(slot)
@@ -2466,9 +2330,9 @@ class HirRunner:
         exception = self._unwind_exception_type()
         pointer = self.load(catch_data)          # the ``Ptr[PanicData]`` caught
         data = self.load(pointer)                # the caught ``PanicData``
-        slot = self.alloca(InlineMode.NONE)
+        slot = self.alloca(False)
         self._commit_pending_slot(slot, exception)
-        self.store(slot, ComptimeAggregate(exception, (data,)))
+        self.store(self.field_index_addr(slot, _index_value(0)), data)
         self._dispatch_exception(slot)
 
     # -- error locations ---------------------------------------------------
@@ -2522,7 +2386,7 @@ class HirRunner:
         to (or read from) in the payload union the place ``place`` points at:
         the place reinterpreted as a pointer to the variant type."""
         if struct_type.is_zst():
-            return ComptimeVal(sval.Undefined(sval.PointerType(struct_type, is_const=False)))
+            return ComptimeVal(sval.UndefinedScalar(sval.PointerType(struct_type, is_const=False)))
         place = _shallow_normalize(place)
         ptr_type = _type_of(place)
         if not isinstance(ptr_type, sval.PointerType):
@@ -2898,7 +2762,7 @@ class HirRunner:
                 phi = data0.payload_phi[data0.region - 1]
                 if phi is None:
                     # a zero-sized exception has no payload: its bind is the unit
-                    regs[inst] = ComptimeVal(sval.Undefined(sval.PointerType(exception, is_const=False)))
+                    regs[inst] = ComptimeVal(sval.UndefinedScalar(sval.PointerType(exception, is_const=False)))
                 else:
                     regs[inst] = RuntimeVal(phi, sval.PointerType(exception, is_const=False))
             case hir.AsBool():
@@ -2969,39 +2833,36 @@ class HirRunner:
             case hir.Load():
                 regs[inst] = self.load(self.operand(inst.ptr))
             case hir.Alloca():
-                regs[inst] = self.alloca(inst.inline, self._declared_type(inst.type), commit_declared=False)
+                regs[inst] = self.alloca(inst.is_comptime, inst.is_const, self._declared_type(inst.type), commit_declared=False)
             case hir.Store():
-                self.store(self.operand(inst.ptr), self.operand(inst.value))
+                if isinstance(inst.ptr, hir.ReturnLoc):
+                    self._store_return_loc(self.operand(inst.value))
+                else:
+                    self.store(self.operand(inst.ptr), self.operand(inst.value))
             case hir.StoreVoidRetloc():
                 self.store_void_retloc()
             case hir.Tuple():
-                regs[inst] = ComptimeTuple(tuple(self.operand_arg(v) for v in inst.values))
-            case hir.TuplePtr():
-                regs[inst] = ComptimeTuplePtr(tuple(self.operand(v) for v in inst.values))
+                regs[inst] = self._build_tuple_value(
+                    tuple(self.operand_arg(v) for v in inst.values)
+                )
             case hir.InitTuple():
-                self.init_tuple(self.operand(inst.tuple_ptr), inst.length)
+                self.init_tuple(self._loc_operand(inst.result_loc), inst.length)
             case hir.TuplePtrElement():
-                regs[inst] = self.tuple_ptr_element(self.operand(inst.tuple_ptr), inst.index)
+                regs[inst] = self.tuple_ptr_element(self._loc_operand(inst.tuple_ptr), inst.index)
             case hir.Binary():
-                return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self.operand(inst.ret))
+                return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self._loc_operand(inst.ret))
             case hir.Compare():
                 return self._eval_cmp(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), inst)
             case hir.Not():
                 return self._eval_not(self.operand(inst.value), inst)
             case hir.Unary():
-                return self._eval_unary(inst.op, self.operand_arg(inst.operand), self.operand(inst.ret))
+                return self._eval_unary(inst.op, self.operand_arg(inst.operand), self._loc_operand(inst.ret))
             case hir.Ord():
-                return self._eval_ord(self.operand(inst.operand), self.operand(inst.ret))
+                return self._eval_ord(self.operand(inst.operand), self._loc_operand(inst.ret))
             case hir.CallInplace():
-                captures = (
-                    None if inst.captures is None
-                    else tuple(self.operand(c) for c in inst.captures)
-                )
-                return self.call(self.operand(inst.callee), self.eval_call_args(inst.args), self.operand(inst.ret), captures=captures)
+                return self.call(self.operand(inst.callee), self.eval_call_args(inst.args), self._loc_operand(inst.ret))
             case hir.CallMethodInplace():
-                return self.call_method(self.operand(inst.base), inst.name, self.eval_call_args(inst.args), self.operand(inst.ret))
-            case hir.RebuildCapture():
-                regs[inst] = self._rebuild_capture(inst.node, inst.as_copy, inst.field_base, self.operand(inst.base))
+                return self.call_method(self.operand(inst.base), inst.name, self.eval_call_args(inst.args), self._loc_operand(inst.ret))
             case hir.FieldAddr():
                 regs[inst] = self.exec_field_name_addr(self.operand(inst.base), inst.name, inst.is_aggregate_init)
             case hir.FieldIndexAddr():
@@ -3707,35 +3568,11 @@ class HirRunner:
                     if resolved is not None:
                         return ComptimeVal(resolved)
                 return ComptimeVal(sval.as_value(obj, ctx=self._analyser._resolver))
-            case hir.ConstRef():
-                # a reference to an immutable global.  At compile time a
-                # reference to a global behaves exactly like the value it
-                # refers to (its static type is a ``sval.PointerType`` of
-                # the referenced object - ``sval.PointerType(
-                # sval.type_of(expr), True)`` - but nothing emits a
-                # runtime load of a compile-time global yet: it is
-                # dereferenced only at compile time (see ``load``), so a
-                # reference is otherwise consumed as an identity - the
-                # callee of a call).  The
-                # referenced object is resolved to its entry like a
-                # ``Const`` value.
-                obj = value.value
-                resolved = self._analyser._resolver.resolve_global(obj)
-                return ComptimeVal(sval.ConstRef(resolved if resolved is not None else obj))
             case hir.Arg(index):
                 assert len(self._frames) > 0, 'Arg outside of any function frame'
                 frame = self._frames[-1]
                 assert index < len(frame.arg_values), 'Arg index out of range'
                 return frame.arg_values[index]
-            case hir.Closure(index):
-                assert len(self._frames) > 0, 'Closure outside of any function frame'
-                frame = self._frames[-1]
-                assert index < len(frame.closure_values), 'Closure index out of range'
-                return frame.closure_values[index]
-            case hir.ResultLoc():
-                # ``hir.ResultLoc`` names the declared results: the value part
-                # of the frame's result location (its error part is separate)
-                return self._result_loc()
             case hir.Inst():
                 reg = regs.get(value)
                 assert reg is not None, 'register not evaluated'
@@ -3763,36 +3600,12 @@ class HirRunner:
         if unit_value is not None:
             return ComptimeVal(unit_value)
         match ptr:
-            case ComptimeBox():
-                return ptr.value
-            case ComptimeAggregatePtr(aggregate_type, ptrs):
-                # an aggregate is held by its fields: loading one loads every
-                # field out of its own place (see ``ComptimeAggregatePtr``)
-                return ComptimeAggregate(aggregate_type, tuple(self.load(p) for p in ptrs))
-            case ComptimeTuplePtr(values):
-                # a tuple is held by its element places: loading one is the value
-                # form of them (see ``ComptimeTuplePtr``)
-                return ComptimeTuple(
-                    tuple(ArgEntry(self.load(p), False) for p in values)
-                )
-            case ComptimeDictPtr(values):
-                # likewise for a ``**kwargs`` dictionary (see ``ComptimeDictPtr``)
-                return ComptimeDict(
-                    {k: ArgEntry(self.load(p), False) for k, p in values.items()}
-                )
-            case ComptimeOptionPtr(is_null, payload_ptr):
-                # an option is held by its tag and its payload place: loading
-                # one is the value form of the two (see ``ComptimeOptionPtr``)
-                return ComptimeOption(is_null, self.load(payload_ptr))
-            case ComptimeTaggedUnionPtr(union_type, tag, payload_ptr):
-                # a tagged union is held by its tag and its payload place:
-                # loading one is the value form of the two (see
-                # ``ComptimeTaggedUnionPtr``)
-                return ComptimeTaggedUnionValue(union_type, tag, self.load(payload_ptr))
-            case ComptimeVal(obj) if isinstance(obj, sval.ConstRef):
-                # a reference to an immutable compile-time global behaves like
-                # the value it refers to
-                return ComptimeVal(obj.value)
+            case ComptimeVal(sval.ComptimePtr(box, offset, _)):
+                # a compile-time place: rebuild the value from the box's cells
+                return ComptimeVal(_load_box_cells(box, offset, type.elem))
+            case ComptimeVal(sval.CastedPtr()):
+                # a pointer reinterpreted by ``ptr_cast`` cannot be read through
+                raise CompileError('cannot read through a pointer cast')
             case RuntimeVal():
                 return RuntimeVal(self._emit(mir.Load(ptr.value)), type.elem)
         raise CompileError('cannot load from a compile-time pointer')
@@ -3810,83 +3623,19 @@ class HirRunner:
         emits the ``Load`` of a name or a subscript, see ``_as_value``).
 
         A zero-sized type has no storage, so no store is *emitted* for one at
-        runtime; a compile-time place (a box, the field of a compile-time
-        aggregate) still records the value, since the type of such a place may
-        have no runtime representation at all."""
+        runtime; a compile-time place (a ``Box``) records the value in its
+        flattened cells instead.
+
+        A runtime value never goes into a compile-time place: that is the
+        ``cannot store a runtime value into a compile-time variable`` error (see
+        the behaviour doc § 13)."""
         value = _shallow_normalize(value)
         ptr = _shallow_normalize(ptr)
-        if isinstance(ptr, ComptimeTuplePtr):
-            # a destructuring target: a tuple of element *places*, one per
-            # element of the value it is stored with (a nested tuple target
-            # pairs with a nested tuple value)
-            todo: list[tuple[InterpVal, InterpVal]] = [(ptr, value)]
-            stores: list[tuple[InterpVal, InterpVal]] = []
-            while todo:
-                target, source = todo.pop()
-                if isinstance(target, ComptimeTuplePtr):
-                    children = self._tuple_source_values(source)
-                    if children is None:
-                        raise CompileError(
-                            f'cannot unpack a value into {len(target.values)} targets'
-                        )
-                    if len(children) != len(target.values):
-                        raise CompileError(
-                            f'cannot unpack {len(children)} values into '
-                            f'{len(target.values)} targets'
-                        )
-                    todo.extend(reversed(list(zip(target.values, children))))
-                    continue
-                stores.append((target, source))
-            for target, source in stores:
-                self.store(target, source)
-            return
 
         if isinstance(ptr, PendingSlot) and ptr.committed is None:
             value_type = _type_of(value)
             if value_type is None:
                 raise CompileError('cannot store a value that has no spy type')
-            if (
-                ptr.inline_mode == InlineMode.FULL
-                and _is_aggregate(value_type)
-                and self._runtime_position() == ptr.runtime_pos
-            ):
-                # an aggregate value into an inline compile-time variable that
-                # has not crossed a runtime block since the variable was created:
-                # such a variable holds its fields as places of their own (see
-                # ``ComptimeAggregatePtr``), so the value is split into one place
-                # (and one store) per field - each of which then lands where its
-                # own kind says, in memory for a runtime field and in a box
-                # otherwise
-                recorded = self._pending_aggregate(ptr)
-                if recorded is None:
-                    self._record_pending_action(
-                        ptr,
-                        _PendingAggregate(
-                            value_type, self._split_runtime_aggregate(value),
-                        ),
-                    )
-                else:
-                    # a second value into the same storage (the branches of an
-                    # ``if`` expression): its fields are places already, which
-                    # the field values are written into
-                    for index, field_value in enumerate(
-                        self._runtime_aggregate_field_values(value)
-                    ):
-                        self.store(recorded.places[index], field_value)
-                return
-            if isinstance(value_type, sval.TupleType) and ptr.inline_mode != InlineMode.NONE:
-                # a tuple *value* into an inline slot: like a tuple literal, its
-                # elements become places of their own (a tuple has no storage a
-                # box could hold, see ``_PendingTuple``), which the value is
-                # distributed into
-                recorded = self._pending_tuple(ptr)
-                if recorded is None:
-                    recorded = _PendingTuple(
-                        tuple(self.alloca(InlineMode.FULL) for _ in value_type.types)
-                    )
-                    self._record_pending_action(ptr, recorded)
-                self.store(ComptimeTuplePtr(recorded.places), value)
-                return
             self._record_pending_store(ptr, value_type, value)
             return
 
@@ -3898,164 +3647,67 @@ class HirRunner:
             # a union value carries no storage - it says nothing but which union
             # it belongs to - so a storage destination has nothing to write
             return
-        if isinstance(ptr, ComptimeVal) and isinstance(ptr.obj, sval.Undefined) and ptr_type.elem.is_zst():
-            # a compile-time pointer with no storage at all: the address of a
-            # zero-sized field or element (see ``field_index_addr``), or of a
-            # zero-sized exception's variant (see ``_union_variant_ptr``).
-            # There is no storage to write, but the value still has to be of
-            # the (single-valued) type the place points at
-            self._coerce(value, elem)
-            return
 
         if _is_undefined_val(value):
-            # an undefined value leaves its destination undefined: a zero-sized
-            # one has no storage, a runtime location is filled with ``undef``,
-            # and the compile-time storage forms record it in their own way
-            elem_unit = elem.get_unit_value()
-            match ptr:
-                case ComptimeBox():
-                    if ptr.is_const:
-                        raise CompileError(
-                            f'cannot store through the const pointer {ptr.type}'
-                        )
-                    ptr.value = ComptimeVal(
-                        elem_unit if elem_unit is not None else sval.Undefined(elem)
-                    )
-                case ComptimeAggregatePtr():
-                    # an aggregate is its fields' (or elements') own places: each
-                    # of them is left undefined in turn
-                    for index in range(len(_aggregate_place_types(elem))):
-                        self.store(self.field_index_addr(ptr, _index_value(index)), value)
-                case ComptimeOptionPtr():
-                    # the tag is what says whether the option is present; with no
-                    # value, it is left undefined (the payload is never read)
-                    ptr.is_null = ComptimeVal(sval.Undefined(sval.BoolType()))
-                case ComptimeTaggedUnionPtr():
-                    # likewise for a union: its variant tag is left undefined
-                    ptr.tag = ComptimeVal(sval.Undefined(ptr.type.tag_type()))
-                case RuntimeVal():
-                    if elem_unit is not None:
-                        # a zero-sized type has no storage to write
-                        return
-                    mir_type = elem.to_mir_type(self._mir_cache)
-                    if mir_type is None:
-                        raise _no_runtime_type(elem)
-                    self._emit(mir.Store(ptr.value, mir.UndefValue(mir_type)))
-                case _:
-                    raise CompileError(f'cannot leave a {elem} undefined')
+            self._store_undefined(ptr, elem)
             return
 
-        # the value is converted to the place's element type once, up front - just
-        # like an ordinary assignment - so every destination form below (an
-        # aggregate, an option, a tagged union, a compile-time box, memory)
-        # writes a value that already is of its own type
+        # the value is converted to the place's element type once, up front
         value = self._coerce(value, elem)
 
-        if _is_aggregate(elem):
-            # an aggregate is held by its fields (or elements), never by a box: a
-            # whole value is written place by place into a compile-time aggregate
-            # and as a whole into memory (see ``ComptimeAggregatePtr``)
-            match ptr:
-                case ComptimeAggregatePtr():
-                    aggregate = _as_aggregate(value)
-                    if aggregate is None:
-                        # a *runtime* aggregate value: its fields are read out of
-                        # the value itself (see ``as_comptime_aggregate``)
-                        aggregate = self.as_comptime_aggregate(value)
-                    # an aggregate value is only ever its own type, exactly like a
-                    # runtime one (see ``_convert_inst``): an aggregate of another
-                    # type of the same shape is not a copy of it - a zero-sized
-                    # destination is type-checked the same, it just has no storage
-                    # to write into
-                    if aggregate.type != elem:
-                        raise CompileError(f'cannot convert a {aggregate.type} value to {elem}')
-                    for index, field_value in enumerate(aggregate.values):
-                        self.store(self.field_index_addr(ptr, _index_value(index)), field_value)
-                case RuntimeVal():
-                    if elem.is_zst():
-                        # a zero-sized aggregate has no storage to write into,
-                        # but the value still has to be of its type
-                        self._coerce(value, elem)
-                        return
-                    if isinstance(value, RuntimeVal):
-                        # a runtime aggregate value is written as a whole
-                        self._emit(mir.Store(ptr.value, self._to_runtime(value)))
-                    else:
-                        aggregate = _as_aggregate(value)
-                        if aggregate is None or aggregate.type != elem:
-                            raise CompileError(f'cannot store {value!r} into {elem}')
-                        self._emit(mir.Store(ptr.value, self._aggregate_to_runtime(aggregate)))
-                case _:
-                    raise CompileError(f'a compile-time box cannot hold the aggregate {elem}')
-            return
-
-        if isinstance(elem, sval.OptionType):
-            # an option value is written through the storage of ``elem`` (the
-            # value was already coerced to the option type above, see
-            # ``ComptimeOption``)
-            coerced = value
-            match ptr:
-                case ComptimeOptionPtr():
-                    option = self._as_comptime_option(coerced, elem)
-                    ptr.is_null = option.is_null
-                    if _to_comptime(option.is_null) is not True:
-                        # present (or unknown): write the payload value into its place
-                        self.store(ptr.payload_ptr, option.value)
-                case RuntimeVal():
-                    self._emit(mir.Store(ptr.value, self._to_runtime(coerced)))
-                case _:
-                    raise CompileError(f'a compile-time box cannot hold the option {elem}')
-            return
-
-        if isinstance(elem, sval.TaggedUnionType):
-            # a tagged union value is written through the storage of ``elem`` (the
-            # value was already coerced to the union type above, see
-            # ``ComptimeTaggedUnionValue``)
-            coerced = value
-            match ptr:
-                case ComptimeTaggedUnionPtr():
-                    if not isinstance(coerced, ComptimeTaggedUnionValue):
-                        assert isinstance(coerced, RuntimeVal)
-                        coerced = self._runtime_union_to_value_form(coerced, elem)
-                    self._store_comptime_tagged_union(ptr, elem, coerced)
-                case RuntimeVal():
-                    self._emit(mir.Store(ptr.value, self._to_runtime(coerced)))
-                case _:
-                    raise CompileError(f'a compile-time box cannot hold the tagged union {elem}')
-            return
-
-        unit = elem.get_unit_value()
         match ptr:
-            case ComptimeBox():
-                if ptr.is_const:
+            case ComptimeVal(sval.ComptimePtr(box, offset, _)):
+                if not ptr.obj.is_writable():
                     raise CompileError(
-                        f'cannot store through the const pointer {ptr.type}'
+                        f'cannot store through the read-only pointer {ptr.obj.type}'
                     )
-                coerced = value
-                if unit is not None:
-                    # a zero-sized type has one value - its unit value - which
-                    # is what a place of it holds; the value was still
-                    # type-checked above
-                    ptr.value = ComptimeVal(unit)
-                else:
-                    if not _is_comptime_val(coerced):
-                        # a box holds a compile-time value only: a runtime value
-                        # that refers to a register (a load, a computation, a
-                        # parameter) is never written into one - such a place
-                        # holds it in memory instead (see ``ComptimeBox``)
-                        raise CompileError(
-                            f'cannot store a runtime value into a compile-time place '
-                            f'of type {elem}'
-                        )
-                    ptr.value = coerced
+                if isinstance(box, bytes):
+                    raise CompileError('cannot write through a byte-string pointer')
+                if not _is_comptime_val(value):
+                    raise CompileError(
+                        f'cannot store a runtime value into a compile-time variable '
+                        f'of type {elem}'
+                    )
+                obj = _to_comptime(value)
+                assert obj is not None
+                cells = _flatten_value(obj, elem)
+                box.cells[offset:offset + len(cells)] = cells
+            case ComptimeVal(sval.CastedPtr()):
+                raise CompileError('cannot write through a pointer cast')
             case RuntimeVal():
-                if unit is not None:
-                    # a zero-sized type has no storage: nothing is emitted at
-                    # runtime (the value was type-checked by the conversion above)
+                if elem.get_unit_value() is not None:
+                    # a zero-sized type has no storage: nothing is emitted
                     return
                 self._emit(mir.Store(ptr.value, self._to_runtime(value)))
             case _:
                 raise CompileError('cannot store through a compile-time pointer')
+
+    def _store_undefined(self, ptr: InterpVal, elem: sval.Type) -> None:
+        """Leave the destination ``ptr`` of element type ``elem`` undefined: a
+        zero-sized place has no storage, a runtime location is filled with
+        ``undef``, and a compile-time ``Box`` records the typed undefined in its
+        cells."""
+        elem_unit = elem.get_unit_value()
+        match ptr:
+            case ComptimeVal(sval.ComptimePtr(box, offset, _)):
+                if not ptr.obj.is_writable():
+                    raise CompileError(
+                        f'cannot store through the read-only pointer {ptr.obj.type}'
+                    )
+                if isinstance(box, bytes):
+                    raise CompileError('cannot write through a byte-string pointer')
+                cells = _flatten_value(sval.coerce_const(sval.UntypedUndefined(), elem), elem)
+                box.cells[offset:offset + len(cells)] = cells
+            case RuntimeVal():
+                if elem_unit is not None:
+                    # a zero-sized type has no storage to write
+                    return
+                mir_type = elem.to_mir_type(self._mir_cache)
+                if mir_type is None:
+                    raise _no_runtime_type(elem)
+                self._emit(mir.Store(ptr.value, mir.UndefValue(mir_type)))
+            case _:
+                raise CompileError(f'cannot leave a {elem} undefined')
 
     def _extract_aggregate_value(self, value: InterpVal, index: int) -> InterpVal:
         """The ``index``-th field (or element) of the aggregate ``value``, in
@@ -4066,8 +3718,9 @@ class HirRunner:
         ``StructType.mirror_is_a_field``), so it is the value itself.  A value
         that is not an aggregate at all (an ``Option``, say) is rejected."""
         value = _shallow_normalize(value)
-        if isinstance(value, ComptimeAggregate):
-            return value.values[index]
+        aggregate = _as_aggregate(value)
+        if aggregate is not None:
+            return ComptimeVal(aggregate.values[index])
         type = _type_of(value)
         if not isinstance(type, (sval.StructType, sval.ArrayType, sval.ComplexType)):
             raise CompileError(f'{value!r} is not an aggregate')
@@ -4095,13 +3748,11 @@ class HirRunner:
             assert mir_index is not None, 'a field with storage has a mirror position'
         return RuntimeVal(self._emit(mir.ExtractValue(value.value, mir_index)), field_type)
 
-    def as_comptime_aggregate(self, ev: InterpVal) -> ComptimeAggregate:
-        """The ``ComptimeAggregate`` form of the aggregate value ``ev`` (whose
-        type it is read off): a compile-time aggregate - held as one object, or
-        as an ``sval.AggregateValue`` - is returned as it is, and a runtime one
-        has every field (or element) read out of the value itself with
-        ``_extract_aggregate_value`` (a struct and an array alike).  A value
-        that is not an aggregate (an ``Option``, say) is rejected."""
+    def as_comptime_aggregate(self, ev: InterpVal) -> sval.AggregateValue:
+        """The ``sval.AggregateValue`` form of the aggregate value ``ev`` (whose
+        type it is read off): a compile-time aggregate - held as one object - is
+        returned as it is, and a value with a runtime part is rejected (a genuine
+        aggregate of runtime parts is a place, not a value form)."""
         ev = _shallow_normalize(ev)
         aggregate = _as_aggregate(ev)
         if aggregate is not None:
@@ -4109,31 +3760,34 @@ class HirRunner:
         type = _type_of(ev)
         if not isinstance(type, (sval.StructType, sval.ArrayType, sval.ComplexType)):
             raise CompileError(f'{ev!r} is not an aggregate')
-        return ComptimeAggregate(
-            type,
-            tuple(
-                self._extract_aggregate_value(ev, index)
-                for index in range(sval.aggregate_type_length(type))
-            ),
-        )
+        objs: list[sval.AnyValue] = []
+        for index in range(sval.aggregate_type_length(type)):
+            obj = _to_comptime(self._extract_aggregate_value(ev, index))
+            if obj is None:
+                raise CompileError(f'{ev!r} is not a compile-time aggregate')
+            objs.append(obj)
+        return sval.AggregateValue(tuple(objs), type)
 
-    def _runtime_aggregate_field_values(self, value: InterpVal) -> list[InterpVal]:
-        """The value of every field (or element) of the aggregate ``value``, read
-        out of the value itself (see ``as_comptime_aggregate``)."""
-        return list(self.as_comptime_aggregate(value).values)
+    def _complex_parts(self, ev: InterpVal) -> tuple[InterpVal, InterpVal]:
+        """The real and the imaginary part of the complex number ``ev``, as
+        values (either may still be runtime): the two field values of a
+        compile-time complex number, or ``mir.ExtractValue`` of a runtime one (a
+        complex number mirrors to a struct of its parts)."""
+        ev = _shallow_normalize(ev)
+        return self._extract_aggregate_value(ev, 0), self._extract_aggregate_value(ev, 1)
 
-    def _split_runtime_aggregate(self, value: InterpVal) -> tuple[InterpVal, ...]:
-        """One fresh place per field (or element) of the aggregate ``value``,
-        written with the field read out of it - the places a compile-time
-        aggregate holds (see ``ComptimeAggregatePtr``).  A nested aggregate
-        field is split the same way, recursively (its own place is a ``FULL``
-        slot holding the nested value, see ``store``)."""
-        places: list[InterpVal] = []
-        for field_value in self._runtime_aggregate_field_values(value):
-            place = self.alloca(InlineMode.FULL)
-            self.store(place, field_value)
-            places.append(place)
-        return tuple(places)
+    def _complex_value(self, type: sval.ComplexType, re: InterpVal, im: InterpVal) -> InterpVal:
+        """A complex number of the type ``type`` built from its two parts: a
+        compile-time value when both are, a ``mir.InsertValue`` chain otherwise."""
+        re_obj = _to_comptime(re)
+        im_obj = _to_comptime(im)
+        if re_obj is not None and im_obj is not None:
+            return ComptimeVal(sval.AggregateValue((re_obj, im_obj), type))
+        mir_type = type.to_mir_type(self._mir_cache)
+        assert isinstance(mir_type, mir.StructType)
+        result = self._emit(mir.InsertValue(mir.UndefValue(mir_type), self._to_runtime(re), 0))
+        result = self._emit(mir.InsertValue(result, self._to_runtime(im), 1))
+        return RuntimeVal(result, type)
 
     def store_void_retloc(self) -> None:
         """Deliver the void unit value into the result location (see
@@ -4148,11 +3802,50 @@ class HirRunner:
                 'value to return'
             )
         location = self._result_loc()
-        if isinstance(location, ComptimeTuplePtr):
-            raise CompileError('a function that returns several values must return them')
-        if isinstance(location, PendingSlot) and self._pending_tuple(location) is not None:
+        if isinstance(location, tuple) or (
+            isinstance(location, PendingSlot) and self._pending_tuple(location) is not None
+        ):
             raise CompileError('a function that returns several values must return them')
         self.store(location, ComptimeVal(sval.Void()))
+
+    def _loc_operand(self, loc: hir.FullResultLoc) -> InterpVal:
+        """The place a HIR result location denotes: a ``ReturnLoc`` resolves to the
+        current frame's result location (see §7.2), any other location is an
+        ordinary place operand."""
+        if isinstance(loc, hir.ReturnLoc):
+            return self._result_loc()
+        return self.operand(loc)
+
+    def _store_return_loc(self, value: InterpVal) -> None:
+        """Deliver ``value`` into the current frame's result location (a ``hir.Store``
+        whose place is ``ReturnLoc``): a value-form tuple is splatted element by
+        element into the result tree, anything else goes into the single result
+        place (see §7.2)."""
+        target = self._result_loc()
+        value = _shallow_normalize(value)
+        aggregate = _as_aggregate(value)
+        if aggregate is not None and isinstance(aggregate.type, sval.TupleType):
+            leaves = tuple(ComptimeVal(v) for v in aggregate.values)
+            if isinstance(target, tuple):
+                if len(target) != len(leaves):
+                    raise CompileError(
+                        f'cannot return {len(leaves)} value(s) from a function '
+                        f'returning {len(target)}'
+                    )
+                for place, leaf in zip(target, leaves):
+                    self.store(place, leaf)
+                return
+            if isinstance(target, PendingSlot) and target.committed is None:
+                # an untyped result location: type it as the leaves' places
+                places = tuple(self.alloca() for _ in leaves)
+                self._record_pending_action(target, _PendingTuple(places))
+                for place, leaf in zip(places, leaves):
+                    self.store(place, leaf)
+                return
+            raise CompileError('cannot return several values into a single result location')
+        if isinstance(target, tuple):
+            raise CompileError('cannot return a single value from a function returning several')
+        self.store(target, value)
 
     # -- options ---------------------------------------------------------------
 
@@ -4164,24 +3857,15 @@ class HirRunner:
             return mir.BoolValue(not obj)
         return self._emit(mir.Cmp('==', self._to_runtime(value), mir.BoolValue(False)))
 
-    def _as_comptime_option(self, ev: InterpVal, option: sval.OptionType) -> ComptimeOption:
-        """The value form of a value that already is of the option type
-        ``option``: a compile-time option as it is, a runtime one read into the
-        tag and the payload it holds (see ``_is_null``/``_option_payload``)."""
-        if isinstance(ev, ComptimeOption):
-            return ev
-        assert isinstance(ev, RuntimeVal) and _type_of(ev) == option
-        return ComptimeOption(self._is_null(ev), self._option_payload(ev, option))
-
     def _coerce_option_value(self, ev: InterpVal, option: sval.OptionType) -> InterpVal:
-        """Materialize ``ev`` as a value form of the option type ``option``: a
-        value that already is one passes through, the null value becomes the
-        absent one and anything else a present value of the child type.
+        """Materialize ``ev`` as a value of the option type ``option``: a value
+        that already is one passes through, the null value becomes the absent one
+        and anything else a present value of the child type.
 
-        The result is a :class:`ComptimeOption` whenever ``ev`` had to change -
-        its tag a bool value and its payload the child value - so that no runtime
-        representation is built here (see ``_option_parts_to_runtime``); a value
-        that already is an option of the type is returned as it is."""
+        A fully compile-time result is the value form - ``sval.OptionValue`` for a
+        present option, ``sval.TypedNull`` for an absent one (see §5.3); a result
+        with a runtime part is materialized into the option's runtime
+        representation (see ``_option_parts_to_runtime``)."""
         ev = _shallow_normalize(ev)
         if _type_of(ev) == option:
             return ev
@@ -4189,10 +3873,23 @@ class HirRunner:
         is_null = self._is_null(ev)
         if _to_comptime(is_null) is True:
             # absent: the payload is discarded, and the child type is only named
-            # by the placeholder value the form carries
-            return ComptimeOption(is_null, ComptimeVal(sval.Undefined(child)))
-        payload = ev.value if isinstance(ev, ComptimeOption) else ev
-        return ComptimeOption(is_null, self._coerce(payload, child))
+            if isinstance(is_null, ComptimeVal):
+                return ComptimeVal(sval.TypedNull(child))
+            if child.is_zst():
+                unit = child.get_unit_value()
+                assert unit is not None
+                payload_value = ComptimeVal(unit)
+            else:
+                payload_value = ComptimeVal(sval.UndefinedScalar(child))
+            return RuntimeVal(self._option_parts_to_runtime(option, is_null, payload_value), option)
+        payload = _to_comptime(ev)
+        if payload is not None:
+            if isinstance(payload, sval.OptionValue):
+                payload = payload.value
+            coerced = _to_comptime(self._coerce(ComptimeVal(payload), child))
+            assert coerced is not None
+            return ComptimeVal(sval.OptionValue(coerced))
+        return RuntimeVal(self._option_parts_to_runtime(option, is_null, ev), option)
 
     # -- tagged unions -------------------------------------------------------
 
@@ -4228,21 +3925,18 @@ class HirRunner:
                 return index
         raise CoerceError(f'cannot materialize a {type} from {ev!r}')
 
-    def init_comptime_tagged_union(self, type: sval.TaggedUnionType) -> ComptimeTaggedUnionPtr:
-        """Fresh compile-time storage for a tagged union, at variant 0 (see
-        ``ComptimeTaggedUnionPtr``)."""
-        variant = type.types[0]
-        payload = self._fresh_place(variant)
-        return ComptimeTaggedUnionPtr(type, ComptimeVal(sval.Int(0, type.tag_type())), payload)
-
     def _tagged_union_tag(self, ev: InterpVal) -> InterpVal:
         """The tag of the tagged union value ``ev``, as an interpreter int: the
-        compile-time tag of a compile-time value, 0 for a single-variant union,
-        the value itself when the payload is zero-sized (the union *is* the tag)
-        and the first field of the struct otherwise."""
+        compile-time tag of a compile-time value (a ``sval.TaggedUnionValue``, or
+        the place of one - a ``ComptimePtr``), 0 for a single-variant union, the
+        value itself when the payload is zero-sized (the union *is* the tag) and
+        the first field of the struct otherwise."""
         ev = _shallow_normalize(ev)
-        if isinstance(ev, ComptimeTaggedUnionValue):
-            return ev.tag
+        obj = _to_comptime(ev)
+        if isinstance(obj, sval.ComptimePtr):
+            obj = _to_comptime(self.load(ev))
+        if isinstance(obj, sval.TaggedUnionValue):
+            return ComptimeVal(sval.Int(obj.index, obj.type.tag_type()))
         type = _type_of(ev)
         assert isinstance(type, sval.TaggedUnionType)
         shape = sval.tagged_union_shape(type, self._mir_cache)
@@ -4273,35 +3967,27 @@ class HirRunner:
         type = ptr_type.elem
         self._tagged_union_index(type, variant_type)
         if variant_type.get_unit_value() is not None:
-            return ComptimeVal(sval.Undefined(sval.PointerType(variant_type, is_const=ptr_type.is_const)))
-        if isinstance(place, ComptimeTaggedUnionPtr):
-            if _to_comptime(place.tag) is None:
-                # a tag only known at runtime: the payload place points at the
-                # payload union storage, whose variant is read/written through
-                # by reinterpreting its address (see ``_materialize_union``)
-                return self._union_variant_ptr(place.payload_ptr, variant_type)
-            payload_type = _type_of(place.payload_ptr)
-            if isinstance(payload_type, sval.PointerType) and payload_type.elem == variant_type:
-                return place.payload_ptr
-            # the current variant differs (a payload is only read once the tag
-            # matched, so such a place is never written through)
-            return self._fresh_place(variant_type)
+            return ComptimeVal(sval.UndefinedScalar(sval.PointerType(variant_type, is_const=ptr_type.is_const)))
+        if isinstance(place, ComptimeVal) and isinstance(place.obj, sval.ComptimePtr):
+            # a compile-time union place: the payload starts at cell ``1`` (the box
+            # layout is ``[tag, max(variant)]``, see §0.2), whichever variant it is
+            cptr = place.obj
+            return ComptimeVal(sval.ComptimePtr(
+                cptr.box, cptr.offset + 1, sval.PointerType(variant_type, cptr.type.is_const),
+            ))
         if sval.tagged_union_shape(type, self._mir_cache) == 'single':
             return RuntimeVal(self._to_runtime(place), sval.PointerType(variant_type, is_const=ptr_type.is_const))
         return self._union_variant_ptr(self._tagged_union_field_ptr(place), variant_type)
 
     def _write_tagged_union_tag(self, ptr: InterpVal, type: sval.TaggedUnionType, index: int) -> InterpVal:
-        """Set the tag of the tagged union place ``ptr`` to the variant
-        ``index`` (a compile-time storage also gets the payload place of that
-        variant) and return the place to write the payload through."""
+        """Set the tag of the tagged union place ``ptr`` to the variant ``index``
+        (a compile-time storage writes the tag cell) and return the place to write
+        the payload through."""
         place = _shallow_normalize(ptr)
-        variant = type.types[index]
-        if isinstance(place, ComptimeTaggedUnionPtr):
-            place.tag = ComptimeVal(sval.Int(index, type.tag_type()))
-            if variant.get_unit_value() is None:
-                payload_type = _type_of(place.payload_ptr)
-                if not (isinstance(payload_type, sval.PointerType) and payload_type.elem == variant):
-                    place.payload_ptr = self._fresh_place(variant)
+        if isinstance(place, ComptimeVal) and isinstance(place.obj, sval.ComptimePtr):
+            cptr = place.obj
+            if isinstance(cptr.box, sval.Box):
+                cptr.box.cells[cptr.offset] = sval.Int(index, type.tag_type())
             return place
         assert isinstance(place, RuntimeVal)
         shape = sval.tagged_union_shape(type, self._mir_cache)
@@ -4316,79 +4002,14 @@ class HirRunner:
         self._emit(mir.Store(tag_ptr, mir.Int(index, tag_mir)))
         return place
 
-    def _store_comptime_tagged_union(self, ptr: ComptimeTaggedUnionPtr, type: sval.TaggedUnionType, value: ComptimeTaggedUnionValue) -> None:
-        """Write the tagged union ``value`` into the compile-time storage ``ptr``:
-        the tag becomes the value's tag and the payload place holds the payload -
-        the variant's own place, rebuilt when the variant changes, or the payload
-        union storage in memory when the tag is only known at runtime."""
-        tag = value.tag
-        if _to_comptime(tag) is None:
-            # a tag only known at runtime: the payload is the payload union
-            # storage, which a variant is read/written through by reinterpreting
-            # its address (see ``_tagged_union_payload_ptr``)
-            ptr.tag = tag
-            if type.payload_type().get_unit_value() is not None:
-                # the payload holds no storage (every variant is zero-sized)
-                ptr.payload_ptr = ComptimeVal(sval.Undefined(sval.PointerType(type.payload_type())))
-            else:
-                ptr.payload_ptr = self._materialize_union(value.value, type.payload_type())
-            return
-        index = self._tagged_union_int(tag)
-        variant = type.types[index]
-        ptr.tag = ComptimeVal(sval.Int(index, type.tag_type()))
-        if variant.get_unit_value() is not None:
-            ptr.payload_ptr = ComptimeVal(sval.Undefined(sval.PointerType(variant)))
-            return
-        payload_type = _type_of(ptr.payload_ptr)
-        if not (isinstance(payload_type, sval.PointerType) and payload_type.elem == variant):
-            ptr.payload_ptr = self._fresh_place(variant)
-        self.store(ptr.payload_ptr, value.value)
-        self._commit_place_tree(ptr.payload_ptr)
-
-    def _materialize_union(self, value: InterpVal, union_type: sval.UnionType) -> InterpVal:
-        """The runtime pointer of fresh memory the union storage ``value`` is
-        written into: a union has no compile-time place an address could be taken
-        of, so a value of it whose variant has to be addressed is materialized
-        into memory (see ``_tagged_union_payload_ptr``)."""
-        slot = self.alloca(InlineMode.NONE)
-        self._commit_pending_slot(slot, union_type)
-        ptr = _shallow_normalize(slot)
-        if isinstance(value, ComptimeVal) and isinstance(value.obj, sval.Undefined):
-            mir_type = union_type.to_mir_type(self._mir_cache)
-            assert mir_type is not None and isinstance(ptr, RuntimeVal)
-            self._emit(mir.Store(ptr.value, mir.UndefValue(mir_type)))
-        else:
-            self.store(ptr, value)
-        return ptr
-
-    def _runtime_union_to_value_form(self, ev: RuntimeVal, type: sval.TaggedUnionType) -> ComptimeTaggedUnionValue:
-        """The value form of the runtime tagged union ``ev`` (of the type
-        ``type``): its tag and its payload - the variant value for a
-        single-variant union, the payload union storage otherwise (see
-        ``ComptimeTaggedUnionValue``)."""
-        shape = sval.tagged_union_shape(type, self._mir_cache)
-        if shape == 'single':
-            return ComptimeTaggedUnionValue(
-                type, ComptimeVal(sval.Int(0, type.tag_type())),
-                RuntimeVal(ev.value, type.types[0]),
-            )
-        tag = self._tagged_union_tag(ev)
-        if shape == 'tag_only':
-            unit = type.payload_type().get_unit_value()
-            assert unit is not None
-            return ComptimeTaggedUnionValue(type, tag, ComptimeVal(unit))
-        return ComptimeTaggedUnionValue(
-            type, tag, RuntimeVal(self._emit(mir.ExtractValue(ev.value, 1)), type.payload_type()),
-        )
-
     def _tagged_union_parts_to_runtime(self, type: sval.TaggedUnionType, tag: InterpVal, value: InterpVal) -> mir.Value:
         """Build the runtime value of a tagged union from its tag ``tag`` (which
         may be a runtime value) and its payload ``value``: a compile-time tag
         makes the payload a variant value, joined into the payload union with an
         ``AsUnion``, while a runtime tag means the payload already *is* the
-        payload union storage (see ``ComptimeTaggedUnionValue``).  A zero-sized
-        payload keeps the tag alone, and a single-variant union is the variant
-        itself."""
+        payload union storage (a value read out of a runtime union).  A
+        zero-sized payload keeps the tag alone, and a single-variant union is the
+        variant itself."""
         shape = sval.tagged_union_shape(type, self._mir_cache)
         if shape == 'single':
             return self._to_runtime(self._coerce(value, type.types[0]))
@@ -4401,7 +4022,7 @@ class HirRunner:
         index = _comptime_int(tag)
         if index is None:
             # a tag only known at runtime: the payload already is the union storage
-            if isinstance(value, ComptimeVal) and isinstance(value.obj, sval.Undefined):
+            if isinstance(value, ComptimeVal) and isinstance(value.obj, (sval.UndefinedScalar, sval.UndefinedAggregate)):
                 union_value = mir.UndefValue(union_mir)
             else:
                 union_value = self._to_runtime(value)
@@ -4432,43 +4053,33 @@ class HirRunner:
             acc = self._emit(mir.Select(cond, mir.Int(to_index, to_tag_mir), acc))
         return RuntimeVal(acc, to_type.tag_type())
 
-    def _runtime_union_value_form(self, ev: RuntimeVal, from_type: sval.TaggedUnionType, to_type: sval.TaggedUnionType) -> ComptimeTaggedUnionValue:
-        """The value form of the runtime tagged union ``ev`` (of the compatible
-        union ``from_type``) converted to ``to_type``: the tag remapped, and the
-        payload the variant value when the tag is compile-time (a single-variant
-        union on either side) and the payload union storage otherwise (see
-        ``ComptimeTaggedUnionValue``)."""
-        shape = sval.tagged_union_shape(to_type, self._mir_cache)
+    def _convert_union_runtime(self, ev: RuntimeVal, from_type: sval.TaggedUnionType, to_type: sval.TaggedUnionType) -> InterpVal:
+        """The runtime tagged union ``ev`` (of the compatible union ``from_type``)
+        converted to ``to_type``: the tag remapped and the payload union storage
+        reinterpreted (see ``_convert_union_storage``)."""
+        to_shape = sval.tagged_union_shape(to_type, self._mir_cache)
         from_shape = sval.tagged_union_shape(from_type, self._mir_cache)
-        if shape == 'single':
+        if to_shape == 'single':
             # a subset of a single-variant union is that variant
-            return ComptimeTaggedUnionValue(
-                to_type, ComptimeVal(sval.Int(0, to_type.tag_type())),
-                RuntimeVal(ev.value, to_type.types[0]),
-            )
-        if from_shape == 'single':
-            variant = from_type.types[0]
-            index = self._tagged_union_index(to_type, variant)
-            return ComptimeTaggedUnionValue(
-                to_type, ComptimeVal(sval.Int(index, to_type.tag_type())),
-                RuntimeVal(ev.value, variant),
-            )
+            return RuntimeVal(ev.value, to_type)
         tag = self._tagged_union_reindex(self._tagged_union_tag(ev), from_type, to_type)
-        if shape == 'tag_only':
-            # the payload holds no storage: its value is the union's unit
-            unit = to_type.payload_type().get_unit_value()
-            assert unit is not None
-            return ComptimeTaggedUnionValue(to_type, tag, ComptimeVal(unit))
+        if to_shape == 'tag_only':
+            return RuntimeVal(self._to_runtime(tag), to_type)
+        struct_mir = to_type.to_mir_type(self._mir_cache)
+        assert isinstance(struct_mir, mir.StructType)
+        union_mir = struct_mir.fields[1].type
         if from_shape == 'tag_payload':
-            # the payload union storage reinterpreted as the target's
-            payload = self._convert_union_storage(
+            storage = self._convert_union_storage(
                 RuntimeVal(self._emit(mir.ExtractValue(ev.value, 1)), from_type.payload_type()),
                 to_type.payload_type(),
             )
-            return ComptimeTaggedUnionValue(to_type, tag, payload)
-        # the source variants are all zero-sized: the active payload has no
-        # storage, so the target's payload storage is undefined
-        return ComptimeTaggedUnionValue(to_type, tag, ComptimeVal(sval.Undefined(to_type.payload_type())))
+            storage_mir = self._to_runtime(storage)
+        else:
+            # the source variants are all zero-sized: the active payload has no
+            # storage
+            storage_mir = mir.UndefValue(union_mir)
+        with_tag = self._emit(mir.InsertValue(mir.UndefValue(struct_mir), self._to_runtime(tag), 0))
+        return RuntimeVal(self._emit(mir.InsertValue(with_tag, storage_mir, 1)), to_type)
 
     def _convert_union_storage(self, value: InterpVal, to_union: sval.UnionType) -> InterpVal:
         """The union storage value ``value`` as a value of the union
@@ -4479,8 +4090,8 @@ class HirRunner:
         unit = to_union.get_unit_value()
         if unit is not None:
             return ComptimeVal(unit)
-        if isinstance(value, ComptimeVal) and isinstance(value.obj, (sval.Undefined, sval.UnionValue)):
-            return ComptimeVal(sval.Undefined(to_union))
+        if isinstance(value, ComptimeVal) and isinstance(value.obj, (sval.UndefinedScalar, sval.UndefinedAggregate, sval.UnionValue)):
+            return ComptimeVal(sval.UndefinedScalar(to_union))
         assert isinstance(value, RuntimeVal)
         if value.type == to_union:
             return value
@@ -4489,35 +4100,41 @@ class HirRunner:
         return RuntimeVal(self._emit(mir.UnionCast(value.value, to_mir)), to_union)
 
     def _coerce_tagged_union_value(self, ev: InterpVal, type: sval.TaggedUnionType) -> InterpVal:
-        """Materialize ``ev`` as a value form of the tagged union ``type``: a
-        value of a compatible union is converted, anything else is the variant it
-        belongs to, tagged.
+        """Materialize ``ev`` as a value of the tagged union ``type``: a value of
+        a compatible union is converted, anything else is the variant it belongs
+        to, tagged.
 
-        The result is a :class:`ComptimeTaggedUnionValue` whenever ``ev`` had to
-        change - its tag the variant position (a compile-time value) and its
-        value the variant, or - for a tag only known at runtime - the payload
-        union storage (see ``ComptimeTaggedUnionValue``); a value that already is
-        a union of the type is returned as it is."""
+        A fully compile-time result is ``sval.TaggedUnionValue`` (see §5.3); one
+        with a runtime part is materialized into the union's representation."""
         ev = _shallow_normalize(ev)
-        if _type_of(ev) == type:
-            return ev
-        if isinstance(ev, ComptimeTaggedUnionValue):
-            if _to_comptime(ev.tag) is None:
-                # a tag only known at runtime: the value already is the payload
-                # union storage
-                return ComptimeTaggedUnionValue(
-                    type,
-                    self._tagged_union_reindex(ev.tag, ev.type, type),
-                    self._convert_union_storage(ev.value, type.payload_type()),
-                )
-            index = self._tagged_union_index(type, ev.type.types[self._tagged_union_int(ev.tag)])
-            return ComptimeTaggedUnionValue(type, ComptimeVal(sval.Int(index, type.tag_type())), ev.value)
         ev_type = _type_of(ev)
+        if ev_type == type:
+            return ev
+        obj = _to_comptime(ev)
+        if isinstance(obj, sval.ComptimePtr):
+            return self._coerce_tagged_union_value(self.load(ev), type)
+        if isinstance(obj, sval.TaggedUnionValue):
+            # a compile-time union of a compatible type: remap the tag and re-coerce
+            # the variant value
+            if isinstance(ev_type, sval.TaggedUnionType):
+                index = self._tagged_union_index(type, ev_type.types[obj.index])
+            else:
+                index = self._tagged_union_variant_index(ComptimeVal(obj.value), type)
+            variant_value = self._coerce(ComptimeVal(obj.value), type.types[index])
+            variant_obj = _to_comptime(variant_value)
+            assert variant_obj is not None
+            return ComptimeVal(sval.TaggedUnionValue(type, index, variant_obj))
         if isinstance(ev, RuntimeVal) and isinstance(ev_type, sval.TaggedUnionType):
-            return self._runtime_union_value_form(ev, ev_type, type)
+            return self._convert_union_runtime(ev, ev_type, type)
         index = self._tagged_union_variant_index(ev, type)
         variant_value = self._coerce(ev, type.types[index])
-        return ComptimeTaggedUnionValue(type, ComptimeVal(sval.Int(index, type.tag_type())), variant_value)
+        variant_obj = _to_comptime(variant_value)
+        if variant_obj is not None:
+            return ComptimeVal(sval.TaggedUnionValue(type, index, variant_obj))
+        return RuntimeVal(
+            self._tagged_union_parts_to_runtime(type, ComptimeVal(sval.Int(index, type.tag_type())), variant_value),
+            type,
+        )
 
     def _arg_value(self, arg: ArgEntry[InterpVal]) -> InterpVal:
         """The value an argument denotes: a reference argument is loaded
@@ -4526,30 +4143,23 @@ class HirRunner:
             return self.load(arg.value)
         return arg.value
 
-    def _tuple_source_values(self, source: InterpVal) -> tuple[InterpVal, ...] | None:
-        """The element *values* a destructuring store reads out of ``source``
-        (see ``store``): a tuple value takes every operand's value (see
-        ``_arg_value``).  None when ``source`` is not a tuple at all."""
-        if isinstance(source, ComptimeTuple):
-            return tuple(self._arg_value(entry) for entry in source.values)
-        return None
-
     def _auto_deref(self, ev: InterpVal) -> InterpVal:
         t = _type_of(ev)
         if isinstance(t, sval.PointerType) and isinstance(t.elem, sval.PointerType):
             return self.load(ev)
         place = _shallow_normalize(ev)
-        # a compile-time box may be declared to hold no fixed type (an ``Any``
-        # variable, see ``ComptimeBox``) yet hold a pointer - a function pointer,
-        # say (``comptime(); fn: Any = foo``).  What it holds is what a
-        # callee/field access needs, so it is dereferenced like a pointer that
-        # points at a pointer
+        # a compile-time place declared to hold no fixed type (an ``Any`` variable)
+        # may yet hold a pointer - a function pointer, say (``comptime(); fn: Any =
+        # foo``).  What it holds is what a callee/field access needs, so it is
+        # dereferenced like a pointer that points at a pointer
         if (
             isinstance(t, sval.PointerType)
-            and isinstance(place, ComptimeBox)
-            and isinstance(_type_of(place.value), sval.PointerType)
+            and isinstance(place, ComptimeVal)
+            and isinstance(place.obj, sval.ComptimePtr)
         ):
-            return self.load(place)
+            loaded = self.load(place)
+            if isinstance(_type_of(loaded), sval.PointerType):
+                return loaded
         return ev
 
     # -- struct and array values ---------------------------------------------
@@ -4569,7 +4179,7 @@ class HirRunner:
                 index = recorded.type.field_index(name)
                 if index is not None:
                     return recorded.places[index]
-            return self.alloca(ptr.inline_mode)
+            return self.alloca()
         ptr = self._auto_deref(ptr)
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
@@ -4629,7 +4239,7 @@ class HirRunner:
             recorded = self._pending_aggregate(ptr)
             if recorded is not None:
                 return recorded.places[_comptime_index(index)]
-            return self.alloca(ptr.inline_mode)
+            return self.alloca()
         type = _type_of(ptr)
         if type is None or not isinstance(type, sval.PointerType):
             raise CompileError(f'cannot take a field or element address of {ptr}')
@@ -4654,21 +4264,57 @@ class HirRunner:
             # to the variant's field address.  The place is inline: a compile-time
             # field value stays compile-time (it is not needlessly materialized
             # and read back as a register, see ``_finish_struct_into_tagged_union``)
-            return self.alloca(InlineMode.FULL)
+            return self.alloca(True)
 
-        if isinstance(container_type, sval.StructType):
+        if isinstance(container_type, sval.AggregateType):
             index_int = _comptime_index(index)
-            fields = container_type.fields()
-            if index_int < 0 or index_int >= len(fields.by_id):
-                raise CompileError(f'type {container_type} has no field at index {index_int}')
-            field_type = fields.get_by_id(index_int).type
+            field_is_ref = False
+            mir_indices: tuple[int | None, ...] | None = None
+            if isinstance(container_type, sval.StructType):
+                fields = container_type.fields()
+                if index_int < 0 or index_int >= len(fields.by_id):
+                    raise CompileError(f'type {container_type} has no field at index {index_int}')
+                field0 = fields.get_by_id(index_int)
+                if field0.is_comptime:
+                    # a compile-time field does not enter the MIR layout: a
+                    # runtime struct reads its default value, a compile-time
+                    # (box) struct the cell's current value (see §2.4/§5.1).  A
+                    # by-reference compile-time capture bakes the captured
+                    # variable's pointer as its default, which *is* the place the
+                    # body acts through (see §9.3)
+                    if field0.is_ref and isinstance(field0.default, sval.ComptimePtr):
+                        return ComptimeVal(field0.default)
+                    return self._comptime_field_place(ptr, container_type, index_int, field0)
+                field_type = field0.type
+                field_is_ref = field0.is_ref
+                mir_indices = container_type.get_field_mir_indices(self._mir_cache)
+            elif isinstance(container_type, sval.TupleType):
+                if index_int < 0 or index_int >= len(container_type.types):
+                    raise CompileError(f'type {container_type} has no element at index {index_int}')
+                field_type = container_type.types[index_int]
+                mir_indices = container_type.get_field_mir_indices(self._mir_cache)
+            elif isinstance(container_type, sval.StrDictType):
+                elem_types = tuple(container_type.values.values())
+                if index_int < 0 or index_int >= len(elem_types):
+                    raise CompileError(f'type {container_type} has no element at index {index_int}')
+                field_type = elem_types[index_int]
+                mir_indices = container_type.get_field_mir_indices(self._mir_cache)
+            elif isinstance(container_type, sval.ComplexType):
+                if index_int < 0 or index_int > 1:
+                    raise CompileError(f'type {container_type} has no field at index {index_int}')
+                field_type = container_type.elem
+            elif isinstance(container_type, sval.ArrayType):
+                field_type = container_type.elem
+            else:
+                raise CompileError(f'cannot take a field or element address of {ptr}')
             field_ptr_type = sval.PointerType(field_type, is_const)
-            if field_type.is_zst():
+            if not field_is_ref and field_type.is_zst():
                 # a zero-sized field occupies no storage and has no address
-                return ComptimeVal(sval.Undefined(field_ptr_type))
+                return ComptimeVal(sval.UndefinedScalar(field_ptr_type))
             if (
-                field_type.classify() == sval.SpecialTypeKind.DST
-                and container_type.get_field_mir_indices(self._mir_cache)[index_int] is None
+                not field_is_ref
+                and field_type.classify() == sval.SpecialTypeKind.DST
+                and mir_indices is not None and mir_indices[index_int] is None
             ):
                 # only the first dynamically-sized field (the struct's flexible
                 # member) has a mirror position; every further one is
@@ -4678,66 +4324,73 @@ class HirRunner:
                     f"can be accessed"
                 )
             match ptr:
-                case ComptimeAggregatePtr(_, ptrs):
-                    # the fields of a compile-time aggregate are their own
-                    # places, in declaration order (see ``ComptimeAggregatePtr``)
-                    return ptrs[index_int]
-                case ComptimeVal():
-                    raise CompileError(
-                        'cannot take the address of a field of a compile-time value'
-                    )
+                case ComptimeVal(sval.ComptimePtr(box, offset, _)):
+                    if isinstance(box, bytes):
+                        raise CompileError('cannot take a field address of a byte string')
+                    field_offset = offset + sval.field_scalar_offset(container_type, index_int)
+                    if field_is_ref:
+                        # an ``is_ref`` field stores a ``*const T``: the cell holds
+                        # the compile-time pointer the read acts through
+                        return ComptimeVal(box.cells[field_offset])
+                    return ComptimeVal(sval.ComptimePtr(box, field_offset, field_ptr_type))
                 case RuntimeVal():
-                    if not container_type.mirror_is_a_field(self._mir_cache):
-                        mir_index = container_type.get_field_mir_indices(self._mir_cache)[index_int]
+                    if isinstance(container_type, sval.ArrayType):
+                        field_addr = RuntimeVal(self._emit(mir.Gep(ptr.value, _mir_index(index)), at), field_ptr_type)
+                    elif isinstance(container_type, (sval.StructType, sval.TupleType, sval.StrDictType)) and container_type.mirror_is_a_field(self._mir_cache):
+                        # the mirror of the aggregate is the mirror of its own
+                        # single stored field: it takes no address arithmetic
+                        field_addr = RuntimeVal(ptr.value, field_ptr_type)
+                    else:
+                        assert mir_indices is not None, 'a field with storage has a mirror position'
+                        mir_index = mir_indices[index_int]
                         assert mir_index is not None, 'a field with storage has a mirror position'
-                        return RuntimeVal(
-                            self._emit(mir.Gep(ptr.value, mir_index), at), field_ptr_type
-                        )
-                    # the mirror of the struct is the mirror of its own field
-                    # (see ``sval.StructType.mirror_is_a_field``): the field is
-                    # the value itself, so it takes no address arithmetic
-                    return RuntimeVal(ptr.value, field_ptr_type)
+                        field_addr = RuntimeVal(self._emit(mir.Gep(ptr.value, mir_index), at), field_ptr_type)
+                    if field_is_ref:
+                        # the field stores a ``*const T``: load it to get the
+                        # pointee address (writing through it is rejected by the
+                        # pointer's constness)
+                        return RuntimeVal(self._emit(mir.Load(field_addr.value), at), sval.PointerType(field_type, is_const=True))
+                    return field_addr
                 case _:
                     raise CompileError(f'cannot take field address of {ptr}')
-
-        if isinstance(container_type, sval.ComplexType):
-            index_int = _comptime_index(index)
-            if index_int < 0 or index_int > 1:
-                raise CompileError(f'type {container_type} has no field at index {index_int}')
-            field_ptr_type = sval.PointerType(container_type.elem, is_const)
-            match ptr:
-                case ComptimeAggregatePtr(_, ptrs):
-                    # the parts of a compile-time complex are their own places,
-                    # real first then imaginary (see ``ComptimeAggregatePtr``)
-                    return ptrs[index_int]
-                case RuntimeVal():
-                    return RuntimeVal(
-                        self._emit(mir.Gep(ptr.value, index_int), at), field_ptr_type
-                    )
-                case _:
-                    raise CompileError(f'cannot take field address of {ptr}')
-
-        if isinstance(container_type, sval.ArrayType):
-            elem_ptr_type = sval.PointerType(container_type.elem, is_const=is_const)
-            if container_type.is_zst():
-                # a zero-sized array holds no storage and so has no addresses:
-                # every value of one equals the unit value of its element type
-                return ComptimeVal(sval.Undefined(elem_ptr_type))
-            match ptr:
-                case ComptimeAggregatePtr(_, ptrs):
-                    # the elements of a compile-time aggregate are their own
-                    # places, in element order (see ``ComptimeAggregatePtr``)
-                    return ptrs[_comptime_index(index)]
-                case RuntimeVal():
-                    return RuntimeVal(
-                        self._emit(mir.Gep(ptr.value, _mir_index(index)), at), elem_ptr_type
-                    )
-            raise CompileError(
-                f'cannot take the address of an element of {container_type}: '
-                f'the array is a compile-time value'
-            )
 
         raise CompileError(f'cannot take a field or element address of {ptr}')
+
+    def _comptime_field_place(self, ptr: InterpVal, container_type: sval.StructType, index: int, field: sval.StructField) -> InterpVal:
+        """The place an ``is_comptime`` struct field is read/written through (see
+        §2.4/§5.1): the current box cell for a compile-time (box) struct - the box
+        is created with the field's default already filled in (see ``_new_box``),
+        so a read gives it and a construction can override it - and the declared
+        default for a runtime struct (which has no storage for the field at all).
+        The fallback place is read-only, so a runtime struct's compile-time field
+        cannot be written."""
+        if isinstance(ptr, ComptimeVal) and isinstance(ptr.obj, sval.ComptimePtr) and isinstance(ptr.obj.box, sval.Box):
+            box = ptr.obj.box
+            offset = ptr.obj.offset + sval.field_scalar_offset(container_type, index)
+            is_const = ptr.obj.type.is_const or box.is_const
+            return ComptimeVal(sval.ComptimePtr(box, offset, sval.PointerType(field.type, is_const=is_const)))
+        if field.default is None:
+            raise CompileError(
+                f"compile-time field '{field.name}' of {container_type} has no value"
+            )
+        return self._const_box_place(field.default, field.type)
+
+    def _const_box_place(self, value: sval.AnyValue, type: sval.Type) -> InterpVal:
+        """A read-only compile-time place holding the constant ``value``: the
+        const ``Box`` a compile-time field's default (or a global's value) is read
+        through (see §4.3)."""
+        box = self._new_box(type, is_const=True)
+        box.cells = _flatten_value(value, type)
+        return ComptimeVal(sval.ComptimePtr(box, 0, sval.PointerType(type, is_const=True)))
+
+    def _new_box(self, type: sval.Type, is_const: bool) -> sval.Box:
+        """A fresh ``Box`` of ``type``: its cells start as the flattened undefined
+        and every ``is_comptime`` field cell is then filled with its declared
+        default (see ``_fill_comptime_defaults``)."""
+        box = sval.Box(self._frames[-1].fn_name, type, is_const=is_const)
+        box.reset(type)
+        _fill_comptime_defaults(box, type, 0)
+        return box
 
     def _emit(self, inst: mir.Inst, at: mir.Insertion | None = None) -> mir.Value:
         """Append one instruction to the block currently being built, or,
@@ -4753,54 +4406,22 @@ class HirRunner:
             self._cur_block.emit(inst)
         return inst
 
-    def alloca(self, inline: InlineMode = InlineMode.NONE, declared: sval.Type | None = None, commit_declared: bool = True) -> PendingSlot:
-        """Reserve a fresh slot.  ``inline`` is how much of the value may be
-        kept inline - nothing, anything but an aggregate, or anything (see
-        ``InlineMode``); a ``declared`` type (an annotated variable, see
-        ``_declared_type``) fixes the slot's storage right away - a
-        compile-time value for a ``Comptime`` variable or a zero-sized type,
-        memory (a :class:`RuntimeVal`) for anything else (see ``hir.Alloca``).
-
-        With ``commit_declared`` false a declared ``Comptime`` variable of a
-        type the stores can decide for (see ``_stores_decide_storage``) does not
-        fix its storage here: it is left to its stores, so a runtime value lands
-        in memory rather than a box (see ``_record_pending_store``)."""
+    def alloca(self, is_comptime: bool | None = None, is_const: bool = False, declared: sval.Type | None = None, commit_declared: bool = True) -> PendingSlot:
+        """Reserve a fresh slot.  ``is_comptime`` is the three-state storage
+        decision (see ``PendingSlot``): ``True`` a compile-time variable (a
+        ``sval.Box``), ``False`` a runtime location (memory), ``None`` inferred
+        from the stores.  A ``declared`` type (an annotated variable, see
+        ``_declared_type``) fixes the slot's declared type; ``is_const`` marks a
+        ``ConstComptime`` variable (its box becomes read-only after the commit).
+        An ordinary annotated variable (``is_comptime=False``) is materialized
+        right away (``commit_declared``); a compile-time one commits at its
+        ``CommitSlot``."""
         insertion = mir.Insertion([], None)
         self._emit(insertion)
-        slot = PendingSlot(insertion, inline, self._runtime_position())
+        slot = PendingSlot(insertion, is_comptime, is_const, self._runtime_position())
         if declared is not None:
-            if inline != InlineMode.NONE and declared.get_unit_value() is None:
-                if not commit_declared and _stores_decide_storage(declared):
-                    # the stores into the variable decide its storage
-                    slot.declared = declared
-                elif _is_aggregate(declared):
-                    # a compile-time variable of an aggregate type: the aggregate
-                    # is built in place, its fields (or elements) being their own
-                    # places
-                    slot.committed = self.init_inline_aggregate(declared)
-                elif isinstance(declared, sval.TupleType):
-                    # a compile-time variable of a tuple type: one place per
-                    # element (a box never holds a tuple, see ``ComptimeTuplePtr``)
-                    slot.committed = self.init_comptime_tuple(declared)
-                elif isinstance(declared, sval.StrDictType):
-                    # and its ``**kwargs`` dictionary counterpart (a box never
-                    # holds one either, see ``ComptimeDictPtr``)
-                    slot.committed = self.init_comptime_dict(declared)
-                elif isinstance(declared, sval.OptionType):
-                    # a compile-time variable of an option type: the option has
-                    # its own place form, a tag value and a payload place (see
-                    # ``ComptimeOptionPtr``)
-                    slot.committed = self.init_comptime_option(declared)
-                elif isinstance(declared, sval.TaggedUnionType):
-                    # a compile-time variable of a tagged union type: the union has
-                    # its own place form, a tag value and a payload place (see
-                    # ``ComptimeTaggedUnionPtr``)
-                    slot.committed = self.init_comptime_tagged_union(declared)
-                else:
-                    # a compile-time variable of a declared type: a box the
-                    # value it is assigned is written into
-                    slot.committed = ComptimeBox(declared, ComptimeVal(sval.Undefined(declared)))
-            else:
+            slot.declared = declared
+            if commit_declared and is_comptime is False:
                 self._commit_pending_slot(slot, declared)
         return slot
 
@@ -4813,8 +4434,6 @@ class HirRunner:
         if node is None:
             return None
         obj = _to_comptime(_shallow_normalize(self.operand(node)))
-        if isinstance(obj, sval.ConstRef):
-            obj = obj.value
         if not isinstance(obj, sval.Type):
             raise CompileError(f'{obj!r} is not a type')
         reps: dict[sval.TypeVar, sval.AnyValue] = {
@@ -4865,23 +4484,42 @@ class HirRunner:
             # ``_coerce_tagged_union_value``)
             return self._coerce_tagged_union_value(ev, target)
         if isinstance(target, sval.TupleType):
-            # a tuple has no runtime representation to convert to: the
-            # compile-time tuple (its value form or its place tree) itself is
-            # what a location of the type holds
-            if not isinstance(ev, (ComptimeTuple, ComptimeTuplePtr)):
-                raise CoerceError(f'cannot materialize a {target} from {ev!r}')
-            return ev
+            # a tuple is a real aggregate now (see §7.1): a value or place of the
+            # type is its own type
+            ev_type = _type_of(ev)
+            base = ev_type.elem if isinstance(ev_type, sval.PointerType) else ev_type
+            if base == target:
+                return ev
+            raise CoerceError(f'cannot materialize a {target} from {ev!r}')
         if isinstance(target, sval.StrDictType):
-            # likewise for a ``**kwargs`` dictionary (see ``sval.StrDictType``)
-            if not isinstance(ev, (ComptimeDict, ComptimeDictPtr)):
-                raise CoerceError(f'cannot materialize a {target} from {ev!r}')
-            return ev
+            # likewise for a ``dict[str, T]`` (see §8)
+            ev_type = _type_of(ev)
+            base = ev_type.elem if isinstance(ev_type, sval.PointerType) else ev_type
+            if base == target:
+                return ev
+            raise CoerceError(f'cannot materialize a {target} from {ev!r}')
         if isinstance(target, sval.ComplexType):
             # a complex number is an aggregate: a real value converts to one with
             # a zero imaginary part and a complex one to a wider element type
             # (see ``_coerce_complex``)
             return self._coerce_complex(ev, target)
         match ev:
+            case ComptimeVal(obj=sval.ComptimePtr()):
+                # a compile-time pointer as a value of a pointer type: it *is* a
+                # pointer already (see ``_type_of``); its pointee is compile-time
+                # storage, so becoming an address of real memory happens only
+                # where a MIR value is needed (see ``_to_runtime``/§4.3)
+                if not isinstance(target, sval.PointerType):
+                    raise CoerceError(
+                        f'cannot materialize a {target} from a compile-time pointer'
+                    )
+                return ev
+            case ComptimeVal(obj=sval.CastedPtr()):
+                # a pointer reinterpreted by ``ptr_cast``: reading or writing
+                # through it is not supported yet (see ``sval.CastedPtr``)
+                raise CoerceError(
+                    f'cannot materialize a {target} from a pointer cast'
+                )
             case ComptimeVal(obj) if isinstance(obj, sval.AggregateValue):
                 # an aggregate held as one compile-time object (see
                 # ``_as_aggregate``): like an interpreter aggregate value, it is
@@ -4903,48 +4541,25 @@ class HirRunner:
                 return ComptimeVal(sval.coerce_const(obj, target))
             case RuntimeVal(value, type):
                 return RuntimeVal(self._convert(value, type, target), target)
-            case (
-                ComptimeAggregatePtr() | ComptimeOptionPtr() | ComptimeTaggedUnionPtr()
-                | ComptimeTuplePtr() | ComptimeDictPtr() | ComptimeBox()
-            ):
-                # a compile-time pointer as a value of a pointer type: it *is* a
-                # pointer already (see ``_type_of``) - its fields/elements are
-                # their own places - so nothing is converted here.  Becoming an
-                # address of real memory happens only where a MIR value is
-                # actually needed (see ``_to_runtime``)
-                # TODO: type check?
-                if not isinstance(target, sval.PointerType):
-                    raise CoerceError(
-                        f'cannot materialize a {target} from a compile-time pointer'
-                    )
-                return ev
-            case ComptimeAggregate():
-                return self._coerce_aggregate(ev, target)
-            case ComptimeCastedPtr():
-                # a pointer reinterpreted by ``ptr_cast``: reading or writing
-                # through it is not supported yet (see ``ComptimeCastedPtr``)
-                raise CoerceError(
-                    f'cannot materialize a {target} from the cast pointer {ev.type}'
-                )
             case _:
                 raise CoerceError('cannot materialize this value')
 
-    def _coerce_aggregate(self, aggregate: ComptimeAggregate, target: sval.Type) -> InterpVal:
+    def _coerce_aggregate(self, aggregate: sval.AggregateValue, target: sval.Type) -> InterpVal:
         """A compile-time aggregate as a value of the aggregate type ``target``:
         only the type is checked here - an aggregate is ever only its own type -
         and the value is returned as it is; its runtime representation is built
         by ``_to_runtime`` where one is actually needed."""
         if not _is_aggregate(target) or aggregate.type != target:
             raise CoerceError(f'cannot convert a {aggregate.type} value to {target}')
-        return aggregate
+        return ComptimeVal(aggregate)
 
     def _coerce_complex(self, ev: InterpVal, target: sval.ComplexType) -> InterpVal:
         """A value of the complex type ``target``: a compile-time value is
-        converted with ``sval.coerce_const`` (the ``AggregateValue`` the
-        interpreter reads back as a ``ComptimeAggregate``); a runtime value is
-        rebuilt part by part - a real (float or integer) value becomes a complex
-        one with a zero imaginary part, and a complex one of a narrower element
-        type is widened.  This is the implicit ``T -> Complex[T]`` conversion.
+        converted with ``sval.coerce_const`` (an ``AggregateValue`` of the type);
+        a runtime value is rebuilt part by part - a real (float or integer) value
+        becomes a complex one with a zero imaginary part, and a complex one of a
+        narrower element type is widened.  This is the implicit ``T ->
+        Complex[T]`` conversion.
 
         Raises :class:`~spy.errors.CoerceError` when the value has no
         materialization as ``target``."""
@@ -4952,28 +4567,15 @@ class HirRunner:
         match ev:
             case ComptimeVal(obj):
                 return ComptimeVal(sval.coerce_const(obj, target))
-            case ComptimeAggregate(aggregate_type) if aggregate_type == target:
-                # an aggregate already of the target type passes through
-                return ev
-            case ComptimeAggregate():
-                # a complex number of another element type: re-coerce its parts
-                # (the element widens or narrows)
-                return ComptimeAggregate(
-                    target,
-                    (
-                        self._coerce(ev.values[0], target.elem),
-                        self._coerce(ev.values[1], target.elem),
-                    ),
-                )
             case RuntimeVal(_, from_type):
                 if from_type == target:
                     return ev
                 re: InterpVal
                 im: InterpVal
                 if isinstance(from_type, sval.ComplexType):
-                    aggregate = self.as_comptime_aggregate(ev)
-                    re = self._coerce(aggregate.values[0], target.elem)
-                    im = self._coerce(aggregate.values[1], target.elem)
+                    re, im = self._complex_parts(ev)
+                    re = self._coerce(re, target.elem)
+                    im = self._coerce(im, target.elem)
                 elif sval.is_numeric_type(from_type):
                     # a real value: the real part is the value, the imaginary one
                     # is zero
@@ -4981,24 +4583,9 @@ class HirRunner:
                     im = ComptimeVal(sval.coerce_const(0.0, target.elem))
                 else:
                     raise CoerceError(f'cannot convert a {from_type} value to {target}')
-                mir_type = target.to_mir_type(self._mir_cache)
-                assert isinstance(mir_type, mir.StructType)
-                result = self._emit(mir.InsertValue(mir.UndefValue(mir_type), self._to_runtime(re), 0))
-                result = self._emit(mir.InsertValue(result, self._to_runtime(im), 1))
-                return RuntimeVal(result, target)
+                return self._complex_value(target, re, im)
             case _:
                 raise CoerceError(f'cannot materialize a {target} from {ev!r}')
-
-    def _materialize_aggregate(
-        self, value: ComptimeAggregate, aggregate_type: sval.Type
-    ) -> InterpVal:
-        """The address of fresh memory the aggregate ``value`` is written into,
-        place by place: an aggregate has no runtime representation of its own,
-        so a runtime location of its type is built by copying it in."""
-        slot = self.alloca(InlineMode.NONE)
-        self._commit_pending_slot(slot, aggregate_type)
-        self.store(slot, value)
-        return _shallow_normalize(slot)
 
     def _zst_pointer(self, type: sval.Type) -> mir.Value:
         """The runtime value of a pointer to the zero-sized type ``type``: the
@@ -5012,76 +4599,113 @@ class HirRunner:
         """Materialize a value as a typed MIR value: a runtime value yields its
         MIR object, a compile-time value a constant built from it
         (``_sval_to_runtime``), and a committed slot the value it was
-        materialized into.  An aggregate has no MIR representation of its own:
-        the *place* of one (a ``ComptimeAggregatePtr``) yields the address of
-        fresh memory it is copied into - what a pointer to it delivers - and an
-        aggregate *value* (a ``ComptimeAggregate``) the value read back out of
-        that memory, which is what a by-value use needs.  An uncommitted slot,
-        a compile-time box and the aggregate of a zero-sized type (which has no
-        runtime value at all) are rejected."""
+        materialized into.  A compile-time aggregate has no MIR value of its own
+        (``_aggregate_to_runtime`` builds the ``InsertValue`` chain a by-value
+        use needs).  An uncommitted slot, a compile-time box and the aggregate
+        of a zero-sized type (which has no runtime value at all) are rejected."""
         ev = _shallow_normalize(ev)
         match ev:
             case RuntimeVal():
                 return ev.value
-            case ComptimeVal():
-                return _sval_to_runtime(ev.obj, self._mir_cache)
-            case ComptimeAggregatePtr(aggregate_type, _):
-                if aggregate_type.is_zst():
-                    # a pointer to a zero-sized aggregate: the pointee has no
-                    # storage, so the pointer is materialized as an undefined one
-                    return self._zst_pointer(aggregate_type)
-                aggregate = self.load(ev)
-                if not isinstance(aggregate, ComptimeAggregate):
-                    # a zero-sized aggregate: its value *is* its unit value, which
-                    # has no runtime representation at all
-                    raise CompileError(
-                        f'a value of the zero-sized {aggregate_type} has no runtime value'
-                    )
-                return self._to_runtime(self._materialize_aggregate(aggregate, aggregate_type))
-            case ComptimeAggregate():
-                return self._aggregate_to_runtime(ev)
-            case ComptimeOption():
-                option = _type_of(ev)
-                assert isinstance(option, sval.OptionType)
-                return self._option_parts_to_runtime(option, ev.is_null, ev.value)
-            case ComptimeOptionPtr():
-                # the compile-time *storage* of an option: what a value of its
-                # pointer type delivers is the address of fresh memory the option
-                # is written into (like a compile-time aggregate pointer), not
-                # the option value itself
-                ptr_type = _type_of(ev)
-                assert isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.OptionType)
-                option = ptr_type.elem
-                mir_type = option.to_mir_type(self._mir_cache)
-                assert mir_type is not None
-                alloca = self._emit(mir.Alloca(mir_type))
-                self._emit(mir.Store(alloca, self._to_runtime(self.load(ev))))
-                return alloca
-            case ComptimeTaggedUnionValue(type, tag, value):
-                # the tagged union value form: the tag and the payload union are
-                # joined into the struct representation (see
-                # ``_tagged_union_parts_to_runtime``)
-                return self._tagged_union_parts_to_runtime(type, tag, value)
-            case ComptimeTaggedUnionPtr(type):
-                # the compile-time *storage* of a tagged union: what a value of
-                # its pointer type delivers is the address of fresh memory the
-                # union is written into (like an option's storage)
-                if type.is_zst():
-                    # a pointer to a zero-sized tagged union: like a zero-sized
-                    # aggregate, the pointee has no storage - an undefined pointer
-                    return self._zst_pointer(type)
-                mir_type = type.to_mir_type(self._mir_cache)
-                assert mir_type is not None
-                alloca = self._emit(mir.Alloca(mir_type))
-                self._emit(mir.Store(alloca, self._to_runtime(self.load(ev))))
-                return alloca
-            case ComptimeBox():
-                raise CompileError('cannot use a compile-time box as a runtime value')
+            case ComptimeVal(obj):
+                return self._comptime_value_to_runtime(obj)
             case PendingSlot():
                 raise CompileError('cannot use an uncommitted slot as a runtime value')
         raise CompileError('cannot return this value')
 
-    def _aggregate_to_runtime(self, ev: ComptimeAggregate) -> mir.Value:
+    def _comptime_value_to_runtime(self, obj: sval.AnyValue) -> mir.Value:
+        """The runtime MIR value of a compile-time object: a scalar constant, the
+        address of fresh memory a compile-time aggregate/option/union is written
+        into, or - for a ``ComptimePtr`` - the automatically lowered address of
+        the constant it points at (see §4.3)."""
+        if isinstance(obj, sval.ComptimePtr):
+            if isinstance(obj.box, sval.Box) and not obj.box.is_const:
+                raise CompileError(
+                    'cannot use a pointer to a mutable compile-time variable as a runtime value'
+                )
+            return self._const_pointer_to_mir(ComptimeVal(obj), obj.type)
+        if isinstance(obj, sval.CastedPtr):
+            raise CompileError('cannot use a pointer cast as a runtime value')
+        if isinstance(obj, sval.AggregateValue):
+            return self._aggregate_to_runtime(obj)
+        if isinstance(obj, sval.OptionValue):
+            option = obj.get_type()
+            assert isinstance(option, sval.OptionType)
+            return self._option_parts_to_runtime(option, ComptimeVal(False), ComptimeVal(obj.value))
+        if isinstance(obj, sval.TaggedUnionValue):
+            return self._tagged_union_parts_to_runtime(
+                obj.type, ComptimeVal(sval.Int(obj.index, obj.type.tag_type())), ComptimeVal(obj.value),
+            )
+        if isinstance(obj, (sval.Null, sval.TypedNull)):
+            option = sval.type_of(obj)
+            if not isinstance(option, sval.OptionType):
+                raise CompileError('cannot use a null value as a runtime value')
+            child = option.child
+            payload = ComptimeVal(child.get_unit_value()) if child.is_zst() else ComptimeVal(sval.UndefinedScalar(child))
+            return self._option_parts_to_runtime(option, ComptimeVal(True), payload)
+        if isinstance(obj, FunctionValue):
+            # a source function value lowers to the address of its compiled
+            # specialization (see §4.3)
+            return self._function_value_to_mir(obj)
+        return _sval_to_runtime(obj, self._mir_cache)
+
+    def _function_value_to_mir(self, fn: FunctionValue) -> mir.Value:
+        """The runtime ``mir`` value of the function value ``fn``: the in-module
+        ``mir.Function`` of its default specialization, or an external symbol when
+        it was compiled in an earlier module (see §4.3).  A generic function has no
+        default specialization and an inlined Python one is no runtime function at
+        all, so both are rejected."""
+        if fn.force_inline:
+            raise CompileError(
+                f'cannot lower {fn.hir.name}: an inlined Python function is not a runtime function'
+            )
+        sig = fn.hir.signature
+        if sig.is_generic():
+            raise CompileError(
+                f'cannot lower the generic function {fn.hir.name}: specialize it first'
+            )
+        provided_args: list[ArgNode] = []
+        for arg in sig.positional.by_id:
+            assert arg.type is not None
+            provided_args.append(_provided_node_of_type(arg.type))
+        provided = ArgList(tuple(provided_args), (), frozendict())
+        call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
+        res = self._analyser._request_function(fn, call_sig, partial_ret_sig)
+        if res is None:
+            raise CompileError(
+                f'the function value {fn.hir.name} is not compiled yet; '
+                f'call std.core.compile on it first'
+            )
+        fn_mir, _ret_sig = res
+        return fn_mir
+
+    def _builtin_compile(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+        """``std.core.compile(fn)``: compile the non-generic function value ``fn``
+        ahead of time (its default specialization, built from its declared types),
+        so that a later store or conversion of it can be lowered to a
+        ``mir.Function`` (see ``_function_value_to_mir``)."""
+        obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[0])))
+        if not isinstance(obj, FunctionValue):
+            raise CompileError('std.core.compile expects a spy function')
+        if obj.force_inline:
+            raise CompileError('std.core.compile cannot compile an inlined Python function')
+        sig = obj.hir.signature
+        if sig.is_generic():
+            raise CompileError('std.core.compile does not accept a generic function')
+        provided_args: list[ArgNode] = []
+        for arg in sig.positional.by_id:
+            assert arg.type is not None
+            provided_args.append(_provided_node_of_type(arg.type))
+        provided = ArgList(tuple(provided_args), (), frozendict())
+        call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
+
+        def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
+            self.store(ret, ComptimeVal(obj))
+            return PollResult.AGAIN
+
+        return self._request_function(obj, call_sig, partial_ret_sig, _resumer)
+
+    def _aggregate_to_runtime(self, ev: sval.AggregateValue) -> mir.Value:
         """Build the runtime value of the aggregate ``ev`` from its fields,
         with a chain of ``mir.InsertValue``: a struct mirror that *is* one of
         its fields (see ``sval.StructType.mirror_is_a_field``) yields that
@@ -5102,18 +4726,18 @@ class HirRunner:
                 # field: the value *is* that field's value
                 for index, mir_index in enumerate(indices):
                     if mir_index is not None:
-                        return self._to_runtime(ev.values[index])
+                        return self._to_runtime(ComptimeVal(ev.values[index]))
                 raise CompileError(f'{aggregate_type} has no stored field')
             result: mir.Value = mir.UndefValue(mir_type)
             for index, mir_index in enumerate(indices):
                 if mir_index is None:
                     continue
-                result = self._emit(mir.InsertValue(result, self._to_runtime(ev.values[index]), mir_index))
+                result = self._emit(mir.InsertValue(result, self._to_runtime(ComptimeVal(ev.values[index])), mir_index))
             return result
-        # an array: the elements sit in element order
+        # an array/tuple: the elements sit in element order
         result = mir.UndefValue(mir_type)
         for index, value in enumerate(ev.values):
-            result = self._emit(mir.InsertValue(result, self._to_runtime(value), index))
+            result = self._emit(mir.InsertValue(result, self._to_runtime(ComptimeVal(value)), index))
         return result
 
     def _option_parts_to_runtime(self, option: sval.OptionType, is_null: InterpVal, value: InterpVal) -> mir.Value:
@@ -5231,8 +4855,8 @@ class HirRunner:
         it is - only the pointee type changes, see ``mir.BitCast``) and one of
         the very same type is left alone.  A *compile-time* pointer is
         materialized with ``_coerce`` when its place converts to the target and
-        wrapped in a :class:`ComptimeCastedPtr` otherwise; recasting one of
-        those drops the wrapper when the target converts the place it wraps."""
+        wrapped in a :class:`sval.CastedPtr` otherwise; recasting one of those
+        drops the wrapper when the target converts the place it wraps."""
         target_obj = _to_comptime(_shallow_normalize(target))
         if not isinstance(target_obj, sval.PointerType):
             raise CompileError(f'ptr_cast needs a pointer type, got {target_obj!r}')
@@ -5246,27 +4870,37 @@ class HirRunner:
             mir_type = target_obj.to_mir_type(self._mir_cache)
             assert isinstance(mir_type, mir.PointerType)
             return RuntimeVal(self._emit(mir.BitCast(ev.value, mir_type)), target_obj)
-        if isinstance(ev, ComptimeCastedPtr):
+        if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.CastedPtr):
             # a pointer already reinterpreted once: when the new target converts
             # the place it wraps, the place itself is the value (the wrapper is
-            # dropped); otherwise the place is wrapped with the new type
-            if self._try_coerce(ev.place, target_obj) is not None:
-                return ev.place
-            return ComptimeCastedPtr(ev.place, target_obj)
+            # dropped); otherwise it is wrapped with the new type
+            inner = ev.obj.ptr
+            if inner.type.is_subtype_of(target_obj):
+                return ComptimeVal(sval.ComptimePtr(inner.box, inner.offset, target_obj))
+            return ComptimeVal(sval.CastedPtr(inner, target_obj))
+        if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.ComptimePtr):
+            # a compile-time pointer: the view type is what changes
+            inner = ev.obj
+            if inner.type.is_subtype_of(target_obj):
+                return ComptimeVal(sval.ComptimePtr(inner.box, inner.offset, target_obj))
+            return ComptimeVal(sval.CastedPtr(inner, target_obj))
+        if isinstance(ev, ComptimeVal) and isinstance(ev.obj, bytes):
+            # a byte string: the pointer points into the byte-string store (see
+            # the byte-string lowering, ``_string_global``)
+            return ComptimeVal(sval.ComptimePtr(ev.obj, 0, target_obj))
         coerced = self._try_coerce(ev, target_obj)
         if coerced is not None:
             return coerced
-        return ComptimeCastedPtr(ev, target_obj)
+        raise CompileError(f'cannot ptr_cast a {from_type} value')
 
     def exec_make_closure(self, inst: hir.MakeClosure) -> PollResult:
-        """Create a closure value (see ``hir.MakeClosure``): evaluate the
+        """Create a closure value (see ``hir.MakeClosure`` and §9): evaluate the
         nested def's parameter annotations, defaults and return annotation into
-        the concrete signature, then evaluate the capture places, and package
-        them into a :class:`ClosureValue`.  A closure only exists at compile
-        time; the captures are kept as they are - the compiler decides at the
-        call site whether each is passed as a pointer (a runtime place) or used
-        as a compile-time value (a compile-time place), and an inlined closure
-        forwards them as they came (see ``_call_function_entry``)."""
+        the concrete signature, then the capture places, and build an *anonymous
+        struct* whose fields are the captures (``_i``) and whose ``__call__`` is
+        the closure's own body (with ``self`` prepended to its parameters).  A
+        closure is thus an ordinary struct value holding its captures - it can be
+        stored, passed, returned and called through ``__call__`` like any other."""
         fn = inst.fn
         positional: IndexedMap[str, SignatureFormalArg] = IndexedMap()
         for i, name in enumerate(fn.param_names):
@@ -5313,14 +4947,68 @@ class HirRunner:
             fn.generic_args, positional, varargs, kwargs, ret_type, fn.exceptions,
             fn.callconv, fn.may_panic,
         )
-        hir_ir = FunctionIR(fn.name, sig, fn.arg_is_ref, fn.body)
-        captures = tuple(self.operand(capture) for capture in inst.captures)
         # the native name is prefixed with the creating frame's function name
         # (the enclosing specialization, its signature included) - known only
         # here, not at parse time
         name_base = f'{self._frames[-1].fn_name}.{fn.local_name}'
+        captures = tuple(self.operand(capture) for capture in inst.captures)
+        move = inst.move
+        # the anonymous struct's fields: one per capture, named ``_i`` (see §9.1).
+        # A compile-time capture is baked into the field's type as an
+        # ``is_comptime`` field (``move=False`` keeps the *pointer*, dereferenced
+        # on a read - ``is_ref``; ``move=True`` bakes the value), a runtime
+        # capture is a plain field (``move=False`` stores the pointer - ``is_ref``
+        # - ``move=True`` stores a copy)
+        head = sval.StructTypeHead(f'{name_base}$closure')
+        field_defaults: list[sval.AnyValue | None] = []
+        for index, capture in enumerate(captures):
+            obj = _to_comptime(capture)
+            if obj is not None:
+                if isinstance(obj, sval.ComptimePtr):
+                    type = obj.type.elem
+                else:
+                    type = sval.type_of(obj)
+                    if type is None:
+                        raise CompileError(f'cannot capture the compile-time value {obj!r}')
+                by_ref = isinstance(obj, sval.ComptimePtr) and not move
+                head.add_field(f'_{index}', type, obj, True, by_ref)
+                field_defaults.append(obj)
+                continue
+            type = _place_type(capture)
+            if type is None:
+                raise CompileError('cannot capture a value whose type is not known')
+            head.add_field(f'_{index}', type, None, False, not move)
+            field_defaults.append(None)
+        struct_type = head.specialize(())
+        # the ``__call__`` method: the closure's own body, with ``self`` (a
+        # pointer to the anonymous struct) prepended to its parameters (the body
+        # already reads ``Arg(0)`` as its self and the captures as its fields)
+        call_positional: IndexedMap[str, SignatureFormalArg] = IndexedMap()
+        call_positional.add('self', SignatureFormalArg(
+            sval.PointerType(struct_type, is_const=False), False, None, TriState.UNKNOWN, False,
+        ))
+        for name, param in sig.positional.items():
+            call_positional.add(name, param)
+        call_sig = Signature(
+            sig.generic_args, call_positional, sig.varargs, sig.kwargs, sig.ret_type,
+            sig.exceptions, sig.callconv, sig.may_panic,
+        )
+        call_ir = FunctionIR(f'{name_base}.__call__', call_sig, (True,) + fn.arg_is_ref, fn.body)
+        head.methods['__call__'] = FunctionValue(f'{name_base}.__call__', call_ir)
+        # the closure value: an instance of the anonymous struct holding the
+        # runtime captures (a compile-time one is baked into the field's default)
+        is_comptime = struct_type.classify() != sval.SpecialTypeKind.NONE
+        place = self._aggregate_place(struct_type, is_comptime=is_comptime)
+        for index, capture in enumerate(captures):
+            if field_defaults[index] is not None:
+                continue
+            field0 = struct_type.fields().get_by_id(index)
+            if field0.is_ref:
+                self.store(self._field_storage_addr(place, struct_type, index), capture)
+            else:
+                self.store(self.field_index_addr(place, _index_value(index)), self.load(capture))
         regs = self._frames[-1].regs
-        regs[inst] = ComptimeVal(ClosureValue(fn, hir_ir, captures, name_base))
+        regs[inst] = place
         return PollResult.AGAIN
 
     def exec_as_func_ptr(self, inst: hir.AsFuncPtr) -> PollResult:
@@ -5346,53 +5034,25 @@ class HirRunner:
             return PollResult.AGAIN
         if not isinstance(obj, FunctionValue):
             raise CompileError(f'as_func_ptr expects a spy function, got {obj!r}')
-        capture_specs: tuple[ArgNode, ...] = ()
-        if isinstance(obj, ClosureValue):
-            # a non-inlined closure is an ordinary runtime function when none of
-            # its captures refers to a runtime register: a runtime capture would
-            # become a hidden pointer parameter (its address), which a function
-            # pointer typed ``T`` has no place for, while a compile-time capture
-            # (a compile-time pointer, whose content is baked into the
-            # specialization) needs none.
-            if obj.force_inline:
-                raise CompileError(
-                    'cannot take the function pointer of an inlined closure'
-                )
-            capture_specs = tuple(
-                self._val_to_node(capture, False)
-                for capture in obj.captures
-            )
-            for spec in capture_specs:
-                if _arg_node_needs_mir(spec):
-                    raise CompileError(
-                        'cannot take the function pointer of a closure that captures '
-                        'a runtime value'
-                    )
-            declared = obj.hir.signature.as_non_generic_fn_type()
-            if declared != fn_type:
-                raise CompileError(
-                    f'as_func_ptr: closure {obj.hir.name} has type {declared}, not {fn_type}'
-                )
-            sig = obj.hir.signature
-        elif obj.force_inline:
+        if obj.force_inline:
             raise CompileError(
                 'cannot take the function pointer of an inlined Python function'
             )
-        else:
-            declared = obj.get_type()
-            if declared != fn_type:
-                raise CompileError(
-                    f'as_func_ptr: function {obj.hir.name} has type {declared}, not {fn_type}'
-                )
-            sig = obj.hir.signature
+        # TODO(§9.5): a closure value is an anonymous struct with a ``__call__``:
+        # ``as_func_ptr`` of a *zero-sized* such struct is the ``__call__`` with
+        # its ``self`` parameter dropped
+        declared = obj.get_type()
+        if declared != fn_type:
+            raise CompileError(
+                f'as_func_ptr: function {obj.hir.name} has type {declared}, not {fn_type}'
+            )
+        sig = obj.hir.signature
         provided_args: list[ArgNode] = []
         for arg in sig.positional.by_id:
             assert arg.type is not None
             provided_args.append(_provided_node_of_type(arg.type))
         provided = ArgList(tuple(provided_args), (), frozendict())
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
-        if len(capture_specs) > 0:
-            call_sig = replace(call_sig, captures=capture_specs)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
             regs[inst] = RuntimeVal(fn_mir, sval.PointerType(fn_type, is_const=True))
@@ -5544,9 +5204,9 @@ class HirRunner:
         widened to the other operand's element type (the implicit ``T ->
         Complex[T]`` conversion).
 
-        Both operands are first turned into their complex value form (a
-        ``ComptimeAggregate``, see ``as_comptime_aggregate``), so a
-        compile-time pair folds and a runtime one emits the arithmetic."""
+        Both operands are first turned into their complex number form (see
+        ``_complex_parts``), so a compile-time pair folds and a runtime one emits
+        the arithmetic."""
         if lhs_type is None or rhs_type is None:
             raise CompileError(f"cannot apply '{op}' to untyped objects")
         if op not in ('+', '-', '*', '/'):
@@ -5559,14 +5219,13 @@ class HirRunner:
             raise CompileError(f"cannot apply '{op}' to {lhs_type} and {rhs_type}")
         elem = target.elem
 
-        # the values are turned into their complex value form first: the real
-        # and imaginary parts of a compile-time value are compile-time, those of
-        # a runtime one are read out of the value itself (see
-        # ``as_comptime_aggregate``)
-        a = self.as_comptime_aggregate(self._coerce(self._arg_value(lhs), target))
-        b = self.as_comptime_aggregate(self._coerce(self._arg_value(rhs), target))
-        ar, ai = a.values[0], a.values[1]
-        br, bi = b.values[0], b.values[1]
+        # the values are turned into their two parts first: the real and
+        # imaginary parts of a compile-time value are compile-time, those of a
+        # runtime one are read out of the value itself (see ``_complex_parts``)
+        a = self._complex_parts(self._coerce(self._arg_value(lhs), target))
+        b = self._complex_parts(self._coerce(self._arg_value(rhs), target))
+        ar, ai = a
+        br, bi = b
 
         def arith(op: BinaryOp, x: InterpVal, y: InterpVal) -> InterpVal:
             return self._fold_or_emit_arith_value(op, x, y, elem)
@@ -5588,7 +5247,7 @@ class HirRunner:
             denom = arith('+', arith('*', br, br), arith('*', bi, bi))
             re = arith('/', arith('+', arith('*', ar, br), arith('*', ai, bi)), denom)
             im = arith('/', arith('-', arith('*', ai, br), arith('*', ar, bi)), denom)
-        self.store(ret, ComptimeAggregate(target, (re, im)))
+        self.store(ret, self._complex_value(target, re, im))
         return PollResult.AGAIN
 
     def _eval_divide(self, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret: InterpVal) -> PollResult:
@@ -5855,7 +5514,7 @@ class HirRunner:
         slot first (like ``astgen._as_ref``)."""
         if arg.is_ref:
             return arg.value
-        slot = self.alloca(InlineMode.NON_AGGREGATE)
+        slot = self.alloca(None)
         self.store(slot, arg.value)
         self._commit_pending_slot(slot)
         return _shallow_normalize(slot)
@@ -5969,7 +5628,7 @@ class HirRunner:
             base, other, name = rhs, lhs, reflected
         else:
             raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
-        slot = self.alloca(InlineMode.NON_AGGREGATE)
+        slot = self.alloca(None)
         regs = self._frames[-1].regs
 
         def on_return() -> None:
@@ -6083,87 +5742,19 @@ class HirRunner:
         # declares one (``__iadd__``, ...); otherwise it is ``x = x op y``
         left_type = _place_type(left)
         if isinstance(left_type, sval.TupleType):
-            # a tuple has no storage of its own, so ``t += u`` is not
-            # ``t = t + u`` (which is not supported for tuples): it extends the
-            # tuple place *in place* by aliasing the elements of ``u`` onto it
-            # (see ``_tuple_extend_in_place``)
-            if op != '+':
-                raise CompileError(
-                    f"a tuple only supports in-place extension with '+=', got '{op}='"
-                )
-            return self._tuple_extend_in_place(left, right)
+            # a tuple ``+=`` is not supported: a tuple now has a runtime
+            # representation, so there is no in-place extension to speak of (see
+            # §7.5) - accumulate into a tuple type built field by field instead
+            raise CompileError('a tuple does not support ``+=``')
         if isinstance(left_type, sval.StructType):
             _, _, inplace = _BINARY_METHODS[op]
             if self._resolve_method(left_type, inplace) is not None:
                 return self.call_method(left, inplace, RawArgList((right,), frozendict()), left)
         return self._eval_binary(op, ArgEntry(left, True), right, left)
 
-    def _tuple_extend_in_place(self, place: InterpVal, right: ArgEntry[InterpVal]) -> PollResult:
-        """``t += u`` where ``t`` is a tuple place: extend ``t`` in place by the
-        elements of the tuple ``u``.
-
-        A tuple has no storage of its own - a tuple variable *is* its
-        :class:`ComptimeTuplePtr`, the tuple of element places - so extending it
-        neither copies nor goes through ``store`` in the common case: a
-        reference to a *stable* place (one whose address is defined in the entry
-        block, see ``_tuple_extend_element``) and the fresh place of a bare
-        value are aliased onto ``t``, and the target is *re-seated* to the
-        concatenation by rebinding its ``values``.  That is what makes an
-        in-place accumulation over non-copyable elements possible: such an
-        element is never loaded out of its place.
-
-        Only a committed tuple place can be a target: an uncommitted slot has no
-        element places yet (it is no operand, see ``PendingSlot``), and a box
-        never holds a tuple."""
-        target = _shallow_normalize(place)
-        if not isinstance(target, ComptimeTuplePtr):
-            raise CompileError(
-                f'cannot extend {target!r} in place: a tuple ``+=`` needs a tuple place'
-            )
-        if not isinstance(_arg_type_of(right), sval.TupleType):
-            raise CompileError('a tuple ``+=`` needs a tuple on the right-hand side')
-        places = list(target.values)
-        for entry in _tuple_arg_entries(right):
-            places.append(self._tuple_extend_element(entry))
-        target.values = tuple(places)
-        return PollResult.AGAIN
-
-    def _tuple_extend_element(self, entry: ArgEntry[InterpVal]) -> InterpVal:
-        """The place one element of ``t += u`` is aliased onto ``t`` as (see
-        ``_tuple_extend_in_place``).
-
-        A bare value goes into a fresh place of its own (a store *into* a place,
-        never a read *out* of one, see ``_inline_arg_place``).  A reference is
-        aliased as the place it already is only while its address is *defined in
-        the entry block* - an ``Alloca`` or a ``Param`` - so that it dominates
-        every later read or write through ``t``; a compile-time place is stable
-        too.  A reference to a block-local register address (a ``Gep``, whether
-        or not its index is constant, a ``BitCast``, an address derived from a
-        load or a call, ...) cannot be a tuple element place - reading it from
-        another block would not be dominated by its definition - so its value is
-        copied into a fresh place of its own; a non-copyable element has no such
-        copy and is rejected."""
-        if not entry.is_ref:
-            return self._inline_arg_place(entry)
-        place = _shallow_normalize(entry.value)
-        if not (
-            isinstance(place, RuntimeVal)
-            and not isinstance(place.value, (mir.Alloca, mir.Param))
-        ):
-            return entry.value
-        elem = _place_type(place)
-        if elem is None or not elem.is_copyable():
-            raise CompileError(
-                f'cannot append a reference to a block-local place of the '
-                f'non-copyable type {elem} to a tuple'
-            )
-        slot = self.alloca(InlineMode.NONE, declared=elem)
-        self.store(slot, self.load(place))
-        return slot
-
     # -- calls ----------------------------------------------------------------
 
-    def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None, captures: tuple[InterpVal, ...] | None = None) -> PollResult:
+    def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None) -> PollResult:
         """Resolve one call by its callee value and run it.  Spy
         functions compile to a native ``call`` producing a typed
         register, plain Python functions are inlined, and the spy
@@ -6175,12 +5766,6 @@ class HirRunner:
         (see ``_call_function_entry``); None when the caller wants nothing
         more.
 
-        ``captures`` are the capture places the call point provides (see
-        ``hir.CallInplace.captures``): ``None`` when the call point provides
-        none, a tuple (possibly empty) to override the callee's own.  It only
-        applies to a ``FunctionValue``/``ClosureValue`` callee; any other
-        callee with a non-``None`` ``captures`` is an error.
-
         Returns ``PollResult.AGAIN`` when the call completed here (an
         inlined callee's body writes into the result location directly),
         or ``PollResult.SUSPEND`` when the callee's specialization was
@@ -6191,42 +5776,33 @@ class HirRunner:
         target = _callee_object(callee)
         if target is not None:
             if isinstance(target, FunctionValue):
-                # a ``ClosureValue`` is a ``FunctionValue``: both dispatch through
-                # the common entry, which unifies the captures (see
-                # ``_call_function_entry``)
-                return self._call_function_entry(target, args, ret, on_return=on_return, captures=captures)
+                return self._call_function_entry(target, args, ret, on_return=on_return)
             if isinstance(target, sval.BoundMethod):
                 # a method of a generic struct resolved from a value: the
                 # struct's type-argument values are substituted into the
                 # method's signature (see ``_call_function_entry``)
                 fn = target.fn
                 assert isinstance(fn, FunctionValue), 'a bound method holds a function value'
-                return self._call_function_entry(fn, args, ret, target.generic_var_values, on_return=on_return, captures=captures)
+                return self._call_function_entry(fn, args, ret, target.generic_var_values, on_return=on_return)
             if isinstance(target, sval.BuiltinFn):
-                if captures is not None:
-                    raise CompileError('cannot provide captures to a builtin call')
                 res = self._call_builtin(target, args, ret)
                 if res == PollResult.AGAIN and on_return is not None:
                     on_return()
                 return res
         callee_type = _type_of(callee)
-        # a call of a *struct value* through its ``__call__`` method: the callee
-        # is a place, so its type is a pointer to the struct, and the address is
-        # the receiver the method is called on (see ``std.core.as_runtime_closure``)
+        # a call of a *struct value* through its ``__call__`` method (a closure is
+        # such a struct, see §9): the callee is a place, so its type is a pointer
+        # to the struct, and the address is the receiver the method is called on
         if (
             isinstance(callee_type, sval.PointerType)
             and isinstance(callee_type.elem, sval.StructType)
             and callee_type.elem.get_method('__call__') is not None
         ):
-            if captures is not None:
-                raise CompileError('cannot provide captures to a struct ``__call__``')
             return self.call_method(callee, '__call__', args, ret, on_return)
         # a runtime function pointer: a value of a pointer-to-function type,
         # called through the pointer the value carries (a function type alone
         # is dynamically sized, so only a pointer to one is a value)
         if isinstance(callee_type, sval.PointerType) and isinstance(callee_type.elem, sval.FunctionType):
-            if captures is not None:
-                raise CompileError('cannot provide captures to a function pointer call')
             return self._call_fn_ptr(callee, callee_type.elem, args, ret, on_return)
         raise CompileError(
             f"cannot compile a call to {callee!r}; only spy functions, plain Python "
@@ -6280,18 +5856,14 @@ class HirRunner:
             # location coerces it to that location's type
             self.store(ret, ComptimeVal(sval.UntypedUndefined()))
             return PollResult.AGAIN
-        if fn.name == 'as_static_ptr':
-            return self._as_static_ptr(binded, ret)
         if fn.name == 'layout_of':
             return self._layout_builtin(binded, ret)
         if fn.name == 'panic':
             return self._builtin_panic(binded)
         if fn.name == 'catch_unwind':
             return self._builtin_catch_unwind(binded, ret)
-        if fn.name == 'gstr':
-            return self._builtin_gstr(binded, ret)
-        if fn.name == 'sstr':
-            return self._builtin_sstr(binded, ret)
+        if fn.name == 'compile':
+            return self._builtin_compile(binded, ret)
         if fn.name == 'const_array':
             return self._builtin_const_array(binded, ret)
         if fn.name == 'bitcast':
@@ -6302,8 +5874,6 @@ class HirRunner:
             return self._builtin_coerce(binded, ret)
         if fn.name == 'compile_error':
             return self._builtin_compile_error(binded)
-        if fn.name == 'as_runtime_closure':
-            return self._builtin_as_runtime_closure(binded, ret)
         if fn.name == 'atomic_load':
             return self._builtin_atomic_load(binded, ret)
         if fn.name == 'atomic_store':
@@ -6316,7 +5886,7 @@ class HirRunner:
             return self._builtin_atomic_fence(binded, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 
-    # -- ``std.core.gstr`` / ``std.core.sstr`` -------------------------------
+    # -- byte-string builtins ------------------------------------------------
 
     def _bytes_builtin_arg(self, args: ArgList[ArgEntry[InterpVal]], what: str) -> bytes:
         """The compile-time ``bytes`` value the one argument of a byte-string
@@ -6328,8 +5898,7 @@ class HirRunner:
 
     def _string_global(self, data: bytes) -> mir.GlobalStringValue:
         """The global static constant holding the bytes ``data`` plus a trailing
-        NUL (the C-style terminator; a caller that wants a length, such as
-        ``sstr``, does not count it).  Identical byte strings share one global
+        NUL (the C-style terminator).  Identical byte strings share one global
         through the analyser's cache, so a body that names the same bytes twice
         emits one location."""
         cache = self._analyser._string_globals
@@ -6338,29 +5907,6 @@ class HirRunner:
             global_value = mir.GlobalStringValue(data + b'\0')
             cache[data] = global_value
         return global_value
-
-    def _string_ptr_type(self) -> sval.PointerType:
-        return sval.PointerType(
-            sval.IntType(8, False), is_const=True, variant=sval.PointerVariant.MULTI
-        )
-
-    def _builtin_gstr(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
-        """``std.core.gstr(s)``: a global static constant holding the bytes of the
-        compile-time byte string ``s``, the result a ``ConstMultiPtr[u8]`` to it."""
-        data = self._bytes_builtin_arg(args, 'std.core.gstr')
-        self.store(ret, RuntimeVal(self._string_global(data), self._string_ptr_type()))
-        return PollResult.AGAIN
-
-    def _builtin_sstr(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
-        """``std.core.sstr(s)``: the ``ConstSlicePtr[u8]`` of the compile-time byte
-        string ``s`` - ``gstr(s)`` and the number of bytes."""
-        data = self._bytes_builtin_arg(args, 'std.core.sstr')
-        slice_type = self._special_type.slice_ptr_of(sval.IntType(8, False), True)
-        self.store(ret, ComptimeAggregate(slice_type, (
-            RuntimeVal(self._string_global(data), self._string_ptr_type()),
-            ComptimeVal(sval.Int(len(data), self._usize_type())),
-        )))
-        return PollResult.AGAIN
 
     # -- ``std.core.const_array`` --------------------------------------------
 
@@ -6654,18 +6200,16 @@ class HirRunner:
         _check_atomic_rmw_op(complex_type, op)
         elem = complex_type.elem
         ptr = self._to_runtime(ptr_ev)
-        parts = self.as_comptime_aggregate(
-            self._coerce(self._arg_value(value_arg), complex_type)
-        )
+        parts = self._complex_parts(self._coerce(self._arg_value(value_arg), complex_type))
         old: list[InterpVal] = []
         for index in (0, 1):
             part_ptr = self._emit(mir.Gep(ptr, index))
-            part_value = self._to_runtime(parts.values[index])
+            part_value = self._to_runtime(parts[index])
             old.append(RuntimeVal(
                 self._emit(mir.AtomicRmw(op, part_ptr, part_value, ordering, volatile)),
                 elem,
             ))
-        self.store(ret, ComptimeAggregate(complex_type, tuple(old)))
+        self.store(ret, self._complex_value(complex_type, old[0], old[1]))
         return PollResult.AGAIN
 
     def _builtin_atomic_cmpxchg(
@@ -6692,7 +6236,7 @@ class HirRunner:
         ))
         old = self._emit(mir.ExtractValue(exchange, 0))
         ok = self._emit(mir.ExtractValue(exchange, 1))
-        self.store(ret, ComptimeTuple((
+        self.store(ret, self._build_tuple_value((
             ArgEntry(RuntimeVal(old, elem), False),
             ArgEntry(RuntimeVal(ok, sval.BoolType()), False),
         )))
@@ -6737,7 +6281,7 @@ class HirRunner:
         ``mir.Panic``).  It never returns, so it ends the current path."""
         panic_type = self._panic_data_type()
         value = self._arg_value(args.positional[0])
-        slot = self.alloca(InlineMode.NONE)
+        slot = self.alloca(False)
         self._commit_pending_slot(slot, panic_type)
         self.store(slot, value)
         pointer = self._to_runtime(_shallow_normalize(slot))
@@ -6750,349 +6294,23 @@ class HirRunner:
         return self._cut()
 
     def _builtin_catch_unwind(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
-        """``std.core.catch_unwind(fn)``: call the non-inline closure ``fn`` and
-        catch a panic it raises (see ``mir.CatchUnwind``); the caught payload is
-        delivered as an ``UnwindException`` through the ordinary error path."""
-        target = _callee_object(self._arg_value(args.positional[0]))
-        if not isinstance(target, ClosureValue):
+        """``std.core.catch_unwind(fn)``: call the closure ``fn`` (an anonymous
+        struct with a ``__call__``) and catch a panic it raises (see
+        ``mir.CatchUnwind``); the caught payload is delivered as an
+        ``UnwindException`` through the ordinary error path."""
+        callable_place = self._arg_value(args.positional[0])
+        ptr = self._auto_deref(callable_place)
+        ptr_type = _type_of(ptr)
+        if not (isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.StructType)):
             raise CompileError('the argument of std.core.catch_unwind must be a closure')
-        if target.force_inline:
-            raise CompileError(
-                'the closure passed to std.core.catch_unwind must be compiled '
-                'into a runtime function (@syntax.closure(inline=False))'
-            )
-        empty: RawArgList[ArgEntry[InterpVal]] = RawArgList((), frozendict())
-        return self._call_function_entry(target, empty, ret, catch_unwind=True)
-
-    # -- ``std.core.as_runtime_closure`` -------------------------------------
-
-    def _builtin_as_runtime_closure(
-        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
-    ) -> PollResult:
-        """``std.core.as_runtime_closure(closure, as_copy=False)``: turn a
-        compile-time closure into an ordinary spy struct value (see
-        ``RuntimeClosurePlan``).  The struct's fields hold the closure's runtime
-        captures and its ``__call__`` rebuilds them and calls the closure, so the
-        value can be stored, passed, returned and called like any other."""
-        closure, as_copy = self._runtime_closure_args(args)
-        # materialize the captures first: ``_val_to_node`` reads them as places
-        capture_places: list[InterpVal] = []
-        for capture in closure.captures:
-            if isinstance(capture, PendingSlot) and capture.committed is None:
-                self._commit_pending_slot(capture)
-            capture_places.append(_shallow_normalize(capture))
-        plan = self._build_runtime_closure(closure, tuple(capture_places), as_copy)
-        # build the struct straight into the destination: the leaves are written
-        # through its address (see ``_fill_runtime_closure``), so no temporary
-        # struct and no whole-struct copy is made.  A destination that has no
-        # address of its own yet - a variable slot (its ``CommitSlot`` commits
-        # it later) or a field of a struct still being built (``finish_struct``
-        # binds it later) - is written through the deferred address
-        # ``_defer_ptr_convertion`` supplies; recording that action also forces
-        # the slot into memory (its ``info`` is never-inline), which the
-        # ``self`` the generated ``__call__`` receives requires (see 2.9).
-        if isinstance(ret, PendingSlot) and ret.committed is None:
-            dest = self._defer_ptr_convertion(ret, plan.struct_type)
-        else:
-            dest = ret
-        self._fill_runtime_closure(plan, dest)
-        return PollResult.AGAIN
-
-    def _runtime_closure_args(
-        self, args: ArgList[ArgEntry[InterpVal]]
-    ) -> tuple[ClosureValue, bool]:
-        """The ``(closure, as_copy)`` of one ``as_runtime_closure`` call.  The
-        arguments are already bound to the builtin's signature (see
-        ``sval.BuiltinSignature.bind``), so the missing ``as_copy`` has been
-        filled with its default ``False``."""
-        target = _callee_object(self._arg_value(args.positional[0]))
-        if not isinstance(target, ClosureValue):
-            raise CompileError('the closure argument of std.core.as_runtime_closure must be a closure')
-        obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[1])))
-        if not isinstance(obj, bool):
-            raise CompileError('the as_copy argument of std.core.as_runtime_closure must be a compile-time bool')
-        return target, obj
-
-    def _build_runtime_closure(
-        self, closure: ClosureValue, capture_places: tuple[InterpVal, ...], as_copy: bool
-    ) -> RuntimeClosurePlan:
-        """Build the struct type and ``__call__`` of one converted closure (see
-        ``RuntimeClosurePlan``): collect the fields in canonical order, make the
-        struct type, generate ``__call__`` (whose ``self`` is a pointer to the
-        struct) and attach it as the struct's method."""
-        uid = self._runtime_closure_counter
-        self._runtime_closure_counter += 1
-        captures = tuple(self._val_to_node(place, False) for place in capture_places)
-        field_types: list[sval.Type] = []
-        leaf_bases: list[int] = []
-        for node in captures:
-            leaf_bases.append(len(field_types))
-            self._collect_capture_fields(node, as_copy, True, field_types)
-        head = sval.StructTypeHead(f'{closure.name_base}$closure#{uid}')
-        for i, type in enumerate(field_types):
-            head.add_field(f'_cap{i}', type)
-        struct_type = head.specialize(())
-        call_fn = self._build_call_function(
-            closure, struct_type, captures, tuple(leaf_bases), as_copy, uid
-        )
-        # ``StructType.get_method`` reads ``head.methods`` on every call, so
-        # attaching the method after ``specialize`` is fine
-        head.methods['__call__'] = call_fn
-        return RuntimeClosurePlan(
-            struct_type=struct_type,
-            call_fn=call_fn,
-            as_copy=as_copy,
-            field_names=tuple(f'_cap{i}' for i in range(len(field_types))),
-            field_types=tuple(field_types),
-            captures=captures,
-            capture_places=capture_places,
-            leaf_bases=tuple(leaf_bases),
-        )
-
-    def _collect_capture_fields(
-        self, node: ArgNode, as_copy: bool, top: bool, out: list[sval.Type]
-    ) -> None:
-        """Append the field type of every runtime leaf of one capture ``node`` to
-        ``out``, in the canonical order (see ``_val_to_node``).  ``top`` marks
-        the capture's own root: a top-level runtime capture is a place, so it
-        contributes a pointer field (or its pointee under ``as_copy``).  A
-        zero-sized pointee (the ``self`` of a zero-sized struct, say)
-        contributes a zero-sized field: ``field_index_addr`` has no storage for
-        it and its stores are no-ops, which is self-consistent."""
-        if isinstance(node, RuntimeArgNode):
-            if top:
-                assert isinstance(node.type, sval.PointerType), \
-                    f'a runtime capture must be a place, got {node.type}'
-                out.append(node.type.elem if as_copy else node.type)
-            else:
-                out.append(node.type)
-            return
-        if isinstance(node, ComptimePtrArg):
-            self._collect_capture_fields(node.content, as_copy, False, out)
-            return
-        if isinstance(node, tuple):
-            for child in node:
-                self._collect_capture_fields(child, as_copy, False, out)
-            return
-        if isinstance(node, frozendict):
-            for child in node.values():
-                self._collect_capture_fields(child, as_copy, False, out)
-            return
-        if isinstance(node, CompoundArgNode):
-            if isinstance(node.container_type, sval.OptionType):
-                # mirror ``_content_leaf_values``: the tag is a compile-time leaf
-                # (no field) and a zero-sized child has no payload storage
-                if not node.container_type.child.is_zst():
-                    self._collect_capture_fields(node.elems[1], as_copy, False, out)
-                return
-            for child in node.elems:
-                self._collect_capture_fields(child, as_copy, False, out)
-            return
-        # a pure compile-time leaf: no field
-
-    def _build_call_function(
-        self,
-        closure: ClosureValue,
-        struct_type: sval.StructType,
-        captures: tuple[ArgNode, ...],
-        leaf_bases: tuple[int, ...],
-        as_copy: bool,
-        uid: int,
-    ) -> FunctionValue:
-        """Build the ``__call__`` of one runtime closure struct: an ordinary
-        ``FunctionValue`` whose signature mirrors the closure's (with ``self: Ptr[Struct]``
-        prepended) and whose body rebuilds the captures from the fields and calls
-        the closure."""
-        csig = closure.hir.signature
-        positional = IndexedMap[str, SignatureFormalArg]()
-        positional.add('self', SignatureFormalArg(
-            sval.PointerType(struct_type, is_const=False), False, None, TriState.UNKNOWN, False,
-        ))
-        for name, param in csig.positional.items():
-            positional.add(name, param)
-        sig = Signature(
-            csig.generic_args, positional, csig.varargs, csig.kwargs, csig.ret_type,
-            csig.exceptions, csig.callconv, csig.may_panic,
-        )
-        arg_is_ref = (True,) + closure.hir.arg_is_ref
-        body = self._generate_call_body(closure, captures, leaf_bases, as_copy)
-        fn_ir = FunctionIR(f'{closure.name_base}.__call__', sig, arg_is_ref, body)
-        return FunctionValue(f'{closure.name_base}.__call__#{uid}', fn_ir)
-
-    def _generate_call_body(
-        self,
-        closure: ClosureValue,
-        captures: tuple[ArgNode, ...],
-        leaf_bases: tuple[int, ...],
-        as_copy: bool,
-    ) -> tuple[hir.Inst, ...]:
-        """The HIR body of the generated ``__call__``: one operand per capture
-        (a ``hir.RebuildCapture`` or, for a pure compile-time capture, a
-        ``hir.Const``), then the call of the closure itself."""
-        csig = closure.hir.signature
-        npos = len(csig.positional.by_id)
-        insts: list[hir.Inst] = []
-        operands: list[hir.Value] = []
-        for i, node in enumerate(captures):
-            if isinstance(node, (RuntimeArgNode, ComptimePtrArg, CompoundArgNode, tuple, frozendict)):
-                rebuild = hir.RebuildCapture(node, as_copy, leaf_bases[i], hir.Arg(0))
-                insts.append(rebuild)
-                operands.append(rebuild)
-            else:
-                # a pure compile-time leaf (a spy value or a plain scalar): baked
-                # straight into the body
-                operands.append(hir.Const(node))
-        # the declaration parameters are passed by place: ``hir.Arg(i)`` is the
-        # parameter's storage and ``is_ref=True`` says the argument logically is
-        # the value it holds (see ``_val_to_node``)
-        positional: list[ArgEntry[hir.Value] | hir.Spread] = [
-            ArgEntry(hir.Arg(i), True) for i in range(1, npos + 1)
-        ]
-        kwargs: list[tuple[str, ArgEntry[hir.Value]] | hir.Spread] = []
-        if csig.varargs is not None:
-            positional.append(hir.Spread(hir.Arg(1 + npos)))
-        if csig.kwargs is not None:
-            kwargs.append(hir.Spread(hir.Arg(1 + npos + (1 if csig.varargs is not None else 0))))
-        insts.append(hir.CallInplace(
-            callee=hir.Const(closure),
-            args=hir.CallArgs(tuple(positional), tuple(kwargs)),
-            ret=hir.ResultLoc(),
-            captures=tuple(operands),
-        ))
-        # a body that returns ``Never`` has no value: it may not terminate with a
-        # ``Ret`` (every path of the call already left the frame)
-        if not (csig.ret_type is not None and isinstance(csig.ret_type, sval.EmptyType)):
-            insts.append(hir.Ret())
-        return tuple(insts)
-
-    def _fill_runtime_closure(self, plan: RuntimeClosurePlan, dest: InterpVal) -> None:
-        """Write every runtime leaf of the captures into its field of ``dest``
-        (the struct the conversion builds), in the canonical order shared with
-        ``_val_to_node`` and ``convert_content``."""
-        index = 0
-        for place, node in zip(plan.capture_places, plan.captures):
-            for value in self._capture_leaf_values(place, node, plan.as_copy):
-                self.store(self.field_index_addr(dest, _index_value(index)), value)
-                index += 1
-        if index != len(plan.field_types):
-            # the two traversals can only disagree on a capture holding a nested
-            # runtime-tagged option/union, which is not transportable (see
-            # ``pending-problems`` #1)
-            raise CompileError(
-                'the runtime captures of a closure do not match its struct fields '
-                f'({index} written, {len(plan.field_types)} declared)'
-            )
-
-    def _capture_leaf_values(
-        self, place: InterpVal, node: ArgNode, as_copy: bool
-    ) -> Iterator[InterpVal]:
-        """The runtime leaf values of one capture (the mirror of ``convert_content``
-        read off the capture *place* instead of the MIR arguments): a top-level
-        capture is the place itself (or the value it holds under ``as_copy``); a
-        nested leaf is the value its field will hold."""
-        if isinstance(node, RuntimeArgNode):
-            assert isinstance(node.type, sval.PointerType), \
-                f'a runtime capture must be a place, got {node.type}'
-            yield self.load(place) if as_copy else place
-            return
-        if isinstance(node, ComptimePtrArg):
-            yield from self._content_leaf_values(place, node.content)
-            return
-        # a pure compile-time leaf: no field
-        assert not isinstance(node, (tuple, frozendict, CompoundArgNode))
-
-    def _content_leaf_values(self, place: InterpVal, node: ArgNode) -> Iterator[InterpVal]:
-        """The runtime leaf values nested in a ``ComptimePtrArg``'s content (the
-        mirror of ``convert_content``)."""
-        if isinstance(node, RuntimeArgNode):
-            yield self.load(place)
-            return
-        place = _shallow_normalize(place)
-        if isinstance(node, ComptimePtrArg):
-            yield from self._content_leaf_values(self.load(place), node.content)
-            return
-        if isinstance(node, tuple):
-            assert isinstance(place, ComptimeTuplePtr)
-            for child, sub in zip(node, place.values):
-                yield from self._content_leaf_values(sub, child)
-            return
-        if isinstance(node, frozendict):
-            assert isinstance(place, ComptimeDictPtr)
-            for key, child in node.items():
-                yield from self._content_leaf_values(place.values[key], child)
-            return
-        if isinstance(node, CompoundArgNode):
-            if isinstance(node.container_type, sval.OptionType):
-                assert isinstance(place, ComptimeOptionPtr)
-                if not node.container_type.child.is_zst():
-                    yield from self._content_leaf_values(place.payload_ptr, node.elems[1])
-                return
-            if isinstance(node.container_type, sval.TaggedUnionType):
-                assert isinstance(place, ComptimeTaggedUnionPtr)
-                if _union_variant_type(node.container_type, place.tag).get_unit_value() is None:
-                    yield from self._content_leaf_values(place.payload_ptr, node.elems[1])
-                return
-            assert isinstance(place, ComptimeAggregatePtr)
-            for child, sub in zip(node.elems, place.ptrs):
-                yield from self._content_leaf_values(sub, child)
-            return
-        # a compile-time leaf: no field
-
-    def _rebuild_capture(
-        self, node: ArgNode, as_copy: bool, field_base: int, base: InterpVal
-    ) -> InterpVal:
-        """Rebuild one capture place from the fields of the runtime closure
-        struct ``base`` points at (see ``hir.RebuildCapture``).  It mirrors
-        ``_init_ptr_target`` but takes every runtime leaf from a fresh field place
-        (``leaf_source``) instead of a MIR formal."""
-        if isinstance(node, RuntimeArgNode):
-            assert isinstance(node.type, sval.PointerType), \
-                f'a runtime capture must be a place, got {node.type}'
-        index = field_base
-
-        def leaf_source(leaf: RuntimeArgNode) -> InterpVal:
-            nonlocal index
-            i = index
-            index += 1
-            field = self.field_index_addr(base, _index_value(i))
-            if leaf is node:
-                # the capture's own place: the stored pointer (``as_copy=False``),
-                # or the field that holds the copied value (``as_copy=True``)
-                return field if as_copy else self.load(field)
-            # a nested runtime leaf: a fresh place holding a copy of the field's
-            # value.  A field only exists for a runtime leaf (see
-            # ``_collect_capture_fields``), so the value is a register read out of
-            # the struct and the place must live in memory - never a compile-time
-            # box (which holds compile-time values only)
-            place = self.alloca(InlineMode.NONE, declared=leaf.type)
-            self.store(place, self.load(field))
-            return place
-
-        return self._init_arg_node(node, [], True, leaf_source)
-
-    # -- ``std.core.as_static_ptr`` ------------------------------------------
-
-    def _as_static_ptr(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
-        """``std.core.as_static_ptr(value)``: a global static constant holding
-        ``value``, the result a pointer to it.  The value is lowered into a
-        global (see ``mir.GlobalConstant``); it may be a compile-time value or a
-        value built out of constants and global references, as long as the
-        constant it makes contains no *register* reference - a ``mir.Inst`` or
-        a ``mir.Param`` (see ``_references_register``).  A pointer inside it is
-        not followed: the value it points at becomes a global of its own, and
-        the pointer points at it (see ``_const_pointer_to_mir``)."""
-        arg = args.positional[0]
-        value = _shallow_normalize(self._arg_value(arg))
-        type = _arg_type_of(arg)
-        if type is None:
-            raise CompileError('cannot determine the type of the value passed to as_static_ptr')
-        mir_type = type.to_mir_type(self._mir_cache)
-        if mir_type is None or type.classify() == sval.SpecialTypeKind.DST:
-            raise CompileError(f'a value of {type} has no runtime representation')
-        constant = self._const_to_mir(value, type)
-        pointer_type = sval.PointerType(type, is_const=True)
-        self.store(ret, RuntimeVal(mir.GlobalConstant(constant, mir.PointerType(mir_type, True)), pointer_type))
-        return PollResult.AGAIN
+        method = self._resolve_method(ptr_type.elem, '__call__')
+        if method is None:
+            raise CompileError('the argument of std.core.catch_unwind must be a closure')
+        fn = method.fn if isinstance(method, sval.BoundMethod) else method
+        if not isinstance(fn, FunctionValue):
+            raise CompileError('the argument of std.core.catch_unwind must be a closure')
+        call_args: RawArgList[ArgEntry[InterpVal]] = RawArgList((ArgEntry(ptr, True),), frozendict())
+        return self._call_function_entry(fn, call_args, ret, catch_unwind=True)
 
     def _const_to_mir(self, ev: InterpVal, type: sval.Type) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
         """The constant MIR value of the value ``ev`` of spy type ``type``: a
@@ -7109,11 +6327,11 @@ class HirRunner:
             # is not followed here - the value it points at becomes a global of
             # its own and the pointer points at it (see ``_const_pointer_to_mir``)
             return self._const_pointer_to_mir(ev, type)
-        if isinstance(ev, (ComptimeAggregatePtr, ComptimeBox, ComptimeOptionPtr, ComptimeTaggedUnionPtr)):
+        if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.ComptimePtr):
             ev = self.load(ev)
         match type:
             case sval.BoolType():
-                return mir.BoolValue(_comptime_bool(ev, 'the value passed to as_static_ptr'))
+                return mir.BoolValue(_comptime_bool(ev, 'the value lowered to a constant'))
             case sval.IntType():
                 obj = _to_comptime(ev)
                 if not isinstance(obj, sval.Int):
@@ -7158,12 +6376,17 @@ class HirRunner:
             return mir.NullValue(mir_type)
         if isinstance(obj, sval.DeclareFunction):
             return _sval_to_runtime(obj, self._mir_cache)
-        if isinstance(obj, sval.Undefined):
+        if isinstance(obj, (sval.UndefinedScalar, sval.UndefinedAggregate)):
             return mir.UndefValue(mir_type)
-        if isinstance(ev, (ComptimeAggregatePtr, ComptimeBox, ComptimeOptionPtr, ComptimeTaggedUnionPtr)):
+        if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.ComptimePtr):
             # the pointer names compile-time storage: the content becomes a global
             # of its own, and the pointer is a reference to it
+            cptr = ev.obj
             elem = type.elem
+            if isinstance(cptr.box, bytes):
+                # a byte-string store: the pointer is a global string constant
+                # (the content plus a trailing NUL, see ``_string_global``)
+                return self._string_global(cptr.box)
             elem_mir = elem.to_mir_type(self._mir_cache)
             if elem_mir is None or elem.classify() == sval.SpecialTypeKind.DST:
                 raise CompileError(f'cannot make a static pointer to a pointer to {elem}')
@@ -7206,14 +6429,16 @@ class HirRunner:
         return mir.AggregateConstant(mir_type, members)
 
     def _const_option_to_mir(self, ev: InterpVal, type: sval.OptionType) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
-        if isinstance(ev, ComptimeOption):
-            is_null, value = ev.is_null, ev.value
-        elif isinstance(_to_comptime(ev), (sval.Null, sval.TypedNull)):
-            is_null, value = ComptimeVal(True), None
+        obj = _to_comptime(ev)
+        value: InterpVal | None = None
+        if isinstance(obj, sval.OptionValue):
+            absent = False
+            value = ComptimeVal(obj.value)
+        elif isinstance(obj, (sval.Null, sval.TypedNull)):
+            absent = True
         else:
             raise CompileError(f'cannot make a static pointer to the option value {ev!r}')
         child = type.child
-        absent = _comptime_bool(is_null, 'the absence of the option')
         if child.is_zst():
             return mir.BoolValue(not absent)
         tag_path = sval.find_first_pointer_type_pos(child)
@@ -7278,12 +6503,14 @@ class HirRunner:
         return result
 
     def _const_tagged_union_to_mir(self, ev: InterpVal, type: sval.TaggedUnionType) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
-        if not isinstance(ev, ComptimeTaggedUnionValue):
+        obj = _to_comptime(ev)
+        if not isinstance(obj, sval.TaggedUnionValue):
             raise CompileError(f'cannot make a static pointer to the union value {ev!r}')
-        tag = self._tagged_union_int(ev.tag)
+        tag = obj.index
+        variant_value = ComptimeVal(obj.value)
         shape = sval.tagged_union_shape(type, self._mir_cache)
         if shape == 'single':
-            return self._const_to_mir(self._coerce(ev.value, type.types[0]), type.types[0])
+            return self._const_to_mir(self._coerce(variant_value, type.types[0]), type.types[0])
         if shape == 'tag_only':
             mir_type = type.to_mir_type(self._mir_cache)
             assert isinstance(mir_type, mir.IntType)
@@ -7297,7 +6524,7 @@ class HirRunner:
         if variant is None:
             payload: mir.Value | mir.AggregateConstant | mir.UnionConstant = mir.UndefValue(union)
         else:
-            payload = mir.UnionConstant(union, variant, self._const_to_mir(self._coerce(ev.value, variant_type), variant_type))
+            payload = mir.UnionConstant(union, variant, self._const_to_mir(self._coerce(variant_value, variant_type), variant_type))
         tag_type = mir_type.fields[0].type
         assert isinstance(tag_type, mir.IntType)
         return mir.AggregateConstant(mir_type, (mir.Int(tag, tag_type), payload))
@@ -7324,7 +6551,7 @@ class HirRunner:
         size = self._sizeof_value(type)
         align = self._alignof_value(type)
         layout = self._resolve_layout_type()
-        value = self._aggregate_to_runtime(ComptimeAggregate(layout, (size, align)))
+        value = self._aggregate_to_runtime(sval.AggregateValue((size, align), layout))
         return RuntimeVal(value, layout)
 
     def _sizeof_value(self, type: sval.Type) -> InterpVal:
@@ -7414,22 +6641,22 @@ class HirRunner:
     def _build_type_info(self, ty: sval.Type) -> InterpVal:
         """The ``TypeInfo`` value that describes the compile-time type ``ty``:
         the variant struct that matches it, tagged in the union."""
-        fields: tuple[InterpVal, ...]
+        fields: tuple[sval.AnyValue, ...]
         if isinstance(ty, sval.IntType):
             variant = 'IntType'
-            fields = (ComptimeVal(ty.bits), ComptimeVal(ty.signed))
+            fields = (ty.bits, ty.signed)
         elif isinstance(ty, sval.PointerType):
             variant = 'PointerType'
-            fields = (ComptimeVal(ty.elem), ComptimeVal(ty.is_const))
+            fields = (ty.elem, ty.is_const)
         elif isinstance(ty, sval.ArrayType):
             variant = 'ArrayType'
-            fields = (ComptimeVal(ty.elem), self._size_option(ty.length_int))
+            fields = (ty.elem, self._size_option(ty.length_int))
         elif isinstance(ty, sval.OptionType):
             variant = 'OptionType'
-            fields = (ComptimeVal(ty.child),)
+            fields = (ty.child,)
         elif isinstance(ty, sval.ComplexType):
             variant = 'ComplexType'
-            fields = (ComptimeVal(ty.elem),)
+            fields = (ty.elem,)
         elif isinstance(ty, sval.StructType):
             variant = 'StructType'
             fields = (
@@ -7457,87 +6684,80 @@ class HirRunner:
             )
         elif isinstance(ty, sval.TupleType):
             variant = 'TupleType'
-            fields = (self._type_slice(ty.types), ComptimeVal(ty.has_ellipsis))
+            fields = (self._type_slice(ty.types), ty.has_ellipsis)
         else:
             raise CompileError(f'cannot reflect the type {ty}')
         union = self._reflect_type_info()
         struct_type = self._reflect_struct(variant)
         index = union.variant_index(struct_type)
         assert index is not None, f'{struct_type} is not a TypeInfo variant'
-        return ComptimeTaggedUnionValue(
-            union,
-            ComptimeVal(sval.Int(index, union.tag_type())),
-            ComptimeAggregate(struct_type, fields),
-        )
+        aggregate = sval.AggregateValue(fields, struct_type)
+        return ComptimeVal(sval.TaggedUnionValue(union, index, aggregate))
 
-    def _build_struct_field(self, field: sval.StructField) -> InterpVal:
+    def _build_struct_field(self, field: sval.StructField) -> sval.AggregateValue:
         """The ``std.reflect.StructField`` value describing one field of a
-        struct: its name as a compile-time ``bytes`` value, its type and its
-        default value (absent when the field declares none)."""
-        default: InterpVal
+        struct: its name as a compile-time ``bytes`` value, its type, its default
+        value (absent when the field declares none) and its ``is_comptime``/
+        ``is_ref`` markers."""
+        default: sval.AnyValue
         if field.default is None:
-            default = ComptimeOption(
-                ComptimeVal(True), ComptimeVal(sval.Undefined(sval.AnyType()))
-            )
+            default = sval.TypedNull(sval.AnyType())
         else:
-            default = ComptimeOption(
-                ComptimeVal(False),
-                self._coerce(ComptimeVal(field.default), sval.AnyType()),
-            )
-        return ComptimeAggregate(self._reflect_struct('StructField'), (
-            ComptimeVal(field.name.encode()),
-            ComptimeVal(field.type),
+            coerced = _to_comptime(self._coerce(ComptimeVal(field.default), sval.AnyType()))
+            assert coerced is not None
+            default = sval.OptionValue(coerced)
+        return sval.AggregateValue((
+            field.name.encode(),
+            field.type,
             default,
-        ))
+            field.is_comptime,
+            field.is_ref,
+        ), self._reflect_struct('StructField'))
 
-    def _build_dict_entry(self, name: str, child: sval.Type) -> InterpVal:
+    def _build_dict_entry(self, name: str, child: sval.Type) -> sval.AggregateValue:
         """The ``std.reflect.DictEntry`` value describing one entry of a
         ``dict[str, T]`` shape: its name as a compile-time ``bytes`` value and
         its type."""
-        return ComptimeAggregate(self._reflect_struct('DictEntry'), (
-            ComptimeVal(name.encode()),
-            ComptimeVal(child),
-        ))
+        return sval.AggregateValue((
+            name.encode(),
+            child,
+        ), self._reflect_struct('DictEntry'))
 
-    def _head_option(self, ty: sval.StructType) -> InterpVal:
+    def _head_option(self, ty: sval.StructType) -> sval.AnyValue:
         """The ``Option[Any]`` a reflected struct's ``head`` is: the template
         head (:class:`sval.StructTypeHead`) of a struct that declares generic
         parameters, the absent option of a non-generic one."""
         if len(ty.head.generic_args) == 0:
-            return ComptimeOption(
-                ComptimeVal(True), ComptimeVal(sval.Undefined(sval.AnyType()))
-            )
-        return ComptimeOption(
-            ComptimeVal(False), self._coerce(ComptimeVal(ty.head), sval.AnyType())
-        )
+            return sval.TypedNull(sval.AnyType())
+        coerced = _to_comptime(self._coerce(ComptimeVal(ty.head), sval.AnyType()))
+        assert coerced is not None
+        return sval.OptionValue(coerced)
 
-    def _size_option(self, length: int | None) -> InterpVal:
+    def _size_option(self, length: int | None) -> sval.AnyValue:
         """The ``Option[int]`` a reflected array size is: an unsized array
         (``None``) as the absent option, a length as the present one."""
         if length is None:
-            return ComptimeOption(
-                ComptimeVal(True), ComptimeVal(sval.Undefined(sval.AnyIntType()))
-            )
-        return ComptimeOption(ComptimeVal(False), ComptimeVal(length))
+            return sval.TypedNull(sval.AnyIntType())
+        return sval.OptionValue(length)
 
-    def _type_slice(self, types: tuple[sval.Type, ...]) -> InterpVal:
+    def _type_slice(self, types: tuple[sval.Type, ...]) -> sval.AggregateValue:
         """A ``ConstSlicePtr[type]`` of the compile-time types ``types``."""
-        return self._const_slice(sval.TYPE_TYPE, tuple(ComptimeVal(type) for type in types))
+        return self._const_slice(sval.TYPE_TYPE, types)
 
-    def _const_slice(self, elem: sval.Type, values: tuple[InterpVal, ...]) -> InterpVal:
+    def _const_slice(self, elem: sval.Type, values: tuple[sval.AnyValue, ...]) -> sval.AggregateValue:
         """A ``ConstSlicePtr[elem]`` compile-time value over ``values``: the
-        values in a fresh array place of their own, the (const) pointer to it and
-        the number of elements - the value ``slice_ptr`` builds for a slice of
-        compile-time storage (see ``ComptimeAggregate``)."""
-        array = self.init_inline_aggregate(sval.ArrayType(elem, len(values)))
-        for index, value in enumerate(values):
-            self.store(self.field_index_addr(array, _index_value(index)), value)
-        self._commit_place_tree(array)
+        values in a fresh (read-only) ``Box`` of their own and the (const)
+        pointer to it, so that a reflected slice is a plain compile-time value
+        (see §4.2)."""
+        array_type = sval.ArrayType(elem, len(values))
+        box = sval.Box('slice', array_type, is_const=True)
+        box.cells = _flatten_value(sval.AggregateValue(tuple(values), array_type), array_type)
+        ptr = sval.ComptimePtr(
+            box, 0,
+            sval.PointerType(array_type, is_const=True, variant=sval.PointerVariant.MULTI),
+        )
         slice_type = self._special_type.slice_ptr_of(elem, True)
-        return ComptimeAggregate(slice_type, (
-            array,
-            ComptimeVal(sval.Int(len(values), self._usize_type())),
-        ))
+        return sval.AggregateValue((ptr, sval.Int(len(values), self._usize_type())), slice_type)
 
     # -- ``std.reflect.reify`` -----------------------------------------------
 
@@ -7558,30 +6778,20 @@ class HirRunner:
         """The compile-time type a reflected value describes: a whole ``TypeInfo``
         value, or a bare ``TypeInfo`` variant value."""
         ev = _shallow_normalize(ev)
-        if isinstance(ev, ComptimeTaggedUnionPtr):
-            ev = self.load(ev)
-        if isinstance(ev, ComptimeTaggedUnionValue):
-            index = _comptime_int(ev.tag)
-            if index is None:
-                raise CompileError(
-                    'std.reflect.reify needs a TypeInfo known at compile time'
-                )
-            variant = ev.type.types[index]
-            payload = _shallow_normalize(ev.value)
-            if isinstance(payload, ComptimeAggregatePtr):
-                payload = self.load(payload)
-            aggregate = _as_aggregate(payload)
-            if aggregate is None:
-                raise CompileError('std.reflect.reify expects a TypeInfo variant value')
-            return self._reify_variant(variant, aggregate.values)
-        if isinstance(ev, ComptimeAggregatePtr):
-            ev = self.load(ev)
-        aggregate = _as_aggregate(ev)
-        if aggregate is None:
-            raise CompileError('std.reflect.reify expects a TypeInfo or one of its variants')
-        return self._reify_variant(aggregate.type, aggregate.values)
+        obj = _to_comptime(ev)
+        if isinstance(obj, sval.ComptimePtr):
+            obj = _to_comptime(self.load(ev))
+        if isinstance(obj, sval.TaggedUnionValue):
+            variant = obj.type.types[obj.index]
+            payload = obj.value
+            if isinstance(payload, sval.AggregateValue):
+                return self._reify_variant(variant, payload.values)
+            raise CompileError('std.reflect.reify expects a TypeInfo variant value')
+        if isinstance(obj, sval.AggregateValue):
+            return self._reify_variant(obj.type, obj.values)
+        raise CompileError('std.reflect.reify expects a TypeInfo or one of its variants')
 
-    def _reify_variant(self, variant: sval.Type, fields: tuple[InterpVal, ...]) -> sval.Type:
+    def _reify_variant(self, variant: sval.Type, fields: tuple[sval.AnyValue, ...]) -> sval.Type:
         """The compile-time type the ``TypeInfo`` variant ``variant`` (whose
         field values are ``fields``, in declaration order) describes."""
         from ..std import reflect
@@ -7615,57 +6825,63 @@ class HirRunner:
             return self._reify_strdict(fields[0])
         raise CompileError(f'{variant} is not a TypeInfo variant')
 
-    def _reify_type(self, ev: InterpVal) -> sval.Type:
+    def _reify_type(self, obj: sval.AnyValue) -> sval.Type:
         """The spy type a reflected ``type`` field holds."""
-        obj = _to_comptime(ev)
         if not isinstance(obj, sval.Type):
             raise CompileError('a reflected field that names a type is not a type')
         return obj
 
-    def _reify_int(self, ev: InterpVal) -> int:
+    def _reify_int(self, obj: sval.AnyValue) -> int:
         """The Python integer a reflected integer field holds."""
-        value = _comptime_int(ev)
-        if value is None:
+        if isinstance(obj, bool):
             raise CompileError('a reflected integer is not known at compile time')
-        return value
+        if isinstance(obj, sval.Int):
+            return obj.value
+        if isinstance(obj, int):
+            return obj
+        raise CompileError('a reflected integer is not known at compile time')
 
-    def _reify_bool(self, ev: InterpVal) -> bool:
+    def _reify_bool(self, obj: sval.AnyValue) -> bool:
         """The Python bool a reflected bool field holds."""
-        return _comptime_bool(ev, 'a reflected bool')
+        if isinstance(obj, bool):
+            return obj
+        raise CompileError('a reflected bool has to be known at compile time')
 
-    def _reify_option(self, ev: InterpVal) -> tuple[bool, InterpVal]:
+    def _reify_option(self, obj: sval.AnyValue) -> tuple[bool, sval.AnyValue | None]:
         """The tag and the payload of a reflected option field: whether it is
         absent and the value it wraps."""
-        ev = _shallow_normalize(ev)
-        if isinstance(ev, ComptimeOptionPtr):
-            ev = self.load(ev)
-        if not isinstance(ev, ComptimeOption):
-            raise CompileError('a reflected option is not a compile-time option')
-        return _comptime_bool(ev.is_null, 'a reflected option tag'), ev.value
+        if isinstance(obj, sval.OptionValue):
+            return False, obj.value
+        if isinstance(obj, (sval.Null, sval.TypedNull)):
+            return True, None
+        raise CompileError('a reflected option is not a compile-time option')
 
-    def _reify_size(self, ev: InterpVal) -> int | None:
+    def _reify_size(self, obj: sval.AnyValue) -> int | None:
         """The element count a reflected ``ArrayType.size`` holds: the absent
         option of an unsized array."""
-        is_absent, value = self._reify_option(ev)
-        return None if is_absent else self._reify_int(value)
+        is_absent, value = self._reify_option(obj)
+        if is_absent:
+            return None
+        assert value is not None
+        return self._reify_int(value)
 
-    def _reify_slice(self, ev: InterpVal) -> tuple[InterpVal, ...]:
+    def _reify_slice(self, obj: sval.AnyValue) -> tuple[sval.AnyValue, ...]:
         """The element values a reflected ``ConstSlicePtr`` field holds."""
-        ev = _shallow_normalize(ev)
-        if isinstance(ev, ComptimeAggregatePtr):
-            ev = self.load(ev)
-        if not isinstance(ev, ComptimeAggregate):
+        if not isinstance(obj, sval.AggregateValue):
             raise CompileError('a reflected slice is not a compile-time slice')
-        array = _shallow_normalize(ev.values[0])
-        if not isinstance(array, ComptimeAggregatePtr):
+        ptr = obj.values[0]
+        if not (isinstance(ptr, sval.ComptimePtr) and isinstance(ptr.type.elem, sval.ArrayType)):
             raise CompileError('a reflected slice does not point at a compile-time array')
-        return tuple(self.load(place) for place in array.ptrs)
+        array = _load_box_cells(ptr.box, ptr.offset, ptr.type.elem)
+        if not isinstance(array, sval.AggregateValue):
+            raise CompileError('a reflected slice is not a compile-time slice')
+        return array.values
 
-    def _reify_type_slice(self, ev: InterpVal) -> tuple[sval.Type, ...]:
+    def _reify_type_slice(self, obj: sval.AnyValue) -> tuple[sval.Type, ...]:
         """The types a reflected ``ConstSlicePtr[type]`` field holds."""
-        return tuple(self._reify_type(item) for item in self._reify_slice(ev))
+        return tuple(self._reify_type(item) for item in self._reify_slice(obj))
 
-    def _reify_struct(self, field_slice: InterpVal, head: InterpVal) -> sval.StructType:
+    def _reify_struct(self, field_slice: sval.AnyValue, head: sval.AnyValue) -> sval.StructType:
         """The struct type a reflected ``StructType`` describes: a *fresh* struct,
         built field by field, so that every reify of the same struct is a type of
         its own (see ``_builtin_reify``).  A reflected template head only lends its
@@ -7673,36 +6889,38 @@ class HirRunner:
         name_base = 'struct'
         is_absent, head_value = self._reify_option(head)
         if not is_absent:
-            head_obj = _to_comptime(head_value)
-            if isinstance(head_obj, sval.StructTypeHead):
-                name_base = head_obj.name_base
+            assert head_value is not None
+            if isinstance(head_value, sval.StructTypeHead):
+                name_base = head_value.name_base
         new_head = sval.StructTypeHead(name_base)
         for item in self._reify_slice(field_slice):
-            field = _as_aggregate(item)
-            if field is None:
+            if not isinstance(item, sval.AggregateValue):
                 raise CompileError('a reflected struct field is not a struct value')
-            name = _to_comptime(field.values[0])
+            name = item.values[0]
             if not isinstance(name, bytes):
                 raise CompileError('a reflected field name is not a byte string')
-            is_default_absent, default_value = self._reify_option(field.values[2])
-            default = None if is_default_absent else _to_comptime(default_value)
+            is_default_absent, default_value = self._reify_option(item.values[2])
+            default = None if is_default_absent else default_value
             new_head.add_field(
-                name.decode(errors='replace'), self._reify_type(field.values[1]), default
+                name.decode(errors='replace'),
+                self._reify_type(item.values[1]),
+                default,
+                self._reify_bool(item.values[3]),
+                self._reify_bool(item.values[4]),
             )
         return new_head.specialize(())
 
-    def _reify_strdict(self, entry_slice: InterpVal) -> sval.StrDictType:
+    def _reify_strdict(self, entry_slice: sval.AnyValue) -> sval.StrDictType:
         """The ``**kwargs``/``dict[str, T]`` type a reflected ``StrDictType``
         describes."""
         values: dict[str, sval.Type] = {}
         for item in self._reify_slice(entry_slice):
-            entry = _as_aggregate(item)
-            if entry is None:
+            if not isinstance(item, sval.AggregateValue):
                 raise CompileError('a reflected dict entry is not a struct value')
-            name = _to_comptime(entry.values[0])
+            name = item.values[0]
             if not isinstance(name, bytes):
                 raise CompileError('a reflected entry name is not a byte string')
-            values[name.decode(errors='replace')] = self._reify_type(entry.values[1])
+            values[name.decode(errors='replace')] = self._reify_type(item.values[1])
         return sval.StrDictType(frozendict(values))
 
     def _call_fn_ptr(
@@ -7751,16 +6969,22 @@ class HirRunner:
         slot.stores.append(_PendingAction(insertion, data))
 
     def _record_pending_store(self, slot: PendingSlot, value_type: sval.Type, value: InterpVal) -> None:
-        """Record a store into a still uncommitted slot.  The value may be kept
-        inline only while the walk has not crossed a runtime block boundary
-        since the slot was created: a runtime value is a MIR register that only
-        dominates the paths after it inside its own block, so a store from
-        another runtime block cannot be held as a compile-time value."""
+        """Record a store into a still uncommitted slot.  A compile-time variable
+        only takes compile-time values (a runtime value into one is the
+        ``cannot store a runtime value into a compile-time variable`` error, see
+        the behaviour doc § 13); the value may be kept inline only while the walk
+        has not crossed a runtime block boundary since the slot was created."""
+        is_comptime_value = _is_comptime_val(value)
+        if slot.is_comptime is True and not is_comptime_value:
+            raise CompileError(
+                f'cannot store a runtime value into a compile-time variable '
+                f'of type {value_type}'
+            )
         self._record_pending_action(
             slot,
             _PendingStore(
                 type=value_type,
-                is_inline=self._runtime_position() == slot.runtime_pos and _is_comptime_val(value),
+                is_inline=self._runtime_position() == slot.runtime_pos and is_comptime_value,
                 value=value,
             ),
         )
@@ -7768,23 +6992,18 @@ class HirRunner:
     def _commit_pending_slot(
         self, val: InterpVal, type: sval.Type | None = None, ptr: mir.Value | None = None
     ) -> None:
-        """Materialize a pending slot.  It becomes a :class:`ComptimeBox` when
-        it may inline values and every action may be inlined, a
-        :class:`ComptimeAggregatePtr`/:class:`ComptimeTuplePtr`/
-        :class:`ComptimeDictPtr` when the value is an aggregate, a tuple or a
-        ``**kwargs`` dictionary (none of which a box ever holds), or - when its
-        type is zero-sized - the unit value it only records; with an explicit
-        result pointer (``ptr``), or otherwise, it becomes a :class:`RuntimeVal`
-        pointer to freshly allocated memory.  The type is the pairwise
-        ``resolve_peer_type`` of the action types (or the given one).  The
-        recorded actions are delivered through ``_exec_pending_actions``, which
-        fills in the instructions that must be spliced at their original
-        positions."""
+        """Materialize a pending slot.  It becomes a compile-time ``sval.Box``
+        (held as a ``ComptimeVal(sval.ComptimePtr)``) when it holds its value in
+        compile-time storage, the unit value when its type is zero-sized, or a
+        ``RuntimeVal`` pointer to freshly allocated memory.  The type is the
+        pairwise ``resolve_peer_type`` of the action types (or the given one).
+        The recorded actions are delivered through ``_exec_pending_actions``,
+        which fills in the instructions spliced at their original positions."""
         if not isinstance(val, PendingSlot):
             raise CompileError('can only commit a pending slot')
         if val.committed is not None:
             # an already materialized storage may still hold unmaterialized leaf
-            # places (a place the stores decide, see ``_stores_decide_storage``)
+            # places
             self._commit_place_tree(val.committed)
             return
         if type is None:
@@ -7794,43 +7013,20 @@ class HirRunner:
             self._bind_slot(val, ptr, type)
             return
 
-        if val.is_inline(type) and (len(val.stores) > 0 or val.declared is not None):
-            if _is_aggregate(type):
-                # a compile-time aggregate: its fields (or elements) are their
-                # own places (see ``init_inline_aggregate``)
-                val.committed = self._inline_aggregate_of(val, type)
-            elif isinstance(type, sval.TupleType):
-                # a compile-time tuple: one place per element (a box never holds
-                # one, see ``ComptimeTuplePtr``)
-                val.committed = self._inline_tuple_of(val, type)
-            elif isinstance(type, sval.StrDictType):
-                # and its ``**kwargs`` dictionary counterpart (a box never holds
-                # one either, see ``ComptimeDictPtr``)
-                val.committed = self.init_comptime_dict(type)
-            elif isinstance(type, sval.OptionType):
-                # a compile-time option: the tag is a value and the payload a
-                # place of its own (see ``ComptimeOptionPtr``)
-                val.committed = self.init_comptime_option(type)
-            elif isinstance(type, sval.TaggedUnionType):
-                # a compile-time tagged union: the tag is a value and the payload
-                # a place of its own (see ``ComptimeTaggedUnionPtr``)
-                val.committed = self.init_comptime_tagged_union(type)
-            else:
-                # a single value in a compile-time box
-                val.committed = ComptimeBox(type, ComptimeVal(sval.Undefined(type)))
+        if val.use_comptime_storage() and (len(val.stores) > 0 or val.declared is not None):
+            # a compile-time variable: a fresh ``Box`` the stored values are
+            # flattened into
+            box = self._new_box(type, is_const=val.is_const)
+            val.committed = ComptimeVal(
+                sval.ComptimePtr(box, 0, sval.PointerType(type, is_const=val.is_const))
+            )
             self._exec_pending_actions(val, type)
             self._commit_place_tree(val.committed)
             return
         unit = type.get_unit_value()
         if unit is not None:
-            if _is_aggregate(type):
-                # a zero-sized aggregate holds its unit value, which a box never
-                # carries: it is held by its own places like any other aggregate
-                val.committed = self._inline_aggregate_of(val, type)
-                self._exec_pending_actions(val, type)
-                self._commit_place_tree(val.committed)
-                return
-            val.committed = ComptimeBox(type, ComptimeVal(unit))
+            # a zero-sized value: its unit value is all it holds
+            val.committed = ComptimeVal(unit)
             return
         if type.classify() == sval.SpecialTypeKind.DST:
             # a dynamically-sized type has no size to allocate and no mirror a
@@ -7845,59 +7041,28 @@ class HirRunner:
         val.insertion.insts.append(alloca)
         self._bind_slot(val, alloca, type)
 
-    def _inline_aggregate_of(self, slot: PendingSlot, type: sval.Type) -> ComptimeAggregatePtr:
-        """The aggregate storage a slot commits to: the places its construction
-        recorded, or fresh ones for a slot that only took whole-value stores
-        (see ``init_inline_aggregate``)."""
-        recorded = self._pending_aggregate(slot)
-        if recorded is None:
-            return self.init_inline_aggregate(type)
-        return ComptimeAggregatePtr(type, recorded.places)
+    def _aggregate_place(self, type: sval.Type, is_comptime: bool = True) -> InterpVal:
+        """A fresh place of the aggregate ``type``: a compile-time ``Box``
+        (``is_comptime``) or fresh memory.  Its fields/elements are addressed with
+        ``field_index_addr`` at their flattened offsets (see §0.2)."""
+        if is_comptime:
+            box = self._new_box(type, is_const=False)
+            return ComptimeVal(sval.ComptimePtr(box, 0, sval.PointerType(type, is_const=False)))
+        slot = self.alloca(False)
+        self._commit_pending_slot(slot, type)
+        return _shallow_normalize(slot)
 
-    def _result_place_tree(self, place: InterpVal) -> InterpVal:
-        """The place tree a multi-value result location is made of (see
-        ``_finish_function``): the element places a pending slot recorded -
-        recursively, since a nested tuple records one on the element place it
-        lives in, and a packed group already records nested tuple pointers -
-        or the tuple pointer the place already is.  A leaf place is returned
-        as it is."""
+    def _result_place_tree(self, place: InterpVal) -> InterpVal | tuple:
+        """The result tree a multi-value result location is made of (see
+        ``_finish_function``): the element places an uncommitted slot recorded (a
+        ``_PendingTuple``), or the place as it is (a single value) - the shape
+        ``_commit_ret_places`` then pairs with the spec."""
         place = _shallow_normalize(place)
-        if isinstance(place, ComptimeTuplePtr):
-            return ComptimeTuplePtr(tuple(self._result_place_tree(child) for child in place.values))
-        if isinstance(place, PendingSlot):
+        if isinstance(place, PendingSlot) and place.committed is None:
             recorded = self._pending_tuple(place)
             if recorded is not None:
-                return ComptimeTuplePtr(tuple(self._result_place_tree(child) for child in recorded.places))
+                return recorded.places
         return place
-
-    def _inline_tuple_of(self, slot: PendingSlot, type: sval.TupleType) -> ComptimeTuplePtr:
-        """The tuple storage a slot commits to: the element places its
-        construction recorded (a literal ``(a, b)`` built by ``init_tuple``, or
-        a whole multi-value result packed into the slot, see
-        ``_deliver_packed_tuple``), or fresh element places for a slot that only
-        took tuple *values* (see ``init_comptime_tuple``).  A tuple is never
-        held by a box."""
-        recorded = self._pending_tuple(slot)
-        if recorded is not None:
-            return ComptimeTuplePtr(recorded.places)
-        return self.init_comptime_tuple(type)
-
-    def init_comptime_tuple(self, type: sval.TupleType) -> ComptimeTuplePtr:
-        """Fresh compile-time storage for a tuple: one place per element (see
-        ``_fresh_place``), which is what a tuple a store delivers is written
-        into."""
-        return ComptimeTuplePtr(tuple(
-            self._fresh_place(elem_type)
-            for elem_type in type.types
-        ))
-
-    def init_comptime_dict(self, type: sval.StrDictType) -> ComptimeDictPtr:
-        """Fresh compile-time storage for a ``**kwargs`` dictionary: one place
-        per name (see ``_fresh_place``)."""
-        return ComptimeDictPtr({
-            name: self._fresh_place(elem_type)
-            for name, elem_type in type.values.items()
-        })
 
     def _bind_slot(self, slot: PendingSlot, ptr: mir.Value, type: sval.Type) -> None:
         slot.committed = RuntimeVal(ptr, sval.PointerType(type, is_const=False))
@@ -7920,37 +7085,41 @@ class HirRunner:
             case _PendingStore():
                 self.store(ptr, action.value)
             case _PendingTuple():
-                # a tuple location: the element places are committed together
-                # with the slot (no ``hir.CommitSlot`` names them) - the slot
-                # itself is already the tuple of places (see ``init_tuple`` and
-                # ``_inline_tuple_of``)
-                self._commit_place_tree(ComptimeTuplePtr(action.places))
-                if not isinstance(ptr, ComptimeTuplePtr):
-                    raise CompileError('cannot deliver a tuple into storage')
+                # a tuple location: each element is written through the address of
+                # its element in the tuple's own storage
+                element_types = tuple(_place_type(place) for place in action.places)
+                for index, place in enumerate(action.places):
+                    element_type = element_types[index]
+                    if element_type is None:
+                        raise CompileError('a tuple element has no type yet')
+                    self._store_into_element(ptr, index, place, element_type)
             case _PendingPtrConvertion():
                 input_ptr = _shallow_normalize(action.input)
                 if not (isinstance(input_ptr, RuntimeVal) and isinstance(input_ptr.type, sval.PointerType)):
                     raise CompileError('cannot convert a compile-time pointer')
                 action.output.value = self._to_runtime(self._convert_result_ptr(input_ptr, action.type))
             case _PendingAggregate():
-                # a compile-time aggregate: every field (or element) place is
-                # committed with the slot (no ``hir.CommitSlot`` names them) and
-                # the slot holds the aggregate itself; a slot materialized into
-                # memory instead copies the values in (see
-                # ``init_inline_aggregate``)
+                # an aggregate construction: every field/element is written
+                # through its address in the aggregate's own storage (a box cell
+                # for a compile-time one, ``mir.Gep`` for memory)
                 place_types = _aggregate_place_types(action.type)
-                aggregate = isinstance(ptr, ComptimeAggregatePtr)
                 for index, place in enumerate(action.places):
-                    if isinstance(place, PendingSlot) and place.committed is None:
-                        self._commit_pending_slot(place, place_types[index])
-                    if aggregate:
-                        continue
-                    self.store(
-                        self.field_index_addr(ptr, _index_value(index)),
-                        self.load(place),
-                    )
+                    self._store_into_element(ptr, index, place, place_types[index])
             case _:
                 raise CompileError(f'unsupported pending action {action}')
+
+    def _store_into_element(self, ptr: InterpVal, index: int, place: InterpVal, type: sval.Type) -> None:
+        """Write the field/element place ``place`` into the ``index``-th
+        field/element of the aggregate storage ``ptr``: an uncommitted place is
+        bound to the element's address - writing through it in place - when the
+        storage is memory, and materialized and stored when it is a box."""
+        addr = self.field_index_addr(ptr, _index_value(index))
+        if isinstance(addr, RuntimeVal) and isinstance(place, PendingSlot) and place.committed is None:
+            self._bind_slot(place, addr.value, type)
+            return
+        if isinstance(place, PendingSlot) and place.committed is None:
+            self._commit_pending_slot(place, type)
+        self.store(addr, self.load(place))
 
     def _defer_ptr_convertion(self, slot: PendingSlot, type: sval.Type) -> InterpVal:
         """The address a delivery into ``slot`` writes through, when the slot
@@ -7970,7 +7139,7 @@ class HirRunner:
         unit = type.get_unit_value()
         if unit is not None:
             self.store(slot, ComptimeVal(unit))
-            return ComptimeVal(sval.Undefined(sval.PointerType(type, is_const=False)))
+            return ComptimeVal(sval.UndefinedScalar(sval.PointerType(type, is_const=False)))
         mir_type = type.to_mir_type(self._mir_cache)
         if mir_type is None or type.is_zst():
             raise _no_runtime_type(type)
@@ -8063,12 +7232,18 @@ class HirRunner:
             # a zero-sized child has no storage to address: its value is the
             # type's unit value, which the place of an undefined pointer names
             # (a store into it is a no-op, see ``store``)
-            return ComptimeVal(sval.Undefined(sval.PointerType(child, type.is_const)))
+            return ComptimeVal(sval.UndefinedScalar(sval.PointerType(child, type.is_const)))
         ptr = _shallow_normalize(ptr)
-        if isinstance(ptr, ComptimeOptionPtr):
-            if write_tag:
-                ptr.is_null = ComptimeVal(False)
-            return ptr.payload_ptr
+        if isinstance(ptr, ComptimeVal) and isinstance(ptr.obj, sval.ComptimePtr):
+            # a compile-time option place: the tag is cell 0, the payload cells
+            # from 1 (see §0.2); taking a present payload's address marks the
+            # option present by writing the tag cell
+            cptr = ptr.obj
+            if isinstance(cptr.box, sval.Box) and write_tag:
+                cptr.box.cells[cptr.offset] = True
+            return ComptimeVal(sval.ComptimePtr(
+                cptr.box, cptr.offset + 1, sval.PointerType(child, cptr.type.is_const),
+            ))
         src = self._to_runtime(ptr)
         if sval.find_first_pointer_type_pos(child) is not None:
             return RuntimeVal(src, sval.PointerType(child, type.is_const))
@@ -8077,6 +7252,16 @@ class HirRunner:
             self._emit(mir.Store(tag, mir.BoolValue(True)))
         payload = self._emit(mir.Gep(src, 1))
         return RuntimeVal(payload, sval.PointerType(child, type.is_const))
+
+    def _comptime_option_is_null(self, ev: ComptimeVal) -> bool:
+        """Whether the compile-time value ``ev`` is an absent option: a
+        compile-time option *place* (a ``ComptimePtr``) is loaded first, then the
+        value form is read - an ``sval.OptionValue`` is present, ``Null``/
+        ``TypedNull`` absent (see §5.3)."""
+        obj = ev.obj
+        if isinstance(obj, sval.ComptimePtr):
+            obj = _to_comptime(self.load(ev))
+        return isinstance(obj, (sval.Null, sval.TypedNull))
 
     def _is_null(self, ev: InterpVal) -> InterpVal:
         """Whether ``ev`` is the *absent* value of an option, as a bool value.
@@ -8092,11 +7277,8 @@ class HirRunner:
         and any other child tags a ``(bool, T)`` struct whose first field is the
         tag."""
         ev = _shallow_normalize(ev)
-        if isinstance(ev, ComptimeOption):
-            # a compile-time option carries its own tag (see ``ComptimeOption``)
-            return ev.is_null
         if isinstance(ev, ComptimeVal):
-            return ComptimeVal(isinstance(ev.obj, (sval.Null, sval.TypedNull)))
+            return ComptimeVal(self._comptime_option_is_null(ev))
         type = _type_of(ev)
         if isinstance(type, sval.NullType):
             return ComptimeVal(True)
@@ -8150,20 +7332,26 @@ class HirRunner:
     def _option_payload(self, ev: InterpVal, option: sval.OptionType) -> InterpVal:
         """The payload ``T`` of the *present* option value ``ev``.
 
-        A compile-time present option (``ComptimeOption``) holds its payload,
-        and any other compile-time value is the payload itself.  A runtime
-        option value is read off its representation: a zero-sized child has no
-        payload but its unit value, a child that still has a free pointer
-        shares the option's representation (the value *is* the payload), and the
-        ``(bool, T)`` representation holds the payload in its second field,
-        which ``mir.ExtractValue`` reads out of the value.  An absent value has
-        no payload and is rejected."""
+        A compile-time present option holds its payload as an
+        ``sval.OptionValue``.  A runtime option value is read off its
+        representation: a zero-sized child has no payload but its unit value, a
+        child that still has a free pointer shares the option's representation
+        (the value *is* the payload), and the ``(bool, T)`` representation holds
+        the payload in its second field, which ``mir.ExtractValue`` reads out of
+        the value.  An absent value has no payload and is rejected."""
         ev = _shallow_normalize(ev)
         child = option.child
-        if isinstance(ev, ComptimeOption):
-            if _to_comptime(ev.is_null) is True:
+        if isinstance(ev, ComptimeVal):
+            # a compile-time option value (an ``OptionValue`` present, a
+            # ``Null``/``TypedNull`` absent) or the place of one (a ``ComptimePtr``)
+            obj = ev.obj
+            if isinstance(obj, sval.ComptimePtr):
+                obj = _to_comptime(self.load(ev))
+            if isinstance(obj, sval.OptionValue):
+                return ComptimeVal(obj.value)
+            if isinstance(obj, (sval.Null, sval.TypedNull)):
                 raise CompileError(f'a present value is required here: {option} is absent')
-            return ev.value
+            return self._coerce(ev, child)
         if isinstance(ev, RuntimeVal) and _type_of(ev) == option:
             if child.is_zst():
                 unit = child.get_unit_value()
@@ -8192,7 +7380,7 @@ class HirRunner:
         if isinstance(type, sval.StructType) and self._resolve_method(type, _BOOL_METHOD) is not None:
             if _is_undefined_val(self._arg_value(value)):
                 raise CompileError('an if condition cannot be undefined')
-            slot = self.alloca(InlineMode.NON_AGGREGATE)
+            slot = self.alloca(None)
             regs = self._frames[-1].regs
 
             def on_return() -> None:
@@ -8208,23 +7396,21 @@ class HirRunner:
     def exec_len(self, inst: hir.Len) -> PollResult:
         """``len(x)`` (see ``hir.Len``): the element count of a tuple, the length
         of an array, or the answer of a struct's own ``__len__``.  The operand is
-        logically a *value*: a tuple yields its length directly (a by-reference
-        one is the ``ComptimeTuplePtr`` place tree at the address it carries), an
-        array its own length (part of its type, a compile-time ``usize``), and a
-        struct is handed to its method through its own place - no copy for a
-        by-reference one, and a value is materialized into a fresh place
-        first."""
+        logically a *value*: a tuple yields its length directly (part of its
+        type now, see §7.1), an array its own length (part of its type, a
+        compile-time ``usize``), and a struct is handed to its method through its
+        own place - no copy for a by-reference one, and a value is materialized
+        into a fresh place first."""
         operand = self.operand_arg(inst.value)
-        if operand.is_ref:
-            place = _shallow_normalize(operand.value)
-            if isinstance(place, ComptimeTuplePtr):
-                self._frames[-1].regs[inst] = ComptimeVal(len(place.values))
-                return PollResult.AGAIN
-        else:
-            if isinstance(operand.value, ComptimeTuple):
-                self._frames[-1].regs[inst] = ComptimeVal(len(operand.value.values))
-                return PollResult.AGAIN
         type = _arg_type_of(operand)
+        if isinstance(type, sval.TupleType):
+            # a tuple's length is part of its type
+            self._frames[-1].regs[inst] = ComptimeVal(sval.Int(len(type.types), self._usize_type()))
+            return PollResult.AGAIN
+        if isinstance(type, sval.StructType) and type.head.name_base in ('$args', '$kwargs'):
+            # a synthesized ``*args``/``**kwargs`` struct (see §8.1)
+            self._frames[-1].regs[inst] = ComptimeVal(sval.Int(len(type.fields().by_id), self._usize_type()))
+            return PollResult.AGAIN
         if isinstance(type, sval.ArrayType):
             # an array's length is part of its type: a compile-time ``usize``
             # (the value ``sstr`` gives), rejected when it is not known yet
@@ -8237,7 +7423,7 @@ class HirRunner:
             self._frames[-1].regs[inst] = ComptimeVal(sval.Int(length, self._usize_type()))
             return PollResult.AGAIN
         if isinstance(type, sval.StructType) and self._resolve_method(type, _LEN_METHOD) is not None:
-            slot = self.alloca(InlineMode.NON_AGGREGATE)
+            slot = self.alloca(None)
             regs = self._frames[-1].regs
 
             def on_return() -> None:
@@ -8288,10 +7474,6 @@ class HirRunner:
         tree: the place of the argument the byte-string key names (see
         ``_subscript_comptime_dict``)."""
         base_ev = _shallow_normalize(base)
-        if isinstance(base_ev, ComptimeTuplePtr):
-            return self._subscript_comptime_tuple(base_ev, index, ret)
-        if isinstance(base_ev, ComptimeDictPtr):
-            return self._subscript_comptime_dict(base_ev, index, ret)
 
         array_type = _array_elem_type_of(base)
         if array_type is not None:
@@ -8314,6 +7496,62 @@ class HirRunner:
             return PollResult.AGAIN
 
         base_type = _type_of(base)
+        if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.TupleType):
+            # a tuple place: the i-th element (a compile-time integer, checked)
+            element_index = _comptime_int(self._arg_value(index))
+            if element_index is None:
+                raise CompileError('a tuple element index has to be a compile-time integer')
+            if not 0 <= element_index < len(base_type.elem.types):
+                raise CompileError(
+                    f'index {element_index} is out of bounds for {base_type.elem}'
+                )
+            self._frames[-1].regs[ret] = self.field_index_addr(base, _index_value(element_index))
+            return PollResult.AGAIN
+        if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.StrDictType):
+            # a ``dict[str, T]`` place: the entry a compile-time byte-string key names
+            key_value = _to_comptime(self._arg_value(index))
+            if not isinstance(key_value, bytes):
+                raise CompileError('a dict element key has to be a compile-time byte string')
+            name = key_value.decode()
+            entry_index = base_type.elem.values.by_key.get(name) if hasattr(base_type.elem.values, 'by_key') else None
+            if entry_index is None:
+                candidates = list(base_type.elem.values.keys())
+                if name not in candidates:
+                    raise CompileError(f'the dict has no element named {name!r}')
+                entry_index = candidates.index(name)
+            self._frames[-1].regs[ret] = self.field_index_addr(base, _index_value(entry_index))
+            return PollResult.AGAIN
+        if (
+            isinstance(base_type, sval.PointerType)
+            and isinstance(base_type.elem, sval.StructType)
+            and base_type.elem.head.name_base == '$args'
+        ):
+            # a synthesized ``*args`` struct (see §8.1): ``args[i]`` is its i-th
+            # element
+            element_index = _comptime_int(self._arg_value(index))
+            if element_index is None:
+                raise CompileError('a tuple element index has to be a compile-time integer')
+            if not 0 <= element_index < len(base_type.elem.fields().by_id):
+                raise CompileError(
+                    f'index {element_index} is out of bounds for the argument tuple'
+                )
+            self._frames[-1].regs[ret] = self.field_index_addr(base, _index_value(element_index))
+            return PollResult.AGAIN
+        if (
+            isinstance(base_type, sval.PointerType)
+            and isinstance(base_type.elem, sval.StructType)
+            and base_type.elem.head.name_base == '$kwargs'
+        ):
+            # a synthesized ``**kwargs`` struct (see §8.1): ``kwargs['k']`` is the
+            # entry the compile-time byte-string key names
+            key_value = _to_comptime(self._arg_value(index))
+            if not isinstance(key_value, bytes):
+                raise CompileError('a dict element key has to be a compile-time byte string')
+            entry_index = base_type.elem.fields().by_key.get(key_value.decode())
+            if entry_index is None:
+                raise CompileError(f'the dict has no element named {key_value.decode()!r}')
+            self._frames[-1].regs[ret] = self.field_index_addr(base, _index_value(entry_index))
+            return PollResult.AGAIN
         if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.BytesType):
             return self._subscript_bytes(base, index, ret)
         if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.PointerType):
@@ -8330,7 +7568,7 @@ class HirRunner:
             # the result is written into a fresh slot and moved into the
             # subscript's register once the call returned - whether the method
             # is inlined or compiled into a specialization of its own
-            slot = self.alloca(InlineMode.FULL)
+            slot = self.alloca(True)
             regs = self._frames[-1].regs
             struct = base_type.elem
 
@@ -8349,16 +7587,22 @@ class HirRunner:
                 base, '__spy_getitemptr__', RawArgList((index,), frozendict()), slot, on_return,
             )
 
-        if not (isinstance(base, ComptimeVal) and isinstance(base.obj, sval.ConstRef) and isinstance(base.obj.value, sval.StructTypeHead)):
+        if not (isinstance(base, ComptimeVal) and isinstance(base.obj, sval.ComptimePtr)):
             raise CompileError(
                 f'cannot subscript {base!r}: a subscript is a place in an array, '
                 f'an element of a pointer, or a specialization of a struct template'
             )
-        struct = base.obj.value
+        loaded = _to_comptime(self.load(base))
+        if not isinstance(loaded, sval.StructTypeHead):
+            raise CompileError(
+                f'cannot subscript {base!r}: a subscript is a place in an array, '
+                f'an element of a pointer, or a specialization of a struct template'
+            )
+        struct = loaded
         args: tuple[InterpVal, ...]
-        if isinstance(index.value, ComptimeTuple):
+        if isinstance(index.value, sval.AggregateValue):
             assert not index.is_ref
-            args = tuple(self._arg_value(a) for a in index.value.values)
+            args = tuple(ComptimeVal(v) for v in index.value.values)
         else:
             args = (self._arg_value(index),)
         arg_values: list[sval.Value] = []
@@ -8371,46 +7615,11 @@ class HirRunner:
         self._frames[-1].regs[ret] = ComptimeVal(instance)
         return PollResult.AGAIN
 
-    def _subscript_comptime_tuple(self, base: ComptimeTuplePtr, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
-        """``t[i]`` of the compile-time tuple place tree ``base`` (a varargs
-        parameter, or a ``Comptime`` variable holding a multi-value result): the
-        *place* of its i-th element.  A tuple has no runtime storage to index,
-        so the index has to be a compile-time integer, and it is bounds-checked
-        (a negative index is out of bounds like any other)."""
-        element_index = _comptime_int(self._arg_value(index))
-        if element_index is None:
-            raise CompileError(
-                'a tuple element index has to be a compile-time integer'
-            )
-        if not 0 <= element_index < len(base.values):
-            raise CompileError(
-                f'index {element_index} is out of bounds for a tuple of '
-                f'{len(base.values)} element(s)'
-            )
-        self._frames[-1].regs[ret] = base.values[element_index]
-        return PollResult.AGAIN
-
-    def _subscript_comptime_dict(self, base: ComptimeDictPtr, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
-        """``d[key]`` of the compile-time ``**kwargs`` dictionary place tree
-        ``base``: the *place* of the argument the key names.  The key has to be
-        a compile-time byte string (a string literal is encoded to one), and a
-        name the dictionary does not hold is rejected."""
-        key_value = _to_comptime(self._arg_value(index))
-        if not isinstance(key_value, bytes):
-            raise CompileError(
-                'a dict element key has to be a compile-time byte string'
-            )
-        name = key_value.decode()
-        place = base.values.get(name)
-        if place is None:
-            raise CompileError(f'the dict has no element named {name!r}')
-        self._frames[-1].regs[ret] = place
-        return PollResult.AGAIN
 
     def _subscript_bytes(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
         """``b[i]`` / ``b[a:c]`` of the compile-time byte string the place
         ``base`` holds: the substring the subscript names, held as a reference
-        (:class:`sval.ConstRef`) - a subscript yields a place.  An integer index
+        (:class:`sval.ComptimePtr`) - a subscript yields a place.  An integer index
         picks one byte (checked against the length), a ``std.slice`` object a
         range (a missing lower bound is 0, a missing upper bound the length, and
         a step has to be 1); every bound has to be compile-time."""
@@ -8433,10 +7642,12 @@ class HirRunner:
                     f'length {len(data)}'
                 )
             piece = data[index_int:index_int + 1]
-        self._frames[-1].regs[ret] = ComptimeVal(sval.ConstRef(piece))
+        self._frames[-1].regs[ret] = ComptimeVal(
+            sval.ComptimePtr(piece, 0, sval.PointerType(sval.BytesType(), is_const=True))
+        )
         return PollResult.AGAIN
 
-    def _bytes_slice_bounds(self, slice_obj: ComptimeAggregate, length: int) -> tuple[int, int]:
+    def _bytes_slice_bounds(self, slice_obj: sval.AggregateValue, length: int) -> tuple[int, int]:
         """The ``(start, end)`` a ``std.slice`` object names over a byte string
         of ``length`` bytes: a missing lower bound is 0, a missing upper bound
         the length, and a step (if written) has to be 1.  Every bound has to be
@@ -8462,9 +7673,8 @@ class HirRunner:
         """The place a subscript of the pointer ``ptr_type`` - the value the
         place ``base`` holds - names: the ``SlicePtr`` of a slice, or the
         element of a multi pointer, an address ``p + i`` away (the element's own
-        place when the pointer names compile-time storage, see
-        ``ComptimeAggregatePtr``).  A single pointer has one place only, its
-        pointee, and is dereferenced with ``p[...]``."""
+        place when the pointer names compile-time storage).  A single pointer
+        has one place only, its pointee, and is dereferenced with ``p[...]``."""
         index_ev = self._arg_value(index)
         index_type = _type_of(index_ev)
         if isinstance(index_type, sval.StructType) and index_type.head is self._special_type.slice_type:
@@ -8478,7 +7688,11 @@ class HirRunner:
                 f'dereferenced with ``p[...]`` (index a ``MultiPtr`` instead)'
             )
         pointer = self.load(base)
-        if isinstance(pointer, ComptimeAggregatePtr) and isinstance(pointer.type, sval.ArrayType):
+        if (
+            isinstance(pointer, ComptimeVal)
+            and isinstance(pointer.obj, sval.ComptimePtr)
+            and isinstance(pointer.obj.type.elem, sval.ArrayType)
+        ):
             # compile-time storage of the elements: the n-th element's own place,
             # which a compile-time index picks - there is no runtime address to
             # take (see ``field_index_addr``)
@@ -8493,51 +7707,50 @@ class HirRunner:
         )
         return PollResult.AGAIN
 
-    def slice_object(self, inst: hir.Slice) -> ComptimeAggregate:
+    def slice_object(self, inst: hir.Slice) -> InterpVal:
         """The ``std.slice`` object a slice subscript builds (see
         ``hir.Slice``): a compile-time aggregate of its bounds, of the type
         ``std.slice[usize]`` - a slice of a pointer counts its elements.  Every
         bound is an *option*: a bound the source left out (a null constant) is
         the *typed* absent value of ``Option[usize]`` (see ``sval.TypedNull``)
-        and a present one an ``Option`` value (see ``ComptimeOption``): an option
-        has no runtime shape of its own, so this is how a field is held.  Which
-        meaning an absent bound has is decided where the slice is used (see
-        ``slice_ptr``)."""
+        and a present one an ``Option`` value (see ``sval.OptionValue``): an
+        option has no runtime shape of its own, so this is how a field is held.
+        Which meaning an absent bound has is decided where the slice is used
+        (see ``slice_ptr``)."""
         usize = self._usize_type()
         start = self._slice_bound_field(self.operand(inst.lower), usize, 'the start of a slice')
         end = self._slice_bound_field(self.operand(inst.upper), usize, 'the end of a slice')
         step = self._slice_bound_field(self.operand(inst.step), usize, 'the step of a slice')
-        return ComptimeAggregate(
-            self._special_type.slice_type.specialize((usize,)), (start, end, step),
-        )
+        slice_type = self._special_type.slice_type.specialize((usize,))
+        return ComptimeVal(sval.AggregateValue((start, end, step), slice_type))
 
-    def _slice_bound_field(self, ev: InterpVal, usize: sval.Type, what: str) -> InterpVal:
+    def _slice_bound_field(self, ev: InterpVal, usize: sval.Type, what: str) -> sval.AnyValue:
         """One bound of the ``std.slice`` object a slice subscript builds, as an
         option value: the absent value when ``ev`` is a null constant, a present
-        option holding it coerced to ``usize`` otherwise."""
+        option holding it coerced to ``usize`` otherwise (see §5.3)."""
         if _comptime_bool(self._is_null(ev), what):
-            return ComptimeVal(sval.TypedNull(usize))
-        return ComptimeOption(ComptimeVal(False), self._coerce(ev, usize))
+            return sval.TypedNull(usize)
+        value = _to_comptime(self._coerce(ev, usize))
+        assert value is not None
+        return sval.OptionValue(value)
 
-    def _slice_bound_value(self, ev: InterpVal, what: str) -> InterpVal | None:
+    def _slice_bound_value(self, obj: sval.AnyValue, what: str) -> InterpVal | None:
         """The value of a bound of the ``std.slice`` object a slice subscript
         built, or None when it is absent (see ``slice_object``)."""
-        ev = _shallow_normalize(ev)
-        if isinstance(ev, ComptimeOption):
-            return None if _comptime_bool(ev.is_null, what) else ev.value
-        if _comptime_bool(self._is_null(ev), what):
+        if isinstance(obj, sval.OptionValue):
+            return ComptimeVal(obj.value)
+        if isinstance(obj, (sval.Null, sval.TypedNull)):
             return None
-        return ev
+        raise CompileError(f'{what} is not a slice bound')
 
-    def slice_ptr(self, base: InterpVal, ptr_type: sval.PointerType, slice_obj: ComptimeAggregate) -> ComptimeAggregatePtr:
+    def slice_ptr(self, base: InterpVal, ptr_type: sval.PointerType, slice_obj: sval.AggregateValue) -> InterpVal:
         """The ``SlicePtr`` a slice subscript of the multi pointer ``ptr_type``
         builds: ``SlicePtr(mptr + a, b - a)``.  The result is the place of a
-        compile-time aggregate - a subscript always yields a pointer - whose
-        fields are *const* boxes (a slice is a view, not a place to write the
-        slice itself through, see ``ComptimeBox``): the pointer field holds the
-        offset pointer (a runtime value when the base is a runtime one, the
-        places the slice names when the base is compile-time storage), the
-        length field the number of elements.
+        compile-time aggregate - a subscript always yields a pointer - a const box
+        when both its fields are compile-time and fresh memory otherwise: the
+        pointer field holds the offset pointer (a runtime value when the base is a
+        runtime one, the offset into the base's compile-time storage otherwise),
+        the length field the number of elements.
 
         A missing lower bound is 0; a missing upper bound has no meaning for a
         bare pointer - it has no length to slice to the end - and a step has to
@@ -8571,9 +7784,13 @@ class HirRunner:
                 self._emit(mir.Gep(base_ev.value, offset)),
                 sval.PointerType(elem, is_const, sval.PointerVariant.MULTI),
             )
-        elif isinstance(base_ev, ComptimeAggregatePtr) and isinstance(base_ev.type, sval.ArrayType):
-            # compile-time storage of the elements: the slice names a range of
-            # the places it holds (a runtime bound has no place to name)
+        elif (
+            isinstance(base_ev, ComptimeVal)
+            and isinstance(base_ev.obj, sval.ComptimePtr)
+            and isinstance(base_ev.obj.type.elem, sval.ArrayType)
+        ):
+            # compile-time storage of the elements: the slice names a range of the
+            # cells it holds (a runtime bound has no place to name)
             start = _comptime_int(start_ev)
             end = _comptime_int(end_ev)
             if start is None or end is None:
@@ -8581,9 +7798,11 @@ class HirRunner:
                     'a slice of compile-time storage needs constant bounds'
                 )
             self._check_slice_range(start, end)
-            element_ptr = ComptimeAggregatePtr(
-                sval.ArrayType(elem, end - start), base_ev.ptrs[start:end],
-            )
+            cptr = base_ev.obj
+            element_ptr = ComptimeVal(sval.ComptimePtr(
+                cptr.box, cptr.offset + start * sval.scalar_count(elem),
+                sval.PointerType(sval.ArrayType(elem, end - start), is_const, sval.PointerVariant.MULTI),
+            ))
         else:
             raise CompileError('cannot slice a compile-time pointer')
         start_int = _comptime_int(start_ev)
@@ -8602,16 +7821,21 @@ class HirRunner:
                 )),
                 usize,
             )
-        return ComptimeAggregatePtr(
-            self._special_type.slice_ptr_of(elem, is_const),
-            (
-                ComptimeBox(
-                    sval.PointerType(elem, is_const, sval.PointerVariant.MULTI),
-                    element_ptr, is_const=True,
-                ),
-                ComptimeBox(usize, length, is_const=True),
-            ),
-        )
+        slice_type = self._special_type.slice_ptr_of(elem, is_const)
+        element_obj = _to_comptime(element_ptr)
+        length_obj = _to_comptime(length)
+        if element_obj is not None and length_obj is not None:
+            # a slice is a view, not a place to write the slice itself through: a
+            # const box (see §4.2)
+            box = self._new_box(slice_type, is_const=True)
+            box.cells = _flatten_value(
+                sval.AggregateValue((element_obj, length_obj), slice_type), slice_type,
+            )
+            return ComptimeVal(sval.ComptimePtr(box, 0, sval.PointerType(slice_type, is_const=True)))
+        place = self._aggregate_place(slice_type, is_comptime=False)
+        self.store(self.field_index_addr(place, _index_value(0)), element_ptr)
+        self.store(self.field_index_addr(place, _index_value(1)), length)
+        return place
 
 
     def _check_slice_range(self, start: int, end: int) -> None:
@@ -8636,49 +7860,6 @@ class HirRunner:
             if isinstance(action.data, _PendingTuple):
                 return action.data
         return None
-
-    def init_inline_aggregate(self, type: sval.Type) -> ComptimeAggregatePtr:
-        """Fresh compile-time storage for an aggregate: every field (or array
-        element) gets a place of its own - a place whose storage the stores into
-        it decide, a box for a compile-time value and memory for a runtime one
-        (see ``_fresh_place``) - and the places, in declaration (or element)
-        order, make up the result.  The result is itself a pointer
-        (``PointerType(type)``): ``HirRunner.field_index_addr`` takes a place out
-        of it, ``store`` writes a place through it and ``load`` reads the whole
-        aggregate (see ``ComptimeAggregatePtr`` and ``ComptimeAggregate``)."""
-        places: list[InterpVal] = []
-        for place_type in _aggregate_place_types(type):
-            places.append(self._fresh_place(place_type))
-        return ComptimeAggregatePtr(type, tuple(places))
-
-    def _fresh_place(self, type: sval.Type) -> InterpVal:
-        """A fresh place for a value of ``type``, used as the
-        field/element/payload of a compile-time aggregate, tuple, dict or
-        option: a nested aggregate/tuple/dict/option gets a pointer form of its
-        own, anything else a slot whose storage the stores into it decide - a
-        compile-time value stays a box, a runtime one lands in memory (see
-        ``PendingSlot``)."""
-        if _is_aggregate(type):
-            return self.init_inline_aggregate(type)
-        if isinstance(type, sval.TupleType):
-            return self.init_comptime_tuple(type)
-        if isinstance(type, sval.StrDictType):
-            return self.init_comptime_dict(type)
-        if isinstance(type, sval.OptionType):
-            return self.init_comptime_option(type)
-        if isinstance(type, sval.TaggedUnionType):
-            return self.init_comptime_tagged_union(type)
-        return self.alloca(InlineMode.FULL, declared=type, commit_declared=False)
-
-    def init_comptime_option(self, option: sval.OptionType) -> ComptimeOptionPtr:
-        """Fresh compile-time storage for an option: the payload gets a place of
-        its own and the tag starts absent (see ``ComptimeOptionPtr``)."""
-        child = option.child
-        if child.is_zst():
-            payload: InterpVal = ComptimeVal(sval.Undefined(sval.PointerType(child, is_const=False)))
-        else:
-            payload = self._fresh_place(child)
-        return ComptimeOptionPtr(ComptimeVal(True), payload)
 
     def finish_struct(
         self,
@@ -8708,12 +7889,11 @@ class HirRunner:
         field in the storage (its value is written through that address, in
         place).
 
-        An inline storage (an expression temporary or a ``Comptime`` variable,
-        see ``PendingSlot.is_inline``) gets no addresses at all: its fields are
-        their own places, which the construction records on the slot for its
-        commit to materialize (see ``init_inline_aggregate``), and a storage that
-        already is a :class:`ComptimeAggregatePtr` wrote every field through
-        its place before."""
+        An aggregate construction is *deferred*: the fields are their own places,
+        which the construction records on the slot for its commit to materialize
+        into the aggregate - a ``Box`` (compile-time) or memory, decided then (see
+        ``PendingSlot.use_comptime_storage``).  A storage that is already
+        materialized wrote every field through its place before."""
         struct_def = _callee_object(struct)
         if isinstance(struct_def, sval.StructTypeHead):
             field_indices = struct_def.fields.by_key
@@ -8757,10 +7937,10 @@ class HirRunner:
             )
             return
 
-        if isinstance(dest, PendingSlot) and dest.committed is None and dest.is_inline(struct_type):
-            # an inline aggregate: its fields are their own places, so the
-            # construction only hands them to the storage slot, whose commit
-            # materializes the aggregate (see ``init_inline_aggregate``)
+        if isinstance(dest, PendingSlot) and dest.committed is None:
+            # the fields are their own places (``field_index_addr`` with
+            # ``is_aggregate_init`` gave each a fresh slot), which the construction
+            # records on the slot for its commit to materialize into the aggregate
             if self._pending_aggregate(dest) is None:
                 places = tuple(
                     provided[index] if index in provided
@@ -8776,42 +7956,10 @@ class HirRunner:
                     if index not in provided:
                         self._default_field_place(dest, index, fields.get_by_id(index))
             return
-        if isinstance(_shallow_normalize(dest), ComptimeAggregatePtr):
-            # the aggregate is already materialized (a ``Comptime`` variable that
-            # was assigned before): every field already is a place, which the
-            # arguments wrote through (see ``field_index_addr``)
-            for index, field0 in enumerate(fields.values()):
-                if index not in provided:
-                    self._default_field_place(dest, index, field0)
-            return
 
-        if isinstance(dest, PendingSlot) and dest.committed is None:
-            # the slot has no address yet: the deferred conversion also
-            # records the struct type as the type of the slot (an uncommitted
-            # error slot included - its commit hands back the payload pointer)
-            dest_ptr = self._defer_ptr_convertion(dest, struct_type)
-        else:
-            dest_ptr = self._convert_result_ptr(_shallow_normalize(dest), struct_type)
-
-        for index, place in provided.items():
-            field_type = fields.get_by_id(index).type
-            if not (isinstance(place, PendingSlot) and place.committed is None):
-                # the field wrote through the address it was given (see
-                # ``field_index_addr``), which is already final
-                continue
-            if field_type.is_zst():
-                # a zero-sized field occupies no storage: the place is
-                # committed for its value alone, which every value of the
-                # field type equals anyway
-                self._commit_pending_slot(place, field_type)
-                continue
-            addr = self.field_index_addr(dest_ptr, _index_value(index), at=place.insertion)
-            if not isinstance(addr, RuntimeVal):
-                # the storage is a compile-time aggregate: the field place is the
-                # aggregate's own place, committed with it (see ``_commit_place_tree``)
-                continue
-            assert isinstance(addr, RuntimeVal), 'a field with storage has an address'
-            self._bind_slot(place, addr.value, field_type)
+        # an already materialized storage: its fields already are places, which
+        # the provided arguments wrote through (see ``field_index_addr``)
+        dest_ptr = _shallow_normalize(dest)
         for index, field0 in enumerate(fields.values()):
             if index not in provided:
                 self._default_field_place(dest_ptr, index, field0)
@@ -8884,65 +8032,60 @@ class HirRunner:
         place that is still pending becomes the address of its element in the
         storage (its value is written through that address, in place).
 
-        An inline storage (see ``PendingSlot.is_inline``) gets no addresses at
-        all: its elements are their own places, which the construction records
-        on the slot for its commit to materialize (see
-        ``init_inline_aggregate``), and a storage that already is a
-        :class:`ComptimeAggregatePtr` wrote every element through its place
-        before.  Neither takes an address."""
+        An aggregate construction is deferred, exactly like a struct's (see
+        ``finish_struct``): the elements are their own places, recorded on the
+        slot for its commit to materialize into the array."""
         array_type = _array_construction_type(array, elements)
-        if isinstance(array, PendingSlot) and array.committed is None and array.is_inline(array_type):
+        if isinstance(array, PendingSlot) and array.committed is None:
             if self._pending_aggregate(array) is None:
                 self._record_pending_action(array, _PendingAggregate(array_type, elements))
             return
-        if isinstance(_shallow_normalize(array), ComptimeAggregatePtr):
-            return
+        # an already materialized storage: the elements already wrote through
+        # their places (see ``field_index_addr``)
 
-        if isinstance(array, PendingSlot) and array.committed is None:
-            array_ptr = self._defer_ptr_convertion(array, array_type)
-        else:
-            array_ptr = self._convert_result_ptr(_shallow_normalize(array), array_type)
-        for index, element in enumerate(elements):
-            if not (isinstance(element, PendingSlot) and element.committed is None):
-                # the element wrote through the address it was given (see
-                # ``field_index_addr``), which is already final
-                continue
-            if array_type.is_zst():
-                # a zero-sized array has nowhere to write an element: the place
-                # is committed for its value alone, which every value of the
-                # element type equals anyway
-                self._commit_pending_slot(element, array_type.elem)
-                continue
-            ptr = self.field_index_addr(
-                array_ptr, _index_value(index), at=element.insertion
-            )
-            assert isinstance(ptr, RuntimeVal), 'an element of an array with storage has an address'
-            self._bind_slot(element, ptr.value, array_type.elem)
+    def _build_tuple_value(self, elems: tuple[ArgEntry[InterpVal], ...]) -> InterpVal:
+        """The *value* of a ``tuple`` expression (see ``hir.Tuple``): a tuple is a
+        real aggregate now (§7.1), so it is a compile-time ``AggregateValue`` when
+        every element is compile-time and an ``InsertValue`` chain otherwise."""
+        types: list[sval.Type] = []
+        for elem in elems:
+            elem_type = _arg_type_of(elem)
+            if elem_type is None:
+                raise CompileError('a tuple element has no type')
+            types.append(elem_type)
+        tuple_type = sval.TupleType(tuple(types), False)
+        objs: list[sval.AnyValue] = []
+        for elem in elems:
+            obj = _to_comptime(self._arg_value(elem))
+            if obj is None:
+                objs = []
+                break
+            objs.append(obj)
+        if len(objs) == len(elems):
+            return ComptimeVal(sval.AggregateValue(tuple(objs), tuple_type))
+        mir_type = tuple_type.to_mir_type(self._mir_cache)
+        if not isinstance(mir_type, mir.StructType):
+            raise CompileError(f'a value of the tuple {tuple_type} has no runtime representation')
+        result: mir.Value = mir.UndefValue(mir_type)
+        for index, elem in enumerate(elems):
+            value = self._coerce(self._arg_value(elem), types[index])
+            result = self._emit(mir.InsertValue(result, self._to_runtime(value), index))
+        return RuntimeVal(result, tuple_type)
 
     def init_tuple(self, location: InterpVal, length: int) -> None:
-        # a tuple has no storage of its own, so initializing one is building the
-        # tuple of the *places* its elements are written into.  A location that
-        # already is such a tuple - the target tuple of a destructuring, an
-        # element of a tuple being initialized - is used as it is; any other
-        # location (a ``Comptime`` variable's slot) records a fresh tuple of
-        # element places as a pending action, so that the slot's type - and the
-        # conflict another store into it would be - is resolved at its commit
-        # (see ``_PendingTuple``).  That tuple of places is what
-        # ``hir.TuplePtrElement`` then takes the element addresses of.
+        # a tuple is initialized into a place of its own: a still uncommitted
+        # location records a fresh tuple of element places as a pending action,
+        # so that the slot's type - and the conflict another store into it would
+        # be - is resolved at its commit (see ``_PendingTuple``); an already
+        # materialized location needs nothing (its ``TuplePtrElement``s address
+        # its elements directly, see ``tuple_ptr_element``)
         location = _shallow_normalize(location)
-        if isinstance(location, ComptimeTuplePtr):
-            if len(location.values) != length:
-                raise CompileError(
-                    f'cannot initialize a tuple of {length} element(s) in a '
-                    f'location of {len(location.values)} place(s)'
-                )
-            return
-        if isinstance(location, PendingSlot) and location.inline_mode != InlineMode.NONE and location.committed is None:
+        if isinstance(location, PendingSlot) and location.committed is None:
             recorded = self._pending_tuple(location)
             if recorded is not None:
                 # a second ``return a, b`` into the same result location (another
                 # path): the element places are the same, so the values written on
-                # this path go where the earlier path's did (see ``_finish_function``)
+                # this path go where the earlier path's did
                 if len(recorded.places) != length:
                     raise CompileError(
                         f'cannot initialize a tuple of {length} element(s) in a '
@@ -8951,59 +8094,31 @@ class HirRunner:
                 return
             self._record_pending_action(
                 location,
-                _PendingTuple(tuple(self.alloca(InlineMode.FULL) for _ in range(length))),
+                _PendingTuple(tuple(self.alloca() for _ in range(length))),
             )
-            return
-        raise CompileError(f'cannot initialize a tuple in {location!r}')
 
     def tuple_ptr_element(self, location: InterpVal, index: int) -> InterpVal:
         # the place the index-th element of the tuple being initialized in
         # ``location`` is written through (see ``init_tuple``)
         location = _shallow_normalize(location)
-        places: tuple[InterpVal, ...] | None = None
-        if isinstance(location, ComptimeTuplePtr):
-            places = location.values
-        elif isinstance(location, PendingSlot):
-            # a slot InitTuple gave a fresh tuple of element places: the tuple is
-            # the initialization it recorded
-            for action in reversed(location.stores):
-                if isinstance(action.data, _PendingTuple):
-                    places = action.data.places
-                    break
-        if places is None:
-            raise CompileError(f'cannot take an element of {location!r}')
-        if index < 0 or index >= len(places):
-            raise CompileError(f'the tuple has no element at index {index}')
-        return places[index]
+        if isinstance(location, PendingSlot) and location.committed is None:
+            recorded = self._pending_tuple(location)
+            if recorded is None:
+                raise CompileError(f'cannot take an element of {location!r}')
+            places = recorded.places
+            if index < 0 or index >= len(places):
+                raise CompileError(f'the tuple has no element at index {index}')
+            return places[index]
+        # an already materialized tuple place: the element's address in it
+        return self.field_index_addr(location, _index_value(index))
 
     def _commit_place_tree(self, place: InterpVal) -> None:
-        # the leaf places a composite place holds are committed with the place
-        # itself: no ``hir.CommitSlot`` of its own names them.  A tuple's element
-        # places are recorded by its construction (see ``init_tuple``), and a
-        # declared ``Comptime`` variable's place tree may still hold leaf places
-        # whose storage the stores decide (see ``_stores_decide_storage``)
-        todo: list[InterpVal] = [place]
-        while todo:
-            value = todo.pop()
-            if isinstance(value, PendingSlot):
-                if value.committed is None:
-                    self._commit_pending_slot(value)
-                continue
-            match value:
-                case ComptimeTuplePtr(values=values):
-                    todo.extend(values)
-                case ComptimeAggregatePtr(ptrs=ptrs):
-                    todo.extend(ptrs)
-                case ComptimeDictPtr(values=values):
-                    todo.extend(values.values())
-                case ComptimeOptionPtr(payload_ptr=payload):
-                    todo.append(payload)
-                case ComptimeTaggedUnionPtr(payload_ptr=payload):
-                    todo.append(payload)
-                case _:
-                    # an already materialized place (a box, a runtime location):
-                    # nothing to commit
-                    pass
+        # a materialized place (a box, a runtime location) holds no unmaterialized
+        # leaf places of its own any more: only a still uncommitted slot needs
+        # committing
+        place = _shallow_normalize(place)
+        if isinstance(place, PendingSlot) and place.committed is None:
+            self._commit_pending_slot(place)
 
     def _method_of(self, struct: sval.StructType, method_name: str) -> sval.AnyValue | None:
         """The value of the method ``method_name`` of the struct type
@@ -9017,11 +8132,10 @@ class HirRunner:
         if method is None:
             return None
         if isinstance(method, sval.Value):
-            # the entry is already a spy value (the ``__call__``
-            # ``as_runtime_closure`` attaches to its generated struct, see
-            # ``_builtin_as_runtime_closure``): use it as it is.  A method read
-            # off a Python class body is a plain object and resolves through the
-            # host instead.
+            # the entry is already a spy value (a closure's ``__call__``, a method
+            # attached by the compiler): use it as it is.  A method read off a
+            # Python class body is a plain object and resolves through the host
+            # instead.
             resolved = method
         else:
             resolved = self._analyser._resolver.resolve_global(method)
@@ -9063,11 +8177,7 @@ class HirRunner:
             match ev:
                 case PendingSlot() if ev.committed is not None:
                     todo.append(_shallow_normalize(ev.committed))
-                case ComptimeBox():
-                    todo.append(ev.value)
                 case ComptimeVal(obj):
-                    if isinstance(obj, sval.ConstRef):
-                        obj = obj.value
                     if isinstance(obj, (sval.Type, type)):
                         return obj
                     return None
@@ -9091,12 +8201,12 @@ class HirRunner:
             method = self._method_of(obj, method_name)
             if method is None:
                 raise CompileError(f'{obj} has no method named {method_name}')
-            return self.call(ComptimeVal(sval.ConstRef(method)), args, ret, on_return)
+            return self.call(ComptimeVal(method), args, ret, on_return)
         if isinstance(obj, sval.IntEnumType):
             method = self._enum_method_of(obj, method_name)
             if method is None:
                 raise CompileError(f'{obj} has no method named {method_name}')
-            return self.call(ComptimeVal(sval.ConstRef(method)), args, ret, on_return)
+            return self.call(ComptimeVal(method), args, ret, on_return)
         if isinstance(obj, sval.StructTypeHead):
             raise CompileError(
                 f'{obj} is a struct template: specialize it before calling its '
@@ -9111,7 +8221,7 @@ class HirRunner:
             target = self._analyser._resolver.resolve_global(fn)
             if target is None:
                 raise CompileError(f'cannot call {obj.__name__}.{method_name}')
-            return self.call(ComptimeVal(sval.ConstRef(target)), args, ret, on_return)
+            return self.call(ComptimeVal(target), args, ret, on_return)
         raise CompileError(f'cannot call a method on the type {obj}')
 
     def call_method(self, ptr: InterpVal, method_name: str, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None) -> PollResult:
@@ -9136,7 +8246,7 @@ class HirRunner:
         # a ``@staticmethod`` takes no receiver: it is called with the given
         # arguments alone
         if isinstance(struct_type, (sval.StructType, sval.IntEnumType)) and struct_type.is_static_method(method_name):
-            return self.call(ComptimeVal(sval.ConstRef(method)), args, ret, on_return)
+            return self.call(ComptimeVal(method), args, ret, on_return)
 
         # a method's first parameter is the struct itself: it is passed by
         # reference (the base's address) unless the method declares
@@ -9152,7 +8262,7 @@ class HirRunner:
             )
 
         return self.call(
-            ComptimeVal(sval.ConstRef(method)),
+            ComptimeVal(method),
             RawArgList((ArgEntry(ptr, self_is_ref),) + args.positional, args.kwargs),
             ret,
             on_return,
@@ -9185,22 +8295,43 @@ class HirRunner:
 
     def _spread_positional(self, place: InterpVal) -> tuple[ArgEntry[InterpVal], ...]:
         """The positional arguments a ``*`` forwarding item contributes: the
-        element places of a ``ComptimeTuplePtr`` (the pointer form only - the
-        shape a frame's varargs slot holds; the value form ``ComptimeTuple`` is
-        rejected)."""
+        element places of the ``$args`` struct the item names (see §8.1), or of a
+        tuple place."""
         place = _shallow_normalize(place)
-        if not isinstance(place, ComptimeTuplePtr):
-            raise CompileError(f'cannot unpack {_type_of(place)} positionally')
-        return tuple(ArgEntry(element, True) for element in place.values)
+        ptr_type = _type_of(place)
+        if not isinstance(ptr_type, sval.PointerType):
+            raise CompileError(f'cannot unpack {ptr_type} positionally')
+        elem = ptr_type.elem
+        if isinstance(elem, sval.TupleType):
+            count = len(elem.types)
+        elif isinstance(elem, sval.StructType) and elem.head.name_base == '$args':
+            count = len(elem.fields().by_id)
+        else:
+            raise CompileError(f'cannot unpack {elem} positionally')
+        return tuple(
+            ArgEntry(self.field_index_addr(place, _index_value(index)), True)
+            for index in range(count)
+        )
 
     def _spread_kwargs(self, place: InterpVal) -> frozendict[str, ArgEntry[InterpVal]]:
         """The keyword arguments a ``**`` forwarding item contributes: the value
-        places of a ``ComptimeDictPtr`` (the pointer form only - the shape a
-        frame's kwargs slot holds; the value form ``ComptimeDict`` is rejected)."""
+        places of the ``$kwargs`` struct the item names (see §8.1), or of a
+        ``dict[str, T]`` place."""
         place = _shallow_normalize(place)
-        if not isinstance(place, ComptimeDictPtr):
-            raise CompileError(f'cannot unpack {_type_of(place)} by keyword')
-        return frozendict((key, ArgEntry(value, True)) for key, value in place.values.items())
+        ptr_type = _type_of(place)
+        if not isinstance(ptr_type, sval.PointerType):
+            raise CompileError(f'cannot unpack {ptr_type} by keyword')
+        elem = ptr_type.elem
+        if isinstance(elem, sval.StrDictType):
+            names = list(elem.values.keys())
+        elif isinstance(elem, sval.StructType) and elem.head.name_base == '$kwargs':
+            names = list(elem.fields().by_id.keys())
+        else:
+            raise CompileError(f'cannot unpack {elem} by keyword')
+        return frozendict(
+            (name, ArgEntry(self.field_index_addr(place, _index_value(index)), True))
+            for index, name in enumerate(names)
+        )
 
     def operand_arg(self, arg: ArgEntry[hir.Value]) -> ArgEntry[InterpVal]:
         return ArgEntry(self.operand(arg.value), arg.is_ref)
@@ -9241,123 +8372,120 @@ class HirRunner:
         ``Signature.solve_param_types``), whether it is a value or - when
         ``is_ref`` - a *place*.
 
-        A **value** provides: a compile-time value as itself; a compile-time
-        pointer as a :class:`~spy.compiler.fn.ComptimePtrArg` (its pointee
-        carried losslessly); a runtime value as its spy type; and a
-        tuple/``dict[str, T]`` as its element tree (whose elements are passed
-        separately).
-
-        A **place** (``is_ref``) provides *what it holds*: a compile-time place
-        its content - flattened field by field for an aggregate, tag + payload
-        for an ``Option``/tagged union, one place per element for a tuple/dict -
-        and a runtime place its element type (the caller emits the load, see
-        ``_make_runtime_call``).  The place branch is the mirror of
-        ``_init_ptr_target``: the ``ArgNode`` it produces is exactly what the
-        callee rebuilds an equivalent place from."""
+        A **value** provides a compile-time value as itself (a compile-time
+        pointer by identity, see §4.2) or a runtime value as its spy type.  A
+        **place** (``is_ref``) provides *what it holds*: a compile-time place the
+        value it holds, a runtime place its element type (the caller emits the
+        load, see ``_make_runtime_call``)."""
         ev = _shallow_normalize(val)
+        # a tuple/``dict`` argument is provided element by element (its elements
+        # are their own places/values, passed separately - see §7.4)
+        val_type = _type_of(ev)
+        container = val_type.elem if isinstance(val_type, sval.PointerType) else val_type
+        if isinstance(container, sval.TupleType):
+            return self._tuple_val_to_nodes(ev, val_type, container)
+        if isinstance(container, sval.StrDictType):
+            return self._dict_val_to_nodes(ev, val_type, container)
         if is_ref:
             # a place: what it provides is the content it holds
-            match ev:
-                case ComptimeBox(value=value):
-                    # a scalar held compile-time: the value it holds
-                    return self._val_to_node(value, False)
-                case ComptimeAggregatePtr(type=agg_type, ptrs=ptrs):
-                    # an aggregate whose fields (or elements) are their own places
-                    elem_types = _aggregate_place_types(agg_type)
-                    return CompoundArgNode(agg_type, tuple(
-                        self._val_to_node(p, True) for p in ptrs[:len(elem_types)]
-                    ))
-                case ComptimeTuplePtr(values=values):
-                    # a tuple has no representation of its own: its elements are
-                    # their own places, passed separately
-                    return tuple(self._val_to_node(p, True) for p in values)
-                case ComptimeDictPtr(values=values):
-                    # the named counterpart of a tuple (a ``dict[str, T]``)
-                    return frozendict(
-                        (name, self._val_to_node(p, True)) for name, p in values.items()
-                    )
-                case ComptimeOptionPtr() as ptr:
-                    # an option is held by its tag and its payload place (tag
-                    # first, the canonical order)
-                    option = _place_type(ptr)
-                    assert isinstance(option, sval.OptionType)
-                    if _to_comptime(_shallow_normalize(ptr.is_null)) is None:
-                        # a tag only known at runtime: the option is not
-                        # transportable losslessly, so it is materialized as one
-                        # runtime argument
-                        return RuntimeArgNode(option, False)
-                    return CompoundArgNode(option, (
-                        self._val_to_node(ptr.is_null, False),
-                        self._val_to_node(ptr.payload_ptr, True),
-                    ))
-                case ComptimeTaggedUnionPtr() as ptr:
-                    # likewise for a tagged union (the tag first)
-                    if _to_comptime(_shallow_normalize(ptr.tag)) is None:
-                        # a tag only known at runtime, as above
-                        return RuntimeArgNode(ptr.type, False)
-                    return CompoundArgNode(ptr.type, (
-                        self._val_to_node(ptr.tag, False),
-                        self._val_to_node(ptr.payload_ptr, True),
-                    ))
-                case _:
-                    # a leaf place: a compile-time one provides the value it
-                    # holds (the load is pure), a runtime one its element type
-                    # (the caller emits the load)
-                    if _is_comptime_val(ev):
-                        return self._val_to_node(self.load(ev), False)
-                    node_type = _arg_type_of(ArgEntry(ev, True))
-                    if node_type is None:
-                        raise CompileError(
-                            'cannot determine the type of an argument passed to a spy function'
-                        )
-                    return RuntimeArgNode(node_type, False)
-
-        if isinstance(ev, _COMPTIME_PTR_FORMS):
-            ptr_type = _type_of(ev)
-            assert isinstance(ptr_type, sval.PointerType)
-            if isinstance(ev, (ComptimeOptionPtr, ComptimeTaggedUnionPtr)):
-                tag = ev.is_null if isinstance(ev, ComptimeOptionPtr) else ev.tag
-                if _to_comptime(_shallow_normalize(tag)) is None:
-                    # a tag only known at runtime: the place is not
-                    # transportable losslessly as compile-time content, so
-                    # the pointer is materialized as one runtime argument
-                    # (still a copy)
-                    return RuntimeArgNode(ptr_type, False)
-            return ComptimePtrArg(ptr_type, self._val_to_node(ev, True))
+            if _is_comptime_val(ev):
+                return self._val_to_node(self.load(ev), False)
+            node_type = _arg_type_of(ArgEntry(ev, True))
+            if node_type is None:
+                raise CompileError(
+                    'cannot determine the type of an argument passed to a spy function'
+                )
+            return RuntimeArgNode(node_type, False)
         match ev:
-            case ComptimeCastedPtr() as casted:
-                # a cast pointer whose underlying place does not convert to the
-                # target type (see ``ComptimeCastedPtr``): reading or writing
-                # through it is not supported, so neither is passing it to a
-                # function
-                raise CompileError(f'cannot pass the cast pointer {casted.type} to a function')
             case RuntimeVal(type=value_type):
                 return RuntimeArgNode(value_type, False)
             case ComptimeVal(obj=obj):
-                if isinstance(obj, sval.ConstRef):
-                    # a const reference to a compile-time global: a compile-time
-                    # pointer to an immutable value (see ``ConstRef``)
-                    return ComptimePtrArg(obj.get_type(), self._val_to_node(ComptimeVal(obj.value), False))
+                # a compile-time value, a compile-time pointer included (passed
+                # by identity, see §4.2)
                 return obj
-            case ComptimeTuple(values=values):
-                return tuple(
-                    self._val_to_node(child.value, child.is_ref) for child in values
-                )
-            case ComptimeDict(values=values):
-                return frozendict(
-                    (name, self._val_to_node(child.value, child.is_ref))
-                    for name, child in values.items()
-                )
             case _:
-                # a value form with no node language of its own (a compile-time
-                # aggregate, option or tagged union): one runtime argument,
-                # materialized where a runtime value is needed
                 node_type = _type_of(ev)
                 if node_type is None:
                     raise CompileError(
                         'cannot determine the type of an argument passed to a spy function'
                     )
                 return RuntimeArgNode(node_type, False)
+
+    def _tuple_val_to_nodes(self, ev: InterpVal, val_type: sval.Type | None, container: sval.TupleType) -> tuple[ArgNode, ...]:
+        """One provided :data:`ArgNode` per element of a tuple argument (see
+        ``_val_to_node``): the element places of a tuple place, the element values
+        of a compile-time tuple, or - for a runtime tuple with no place of its own
+        - its elements after materializing it."""
+        if isinstance(val_type, sval.PointerType):
+            return self._tuple_element_nodes(ev, container)
+        aggregate = _as_aggregate(ev)
+        if aggregate is not None:
+            return tuple(self._val_to_node(ComptimeVal(value), False) for value in aggregate.values)
+        slot = self.alloca(False)
+        self._commit_pending_slot(slot, container)
+        self.store(slot, ev)
+        return self._tuple_element_nodes(slot, container)
+
+    def _tuple_element_nodes(self, place: InterpVal, container: sval.TupleType) -> tuple[ArgNode, ...]:
+        return tuple(
+            self._val_to_node(self.field_index_addr(place, _index_value(index)), True)
+            for index in range(len(container.types))
+        )
+
+    def _dict_val_to_nodes(self, ev: InterpVal, val_type: sval.Type | None, container: sval.StrDictType) -> frozendict[str, ArgNode]:
+        """The named counterpart of ``_tuple_val_to_nodes`` (a ``dict[str, T]``)."""
+        names = list(container.values.keys())
+        if isinstance(val_type, sval.PointerType):
+            return frozendict(
+                (name, self._val_to_node(self.field_index_addr(ev, _index_value(index)), True))
+                for index, name in enumerate(names)
+            )
+        aggregate = _as_aggregate(ev)
+        if aggregate is not None:
+            return frozendict(
+                (name, self._val_to_node(ComptimeVal(value), False))
+                for name, value in zip(names, aggregate.values)
+            )
+        slot = self.alloca(False)
+        self._commit_pending_slot(slot, container)
+        self.store(slot, ev)
+        return frozendict(
+            (name, self._val_to_node(self.field_index_addr(slot, _index_value(index)), True))
+            for index, name in enumerate(names)
+        )
+
+    def _tuple_arg_entries(self, ev: ArgEntry[InterpVal]) -> tuple[ArgEntry[InterpVal], ...]:
+        """One operand per element of a tuple argument, for a call that passes the
+        elements separately (see ``ArgNode``): the element places of a tuple
+        place, or the element values of a compile-time tuple."""
+        value = _shallow_normalize(ev.value)
+        ptr_type = _type_of(value)
+        if isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.TupleType):
+            return tuple(
+                ArgEntry(self.field_index_addr(value, _index_value(index)), True)
+                for index in range(len(ptr_type.elem.types))
+            )
+        aggregate = _as_aggregate(value)
+        if aggregate is not None and isinstance(aggregate.type, sval.TupleType):
+            return tuple(ArgEntry(ComptimeVal(element), False) for element in aggregate.values)
+        raise CompileError(f'cannot take the elements of the argument value {ev!r}')
+
+    def _dict_arg_entries(self, ev: ArgEntry[InterpVal]) -> dict[str, ArgEntry[InterpVal]]:
+        """One operand per name of a ``dict[str, T]`` argument (see
+        ``_tuple_arg_entries``)."""
+        value = _shallow_normalize(ev.value)
+        ptr_type = _type_of(value)
+        if isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.StrDictType):
+            names = list(ptr_type.elem.values.keys())
+            return {
+                name: ArgEntry(self.field_index_addr(value, _index_value(index)), True)
+                for index, name in enumerate(names)
+            }
+        aggregate = _as_aggregate(value)
+        if aggregate is not None and isinstance(aggregate.type, sval.StrDictType):
+            names = list(aggregate.type.values.keys())
+            return {name: ArgEntry(ComptimeVal(element), False) for name, element in zip(names, aggregate.values)}
+        raise CompileError(f'cannot take the values of the argument value {ev!r}')
 
     def _call_function_entry(
         self,
@@ -9366,14 +8494,12 @@ class HirRunner:
         ret: InterpVal,
         generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
         on_return: Callable[[], None] | None = None,
-        captures: tuple[InterpVal, ...] | None = None,
         catch_unwind: bool = False,
     ) -> PollResult:
         """A call of a registered spy function with the given (already
         evaluated) argument values - the common tail of an ordinary
-        function call, of a method call (whose ``self`` the caller
-        prepended to the arguments) and of a closure call
-        (``ClosureValue``, a ``FunctionValue``).  The call is specialized
+        function call and of a method call (whose ``self`` the caller
+        prepended to the arguments).  The call is specialized
         from the marshaled argument types (an annotated parameter fixes its
         type, an unannotated one is typed by its argument); a plain Python
         callee (``force_inline``) is inlined into the current stream
@@ -9391,12 +8517,6 @@ class HirRunner:
         method's signature names the struct's type parameters, and they are
         substituted into it before it is specialized.
 
-        ``captures`` are the capture places the call point provides (see
-        ``hir.CallInplace.captures`` and :attr:`FunctionValue.captures`):
-        None to use the callee's own captures, a tuple (possibly empty) to
-        override them - only the ``__call__`` ``as_runtime_closure``
-        generates provides them.
-
         ``catch_unwind`` emits a may-panic call as a ``CatchUnwind`` instead
         of a ``CallMayPanic`` (see ``_builtin_catch_unwind``)."""
         sig = fn.hir.signature
@@ -9404,9 +8524,6 @@ class HirRunner:
             sig = sig.substitute_type_vars(dict(generic_var_values))
         binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
         _check_comptime_args(sig, binded_args)
-        # the capture places this call runs with: what the call point provided,
-        # or the callee's own (empty for an ordinary function)
-        effective_captures = captures if captures is not None else fn.captures
         if fn.force_inline:
             # an undecorated plain Python function or a forced-inline closure:
             # its body is inlined into the current stream (it has no native
@@ -9440,29 +8557,19 @@ class HirRunner:
                 frozendict(frame_values),
                 value_is_empty=isinstance(sig.ret_type, sval.EmptyType),
                 on_done=on_return,
-                closure_values=self._inline_capture_values(effective_captures),
                 param_types=param_types,
                 has_varargs=sig.varargs is not None,
                 has_kwargs=sig.kwargs is not None,
             )
-        capture_args = tuple(ArgEntry(capture, False) for capture in effective_captures)
-        capture_specs = tuple(self._val_to_node(arg.value, arg.is_ref) for arg in capture_args)
         provided = self._provided_types(sig, binded_args)
-        if isinstance(fn, ClosureValue):
-            # a closure argument can only be handed to an inline call (a runtime
-            # specialization has no place for a closure value)
-            for node in provided.values():
-                for type in _arg_node_types(node):
-                    if isinstance(type, sval.ClosureType):
-                        raise CompileError('a closure can only be passed to an inline function')
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
-        if len(capture_specs) > 0:
-            call_sig = replace(call_sig, captures=capture_specs)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
+            instance = fn.specs.get(call_sig)
             res = self0._make_runtime_call(
-                fn_mir, binded_args, ret, call_sig, ret_sig, capture_args,
+                fn_mir, binded_args, ret, call_sig, ret_sig,
                 catch_unwind=catch_unwind,
+                comptime_values=None if instance is None else instance.ret_comptime_values,
             )
             if on_return is not None and not ret_sig.value_is_empty():
                 # the callee delivered its value into ``ret``: finish what the
@@ -9471,16 +8578,6 @@ class HirRunner:
             return res
 
         return self._request_function(fn, call_sig, partial_ret_sig, _resumer, generic_var_values)
-
-    def _inline_capture_values(self, captures: tuple[InterpVal, ...]) -> tuple[InterpVal, ...]:
-        """The capture places an inlined body is run with: the given places,
-        each materialized if it is still a pending slot."""
-        out: list[InterpVal] = []
-        for capture in captures:
-            if isinstance(capture, PendingSlot) and capture.committed is None:
-                self._commit_pending_slot(capture)
-            out.append(_shallow_normalize(capture))
-        return tuple(out)
 
     def _request_function(
         self,
@@ -9509,7 +8606,7 @@ class HirRunner:
         self._fn_req_resumer = None
         return resumer(self, fn_mir, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature, capture_args: tuple[ArgEntry[InterpVal], ...] = (), catch_unwind: bool = False) -> PollResult:
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature, catch_unwind: bool = False, comptime_values: list[sval.AnyValue | None] | None = None) -> PollResult:
         """Emit the native call of an already-resolved callee and hand its
         result to the call's result location.  A callee that cannot return
         normally (no value and no error, or no value at all) ends the current
@@ -9517,31 +8614,20 @@ class HirRunner:
         mir_args: list[mir.Value] = []
 
         def convert_one(arg: ArgEntry[InterpVal], sig_arg: ArgNode) -> None:
-            if isinstance(sig_arg, ComptimePtrArg):
-                # a compile-time pointer: no MIR argument for the pointer itself,
-                # but its content's runtime leaves are passed separately.  The
-                # pointer is the argument value (or, when the argument is a place,
-                # what that place holds - the loaded pointer)
-                pointer = self.load(arg.value) if arg.is_ref else arg.value
-                convert_content(ArgEntry(pointer, False), sig_arg.content)
-                return
             if not isinstance(sig_arg, RuntimeArgNode):
                 # a compound argument: its elements are passed separately, in
                 # their own order (see ``ArgNode``)
                 if isinstance(sig_arg, tuple):
-                    for child, sub in zip(sig_arg, _tuple_arg_entries(arg)):
+                    for child, sub in zip(sig_arg, self._tuple_arg_entries(arg)):
                         convert_one(sub, child)
                     return
                 if isinstance(sig_arg, frozendict):
-                    entries = _dict_arg_entries(arg)
+                    entries = self._dict_arg_entries(arg)
                     for key, child in sig_arg.items():
                         convert_one(entries[key], child)
                     return
-                if isinstance(sig_arg, CompoundArgNode):
-                    for child, sub in zip(sig_arg.elems, _aggregate_arg_entries(arg)):
-                        convert_one(sub, child)
-                    return
-                # a compile-time leaf carries no runtime value and is never passed
+                # a compile-time leaf (a value, a compile-time pointer, ...)
+                # carries no runtime value and is never passed
                 return
             if sig_arg.is_ref:
                 if arg.is_ref:
@@ -9558,61 +8644,13 @@ class HirRunner:
                         )
                     mir_args.append(ev.value)
                 else:
-                    slot = self.alloca(InlineMode.NONE)
+                    slot = self.alloca(False)
                     self._commit_pending_slot(slot, sig_arg.type)
                     self.store(slot, arg.value)
                     mir_args.append(self._to_runtime(slot))
             else:
                 ev = self.load(arg.value) if arg.is_ref else arg.value
                 mir_args.append(self._to_runtime(self._coerce(ev, sig_arg.type)))
-
-        def convert_content(arg: ArgEntry[InterpVal], node: ArgNode) -> None:
-            """Emit the MIR arguments of the runtime leaves of the compile-time
-            pointer content ``node`` (see ``ComptimePtrArg``): the mirror of
-            ``_init_ptr_target``, whose runtime leaves are consumed in the same
-            depth-first order.  ``arg`` is the place (or value) the content is
-            read out of."""
-            if isinstance(node, RuntimeArgNode):
-                # a runtime leaf of the pointee: its value, read out of the place
-                # that holds it, is passed by value
-                convert_one(ArgEntry(self.load(arg.value), False), node)
-                return
-            place = _shallow_normalize(arg.value)
-            if isinstance(node, ComptimePtrArg):
-                # a pointer inside the pointee: its content, read out of the place
-                # that holds the pointer
-                convert_content(ArgEntry(self.load(place), False), node.content)
-                return
-            if isinstance(node, tuple):
-                assert isinstance(place, ComptimeTuplePtr)
-                for child, sub in zip(node, place.values):
-                    convert_content(ArgEntry(sub, True), child)
-                return
-            if isinstance(node, frozendict):
-                assert isinstance(place, ComptimeDictPtr)
-                for key, child in node.items():
-                    convert_content(ArgEntry(place.values[key], True), child)
-                return
-            if isinstance(node, CompoundArgNode):
-                if isinstance(node.container_type, sval.OptionType):
-                    assert isinstance(place, ComptimeOptionPtr)
-                    tag, payload = node.elems
-                    convert_content(ArgEntry(place.is_null, False), tag)
-                    if not node.container_type.child.is_zst():
-                        convert_content(ArgEntry(place.payload_ptr, True), payload)
-                    return
-                if isinstance(node.container_type, sval.TaggedUnionType):
-                    assert isinstance(place, ComptimeTaggedUnionPtr)
-                    tag, payload = node.elems
-                    convert_content(ArgEntry(place.tag, False), tag)
-                    if _union_variant_type(node.container_type, place.tag).get_unit_value() is None:
-                        convert_content(ArgEntry(place.payload_ptr, True), payload)
-                    return
-                assert isinstance(place, ComptimeAggregatePtr)
-                for child, sub in zip(node.elems, place.ptrs):
-                    convert_content(ArgEntry(sub, True), child)
-                return
-            # a compile-time leaf: nothing to pass
 
         for arg, (_, sig_arg) in zip(args.positional, call_sig.positional):
             convert_one(arg, sig_arg)
@@ -9624,11 +8662,6 @@ class HirRunner:
         if call_sig.kwargs is not None:
             for name, arg in args.kwargs.items():
                 convert_one(arg, call_sig.kwargs[name])
-
-        # the hidden capture parameters of a closure call come after every
-        # declared argument (see ``_call_function_entry``)
-        for arg, sig_arg in zip(capture_args, call_sig.captures):
-            convert_one(arg, sig_arg)
 
         spec = ret_sig.ret_spec(self._mir_cache)
         callee_result = ret_sig.result_type()
@@ -9650,6 +8683,7 @@ class HirRunner:
                 callee, mir_args, ret, ret_sig.ret_type_spec,
                 noreturn=ret_sig.is_noreturn(),
                 unwind_defers=unwind_defers, catch_unwind=catch_unwind,
+                comptime_values=comptime_values,
             )
             if value_is_empty:
                 return self._cut()
@@ -9658,17 +8692,18 @@ class HirRunner:
         # its error code and payload through fresh places, dispatched below
         callee_exceptions = tuple(ret_sig.exceptions.values)
         use_ret_payload = self._use_ret_payload(callee_exceptions)
-        code_place = self.alloca(InlineMode.NONE)
+        code_place = self.alloca(False)
         if use_ret_payload:
             # no ``try`` catches the callee's errors: it writes them straight
             # into the function's own error payload (no copy on the way out)
             payload_place: InterpVal = self._function_result().payload
         else:
-            payload_place = self.alloca(InlineMode.NONE)
+            payload_place = self.alloca(False)
         error_tuple: tuple[InterpVal, InterpVal] = (code_place, payload_place)
         self._deliver_result(
             callee, mir_args, ret, spec, error_tuple,
             unwind_defers=unwind_defers, catch_unwind=catch_unwind,
+            comptime_values=comptime_values,
         )
         self._check_call_error(
             callee_exceptions, callee_result, code_place, payload_place,
@@ -9765,6 +8800,7 @@ class HirRunner:
         noreturn: bool = False,
         unwind_defers: tuple[mir.BasicBlock, ...] | None = None,
         catch_unwind: bool = False,
+        comptime_values: list[sval.AnyValue | None] | None = None,
     ) -> None:
         """Emit the native call of a callee returning the value(s) of ``spec``
         and hand every result to its place.
@@ -9783,7 +8819,7 @@ class HirRunner:
         written into its place.  A ``noreturn`` call (``mir.NoReturn``) ends the
         block it is emitted into."""
         places: list[InterpVal] = []
-        packed: list[tuple[InterpVal, ComptimeTuplePtr]] = []
+        packed: list[tuple[InterpVal, InterpVal | tuple]] = []
         if err_loc is None:
             self._pair_places(spec, ArgEntry(ret_loc, True), places, packed)
         else:
@@ -9798,6 +8834,16 @@ class HirRunner:
         ret_type: mir.ReturnType = mir.VOID
         by_value: tuple[InterpVal, sval.Type] | None = None
         for leaf, place in zip(iter_ret_leaves(spec), places):
+            if isinstance(leaf, RetComptime):
+                # a fully compile-time result leaf: no MIR argument - the callee's
+                # compile-time value (its per-``FunctionInstance`` list, see §7.3)
+                # is stored into the reserved place
+                if comptime_values is None or leaf.index >= len(comptime_values):
+                    raise CompileError(
+                        'the call delivered no compile-time result the callee returned'
+                    )
+                self.store(place, ComptimeVal(comptime_values[leaf.index]))
+                continue
             if leaf.via_result_ptr:
                 target = place
                 if isinstance(target, PendingSlot) and target.committed is None:
@@ -9838,7 +8884,7 @@ class HirRunner:
             normal = mir.BasicBlock()
             catch_block = mir.BasicBlock()
             panic_type = self._panic_data_type()
-            catch_data = self.alloca(InlineMode.NONE)
+            catch_data = self.alloca(False)
             self._commit_pending_slot(catch_data, sval.PointerType(panic_type, is_const=False))
             catch_data_ptr = self._to_runtime(_shallow_normalize(catch_data))
             call_inst = self._emit(mir.CatchUnwind(
@@ -9878,74 +8924,70 @@ class HirRunner:
         for target, tree in packed:
             self._deliver_packed_tuple(target, tree)
 
-    def _deliver_packed_tuple(self, target: InterpVal, tree: ComptimeTuplePtr) -> None:
+    def _deliver_packed_tuple(self, target: InterpVal, tree: InterpVal | tuple) -> None:
         """Deliver a multi-value result packed into the single place ``target``
-        (a call the caller gave neither a place per result nor a tuple target,
-        see ``_pair_places``).  A still uncommitted slot adopts the tree's
-        element places as its own tuple storage - the storage a tuple variable
-        holds *is* the place tree, never a value, so it is recorded as a
-        ``_PendingTuple`` rather than a store (see ``_inline_tuple_of``); any
-        other place receives the tuple *value* (see ``store``)."""
+        (a call the caller gave neither a place per result nor a tuple target, see
+        ``_pair_places``).  A still uncommitted slot records the tree's leaf places
+        as its own tuple storage (see ``_PendingTuple``); any other place receives
+        the elements, one per field."""
+        leaves = _flatten_result_tree(tree)
         if isinstance(target, PendingSlot) and target.committed is None:
-            self._record_pending_action(target, _PendingTuple(tree.values))
+            self._record_pending_action(target, _PendingTuple(leaves))
             return
-        self._commit_place_tree(tree)
-        self.store(target, self.load(tree))
+        for index, place in enumerate(leaves):
+            self.store(self.field_index_addr(target, _index_value(index)), self.load(place))
 
     def _pair_places(
         self,
         node: RetSpec,
         entry: ArgEntry[InterpVal],
         places: list[InterpVal],
-        packed: list[tuple[InterpVal, ComptimeTuplePtr]],
+        packed: list[tuple[InterpVal, InterpVal | tuple]],
     ) -> None:
-        """Pair the results of ``node`` with the place tree the caller
-        reserved: a single result takes the place ``entry`` denotes, a group
-        takes a tuple of places nested exactly like the results (see
-        ``astgen._gen_target_tuple``), and the leaves are appended to
-        ``places`` in depth-first order.  A group the caller gives a single
-        non-tuple place is *packed*: fresh places are reserved and their
-        (nested) tuple is stored in that place after the call (see
+        """Pair the results of ``node`` with the place tree the caller reserved: a
+        single result takes the place ``entry`` denotes, a group takes a (nested)
+        tuple of places nested exactly like the results (see ``astgen``), and the
+        leaves are appended to ``places`` in depth-first order.  A group the caller
+        gives a single non-tuple place is *packed*: fresh places are reserved and
+        their (nested) tuple is stored in that place after the call (see
         ``_deliver_result``).  The root result-type group is unwrapped by the
         caller (``_deliver_result``), so ``node`` is never one here."""
         target = entry.value
         match node:
-            case RetValue():
-                if isinstance(target, ComptimeTuplePtr):
+            case RetValue() | RetComptime():
+                if isinstance(target, tuple):
                     raise CompileError('cannot unpack one value into a tuple target')
-                if not entry.is_ref:
+                if isinstance(node, RetValue) and not entry.is_ref:
                     raise CompileError(
                         'the target of a multi-value result must be addressable'
                     )
                 places.append(target)
             case RetTuple(type=type, values=values):
                 assert not isinstance(type, sval.ResultType)
-                if isinstance(target, ComptimeTuplePtr):
-                    if len(target.values) != len(values):
+                if isinstance(target, tuple):
+                    if len(target) != len(values):
                         raise CompileError(
                             f'cannot unpack {len(values)} value(s) into '
-                            f'{len(target.values)} target(s)'
+                            f'{len(target)} target(s)'
                         )
-                    for child, sub in zip(values, target.values):
+                    for child, sub in zip(values, target):
                         self._pair_places(child, ArgEntry(sub, True), places, packed)
                     return
                 tree = self._fresh_places(node, places)
-                assert isinstance(tree, ComptimeTuplePtr)
                 packed.append((target, tree))
 
-    def _fresh_places(self, node: RetSpec, places: list[InterpVal]) -> InterpVal:
-        """Fresh places for a group packed into a single location: a tuple of
-        places mirroring the (possibly nested) shape of the results, with the
-        leaf places appended to ``places`` in depth-first order."""
+    def _fresh_places(self, node: RetSpec, places: list[InterpVal]) -> InterpVal | tuple:
+        """Fresh places for a group packed into a single location: a (nested)
+        Python tuple of places mirroring the shape of the results, with the leaf
+        places appended to ``places`` in depth-first order."""
         match node:
-            case RetValue():
-                place = self.alloca(InlineMode.FULL)
+            case RetValue() | RetComptime():
+                place = self.alloca(True)
                 places.append(place)
                 return place
             case RetTuple(values=values):
-                return ComptimeTuplePtr(
-                    tuple(self._fresh_places(child, places) for child in values)
-                )
+                return tuple(self._fresh_places(child, places) for child in values)
+        raise CompileError(f'cannot reserve fresh places for {node!r}')
 
     def _inline_arg_place(self, arg: ArgEntry[InterpVal], declared: sval.Type | None = None) -> InterpVal:
         """The place an inlined callee's argument (a positional by-value
@@ -9962,9 +9004,9 @@ class HirRunner:
         if arg.is_ref:
             return arg.value
         if declared is None:
-            slot = self.alloca(InlineMode.FULL)
+            slot = self.alloca(True)
         else:
-            slot = self.alloca(InlineMode.FULL, declared, commit_declared=False)
+            slot = self.alloca(True, declared, commit_declared=False)
         self.store(slot, arg.value)
         self._commit_pending_slot(slot)
         return slot
@@ -9979,7 +9021,6 @@ class HirRunner:
         generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
         value_is_empty: bool = False,
         on_done: Callable[[], None] | None = None,
-        closure_values: tuple[InterpVal, ...] = (),
         param_types: tuple[sval.Type | None, ...] | None = None,
         has_varargs: bool = False,
         has_kwargs: bool = False,
@@ -10027,13 +9068,9 @@ class HirRunner:
         # ``_init_args_from_signature``, which does the same for a compiled
         # callee)
         if has_varargs:
-            arg_values.append(
-                ComptimeTuplePtr(tuple(self._inline_arg_place(a) for a in args.varargs))
-            )
+            arg_values.append(self._vararg_struct_from_entries(args.varargs))
         if has_kwargs:
-            arg_values.append(
-                ComptimeDictPtr({k: self._inline_arg_place(a) for k, a in args.kwargs.items()})
-            )
+            arg_values.append(self._vararg_struct_from_entries(args.kwargs))
         frame_values: dict[sval.TypeVar, InterpVal] = {}
         if generic_var_values is not None:
             frame_values = {tv: ComptimeVal(v) for tv, v in generic_var_values.items()}
@@ -10046,7 +9083,6 @@ class HirRunner:
             ComptimeResultPtr(ret, error.code, error.payload),
             body, fn_name, value_is_empty=value_is_empty, on_done=on_done,
             compile_vars=self._inherit_compile_vars(),
-            closure_values=closure_values,
         )
         self._frames.append(frame)
         return PollResult.AGAIN
@@ -10108,7 +9144,7 @@ class HirRunner:
         result_type = sig.result_type()
         self._write_deferred_error_codes(result_type)
         spec = sig.ret_spec(self._mir_cache)
-        places = _result_places(self._current_result_loc())
+        places = self._result_places(self._current_result_loc())
         index = ret_by_value_index(spec)
         for block, defer_blocks in self._deferred_returns:
             if index is None:
@@ -10119,9 +9155,10 @@ class HirRunner:
                     load = mir.Load(slot.value)
                     block.insts.append(load)
                     block.insts.append(mir.Ret(load, defer_blocks))
-                elif isinstance(slot, ComptimeBox):
-                    assert slot.value is not None
-                    block.insts.append(mir.Ret(self._to_runtime(slot.value), defer_blocks))
+                elif isinstance(slot, ComptimeVal) and isinstance(slot.obj, sval.ComptimePtr):
+                    # a compile-time result place (a box): its value is lowered into
+                    # a constant the deferred return delivers
+                    block.insts.append(mir.Ret(self._to_runtime(self.load(slot)), defer_blocks))
                 else:
                     raise CompileError('cannot deliver the return value')
 
