@@ -151,6 +151,9 @@
 - 因此 `tuple[...]` 的「运行时表示」用于**变量 / 字段 / 表达式值**等其它位置；
   在返回/形参位置它被特殊解释。元组/字典类型字段（`Foo.t: tuple[i32, i32]`）与
   结构体字段**完全同规则**（布局、可拷贝性、传参）。
+- **元组/字典形参的「逻辑类型」（Q1）**：callee 侧实际绑定的是**合成的 `StructType`**
+  （`$args`/`$kwargs`，字段名分别为 `_0,_1,…` / 条目名，见 §7.4/§8）；因此对这样的形参做
+  `std.reflect.type_info` 得到的是 **`StructType`**（**不加特判**），tuple 与 dict 靠**字段名**区分。
 
 ### 2.4 struct 字段的两个新标记
 
@@ -229,23 +232,36 @@
 
 - 普通变量的存储：
   - **带类型注解（非 `Comptime`）** 的普通声明 → **运行时存储**（内存）——之后可以写运行时值。
-  - **无注解**的声明 / 解构目标 → **推断**（见下的推断规则）——按写进它的值决定是编译期还是运行时。
+  - **无注解**的普通声明 / 解构目标 → **运行时存储**（内存）（`is_comptime = False`）——同样可以写
+    运行时值。因此一个无注解变量不能直接持有编译期专属值（如未定型整数）：要持有就写成
+    `x: Comptime = e`（见 §3.1）、把类型写出来（`x: i32 = 1`），或写成 `InferComptime`（见下）。
+- **`InferComptime`（推断存储）**：声明形式 `x: InferComptime = e`、`x: InferComptime[T] = e`，
+  以及语句标记 `syntax.infer_comptime()` + 紧随其后的一条声明（错误条件与 `syntax.comptime()` 相同：
+  只能标记**新声明**、必须紧跟其前）。
+  - 语义：该 slot 的存储**留给写进去的值**决定（`is_comptime = None`，推断规则见下）。写入的值
+    **全是编译期值**时它是编译期存储（Box），否则是运行时存储（内存）。
+  - 用途：一条声明既能持有编译期专属值（未定型整数、类型值等），又能落在内存里接受运行时值，
+    而不必在源码里写死是哪种。
+  - **仅限局部变量声明**：形参（含 `*args`/`**kwargs`、闭包形参）写 `InferComptime` 是编译错误——
+    形参总是按签名给出的存储（要编译期形参请写 `Comptime`）。
 - 新字段 `PendingSlot.is_comptime: bool | None` 取代旧 `inline_mode`
   （`NONE`/`NON_AGGREGATE`/`FULL`）：
-  - `True`：该 slot 一定是编译期存储（comptime alloca / Box）——
-    `Comptime`/`ConstComptime` 变量。
-  - `False`：该 slot 一定是运行时存储（内存）——带注解的普通变量 / 参数。
-  - `None`：**推断**——由写进它的值决定该 slot 是编译期还是运行时。
-- **推断规则**：在 `CommitSlot` 提交时，当且仅当该 slot 上**已有的写入**（store，
-  以及构造式写入）**全部是编译期值**时，它是编译期存储；否则运行时。（`Comptime`/`ConstComptime`
-  声明走 `True`；**带注解的**普通声明走 `False`；**无注解的**声明、解构目标、表达式临时量
-  走 `None` 推断。）
+  - `True`：该 slot 一定是编译期存储（comptime alloca / Box）——`Comptime`/`ConstComptime` 变量，
+    `unroll` 的编译期 `for` 的迭代器/循环变量槽。
+  - `False`：该 slot 一定是运行时存储（内存）——**普通变量声明（含无注解的声明与解构目标）**、
+    参数（其存储是该参数的地址）、**普通（非 `unroll`）`for` 的迭代器/循环变量槽**。
+  - `None`：**推断**——由写进它的值决定该 slot 是编译期还是运行时。写在源码里就是上述
+    `InferComptime`/`syntax.infer_comptime()`；编译器内部的槽（表达式临时量、`*args`/`**kwargs`
+    合成 struct 的字段槽、内部的 `def` 名槽、非编译期 `for` 的槽等）也走 `None`。
+- **推断规则**（仅 `is_comptime = None` 的内部槽）：在 `CommitSlot` 提交时，当且仅当该 slot 上
+  **已有的写入**（store，以及构造式写入）**全部是编译期值**时，它是编译期存储；否则运行时。
+  （`Comptime`/`ConstComptime` 声明走 `True`；普通声明走 `False`；表达式临时量等内部槽走 `None` 推断。）
 - **`inline_mode → is_comptime` 不是机械替换**：`NONE` / `NON_AGGREGATE` / `FULL`
   各有不同语义，其每个使用点都要按新模型**逐个重新判断**，不能只做名字映射
   （见 §11）。
-- **`x = 1`（未注解的整数字面量初始化）**：仍然报错——问题是字面量没有可落地的
-  **类型**（未定型整数），不是编译期与否。需类型标注（`x: i32 = 1`）或写成
-  `Comptime` 变量。此行为与现状一致。
+- **`x = 1`（未注解的整数字面量初始化）**：报错——无注解的声明是**运行时存储**，而字面量没有
+  可落地的**类型**（未定型整数），因此由 `_no_runtime_type`/未定型整数路径给出。需类型标注
+  （`x: i32 = 1`）或写成 `Comptime` 变量（`x: Comptime = 1`）。
 - 已定成运行时存储的 slot 之后写编译期值照常可写；「一次写入决定了存储」的规则
   在 `is_comptime` 为 `True/False` 时不再有歧义，`None` 时按上面的推断。反之，已定成**编译期**
   存储的 slot 之后写**运行时值**是编译错误（同 §3.1）。
@@ -303,11 +319,11 @@
     可**别名**（读透可见；const 本身不可写）。
     （**变化**：旧语义每个调用前复制 pointee，callee 改的是自己的拷贝、写不回去。）
   - **非 const** `ComptimePtr`（`is_const = False` 的 box，即可变编译期变量/聚合的
-    地址）**暂不允许**被**物化成运行时值/地址**：不能作非内联函数的实参、不能作非内联
-    函数返回值、**不能存进运行时 storage**（不再物化一份拷贝）。根因是可变编译期全局变量
-    **暂不支持 lower**（见 §4.3）；它只能在内联范围 / 编译期内使用。**注意**：这只关乎「把
-    指针本身物化成运行时值」；闭包捕获是把指针**烘进 struct 类型**（不是物化），不受此限
-    （见 §9.3）。
+    地址）**不报错，而是物化一份拷贝**：当它必须变成运行时值/地址时（作非内联函数的实参、
+    作非内联函数返回值、**存进运行时 storage** 等），实现会**新分配一块内存并把 box 的内容
+    复制进去**，返回该内存的地址。callee 拿到的是**拷贝**，写不回原 box（效果上等同于旧语义的
+    「复制 pointee」，但旧语义不再需要）。**注意**：这只关乎「把指针本身物化成运行时值」；
+    闭包捕获是把指针**烘进 struct 类型**（不是物化），不受此影响（见 §9.3）。
   - 内联函数 / 内联闭包内部：编译期指针照常按身份别名、不复制。
   - **编译期返回值经 `RetSpec` 的 `RetComptime` 叶子交付**：完全编译时已知的返回值（含 const
     `ComptimePtr`）不写运行时结果位置；**inline** 调用写进调用点的 `ResultLocTree` 叶子（一个**编译期
@@ -345,8 +361,10 @@
     ```
     `ref(const_value)` 在编译期语境下是 `ComptimePtr`，在需要运行时指针时由 lower
     自动处理（指向该全局常量）。
-- **可变编译期变量暂不支持 lower**：`is_const = False` 的 box 需要运行时表示时报错
-  （见 §4.2 的限制）。因此普通 `Comptime` 变量**不能**经 `ref` 进入运行时。
+- **可变编译期变量（`is_const = False` 的 box）的物化 = 一份拷贝**：需要运行时表示时
+  新分配一块内存并把 box 的内容复制进去，返回该内存的地址（见 §4.2）；**不**生成指向该 box 的全局，
+  **也不报错**。因此普通 `Comptime` 变量经 `ref` 进入运行时后，callee 写的是拷贝、写不回原变量
+  （要共享存储请用 `ConstComptime` + `ref`，它 lower 成全局常量）。
 - lower 的表示遵循旧 `as_static_ptr` 的约束与表示：
   - 值必须完全编译时已知（不存在「引用寄存器」的问题——见 §1）。
   - 指针字段**不**被跟随：它指向的内容各自成为独立全局，指针指过去。
@@ -503,6 +521,11 @@ semantics**，而且结果位置与「值」彻底分开：`type ResultLocTree =
     `return` 所返回的值**（每条 `return` 把自己的编译期值写入 callee `FunctionInstance` 上的槽，
     后写覆盖先写）。**本次重构不对「所有 `return` 路径是否给出同一个编译期值」做检查**（见 §15）；
     调用点取出该值后写进对应 place；该 place 必须是编译期 place（否则报错）。
+  - **Python 调用方**：编译期叶子不经过内存（没有 out 指针）。`glue._read_result` 直接读 callee
+    `FunctionInstance.ret_comptime_values[leaf.index]`，并按「有自然 Python 镜像的标量转成 Python
+    `int`/`float`，其余**原样**交出编译器内部对象」交付（`glue._comptime_to_python`）。于是
+    `def f(): return 1` 从 Python 调用得到 `1`（`def f(): return (1, 2)` 得到 Python 元组 `(1, 2)`）；
+    类型值/指针/函数值等则原样是 `sval` 对象——它们的 Python 侧 API **未定义**（未定型行为）。
   - **未来**：可手动指定把 `classify()==NONE` 的类型也按编译时返回。
 - 调用侧：解构 `a, b = f()`（多值结果经 RLS 写进 `ResultLocTree`）、或 `return f()`
   转发（逐个写进自己的 result location）——保留。
@@ -521,8 +544,10 @@ semantics**，而且结果位置与「值」彻底分开：`type ResultLocTree =
 
 ### 7.4 元组作参数 / 返回值
 
-- 形参注解 `tuple[T1, ...]`：**铺平传参**，callee 重组为元组值；元素为编译期值时
-  不占 MIR 实参。可嵌套、可转发、泛型（`tuple[T, T]` 解类型参数）——保留。
+- 形参注解 `tuple[T1, ...]`：**铺平传参**，callee 重组为**合成 `StructType`**（不再是元组值本身）；
+  元素为编译期值时不占 MIR 实参。可嵌套、可转发、泛型（`tuple[T, T]` 解类型参数）——保留。
+- **callee 侧表示（Q1）**：该合成 struct 的字段名为 `_0,_1,…`；其**反射类型是 `StructType`**（不是
+  `TupleType`），tuple/dict 形参靠字段名区分。
 - 结构体元素**不**铺平（整体一个运行时实参，按值/按引用规则）——保留。
 - 返回注解元组 = 多返回值（§7.3）。
 
@@ -559,8 +584,9 @@ semantics**，而且结果位置与「值」彻底分开：`type ResultLocTree =
 - `**kwargs` 形参 / `dict[str, T]` 形参仍**按名铺平**传参，callee 重组为字典值。
 - 访问：`len(kwargs)`、`kwargs[b'name']`（编译期字节串名）——保留。
 - 反射：`std.reflect.type_info` 的 `StrDictType` 变体（`entries`：name + type）、
-  `TupleType` 变体仍可用（见 §10）。
-- 无注解的 `dict` 参数：调用点给的任意形状，编译期按反射分类（保留）。
+  `TupleType` 变体仍可用（见 §10）。但 `**kwargs`/`dict` **形参**绑定的合成 struct（`$kwargs`，
+  字段名 = 条目名）反射为 **`StructType`**（Q1，见 §7.4/§10）。
+- 无注解的 `dict` 参数：调用点给的任意形状，编译期按反射分类（保留；分类对象是合成 `StructType`）。
 - **预期变化**：由于有运行时表示，字典值可存进普通变量/字段、按值或引用传递；
   条目访问 `d['name']` 仍**只支持编译期字节串名**（**不支持运行时键查找**）。
 
@@ -619,10 +645,12 @@ semantics**，而且结果位置与「值」彻底分开：`type ResultLocTree =
 
 ### 9.5 `as_func_ptr`
 
-- `syntax.as_func_ptr(T, f)`：`f` 必须是一个**有 `__call__` 方法的 struct**，且该
-  struct 是 **ZST**（即捕获的运行时量为零）；结果是**去掉 `self` 参数的 `__call__`
-  函数**（`fn.FunctionValue`，`get_type` 返回**常**函数指针），由 `lower` 自动 lower；
-  `T` 是所得函数指针的类型。
+- `syntax.as_func_ptr(T, f)`：**第一个参数 `T` 只给 Python 类型检查器看，实现忽略之
+  （Q3）**——不再校验它。`f` 必须是一个**有 `__call__` 方法的 struct**，且该 struct 是 **ZST**
+  （即捕获的运行时量为零）；结果是**去掉 `self` 参数的 `__call__`**（一个不含 `self` 的
+  `fn.FunctionValue`，`get_type` 返回**常**函数指针），由 `lower` 自动 lower。实现上包一层：
+  体内先 `self_val = typed_undefined(T)`（ZST 的「未定义实例」携带类型级的编译期捕获），
+  再 `return self_val.__call__(args…)`（Q2）。
 - 普通 spy 函数与 extern 函数**直接用其名字**即可取到函数指针（无需 `as_static_ptr` /
   `as_func_ptr`）：函数值本身即**常**函数指针（`FunctionValue.get_type` 返回 `PointerType(fn_type, is_const=True)`），
   目标函数类型来自函数自身的签名，不必再显式给出 `T`。因此 `as_func_ptr` 现在只服务
@@ -640,6 +668,9 @@ semantics**，而且结果位置与「值」彻底分开：`type ResultLocTree =
   存储。
 - **`reflect.StructField` 新增 `is_comptime` / `is_ref` 字段**：用于呈现 struct 字段的
   这两个标记（含闭包 struct 的 `is_comptime` 捕获字段）。
+- **元组/字典形参的反射（Q1）**：`TupleType`/`StrDictType` 变体本身仍存在（用于显式元组/字典
+  **类型**），但 `tuple[...]`/`**kwargs` **形参**绑定的合成 struct 反射为 **`StructType`**
+  （字段名分别为 `_0,_1,…` / 条目名）；不加特判。
 - 字节串：**`std.core.gstr` 不再保留**——字节串编译期值经其 `ComptimePtr`（`box` 为该
   `bytes` 值）由 `lower` 生成运行时全局常量（并在末尾补一个 NUL）。`std.core.sstr` 保留为
   **库函数**：
@@ -735,9 +766,10 @@ semantics**，而且结果位置与「值」彻底分开：`type ResultLocTree =
 | `Comptime` 参数收到运行时实参 | 报错（不静默丢弃） |
 | 写入 `ConstComptime`（`is_const = True` 的 box）/ 写只读的指针视图 | 报错 |
 | `ConstComptime` 声明无初值 | 报错（必须带初值） |
-| **物化**非 const 编译期指针为运行时值/地址（非内联实参 / 非内联返回 / 存运行时 storage） | 报错（只允许内联/编译期使用） |
+| **无注解变量**（运行时存储）持有编译期专属类型（如未定型整数 `x = 1`） | 报错（`_no_runtime_type`：需类型标注 `x: i32 = 1` 或 `Comptime` 变量）|
 | 编译期 `if` / `unroll` 条件不是编译期值 | 报错 |
-| `syntax.comptime()` / `syntax.const_comptime()` 未紧接新声明 / 冗余标注 / 用作值 | 与现状相同的报错 |
+| `syntax.comptime()` / `syntax.const_comptime()` / `syntax.infer_comptime()` 未紧接新声明 / 冗余标注 / 用作值 | 与现状相同的报错 |
+| 形参（含 `*args`/`**kwargs`、闭包形参）写 `InferComptime` | 报错（推断仅限局部变量声明） |
 | 解构目标 arity 与值元数不符 | 报错 |
 | 解构的 RHS 是结构体/数组构造子 | 报错（astgen） |
 | 元组下标越界 / 负 / 运行时 | 报错 |
@@ -746,6 +778,7 @@ semantics**，而且结果位置与「值」彻底分开：`type ResultLocTree =
 | `as_func_ptr` 的 `f` 不是「有 `__call__` 的 ZST struct」 | 报错 |
 | 写透 `is_ref` 字段（存常指针，不可写） | 报错 |
 | 为**运行时 struct** 的 `is_comptime` 字段提供构造实参 | 报错（只有编译时 struct 变量能覆盖） |
+| 同一存储的多次聚合构造类型不同（`if` 两臂，含两个不同的 ZST struct） | 报错（无 peer 类型，Q5） |
 | `compile_error` 非字节串/运行时消息 | 报错 |
 | 传递给 `typeof` 的调用抛出错误离开探针 | 报错 |
 | 结果位置形状循环依赖（互相递归省略返回注解） | 报错（结果位置无法定型） |
@@ -777,7 +810,8 @@ semantics**，而且结果位置与「值」彻底分开：`type ResultLocTree =
    接受 ZST struct 取 `__call__`。旧闭包限制全部取消。
 8. **struct 字段新标记**：`is_comptime`（不进 MIR、ZST 判定排除；运行时 struct 读默认值、
    编译期 struct 读 box cell）、`is_ref`（存常指针、`field_index_addr` 额外 load）。
-9. **`PendingSlot.inline_mode` → `is_comptime`**：三态，`None` 表示推断。
+9. **`PendingSlot.inline_mode` → `is_comptime`**：三态，`None` 表示推断；源码里用
+   `InferComptime`/`syntax.infer_comptime()` 显式请求推断（形参不允许）。
 10. 旧 `Comptime*Value`/`Comptime*Ptr` 形式全部消失，编译期存储统一为 `Box`；
     `ComptimeCastedPtr` → `sval.CastedPtr`。
 11. **函数值的类型**变为**常函数指针**：`fn.FunctionValue.get_type()` 返回

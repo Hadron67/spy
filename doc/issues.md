@@ -2,7 +2,7 @@
 
 这里记录在实现各项特性时发现、但**本任务不处理**的顺带问题（多为既有实现里已存在的问题）。每节给出原状、最小复现/后果与（若有）规避办法。
 
-> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型）已随相关重构或修复解决，已从本文件移除。
+> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除），已从本文件移除。
 
 ---
 
@@ -68,36 +68,54 @@ def f(x: i32) -> i32:
 
 ---
 
-## 5. 前置的编译期循环会让带类型的 `comptime()` 局部变量落成内存，从而不能做编译期元组下标
+## 6. 互递归 closure 的类型循环依赖（comptime 重构引入的回归）
 
-对一个编译期 `Comptime` 元组，用 `comptime()` 声明的 `while` 循环变量做下标会报 `a tuple element index has to be a compile-time integer`；改用 `unroll()` 的 `for k in range(n)` 则正常。
-
-真正的触发条件**不是** `+=`：只要下标变量 `k` 的声明之前存在一个 `unroll()` 的编译期循环就会失败——用多值调用的结果元组建元组、只在前面补一个（哪怕什么都不做的）编译期循环同样失败；反之，`+=` 元组若不写循环（手写两次 `+=`）则正常。原描述「多值调用没问题、只有 `+=` 元组如此」并不准确。
-
-最小复现：
+两个兄弟闭包互相引用（互相捕获）时不再能编译：
 
 ```python
 @func()
-def via_while(x: i32) -> i32:
-    t: Comptime = ()
-    comptime()
-    j: usize = 0
-    unroll()
-    while j < 2:
-        t += (x + j,)
-        j = j + 1
-    comptime()
-    k: usize = 0
-    s: i32 = 0
-    unroll()
-    while k < 2:
-        s = s + t[k]     # a tuple element index has to be a compile-time integer
-        k = k + 1
-    return s
+def f(n: i32) -> i32:
+    @syntax.closure(inline=False)
+    def even(x: i32) -> i32:
+        if x == 0:
+            return 1
+        return odd(x - 1)      # 捕获 odd
+
+    @syntax.closure(inline=False)
+    def odd(x: i32) -> i32:
+        if x == 0:
+            return 0
+        return even(x - 1)     # 捕获 even
+
+    return even(n)
 ```
 
-等价的 `unroll(); for k in range(2): s = s + t[k]` 正常。
+- **原状**（comptime 重构前）：closure 的值类型由**签名**决定（与捕获无关），互相引用的签名在解析期就已知，因此没有类型层面的循环；`spy.tests.closures.SpyClosureTest.test_mutually_recursive_closures` 通过。
+- **现状**（重构后）：closure 的值类型是**含捕获字段的匿名 struct**（见 behaviour §9、task §9）。建 `even$closure` 时要把 `odd`（兄弟 `def` 的槽）作为按引用捕获的字段，字段类型 = `odd$closure` 的 struct 类型；而此时 `odd` 还没建出 → `interp.exec_make_closure` 报
+  `cannot capture a value whose type is not known`（`_place_type(capture)` 为 None，因为那个槽还没 `CommitSlot`）。于是该用例失败。
+- **可能的修复方向**（尚未决定）：
+  - **(a)** 按引用捕获（`move=False`）的字段类型用**指向「前向声明的 struct」的指针**：先建一个空的 `StructTypeHead` 绑在闭包上，等该兄弟闭包建好后再补字段/特化（spy 已有「head 先绑定、字段后加」的自引用机制，见 `dsl._RegisteredClass.get_entry`）。
+  - **(b)** 捕获另一个 closure 时，字段类型用它**签名对应的函数类型**（而非它的捕获 struct 类型），读取时再收敛成实际 struct 类型。
+  - **(c)** 接受为新限制：互递归 closure 不再支持，改为报错并更新用例。
+- 与 #2（捕获闭包值）相关：两者都是「闭包值」的类型/可表示性问题。
 
-根因：`astgen._predeclare` 会把一个**带类型的** `comptime` 局部变量（`comptime(); k: u64 = 0`、`k: Comptime[u64] = 0`）的 `Alloca` 预扫描提升到子块头部（裸 `Comptime` 已被此前「就地声明」的修复绕过，带类型的没有）。于是 `k` 的 `Alloca` 在入口块运行、`PendingSlot.runtime_pos` 记为入口块；而它前面的那个编译期循环结束时，`_exec_break_loop`/`_cut` 会新建一个退出块并让 walk 继续在其中，初始化 `k = 0` 的那条 `Store` 便落在这个退出块里。`_record_pending_store` 里的 `is_inline=self._runtime_position() == slot.runtime_pos and _is_comptime_val(value)` 因两块不等而判为 not inline，而 `PendingSlot.is_inline` 要求所有 store 都 inline，于是 `k` 被物化成内存（`RuntimeVal`/`Alloca`）。到 `t[k]` 时，`_subscript_comptime_tuple` 经 `_arg_value` 读到的是一个运行期 `Load` 而不是编译期整数，遂报错。（`_runtime_position` 的 docstring 声称编译期 `if`/`loop` 不改变运行期位置，但实现直接返回 `self._cur_block`，而编译期循环的退出块确实改变了它——意图与实现有缺口。这与 #4 是同一处 `PendingSlot` 存储判定的两个面。）
+---
 
-规避：编译期下标循环统一用 `for ... in range()` + `unroll()`，不要在 `+=` 元组上用 `while` 下标。
+## 7. 声明的「编译期专属」返回类型无法编译（`-> bytes` / `-> type` 等）
+
+```python
+@func()
+def f() -> bytes:
+    return b'hi'
+```
+
+报 `bytes is a compile-time-only type: a runtime location cannot hold it and must declare its type`（`_no_runtime_type`）。
+
+- 触发链：`run_function` 在跑函数体**之前**调 `_materialize_ret_sig` → `_commit_ret_places` → 对 `RetComptime` 叶子调 `_commit_pending_slot(place, node.type)`。该 place 是 `_ret_spec_place` 给的 `alloca(True)`，但此刻它**既没有 store 也没有 declared 类型**，于是 `_commit_pending_slot` 的
+  `if val.use_comptime_storage() and (len(val.stores) > 0 or val.declared is not None)` 不成立 → 落到运行时路径 →
+  `to_mir_type()` 为 `None` → `_no_runtime_type`。
+- 对比：**不写**返回注解时结果位置是**推断**的（`alloca()`），`return 1` / `return (1, 2)` 反而能编译，值也能交付给 Python 调用方（behaviour §7.3）。
+- 待做：让 `_commit_ret_places` 的 `RetComptime` 分支直接把它提交成编译期 box（该 place 按构造就是编译期存储）——例如带上声明类型，或走专门的分支。
+- 波及：`-> bytes` 目前无用例（`grep` 不到），修好前不要依赖它。要返回类型值可以绕开：`t: Comptime = i32; return t`（不写返回注解）能编译并交给 Python。
+
+

@@ -80,9 +80,11 @@
   （tag 是第 0 个 cell，payload 从 `+1` 起）；嵌套聚合直接内联拼接，偏移 = 各前缀宽度之和。宽度规则：
   - **聚合体一律由成员定**（与自身是否 `is_zst()` 无关）：struct/array/tuple/strdict = 成员之和
     （含 `is_comptime` 字段；`is_ref` 字段按类型 `*const T` = 1 cell）、complex = 2、option = `1 (tag) + child`、
-    tagged union = `1 (tag) + max(variant)`（payload 按**变体最大宽度**取齐，不足留 `UndefinedScalar`）、
+    tagged union = `1 (tag) + max(variant)`（**恒为此形，含单变体**：`tag_bits == 0` 时 tag cell 仍占 1，
+    payload 按**变体最大宽度**取齐，不足留 `UndefinedScalar`）、
     **untagged `UnionType` = `max(variant)`**（其 tag 是旁边的错误码，不占 box cell）。故**空 struct = 0 cell**、
-    字段全为 ZST 标量的 struct 每个字段各占 1、单成员聚合体 = 该成员。
+    字段全为 ZST 标量的 struct 每个字段各占 1、单成员聚合体 = 该成员（**但单变体 tagged union 不是**：它仍是
+    `1 (tag) + 该变体`，与 §2.1 的「单变体 = 该变体类型」是**运行时表示 vs. Box 铺平**两套独立规则）。
   - **标量类型（`ScalarType`）恒占 1 cell**（**含 ZST 标量**）。即「ZST 标量占 1，ZST 聚合体按成员（可为 0）」。
   - **布局只由「类型」决定，与具体值无关**：标量类型的 undefined 是 `UndefinedScalar`（1 个 cell）；
     聚合类型的 undefined（`UndefinedAggregate`）**不落成单个 cell**，而按该聚合体展开、**每个标量叶 cell
@@ -313,20 +315,24 @@
 `spy/compiler/astgen.py`：
 
 - 所有构造 `hir.Alloca(...)` 的点 → **修改**（逐个重判，非机械替换）。**统一策略（已定）**：
-  `Comptime`/`ConstComptime` 声明 → `True`；**带类型注解（非 `Comptime`）的普通声明** → `False`
-  （运行时存储，之后可写运行时值）；**无注解的声明、解构目标、表达式临时量、内部槽** → `None`（按写入推断）。
+  `Comptime`/`ConstComptime` 声明 → `True`；**普通变量声明（含带类型注解、无注解的声明与解构目标）
+  → `False`**（运行时存储，之后可写运行时值）；`InferComptime` 声明与 `syntax.infer_comptime()`
+  标记 → `None`（用户可显式请求推断，见 §3.5）；
+  **表达式临时量、内部槽（`def` 名槽、bare `raise` 槽等） → `None`**（按写入推断）。
   - `_predeclare_name(name, hir.InlineMode.FULL)`（def 名，L381）→ `is_comptime=None`
     （**不是 `True`**：新模型下闭包是普通 struct 值，捕获运行时变量时含运行时字段、是运行时值，
     `True` 会触发 `cannot store a runtime value…`）。
-  - `_predeclare_target`（无注解赋值，L391）→ `None`；`_predeclare_ann`（L433）→ `True`/`False`
-    （按声明是否 `Comptime`）。
+  - `_predeclare_target`（无注解赋值，L391）→ `False`；`_predeclare_ann`（L433）→ `True`/`False`/`None`
+    （按声明是 `Comptime`/普通/`InferComptime`）。
   - `_gen_stmt` 的 bare `raise` 临时槽（`NON_AGGREGATE`，L504）→ `is_comptime=None`（推断）。
-  - `_gen_for`：编译期 `for` 的迭代器/循环变量槽（`FULL`，L707-714、L724-727）→ `True`；
-    非编译期 `for` 的槽（`NON_AGGREGATE`/`NONE`）→ `None`。
-  - `_gen_lhs` 的 `inline_mode` 参数 → 改为 `is_comptime: bool | None`（默认 `None`）。
-  - `_gen_assign`（L925）→ `True if by_marker else None`（无注解声明按写入推断，与解构目标一致）；
-    `_gen_ann_assign`（L991）→ `True`/`False`（按注解是否 `Comptime`）；
-    `_gen_target_tuple`（L1027）→ 默认 `None`（与 `_gen_lhs` 一致；解构目标与单目标同策略）。
+  - `_gen_for`：`unroll` 的编译期 `for` 的迭代器/循环变量槽（`FULL`，L707-714、L724-727）→ `True`；
+    普通 `for` 的槽 → `False`（普通循环的迭代器与循环变量是运行时存储）。
+  - `_gen_lhs` 的 `inline_mode` 参数 → 改为 `is_comptime: bool | None`（默认 `False`，即普通声明）；
+    仅 `InferComptime` 声明与内部槽传 `None`。
+  - `_gen_assign`（L925）→ 按标记定：`Comptime`/`ConstComptime` → `True`，`InferComptime` → `None`，
+    否则 `False`（无注解声明也是**普通变量**，不推断）；
+    `_gen_ann_assign`（L991）→ `True`/`False`/`None`（按注解）；
+    `_gen_target_tuple`（L1027）→ 默认 `False`（解构目标与单目标同策略）。
   - `_gen_expr` 的表达式临时槽（`NON_AGGREGATE`，L1341）→ `None`。
   - **`_as_ref`（L1158，`NON_AGGREGATE`）→ `None`**（此点原清单漏列）。
 
@@ -347,7 +353,9 @@
   `init_comptime_option` / `init_comptime_tagged_union` / `init_inline_aggregate` / `_fresh_place` /
   `_bind_slot` → **修改或删除**（见 §5、§7）。
 
-- 行为保留：`x = 1`（未注解整数字面量）仍报「无落地类型」错误（现由 `_no_runtime_type`/未定型整数路径给出）。
+- 行为保留：`x = 1`（未注解整数字面量）报「无落地类型」错误（由 `_no_runtime_type`/未定型整数路径
+  给出）——无注解声明是**运行时存储**（`False`），而字面量没有可落地的类型；要持有编译期值请写
+  `x: Comptime = 1`，或写 `x: InferComptime = 1`（存储推断为编译期，见 §3.5）。
 
 ### 3.4 `ConstComptime`
 
@@ -373,6 +381,42 @@
 `spy/compiler/interp.py`：
 
 - `Box` 提交后 `is_const=True`；此后写它是编译错误（`store` 对 `is_const` box 报错，已有一部分逻辑在 `ComptimeBox.is_const`，迁移即可）。
+
+### 3.5 `InferComptime`（推断存储）
+
+把 `is_comptime = None`（推断）作为**用户可写**的声明形式（§3.3 的「用户不能显式请求推断」
+作废）：一条声明既能持有编译期专属值，又能落内存接受运行时值，由写进去的值决定。
+
+`spy/compiler/syntax.py`：
+
+- **新增** `type InferComptime[T = Any] = T`（与 `Comptime` 平行）。
+- **新增** `def infer_comptime(): ...`（与 `comptime()` 平行）。
+
+`spy/compiler/sval.py`：
+
+- **新增** `unwrap_infer_comptime(annotation) -> tuple[bool, Any]`（与 `unwrap_const_comptime` 平行），
+  供形参路径识别并**拒绝**它。
+
+`spy/compiler/astgen.py`：
+
+- `_split_comptime(node)` → **修改**：额外识别 `InferComptime`，返回 `is_comptime=None`
+  （签名改为 `tuple[bool | None, bool, ast.expr | None]`）。
+- `_gen_ann_assign` / `_predeclare_ann` → **修改**：`is_comptime` 可为 `None`；
+  「冗余标注」检查改为 `is_comptime is not False`；bare `InferComptime`（无类型）与 bare `Comptime`
+  一样不在预扫描处声明（它由初始化 store 提交）。
+- `_gen_assign` → **修改**：由标记定 `is_comptime`（`InferComptime` → `None`）。
+- `_as_marker` / `_Pragma` 家族：**新增** `_InferComptime` 标记类；`_predeclare` 与 `_gen_stmt`
+  的标记分派一并识别。
+- **形参拒绝**：普通形参路径（`unwrap_infer_comptime`）、`*args`/`**kwargs`
+  （`vararg_formal`）、闭包形参与闭包 `*args`/`**kwargs`（`_gen_closure`/`_gen_closure_vararg`，
+  按 `_split_comptime` 的 `None`）→ 编译错误（推断仅限局部变量声明）。
+
+`spy/compiler/interp.py`：**无需修改**——`PendingSlot.is_comptime = None` 的推断提交路径已实现（§3.3）。
+
+`spy/std/core.py`：
+
+- `range.__next__` 的 `result`（元素可能无运行时表示）用 `syntax.infer_comptime()` 声明，
+  取代旧 `comptime()`。
 
 ---
 
@@ -409,10 +453,10 @@
 - **`Box.name_base` 只是 MIR 里的命名提示（原 §17-Q16，已定）**：不参与特化键（键 = `Box` 身份 +
   `offset` + 视图类型，即上面的 `ComptimePtr` 结构化相等），**不要求唯一/稳定、无链接影响**；若某处拿它
   当 MIR 符号名，同名冲突由 MIR 层消歧即可。
-- 跨非内联边界：**只允许 const 指针**（`is_const=True` 的 box）。**作为编译期实参/返回值/捕获时按身份
-  传递**（进特化键，callee/闭包**别名同一 box**，不 lower）；**只有被物化成运行时值/地址**时
-  （需要运行时表示，如非内联实参 / 非内联返回 / **存进运行时 storage**）才处理：非 const → 报错，
-  const → 自动 lower（见 §16）。**闭包捕获不算物化**（指针烘进 struct 类型），不受此限（见 §9.3）。
+- 跨非内联边界：**只允许 const 指针**（`is_const=True` 的 box）按**身份**传递。**作为编译期实参/返回值/捕获时按身份
+  传递**（进特化键，callee/闭包**别名同一 box**，不 lower）；**非 const** 指针被**物化成运行时值/地址**时
+  （需要运行时表示，如非内联实参 / 非内联返回 / **存进运行时 storage**）**物化一份拷贝**（新分配内存 +
+  复制 box 内容，返回该内存地址，不报错、不 alias 原 box）；const → 自动 lower（见 §4.3/§16）。**闭包捕获不算物化**（指针烘进 struct 类型），不受此限（见 §9.3）。
 - **跨 context（已定）**：设计上保证一个 context 的编译期值**不会泄漏**到另一个 context
   （`Box`/`ComptimePtr`/`FunctionValue` 都是本 context 的身份对象）；跨 context 传递的只有可重新
   lower 的编译期值。
@@ -440,7 +484,9 @@
   （`is_comptime` 字段被跳过、`is_ref` 字段按指针写出）。
 - `fn.FunctionValue.get_type()`（fn.py L917）→ **修改**：返回**常函数指针**类型 `PointerType(fn_type, is_const=True)`
   （`fn_type = signature.as_non_generic_fn_type() or AnyFunction()`）；与 `sval.DeclareFunction.get_type`（已是 `PointerType(type, True)`）一致。
-- 非 const box（普通 `Comptime` 变量）**不支持 lower**：其 `ref` 进不了运行时，只在编译期/内联范围使用。
+- 非 const box（普通 `Comptime` 变量）的**物化 = 一份拷贝**：需要运行时表示时新分配一块内存并把 box 的
+  内容复制进去，返回该内存的地址（不生成指向该 box 的全局，也不报错）。因此普通 `Comptime` 变量经 `ref`
+  进入运行时后，callee 写的是拷贝、写不回原变量（要共享存储用 `ConstComptime` + `ref`）。
 - **`mir`/`lower` 侧：函数值的自动 lower（原 §17-Q5 遗留，已定）→ 直接是函数符号本身，不经 `GlobalConstant`**：
   - **同模块**的 spy 函数 / 闭包 `__call__` → `mir.Function`（`FunctionValue` 取其实例化后的
     `FunctionInstance.mir`）；`mir.Function` 是 `GlobalValue`，其 `get_type()` =
@@ -467,6 +513,13 @@
 - **astgen 具体落点**：`_make_load` 删 `ConstRef` 分支；`Attribute` 的全局折叠**移到 `_as_ref` 之前**；
   `Subscript` 通用路径记录 `is_global` 并 box base、去掉原 “subscript of non-reference” 报错；
   `_gen_call` 结构不变（callee 经 `_as_ref`）；`_gen_struct_ctor(callee.value, …)` 收到的是 `hir.Const`
+- **`_gen_call` 的「普通 Python 函数属性」折叠（Q4，已定）**：`_gen_call` 开头已算
+  `fn_global = self._try_resolve_object(node.func)`；在标记分派（`cast`/`syntax.array`/`isinstance`/`ord`/`len`）
+  **之后、`ast.Attribute` 分支之前**新增一条：若 `fn_global` 是**裸 Python 函数**（`types.FunctionType`，
+  即普通 Python 类/模块的属性函数，如 `_ClassNamePlain.bar`）且基址不是 spy 枚举类，则直接发
+  `hir.CallInplace(self._as_ref(ArgEntry(hir.Const(fn_global), False)), …)`——与「裸名字调用 Python 函数」一致。
+  `@struct()` 的类名方法（`_try_resolve_object` 得到 `_RegisteredFn`）与枚举类名调用保持原路径
+  （`CallMethodInplace` + `_call_class_method`）。
   （`hir.FinishStruct.struct` 的语义/文档由「引用」改为「值」）。
 - **interp 具体落点**：`_callee_object` 的 `ComptimeVal(obj) → obj`（不再解 `sval.ConstRef`），并**新增解包
   `ComptimePtr`**（box → 值）；`operand` 删 `case hir.ConstRef()`；`load` 删 `sval.ConstRef` 分支；
@@ -495,6 +548,10 @@
   **修改或删除**：新模型下聚合值统一为 `Box` 铺平存储（编译期）或 `RuntimeVal`（运行时），
   不再有 `ComptimeAggregate`/`ComptimeAggregatePtr` 两个中间形式（见 §7）。
 - 整体拷贝按值：`b: Comptime = a` → 各自新 box（`_coerce`/`store` 中保证）。
+- **同一存储的多次聚合构造（`if` 表达式两臂，Q5，已定）**：`field_index_addr(is_aggregate_init)`
+  复用该存储已记录的字段 place 时**须做下标防护**（越界则新建槽）；`finish_struct` 在已有记录但
+  `struct_type` **不同**时**记一条冲突 store**，由 commit 报「无 peer 类型」。ZST 亦然——两臂是两个不同的
+  ZST struct 时报错（`choose_two_zst_structs`）。
 
 ### 5.2 与运行时聚合的关系
 
@@ -590,8 +647,10 @@
     `ast.BoolOp()` → `_gen_boolop`（`hir.Block` + `Store`/`break_if`）；
   - `ast.Tuple()` → **`hir.InitTuple`** + 逐元素 `hir.TuplePtrElement`（递归；base 可为 `ReturnLoc`）；
   - `ast.IfExp()` → 条件 + `hir.If`/`hir.Else`/`hir.End`（两臂递归，同一 `result_loc`）；
-  - 其余 → 默认分支 `hir.Store(result_loc, value)`：`result_loc` 是**具体树**时 astgen 展开为 `target[i] = expr[i]`；
-    是 `ReturnLoc()` 时单个 `Store(ReturnLoc(), value)`，由 interp 定型/splat。
+  - 其余 → 默认分支 **`hir.Store(ptr, value)`（`Store.ptr` 只能是 `hir.Value | ReturnLoc`，**不接受树**）**：
+    - `result_loc` 是**具体树**（N 叶）时，astgen 先取 `expr` 的 **place**（`_as_ref`）再展开为逐元素写入
+      `target[i] = expr[i]`（第 i 叶 ← `Load(Subscript(expr_place, i))`）——**不是**一次写整棵树；
+    - `result_loc` 是 `ReturnLoc()` 时单个 `Store(ReturnLoc(), value)`，由 interp 按 `value` 形状定型/splat。
   - RHS 是结构体/数组构造子 → 报错。
 - `_gen_boolop`（L1644）→ **修改**：`result_loc` 参数 → `FullResultLoc`（`return a and b` 会把 `ReturnLoc()` 传进来，
   内部走 `Store`/`break_if`）。
@@ -662,6 +721,17 @@
 - `_deliver_result`（L9758）/ `_pair_places`（L9895）→ **修改**：`RetComptime` 叶不成 MIR 实参，
   改为「取 list 值 → `store` 到对应 place」。
 - `_materialize_ret_sig`（L2242）/ `_make_runtime_call` → **修改**（报错文案 / 传导）。
+- `_finish_function`（填 `_deferred_returns`）→ **修改**：延迟返回（返回约定未定，如省略返回注解 / 异常集推断）
+  同样要把每个 `RetComptime` 叶的值记进 callee 的 `list`（抽出 `_record_ret_comptime_value`，与
+  `_emit_function_return` 共用）。否则非 inline 调用点会报
+  `the call delivered no compile-time result the callee returned`（见 progress §1.18）。
+
+`spy/compiler/glue.py`（Python 边界，见 behaviour §7.3）：
+
+- `_read_result` 的 `RetComptime` 分支 → **修改**：不再 `return None`，改为读
+  `instance.ret_comptime_values[leaf.index]` 并经新增的 **`_comptime_to_python`** 转成 Python 值——裸
+  `int`/`float`（未定型字面量）原样、`sval.Int`/`sval.Float` 取 `.value`、**其余原样**交出 `sval` 对象
+  （类型值/指针/函数值/聚合的 Python 侧 API 未定义，未定型行为）。列表缺失/下标越界时仍返回 `None`（不掩盖随后抛出的 spy 异常）。
 - **打包成一个变量**：**当所有结果叶 `classify() != COMPTIME` 时**，`packed = f()`（普通元组变量）——
   `CommitSlot` 处由调用结果推断元组类型并打包。**若任一结果叶 `classify() == COMPTIME`**（类型值 /
   const 指针 / 字节串 / 函数值等），打包出的元组类型无运行时表示，目标变量必须是 `Comptime`。
@@ -676,6 +746,9 @@
 - 元素为编译期值时不占 MIR 实参——**保留**：合成 struct 里该字段 `is_comptime=True`、`default=该编译时值`
   （值烘进类型，不 store、不进 MIR 布局），见 §8.1。
 - 结构体元素不铺平——保留。
+- **反射（Q1，已定）**：`std.reflect.type_info` **不**为合成 struct 加特判——它按合成 struct 的
+  **逻辑类型 `StructType`** 报告。于是元组/字典参数在反射里都是 `StructType`（`$args`/`$kwargs` 的字段名
+  分别为 `_0,_1,…` / 条目名），二者靠**字段名**区分；`tuple_args` 的反射用例据此改写。
 
 ### 7.5 `t += u`
 
@@ -763,8 +836,13 @@
 `spy/compiler/hir.py`：
 
 - `hir.MakeClosure`（L442）→ **修改**：产出匿名 struct 类型（字段=捕获，`__call__`=嵌套函数体）；
-  删除 `captures` 语义改为字段。
-- **匿名 struct 类型的身份（已定）**：捕获烘进字段的**默认值**，故 `StructField` 的相等/哈希
+  删除 `captures` 语义改为字段。**捕获字段按下标 `_0, _1, ...` 命名**（第 i 个捕获 = 字段 `_i`，
+  顺序即 `MakeClosure.captures` 的顺序）；`MakeClosure.captures` 保留（它是创建点传入的捕获 place，用来
+  熔进字段默认值）。
+- **闭包体的捕获/参数访问（已定）**：`__call__` 的 `self` 是 `hir.Arg(0)`（指向该匿名 struct 的指针）；
+  闭包声明的形参整体**后移一位**（第 i 个形参 = `hir.Arg(i+1)`）；闭包体内对捕获量（第 i 个）的引用
+  解析为 `self.<i>`（`hir.FieldIndexAddr(hir.Arg(0), i)` 这个 place）。
+- **匿名 struct 类型的身份（已定）**：捕获熔进字段的**默认值**，故 `StructField` 的相等/哈希
   必须包含默认值（`ComptimePtr` 身份/内容、`move` 捕获的值按结构），不同捕获 ⇒ 不同类型；
   `MirLowerCache` 的键也要包含它，同时 `is_comptime` 字段不进 MIR 布局缓存。
 - `hir.Closure`（L160）→ **删除**（捕获经 struct 字段读取）。
@@ -816,12 +894,21 @@
 
 ### 9.5 `as_func_ptr`
 
+**语义收窄（Q3，已定）**：`as_func_ptr` **仅供「闭包 → 函数」转换**。普通 spy 函数不再需要它
+（`sval.FunctionValue` 本身可被自动 lower）；需要 `ConstPtr[FnType]` 时用 `coerce(fn, ConstPtr[FnType])`
+（Python 不会把函数当 `ConstPtr`，`coerce` 只为类型检查器）。**第一个参数（`type[T]`）只给 Python
+类型检查器看，实现忽略之**（不再校验 `fn_type`）。
+
 `spy/compiler/interp.py`：
 
-- `exec_as_func_ptr`（L5326）→ **修改**：`f` 必须是有 `__call__` 的 **ZST** struct；
-  结果是去掉 `self` 参数的 `__call__`（`fn.FunctionValue`，`get_type` 报函数指针），由自动 lower 进入运行时。
-- 普通 spy 函数 / extern 函数：直接用名字取函数指针（`FunctionValue.get_type` 报函数指针类型）。
-- `syntax.as_func_ptr`（syntax.py L167）→ **修改**：语义调整（ZST 闭包专用）。
+- `exec_as_func_ptr` → **修改**：`f` 必须是有 `__call__` 的 **ZST** struct（含运行时字段/捕获则报错）。
+  **结果是不含 `self` 参数的 `FunctionValue`**：生成一个 wrapper `FunctionValue`，其体内先
+  `self_val = typed_undefined(T)`（`T` = 闭包匿名 struct 类型；其 `is_comptime` 字段的默认值即捕获值，
+  故 ZST 的「未定义实例」携带正确捕获），再 `return self_val.__call__(args…)`（`CallMethodInplace`；
+  参数按闭包 `arg_is_ref` 前移、`self` 去掉）；该 `FunctionValue` 由自动 lower 进入运行时（Q2，已定）。
+- extern / `DeclareFunction`：已是函数指针，原样返回。
+- `syntax.as_func_ptr`（syntax.py L167）→ **修改**：语义调整（ZST 闭包专用）；
+  普通 spy 函数「直接取函数指针」（`FunctionValue.get_type` 报常函数指针类型）。
 
 ---
 
@@ -995,7 +1082,7 @@
 | `Comptime` 参数收到运行时实参 | `interp._check_comptime_args` |
 | 写只读的编译期指针（指针视图只读或 `Box.is_const` 只读） | `interp.store`（`ComptimePtr`） |
 | `ConstComptime` 无初值 | `astgen._gen_ann_assign` |
-| 物化非 const 编译期指针为运行时值/地址 | `interp`（`ComptimePtr` 的 lower 入口/`_val_to_node`） |
+| 无注解变量（运行时存储）持有编译期专属类型（如未定型整数） | `interp._commit_pending_slot`（`_no_runtime_type`）|
 | 编译期 `if`/`unroll` 条件非编译期值 | `interp._exec_if`/`_exec_loop` |
 | `comptime()`/`const_comptime()` 错误用法 | `astgen._gen_stmt`/`_gen_syntax_call` |
 | 解构 arity 不符 | `interp.store`（树）/`astgen` |
@@ -1015,9 +1102,18 @@
 ## 17. 待确认问题
 
 已确认的决定均已直接写入上文对应章节（§0.2/§0.3/§2.0/§2.1/§2.2/§2.4/§3.1/§3.3/§3.4/§4.1/§4.2/§4.3/
-§5.2/§5.3/§7.2/§7.3/§7.4/§8.1/§9.3/§9.5/§10/§16）。原 Q5（含遗留）/Q6/Q7（前半）/Q11/Q13/Q14/Q15/Q16/Q17/Q18/
+§5.1/§5.2/§5.3/§7.2/§7.3/§7.4/§8.1/§9.3/§9.5/§10/§16）。原 Q5（含遗留）/Q6/Q7（前半）/Q11/Q13/Q14/Q15/Q16/Q17/Q18/
 Q19/Q20 已解决并迁入正文（Q5→§4.3/§10、Q6/Q16/Q17→§4.2、Q7 前半→§7.3、Q11→§2.0/§2.1/§2.2、Q13→§8.1、
-Q14/Q15→§0.2/§2.4/§4.1、Q18→§4.1/§4.3/§10、Q19→§5.3、Q20→§7.2）。以下为仍**未决**的点：
+Q14/Q15→§0.2/§2.4/§4.1、Q18→§4.1/§4.3/§10、Q19→§5.3、Q20→§7.2）。
+**本轮实现期再确认（Q1–Q5）**：Q1 反射报告合成 struct 为 `StructType`（不加特判，tuple/dict 靠字段名区分）→§7.4；
+Q2 `as_func_ptr` 生成「`typed_undefined` + `__call__`」的不含 `self` 的 wrapper `FunctionValue` →§9.5；
+Q3 `as_func_ptr` 忽略第一个参数、收窄为「闭包→函数」（普通函数用 `coerce(fn, ConstPtr[…])`）→§9.5；
+Q4 `_gen_call` 折叠「全局上的裸 Python 函数属性」为直接调用 →§4.3；
+Q5 同一存储多次聚合构造的下标防护 + 冲突 store（ZST peer）→§5.1。
+**再确认（Q-a–Q-d）**：Q-a 普通/无注解声明 = 运行时存储（`is_comptime=False`），推断另由
+`InferComptime`/`syntax.infer_comptime()` 显式请求 →§3.3/§3.5（落地记录见 §18.2）；Q-b 非 const
+`ComptimePtr` 物化 →§4.3；Q-c slice 下标为可写 `SlicePtr`（暂不修）；Q-d 元组内出现编译期
+专属类型的元素（暂缓）→§18.1。以下为仍**未决**的点：
 
 - **Q7 遗留（手写指定编译期返回）**：把 `classify()==NONE` 的类型也按编译时返回（正文 §7.3 已引用）。
   **本次重构暂不决定其实现、不实现**，留待后续。
@@ -1028,3 +1124,47 @@ Q14/Q15→§0.2/§2.4/§4.1、Q18→§4.1/§4.3/§10、Q19→§5.3、Q20→§7.2
   （已知限制，由用户避免）；仅在 §6 收敛 `_runtime_position` 以修掉 `issues.md` #5。
 > **限制（原 Q20，已定并落 §7.2）**：互相递归且都省略返回注解的函数（结果形状循环依赖）无法定型——
 > 报错 / 需显式注解。
+
+---
+
+## 18. 下一步任务（本重构遗留）
+
+本节记录遗留的待办：§18.1 是一项暂缓实现的功能；§18.2 是已落地规则的记录与它剩下的一个子项。
+
+### 18.1 元组内出现「编译期专属类型」的元素（原 Q-d）
+
+**现状/限制**：元组的值会物化成一个运行时聚合（`_build_tuple_value`）；若其中某个元素类型
+`classify() == COMPTIME`（最典型的是**未定型整数字面量** `AnyIntType`），而元组里**同时**有运行时元素
+（如 `(Big(a, b, c), 100)`），则该元组类型 `tuple[Big, int]` 没有运行时表示，构建时报
+`a value of the tuple tuple[Big, int] has no runtime representation`。
+
+**为何暂不修**：正确做法是元组实参**不物化整值**，而按形参**逐元素** coercion（`100` 由形参 `tuple[Big, i64]`
+的第二元素定成 `i64`）；但这需要「从尚未提交的临时量/字面量的 `_PendingTuple` 直接拆出元素 place」这样一条
+新路径，超出本轮范围。用户已确认：**普通元组里的整数字面量就按 `AnyIntType` 处理**，只有把它传给
+**C callconv 的 varargs** 时才自动物化成 `c_int`。
+
+**临时规避（已完成）**：`spy/tests/tuple_args.py` 的 3 个用例（`call_big`/`call_forward_big`/
+`call_big_with_a_literal_element`）改为 `coerce(100, i64)` 等显式 `i64` 字面量，使元组保持运行时表示。
+
+**待办**：实现「元组实参不物化、按形参逐元素 coercion」，并把上述 3 个用例改回普通字面量。
+
+### 18.2 用户无注解声明 = 运行时存储（原 Q-a）——已落地（本轮）
+
+**已实现**：普通变量声明（含无注解与解构目标）→ **运行时存储**（`is_comptime=False`）；只有显式写
+`Comptime`/`ConstComptime` 才是 `True`；`is_comptime=None`（推断）可由 `InferComptime` /
+`syntax.infer_comptime()` 显式请求（见 §3.5），其余留给编译器内部槽。于是 `x = 1` 由「运行时槽 +
+未定型整数」报 `_no_runtime_type`，不需额外特判。
+
+**落地的关键点**（原「受阻」三项的处理）：
+1. **`std/core.py` 的 `range.__next__`**：`result` 改用 `syntax.infer_comptime()`——`False` 会让
+   编译期专属的元素类型（未定型整数）装不进运行时槽（`int is a compile-time-only type`）。
+2. 编译期 `for` 的**迭代器/循环变量槽**（`_gen_for`）**保持** `True`，无需改动（见 §3.3）。
+3. `options` 的静默错结果（`75 != 77`）：`p = ref(ch)` 落内存成拷贝；测试改为
+   `p: InferComptime = ref(ch)`。
+
+**同时更新的测试**：`tuple_ops` 的 `t = (0, 0, 0)` / `t = (5, 6)`（全未定型的编译期元组）改为
+`t: InferComptime = ...`；`comptime.py` 新增 `SpyInferComptimeTest`（标记/注解两种写法、运行时值落
+内存、形参拒绝）。
+
+**遗留**：`basics.test_untyped_integer_slot_is_rejected` 的 `untyped_return()` 子用例仍不报错——
+**函数结果位置**（无返回注解）是内部推断槽，与本规则无关，待单独处理（结果位置定型）。
