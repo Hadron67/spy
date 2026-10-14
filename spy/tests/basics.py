@@ -8,12 +8,14 @@ from ..compiler import (
     f32,
     f64,
     i32,
+    sval,
     u64,
 )
 from ..compiler import as_ as spy_as
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func
+from ..compiler.syntax import Comptime
 from ..std import (
     Numeric,
 )
@@ -282,7 +284,18 @@ def untyped_local(n: i32) -> i32:
 
 @func()
 def untyped_return():
+    # no return annotation: the result is the untyped literal itself, delivered
+    # at compile time (a ``RetComptime`` leaf, see the behaviour doc §7.3) - a
+    # Python caller gets the value (see ``test_an_untyped_result_is_delivered_to_python``)
     return 1
+
+
+@func()
+def untyped_type_return():
+    # a compile-time *type* result: not a scalar, so a Python caller gets the
+    # compiler's own object back as it is (see ``glue._comptime_to_python``)
+    t: Comptime = i32
+    return t
 
 
 @func()
@@ -446,12 +459,23 @@ class SpyFunctionCallTest(TestCase):
         # slot that has to live in memory must declare its type
         with self.assertRaises(CompileError):
             untyped_local(5)
-        with self.assertRaises(CompileError):
-            untyped_return()
         # the same holds for the slot of an unannotated parameter, which
         # is typed by the call (here: by an untyped literal argument)
         with self.assertRaises(CompileError):
             call_untyped_param()
+
+    def test_an_untyped_result_is_delivered_to_python(self) -> None:
+        # a function with no return annotation returns the untyped literal at
+        # *compile time* (its result leaf is a ``RetComptime``, no memory is
+        # involved): a Python caller gets the value itself (see ``glue``)
+        self.assertEqual(untyped_return(), 1)
+
+    def test_a_non_scalar_result_is_handed_over_as_it_is(self) -> None:
+        # only the scalars with an obvious Python mirror are converted; anything
+        # else - here a type value - is the compiler's own object (see
+        # ``glue._comptime_to_python``)
+        value = untyped_type_return()
+        self.assertIsInstance(value, sval.Type)
 
 
 @func()

@@ -252,7 +252,8 @@ def dict_value_is_tuple(x) -> spy_bool:
         child = type_info(entry.type)
         if isinstance(c := child, StructType):
             if is_tuple_shape(c):
-                syntax.comptime()
+                # the entry's value is read out of the runtime ``$args`` struct:
+                # it is a runtime tuple, so the local is a plain variable
                 value = x[entry.name]
                 return value[0] + value[1] == 3
     return False

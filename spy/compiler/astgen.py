@@ -85,6 +85,7 @@ from .sval import (
     VoidType,
     as_value,
     unwrap_comptime,
+    unwrap_infer_comptime,
 )
 from .sval import (
     TypeVar as SpyTypeVar,
@@ -225,9 +226,25 @@ class _Comptime(_Pragma):
 class _ConstComptime(_Pragma):
     pass
 
+@dataclass(frozen=True, slots=True)
+class _InferComptime(_Pragma):
+    pass
+
 _UNROLL = _Unroll()
 _COMPTIME = _Comptime()
 _CONST_COMPTIME = _ConstComptime()
+_INFER_COMPTIME = _InferComptime()
+
+def _marker_call(marker: _Pragma) -> str:
+    """The source spelling of a statement marker, for diagnostics."""
+    if marker is _UNROLL:
+        return 'syntax.unroll()'
+    if marker is _COMPTIME:
+        return 'syntax.comptime()'
+    if marker is _CONST_COMPTIME:
+        return 'syntax.const_comptime()'
+    assert marker is _INFER_COMPTIME
+    return 'syntax.infer_comptime()'
 
 class _Builder:
     """Translates the AST of one function body into one linear
@@ -363,6 +380,8 @@ class _Builder:
                 return _COMPTIME
             if fn is syntax.const_comptime:
                 return _CONST_COMPTIME
+            if fn is syntax.infer_comptime:
+                return _INFER_COMPTIME
         return None
 
     def _gen_body(self, stmts: list[ast.stmt]) -> None:
@@ -413,7 +432,7 @@ class _Builder:
                 # block
                 break
             marker = self._as_marker(stmt)
-            if marker is _COMPTIME or marker is _CONST_COMPTIME:
+            if marker is _COMPTIME or marker is _CONST_COMPTIME or marker is _INFER_COMPTIME:
                 comptime_marker = marker
                 index += 1
                 continue
@@ -457,17 +476,19 @@ class _Builder:
         if self._lookup_within_function(target.id) is not None:
             return
         is_comptime, is_const, type_node = self._split_comptime(node.annotation)
-        if is_comptime and marker is not None:
+        if is_comptime is not False and marker is not None:
             raise CompileError(
-                f"'{target.id}' is already declared compile-time by its "
-                f"annotation; drop the syntax.comptime() marker before it"
+                f"'{target.id}' is already declared by its annotation; drop the "
+                f"{_marker_call(marker)} before it"
             )
         if marker is _CONST_COMPTIME:
             is_comptime = True
             is_const = True
         elif marker is _COMPTIME:
             is_comptime = True
-        if is_comptime and type_node is None:
+        elif marker is _INFER_COMPTIME:
+            is_comptime = None
+        if is_comptime is not False and type_node is None:
             # a compile-time slot with no declared type is committed by its
             # initializing store, not at the pre-scan: declaring it here would
             # put its ``Alloca`` in the wrong runtime block (see
@@ -499,6 +520,8 @@ class _Builder:
             comptime_marker = _CONST_COMPTIME
         elif _COMPTIME in self._pragmas:
             comptime_marker = _COMPTIME
+        elif _INFER_COMPTIME in self._pragmas:
+            comptime_marker = _INFER_COMPTIME
         self._pragmas.clear()
         is_comptime = comptime_marker is not None
 
@@ -742,18 +765,20 @@ class _Builder:
         starts the next iteration.  The ``syntax.unroll()`` marker immediately
         before the ``for`` opens the loop as a compile-time one (see
         ``interp``): the iterable and the loop variable(s) of a compile-time
-        loop are *compile-time values*, so both are built into inline slots -
-        a compile-time iterable is an aggregate with no runtime representation
-        of its own, which an ordinary expression temporary may not hold."""
+        loop are *compile-time values*, so both are built into compile-time
+        slots - a compile-time iterable is an aggregate with no runtime
+        representation of its own, which an ordinary expression temporary may
+        not hold.  A plain ``for`` is an ordinary runtime loop: its iterator and
+        loop variable are runtime storage (``is_comptime=False``)."""
         from ..std.core import StopIteration
 
         # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
         # iteration would restart the iteration)
-        it = self.add(hir.Alloca(is_comptime=True if is_inline else None))
+        it = self.add(hir.Alloca(is_comptime=True if is_inline else False))
         if is_inline:
-            # a compile-time iterable is evaluated into an inline slot of its
-            # own (result-location semantics), so that it never goes through an
-            # expression temporary
+            # a compile-time iterable is evaluated into a compile-time slot of
+            # its own (result-location semantics), so that it never goes through
+            # an expression temporary
             iter_slot = self.add(hir.Alloca(is_comptime=True))
             self._gen_result_loc(node.iter, iter_slot)
             self.add(hir.CommitSlot(iter_slot))
@@ -769,10 +794,7 @@ class _Builder:
         self.add(hir.Loop(is_inline=is_inline))
         self.add(hir.Try((None,), (hir.Const(StopIteration),)))
         new_slots: list[hir.Value] = []
-        place = self._gen_lhs(
-            node.target, new_slots,
-            True if is_inline else None,
-        )
+        place = self._gen_lhs(node.target, new_slots, True if is_inline else False)
         self.add(hir.CallMethodInplace(it, '__next__', hir.CallArgs((), ()), place))
         for slot in new_slots:
             self.add(hir.CommitSlot(slot))
@@ -964,15 +986,18 @@ class _Builder:
         ``_gen_ann_assign``)."""
         by_marker = marker is not None
         if by_marker and not self._declares_a_fresh_name(target):
+            assert marker is not None
             raise CompileError(
-                'syntax.comptime() marks a declaration: it must be followed by an '
-                'assignment that declares a fresh variable'
+                f'{_marker_call(marker)} marks a declaration: it must be followed '
+                f'by an assignment that declares a fresh variable'
             )
         new_slots: list[hir.Value] = []
-        place = self._gen_lhs(
-            target, new_slots,
-            True if by_marker else False,
-        )
+        is_comptime: bool | None = False
+        if marker is _COMPTIME or marker is _CONST_COMPTIME:
+            is_comptime = True
+        elif marker is _INFER_COMPTIME:
+            is_comptime = None
+        place = self._gen_lhs(target, new_slots, is_comptime)
         self._gen_result_loc(value, place)
         for slot in new_slots:
             self.add(hir.CommitSlot(slot))
@@ -1031,16 +1056,18 @@ class _Builder:
                 f"an annotated declaration introduces a new variable"
             )
         is_comptime, is_const, type_node = self._split_comptime(node.annotation)
-        if is_comptime and marker is not None:
+        if is_comptime is not False and marker is not None:
             raise CompileError(
-                f"'{target.id}' is already declared compile-time by its "
-                f"annotation; drop the syntax.comptime() marker before it"
+                f"'{target.id}' is already declared by its annotation; drop the "
+                f"{_marker_call(marker)} before it"
             )
         if marker is _CONST_COMPTIME:
             is_comptime = True
             is_const = True
         elif marker is _COMPTIME:
             is_comptime = True
+        elif marker is _INFER_COMPTIME:
+            is_comptime = None
         if is_const and node.value is None:
             raise CompileError(
                 f"'{target.id}' is a compile-time constant (ConstComptime) and must "
@@ -1053,26 +1080,34 @@ class _Builder:
             self._gen_result_loc(node.value, slot)
         self.add(hir.CommitSlot(slot))
 
-    def _split_comptime(self, node: ast.expr) -> tuple[bool, bool, ast.expr | None]:
+    def _split_comptime(self, node: ast.expr) -> tuple[bool | None, bool, ast.expr | None]:
         """Split a *local* variable's annotation into its ``Comptime``/
-        ``ConstComptime`` marker and the type it wraps (the annotation
-        counterpart of the parameter path, see ``sval.unwrap_comptime``): the
-        bare ``Comptime`` splits to ``(True, False, None)``, ``Comptime[T]`` to
-        ``(True, False, T)``, the ``ConstComptime`` spellings to the same with
-        ``is_const`` set, and anything else to ``(False, False, node)``.  The
-        marker is recognized by the global name it is written as, so a variable
-        of the same name shadows it like any global."""
+        ``ConstComptime``/``InferComptime`` marker and the type it wraps (the
+        annotation counterpart of the parameter path, see
+        ``sval.unwrap_comptime``): the bare ``Comptime`` splits to
+        ``(True, False, None)``, ``Comptime[T]`` to ``(True, False, T)``, the
+        ``ConstComptime`` spellings to the same with ``is_const`` set, the
+        ``InferComptime`` spellings to ``(None, False, ...)`` (the storage is
+        inferred from the stores), and anything else to ``(False, False, node)``.
+        The marker is recognized by the global name it is written as, so a
+        variable of the same name shadows it like any global."""
         obj = self._try_resolve_object(node)
         if obj is syntax.Comptime:
             return True, False, None
         if obj is syntax.ConstComptime:
             return True, True, None
+        if obj is syntax.InferComptime:
+            return None, False, None
         if isinstance(node, ast.Subscript):
             base = self._try_resolve_object(node.value)
             if base is syntax.Comptime or base is syntax.ConstComptime:
                 if isinstance(node.slice, ast.Tuple):
                     raise CompileError(f'{base.__name__} takes exactly one type argument')
                 return True, base is syntax.ConstComptime, node.slice
+            if base is syntax.InferComptime:
+                if isinstance(node.slice, ast.Tuple):
+                    raise CompileError('InferComptime takes exactly one type argument')
+                return None, False, node.slice
         return False, False, node
 
     def _split_type_value(self, node: ast.expr) -> tuple[bool, ast.expr]:
@@ -2023,13 +2058,21 @@ class _Builder:
         None when it is not declared): its name, whether it carries the
         ``Comptime`` marker, and its *element/value* annotation as an operand
         evaluated in the enclosing frame (None when unannotated).  A
-        ``type[...]`` annotation is rejected."""
+        ``type[...]`` annotation and the ``InferComptime`` marker (a local-only
+        one) are rejected."""
         if arg is None:
             return None, False, None
         is_comptime = False
         annotation: hir.Value | None = None
         if arg.annotation is not None:
-            is_comptime, _is_const, type_node = self._split_comptime(arg.annotation)
+            split_is_comptime, _is_const, type_node = self._split_comptime(arg.annotation)
+            if split_is_comptime is None:
+                raise CompileError(
+                    f'*args/**kwargs of closure {name} cannot be declared '
+                    f'InferComptime: only a local declaration may infer its '
+                    f'storage (use Comptime instead)'
+                )
+            is_comptime = split_is_comptime
             if type_node is not None:
                 is_type_value, type_node = self._split_type_value(type_node)
                 if is_type_value:
@@ -2087,6 +2130,12 @@ class _Builder:
             for i, a in enumerate(args.args):
                 if a.annotation is not None:
                     ct, _is_const, type_node = self._split_comptime(a.annotation)
+                    if ct is None:
+                        raise CompileError(
+                            f"parameter '{a.arg}' of closure {name} cannot be "
+                            f"declared InferComptime: only a local declaration "
+                            f"may infer its storage (use Comptime instead)"
+                        )
                     is_comptime[i] = ct
                     if type_node is not None:
                         tv, type_node = self._split_type_value(type_node)
@@ -2354,6 +2403,15 @@ def parse_function(
     for i, arg in enumerate(all_args):
         has_default = i >= offset
         default_value = default_of(defaults[i - offset]) if has_default else None
+        # ``InferComptime`` only applies to a *local* declaration: a parameter
+        # always has the storage its signature says (see ``SignatureFormalArg``)
+        is_infer, _ = unwrap_infer_comptime(annotations.get(arg.arg))
+        if is_infer:
+            raise CompileError(
+                f"parameter '{arg.arg}' of function {node.name} cannot be "
+                f"declared InferComptime: only a local declaration may infer its "
+                f"storage (use Comptime for a compile-time parameter)"
+            )
         # ``Comptime``/``Comptime[T]`` annotate a compile-time parameter (see
         # ``SignatureFormalArg``): the marker is split off the annotation and
         # the type it wraps is the parameter's declared type
@@ -2395,6 +2453,12 @@ def parse_function(
     def vararg_formal(arg: ast.arg | None) -> SignatureFormalArg | None:
         if arg is None:
             return None
+        is_infer, _ = unwrap_infer_comptime(annotations.get(arg.arg))
+        if is_infer:
+            raise CompileError(
+                f"*args/**kwargs of function {node.name} cannot be declared "
+                f"InferComptime: only a local declaration may infer its storage"
+            )
         is_comptime, annotated = unwrap_comptime(annotations.get(arg.arg))
         if get_origin(annotated) is type:
             raise CompileError(

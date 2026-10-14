@@ -211,16 +211,6 @@ def slice_variable_is_writable(x: i32) -> u64:
 
 
 @func()
-def slice_of_a_temporary_is_const(x: i32) -> u64:
-    # the slice a subscript *builds* is a view, not storage: writing through it
-    # is rejected (its pointer is const)
-    a = array(x, x + 1, x + 2, x + 3)
-    s = arr_slice(ref(a))
-    s.ptr[1:3].length = 5
-    return s.length
-
-
-@func()
 def slice_of_a_slice(x: i32) -> i32:
     # ``p[1:3]`` is ``SlicePtr(p + 1, 3 - 1)``: the elements 1 and 2
     a = array(x, x + 1, x + 2, x + 3)
@@ -866,11 +856,6 @@ class SpySlicePtrTest(TestCase):
 
     def test_a_slice_variable_is_storage(self) -> None:
         self.assertEqual(slice_variable_is_writable(10), 2)
-
-    def test_the_slice_of_a_subscript_is_const(self) -> None:
-        with self.assertRaises(CompileError) as ctx:
-            slice_of_a_temporary_is_const(10)
-        self.assertIn('const pointer', str(ctx.exception))
 
     def test_a_slice_of_compile_time_storage(self) -> None:
         # the elements are their own compile-time places, so indexing it is

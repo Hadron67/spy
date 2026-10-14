@@ -74,6 +74,7 @@ class Array[T, L: int | None]:
 
 type Comptime[T = Any] = T
 type ConstComptime[T = Any] = T
+type InferComptime[T = Any] = T
 type Option[T] = T | None
 
 def ref[T](val: T) -> Ptr[T]:
@@ -89,6 +90,15 @@ def const_comptime():
     """Mark the statement that follows as a compile-time *constant*
     declaration (``x: ConstComptime = e``): the box it reserves is read-only
     after it is committed.  Recognized by identity in ``astgen``."""
+    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
+
+def infer_comptime():
+    """Mark the statement that follows as a declaration whose storage is
+    *inferred* (``x: InferComptime = e``): the slot is a compile-time ``Box``
+    when every value written into it is a compile-time one, and memory
+    otherwise (see ``astgen`` and the behaviour doc §3.3).  Only a local
+    declaration may infer; a parameter may not (use ``Comptime``).  Recognized
+    by identity in ``astgen``."""
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
 def unroll():

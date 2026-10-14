@@ -19,6 +19,7 @@ from ..compiler.syntax import (
     Array,
     Comptime,
     ConstComptime,
+    InferComptime,
     Option,
     Ptr,
     array,
@@ -791,7 +792,7 @@ def comptime_option_ref_aliases() -> i32:
     # the local ``p`` holds the pointer itself, so writing through it writes
     # ``ch`` as well
     ch: Comptime[Option[i32]] = 5
-    p: Comptime = ref(ch)
+    p: InferComptime = ref(ch)
     p[...] = 7
     if (v := p[...]) is not None and (w := ch) is not None:
         return v * 10 + w

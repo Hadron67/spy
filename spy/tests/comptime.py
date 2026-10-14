@@ -11,6 +11,7 @@ from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
     Comptime,
+    InferComptime,
     Ptr,
     ref,
 )
@@ -355,7 +356,7 @@ class SpyComptimeMarkerTest(TestCase):
     def test_a_redundant_annotation_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:
             comptime_marker_redundant()
-        self.assertIn('already declared compile-time', str(ctx.exception))
+        self.assertIn('already declared by its annotation', str(ctx.exception))
 
     def test_it_marks_a_declaration_not_an_assignment(self) -> None:
         with self.assertRaises(CompileError) as ctx:
@@ -370,6 +371,152 @@ class SpyComptimeMarkerTest(TestCase):
     def test_it_must_come_immediately_before_the_declaration(self) -> None:
         with self.assertRaises(CompileError):
             comptime_marker_before_a_loop()
+
+
+# ---------------------------------------------------------------------------
+# ``InferComptime`` / ``syntax.infer_comptime()``: the storage decision is left
+# to the stores - a compile-time value stays in a box, a runtime one lands in
+# memory - so a declaration may hold a compile-time-only value (an untyped
+# integer literal, a type) without saying which storage it wants.  Only a
+# *local* declaration may infer: a parameter always has the storage its
+# signature says (see astgen._split_comptime)
+# ---------------------------------------------------------------------------
+
+
+@func()
+def infer_comptime_holds_an_untyped_literal() -> i32:
+    # the value is compile-time-only, so the inferred slot is a box and the loop
+    # condition is a compile-time value
+    n: InferComptime = 4
+    total: i32 = 0
+    syntax.unroll()
+    while n > 0:
+        total = total + n
+        n = n - 1
+    return total
+
+
+@func()
+def infer_comptime_marker_holds_a_type(x: i32) -> spy_bool:
+    # the statement marker form decides the storage the same way
+    syntax.infer_comptime()
+    t = spy_typeof(x)
+    return t == i32
+
+
+@func()
+def infer_comptime_lands_in_memory(x: i32) -> i32:
+    # a runtime value: the inferred slot is memory, so a runtime loop may write
+    # it (a bare ``Comptime`` one could not hold the value at all)
+    c: InferComptime = x
+    y: i32 = 0
+    while y < 3:
+        c = c + 1
+        y = y + 1
+    return c
+
+
+@func()
+def infer_comptime_declares_the_type(x: i32) -> i32:
+    # ``InferComptime[T]`` declares the type; only the storage is inferred
+    c: InferComptime[i32] = x
+    y: i32 = 0
+    while y < 3:
+        c = c + 1
+        y = y + 1
+    return c
+
+
+@func()
+def infer_comptime_marker_destructuring() -> i32:
+    # the marker marks every name a destructuring declaration declares
+    syntax.infer_comptime()
+    a, b = 1, 2
+    total: i32 = 0
+    syntax.unroll()
+    while a > 0:
+        total = total + a * 10 + b
+        a = a - 1
+    return total
+
+
+@func()
+def infer_comptime_marker_redundant() -> i32:
+    # the annotation already declares the storage
+    syntax.infer_comptime()
+    a: InferComptime = 1
+    return a
+
+
+@func()
+def infer_comptime_marker_before_a_non_declaration() -> i32:
+    syntax.infer_comptime()
+    return 1
+
+
+@func()
+def infer_comptime_parameter(x: InferComptime) -> i32:
+    # a parameter always has the storage its signature says
+    return x
+
+
+@func()
+def infer_comptime_varargs(*args: InferComptime) -> i32:
+    return 0
+
+
+@func()
+def infer_comptime_closure_parameter() -> i32:
+    def inner(x: InferComptime) -> i32:
+        return x
+    return inner(1)
+
+
+@func()
+def infer_comptime_closure_varargs() -> i32:
+    def inner(*args: InferComptime) -> i32:
+        return 0
+    return inner(1)
+
+
+class SpyInferComptimeTest(TestCase):
+    """``InferComptime``/``syntax.infer_comptime()``: a local declaration whose
+    storage is inferred from the values written into it - a compile-time value
+    stays in a box (so a compile-time-only value is allowed), a runtime one
+    lands in memory.  Only a local may infer; a parameter may not."""
+
+    def test_a_compile_time_only_value(self) -> None:
+        self.assertEqual(infer_comptime_holds_an_untyped_literal(), 4 + 3 + 2 + 1)
+
+    def test_the_marker_form(self) -> None:
+        self.assertTrue(infer_comptime_marker_holds_a_type(1))
+
+    def test_a_runtime_value_lands_in_memory(self) -> None:
+        self.assertEqual(infer_comptime_lands_in_memory(10), 13)
+        self.assertEqual(infer_comptime_declares_the_type(10), 13)
+
+    def test_a_destructuring_declaration(self) -> None:
+        self.assertEqual(infer_comptime_marker_destructuring(), 1 * 10 + 2)
+
+    def test_a_redundant_annotation_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            infer_comptime_marker_redundant()
+        self.assertIn('already declared by its annotation', str(ctx.exception))
+
+    def test_the_marker_must_be_followed_by_a_declaration(self) -> None:
+        with self.assertRaises(CompileError):
+            infer_comptime_marker_before_a_non_declaration()
+
+    def test_it_is_local_only(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            infer_comptime_parameter(1)
+        self.assertIn('InferComptime', str(ctx.exception))
+        with self.assertRaises(CompileError):
+            infer_comptime_varargs(1)
+        with self.assertRaises(CompileError):
+            infer_comptime_closure_parameter()
+        with self.assertRaises(CompileError):
+            infer_comptime_closure_varargs()
 
 
 class SpyTupleTest(TestCase):
@@ -557,6 +704,7 @@ class SpyCompileErrorTest(TestCase):
 
 all_tests = [
     SpyComptimeMarkerTest,
+    SpyInferComptimeTest,
     SpyTupleTest,
     SpyTypeOfTest,
     SpyCompileErrorTest,

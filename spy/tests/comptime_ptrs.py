@@ -4,6 +4,7 @@ from unittest import TestCase
 from ..compiler import i32, syntax
 from ..compiler.dsl import func, func_type, struct
 from ..compiler.syntax import Comptime, ConstComptime, Option, Ptr, as_func_ptr, ref
+from ..std.core import coerce
 
 # ---------------------------------------------------------------------------
 # compile-time pointers crossing a *non-inline* boundary: a compile-time pointer
@@ -111,7 +112,10 @@ def take_tuple_ptr(p: Ptr[tuple[i32, i32]]) -> i32:
 
 @func()
 def comptime_ptr_tuple() -> i32:
-    t: Comptime = (3, 4)
+    # the elements are spelled out: the pointee type of ``take_tuple_ptr`` is
+    # ``tuple[i32, i32]``, and a plain ``(3, 4)`` would keep them untyped (see
+    # task §18.1)
+    t: Comptime = (coerce(3, i32), coerce(4, i32))
     const_t: ConstComptime = t
     return take_tuple_ptr(ref(const_t))
 
@@ -244,7 +248,7 @@ def compiled_closure_captures_a_comptime_aggregate() -> i32:
 def compiled_closure_captures_a_comptime_tuple() -> i32:
     # a captured tuple is a compile-time pointer of its own: the capture is
     # baked into the closure's struct type (see the behaviour doc §9.3)
-    t: Comptime = (3, 4)
+    t: Comptime = (coerce(3, i32), coerce(4, i32))
 
     @syntax.closure(inline=False)
     def f() -> i32:

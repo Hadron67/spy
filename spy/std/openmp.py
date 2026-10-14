@@ -213,11 +213,11 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
             # unannotated local whose stores are all compile-time would be a
             # compile-time box, whose address cannot cross to a runtime call - see
             # the behaviour doc §3.3/§4.2)
-            lower: LT = coerce(0, LT)
-            upper: LT = int_cast(n - 1, LT)
-            stride: ST = coerce(0, ST)
+            lower = coerce(0, LT)
+            upper = int_cast(n - 1, LT)
+            stride = coerce(0, ST)
             init_fn(_ident(), gtid[...], _SCHED_STATIC, ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
-            i: LT = lower
+            i = lower
             while i <= upper:
                 ptr_cast(kernel, Ptr[K])[...](i)
                 i += 1

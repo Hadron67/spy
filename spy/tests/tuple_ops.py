@@ -16,7 +16,7 @@ from unittest import TestCase
 
 from ..compiler import CompileError, i32, syntax
 from ..compiler.dsl import func, struct
-from ..compiler.syntax import Comptime
+from ..compiler.syntax import InferComptime
 
 # ---------------------------------------------------------------------------
 # building a tuple value element by element
@@ -27,7 +27,7 @@ from ..compiler.syntax import Comptime
 def sum_accumulated() -> i32:
     # the ``reduce`` shape: a compile-time loop filling one element per
     # iteration.  The tuple is built first (its arity is fixed), then filled
-    t: Comptime = (0, 0, 0)
+    t: InferComptime = (0, 0, 0)
     syntax.unroll()
     for i in range(3):
         t[i] = i * 10  # pyright: ignore
@@ -47,7 +47,7 @@ def concat_two(x: i32, y: i32) -> i32:
 @func()
 def append_literal() -> i32:
     # a tuple literal is the value itself
-    t: Comptime = (5, 6)
+    t: InferComptime = (5, 6)
     return t[0] + t[1]
 
 

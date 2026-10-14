@@ -3704,6 +3704,23 @@ def unwrap_const_comptime(annotation: Any) -> tuple[bool, Any]:
         return True, args[0]
     return False, annotation
 
+def unwrap_infer_comptime(annotation: Any) -> tuple[bool, Any]:
+    """Like :func:`unwrap_comptime`, for the ``syntax.InferComptime`` marker:
+    ``(True, None)`` for the bare ``InferComptime``, ``(True, T)`` for
+    ``InferComptime[T]`` and ``(False, annotation)`` for anything else.  The
+    marker only applies to a *local* declaration, so the parameter path rejects
+    it (see ``astgen``)."""
+    if annotation is None:
+        return False, None
+    if annotation is syntax.InferComptime:
+        return True, None
+    if typing.get_origin(annotation) is syntax.InferComptime:
+        args = typing.get_args(annotation)
+        if len(args) != 1:
+            raise TypeError(f'InferComptime takes exactly one type argument, got {annotation!r}')
+        return True, args[0]
+    return False, annotation
+
 def negate(value: AnyValue) -> AnyValue | None:
     if isinstance(value, (int, float)):
         return -value

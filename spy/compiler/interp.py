@@ -1276,15 +1276,24 @@ def _index_value(index: int) -> InterpVal:
     """A compile-time field/element index as an interpreter value."""
     return ComptimeVal(sval.Int(index, sval.IntType(64, False)))
 
+def _try_comptime_index(index: InterpVal) -> int | None:
+    """The Python integer a compile-time index denotes, or None when the index
+    is a runtime value (an array element may be addressed by a runtime one, see
+    ``field_index_addr``)."""
+    if isinstance(index, ComptimeVal) and isinstance(index.obj, sval.Int):
+        return index.obj.value
+    return None
+
 def _comptime_index(index: InterpVal) -> int:
     """The Python integer a compile-time index denotes (a field or element of
     an aggregate held compile-time is always named by a compile-time index)."""
-    if isinstance(index, ComptimeVal) and isinstance(index.obj, sval.Int):
-        return index.obj.value
-    raise CompileError(
-        'cannot pick a field or element with a runtime index: it has to be a '
-        'compile-time integer'
-    )
+    result = _try_comptime_index(index)
+    if result is None:
+        raise CompileError(
+            'cannot pick a field or element with a runtime index: it has to be a '
+            'compile-time integer'
+        )
+    return result
 
 def _mir_index(index: InterpVal) -> int | mir.Value:
     """The MIR index an element index denotes: a constant when it is known
@@ -2262,19 +2271,26 @@ class HirRunner:
         for leaf, place in zip(iter_ret_leaves(spec), places):
             if not isinstance(leaf, RetComptime):
                 continue
-            value = _to_comptime(self.load(place))
-            values = self._fn_instance.ret_comptime_values
-            if values is None:
-                values = self._fn_instance.ret_comptime_values = []
-            while len(values) <= leaf.index:
-                values.append(None)
-            values[leaf.index] = value
+            self._record_ret_comptime_value(leaf, place)
         index = ret_by_value_index(spec)
         if index is None:
             self._cur_block.emit(mir.Ret(None, defer_blocks))
         else:
             self._cur_block.emit(mir.Ret(self._to_runtime(self.load(places[index])), defer_blocks))
 
+    def _record_ret_comptime_value(self, leaf: RetComptime, place: InterpVal) -> None:
+        """Record the value a ``RetComptime`` leaf holds at a return site - the
+        path's own return (``_emit_function_return``), or the deferred return
+        ``_finish_function`` fills in.  The callee's per-``FunctionInstance`` list
+        is what a non-inline caller reads to deliver the value (see §7.3); the
+        last path's value wins."""
+        value = _to_comptime(self.load(place))
+        values = self._fn_instance.ret_comptime_values
+        if values is None:
+            values = self._fn_instance.ret_comptime_values = []
+        while len(values) <= leaf.index:
+            values.append(None)
+        values[leaf.index] = value
 
     def _end_error_path(self, defer_blocks: tuple[mir.BasicBlock, ...] = ()) -> None:
         """End a path at the function boundary (an error escaping the function):
@@ -4302,7 +4318,7 @@ class HirRunner:
 
         if isinstance(container_type, sval.AggregateType):
             is_array = isinstance(container_type, sval.ArrayType)
-            index_int = _comptime_index(index)
+            index_int = _try_comptime_index(index)
             if not is_array and index_int is None:
                 # only an array takes a runtime index; every other aggregate
                 # element is named by a compile-time integer
@@ -6487,6 +6503,10 @@ class HirRunner:
                 return self._const_tagged_union_to_mir(ev, type)
             case sval.StructType():
                 return self._const_struct_to_mir(ev, type)
+            case sval.TupleType():
+                return self._const_tuple_to_mir(ev, type)
+            case sval.StrDictType():
+                return self._const_strdict_to_mir(ev, type)
             case sval.ArrayType():
                 return self._const_array_to_mir(ev, type)
             case _:
@@ -6558,6 +6578,21 @@ class HirRunner:
                 continue
             members[mir_index] = self._const_to_mir(ComptimeVal(aggregate.values[index]), fields[index].type)
         return mir.AggregateConstant(mir_type, tuple(members[i] for i in range(len(mir_type.fields))))
+
+    def _const_tuple_to_mir(self, ev: InterpVal, type: sval.TupleType) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
+        """A compile-time tuple lowers as its mirror struct (a tuple mirrors to a
+        synthesized struct, see ``MirLowerCache.tuple_struct``), element by
+        element, exactly like a struct."""
+        if type.classify() == sval.SpecialTypeKind.COMPTIME:
+            raise _no_runtime_type(type)
+        return self._const_struct_to_mir(ev, self._mir_cache.tuple_struct(type))
+
+    def _const_strdict_to_mir(self, ev: InterpVal, type: sval.StrDictType) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
+        """A compile-time ``dict[str, T]`` lowers as its mirror struct (see
+        ``MirLowerCache.strdict_struct``), one member per entry."""
+        if type.classify() == sval.SpecialTypeKind.COMPTIME:
+            raise _no_runtime_type(type)
+        return self._const_struct_to_mir(ev, self._mir_cache.strdict_struct(type))
 
     def _const_array_to_mir(self, ev: InterpVal, type: sval.ArrayType) -> mir.AggregateConstant:
         aggregate = _as_aggregate(ev)
@@ -9474,6 +9509,16 @@ class HirRunner:
         self._write_deferred_error_codes(result_type)
         spec = sig.ret_spec(self._mir_cache)
         places = self._result_places(self._current_result_loc())
+        if len(self._deferred_returns) > 0:
+            # every return of this function deferred its ``mir.Ret`` (its return
+            # convention was not fixed yet), so none of them went through
+            # ``_emit_function_return``: record the compile-time result leaves
+            # here, from the place the deferred return delivers - the last written
+            # value wins, exactly like that return (see §7.3)
+            for leaf, place in zip(iter_ret_leaves(spec), places):
+                if not isinstance(leaf, RetComptime):
+                    continue
+                self._record_ret_comptime_value(leaf, place)
         index = ret_by_value_index(spec)
         for block, defer_blocks in self._deferred_returns:
             if index is None:

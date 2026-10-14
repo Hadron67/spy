@@ -704,13 +704,31 @@ def _storage_leaves(spec: RetSpec) -> list[RetValue]:
     ]
 
 
+def _comptime_to_python(obj: AnyValue | None) -> Any:
+    """The Python value of one compile-time result leaf (see ``_read_result``).
+
+    Only the scalars that have an obvious Python mirror are converted - a
+    compile-time integer or float is a bare Python ``int``/``float`` (an untyped
+    literal, see ``sval.AnyValue``) or a typed ``sval.Int``/``sval.Float`` (whose
+    ``value`` is that Python scalar).  Every other compile-time value (a type, a
+    pointer, a function value, an aggregate, ...) is handed back *as it is*: the
+    compiler's own object, whose Python API is not defined yet."""
+    if isinstance(obj, (int, float)):
+        return obj
+    if isinstance(obj, (sval.Int, sval.Float)):
+        return obj.value
+    return obj
+
+
 def _read_result(
     instance: FunctionInstance,
     buffers: list[Any],
     context: CompileContext,
 ) -> Any:
     """Turn the out pointers of a finished call back into Python values,
-    raising the spy exception the error code names."""
+    raising the spy exception the error code names.  A compile-time result leaf
+    has no out pointer: its value is read off the ``FunctionInstance`` and
+    converted (see ``_comptime_to_python``)."""
     ret_sig = instance.ret_sig
     assert ret_sig is not None
     value_spec = ret_sig.ret_type_spec
@@ -729,10 +747,14 @@ def _read_result(
                 return _read(spec.type, buffer, 0, context)
             case RetTuple():
                 return tuple(read(value) for value in spec.values)
-            case RetComptime():
-                # a compile-time result leaf never crosses the call boundary (its
-                # value lives on the ``FunctionInstance``, see §7.3)
-                return None
+            case RetComptime() as leaf:
+                # a compile-time result leaf never crosses the call boundary as
+                # memory (see §7.3): its value lives on the ``FunctionInstance``,
+                # which the caller reads it from (see ``_comptime_to_python``)
+                values = instance.ret_comptime_values
+                if values is None or leaf.index >= len(values):
+                    return None
+                return _comptime_to_python(values[leaf.index])
 
     # the value part first, then the error code and the payload
     if not _value_is_empty(value_spec):

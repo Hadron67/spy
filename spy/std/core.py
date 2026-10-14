@@ -12,7 +12,7 @@ from ..compiler.syntax import (
     Opaque,
     Option,
     Ptr,
-    comptime,
+    infer_comptime,
     ptr_cast,
 )
 
@@ -53,12 +53,14 @@ class range[T: Numeric]:
     def __next__(self) -> T:
         if self.start >= self.end:
             raise StopIteration()
-        # the element is delivered straight through the return (result-location
-        # semantics): an intermediate local would be runtime storage (see the
-        # behaviour doc §3.3), which a compile-time-only element type (an untyped
-        # literal's ``int``) cannot occupy
+        # ``result`` holds a value that may have no runtime representation (the
+        # element of a compile-time iterator, e.g. an untyped integer literal),
+        # so its storage is left to be inferred: a compile-time element stays in
+        # a box, a runtime one lands in memory (see the behaviour doc §3.3)
+        infer_comptime()
+        result = self.start
         self.start += self.step
-        return self.start - self.step
+        return result
 
 @struct()
 class ConstSlicePtr[T]:
