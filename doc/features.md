@@ -1,0 +1,1622 @@
+# spy 特性清单
+
+本文档列举 **当前代码**（`spy/spy/compiler` + `spy/spy/std`）已经实现的语言特性与可观察行为。
+它取代过时的 `README.md`，反映 comptime 重构之后的状态；行为规格的完整推导见
+`doc/archive/comptime-refactor/behaviour.md`（已归档），已知缺陷见 `doc/issues.md`。
+
+> 说明：本文按「语言表面」组织——即一个 spy 程序员能写出的东西及其语义。
+> 编译器内部各阶段如何实现这些行为见 `doc/implementation.md`。
+
+---
+
+## 0. 总览
+
+`spy` 把普通 Python 函数编译成原生机器码。用 `@spy.func()` 注册函数后，首次调用即按实参类型
+编译出该类型的一个**特化**（specialization），之后是原生调用，不再经过 Python。
+
+函数必须定义在真实源码文件里（编译需要函数的源码）。
+
+编译流程与各阶段实现见 `doc/implementation.md`。
+
+### 0.1 示例约定
+
+本文所有 ```python 代码块都是**可运行**的完整示例：它们假定下面这段**共享导入**（在真实代码里
+`spy` 的公开入口是 `spy.compiler`；这里用 `import spy.compiler as spy` 的等价写法）：
+
+```python
+from spy.compiler import (
+    func, struct, decl_func, func_type, Enum,
+    i8, i16, i32, i64, u8, u16, u32, u64, u0, usize, isize,
+    f32, f64, c64, c128,
+    c_char, c_uchar, c_short, c_ushort, c_int, c_uint,
+    c_long, c_ulong, c_longlong, c_ulonglong,
+    Ptr, ConstPtr, MultiPtr, ConstMultiPtr, Option,
+    typeof, compile_log, as_ as spy_as,
+)
+from spy.compiler.syntax import (
+    Array, Opaque, array,
+    Comptime, ConstComptime, InferComptime,
+    comptime, const_comptime, infer_comptime, unroll,
+    ref, ptr_cast, as_func_ptr, closure,
+    defer, okdefer, errdefer, OK, RAISE, UNWIND, ERR, ALL,
+)
+from spy.std import (
+    ConstSlicePtr, SlicePtr, Numeric, StopIteration,
+    arr_slice, const_arr_slice, const_array, range, slice, sstr, undefined,
+)
+from spy.std.core import (
+    panic, catch_unwind, UnwindException, coerce, typed_undefined, bitcast,
+    unwrap, unwrap_or, compile_error,
+)
+from spy.std.c import snprintf
+from spy.std.mem import Layout, layout_of, size_of, align_of
+from spy.std.int import IntCastError, int_cast, try_int_cast, truncate, valid_range
+from spy.std.atomic import (
+    MemoryOrder, RmwOp,
+    atomic_load, atomic_store, atomic_rmw, atomic_cmpxchg, atomic_fence, atomic_fetch_add,
+)
+from spy.std.reflect import TypeInfo, IntType, type_info, reify
+from typing import TYPE_CHECKING, Literal, Never, NoReturn
+```
+
+> 代码块可以用 `tools/run_doc_examples.py` 批量运行验证：脚本把每个 ```python 块物化成一个真正的
+> `.py` 文件（`spy` 需要源码）后执行，第一个可运行块作为共享导入前置到其余每个块。
+> 运行：`python3 tools/run_doc_examples.py doc/features.md`。
+
+---
+
+## 1. 类型系统
+
+### 1.1 整数与浮点
+
+- 定宽整数 `u8/u16/u32/u64`、`i8/i16/i32/i64`；零位整数 `u0`（ZST）。
+- 浮点 `f32/f64`。
+- `spy.usize` / `spy.isize`：按目标平台指针宽度决定的整数。
+- C 整数类型 `c_char/c_uchar`、`c_short/c_ushort`、`c_int/c_uint`、`c_long/c_ulong`、`c_longlong/c_ulonglong`：
+  宽度（及 `c_char` 的有符号性）由目标平台决定（例如 `c_long` 在 Windows 为 32 位、常见 64 位 Unix 为 64 位）。
+- 未定型的整数字面量：字面量 `1` 起初没有具体类型，由它被写入的位置或与它配对的类型决定。
+- 整数子类型按范围包含：`i8` 是 `i16` 的子类型，`u8` 不是 `i8` 的子类型。整数不是浮点。
+
+```python
+@func()
+def arith(a: i32, b: i32) -> i32:
+    return a + b * 2 - (a // b) + (a % b)
+
+@func()
+def to_float(a: i32, b: i32) -> f64:
+    return a / b                 # integer / is true division -> f64
+
+@func()
+def width_and_literals() -> i32:
+    x: i32 = 1                   # the literal's type comes from the annotation
+    y: i64 = x                   # widening is implicit
+    return x + 2
+
+@func()
+def target_sized(n: usize) -> usize:
+    return n + 1
+
+@func()
+def c_types(x: c_int) -> c_int:
+    return x + 1
+
+assert arith(7, 3) == 12
+assert to_float(3, 2) == 1.5
+assert width_and_literals() == 3
+assert target_sized(5) == 6
+assert c_types(41) == 42
+```
+
+### 1.2 布尔
+
+`spy.bool`。没有「真值转换」：`if`/`while`/`not`/`and`/`or` 的条件都必须是 `spy.bool`
+（对象提供 `__bool__` 时也会被调用，见 §7.2）。
+
+```python
+@func()
+def both(a: bool, b: bool) -> bool:
+    return a and b
+
+@func()
+def in_range(x: i32) -> bool:
+    return x > 0 and x < 10
+
+assert both(True, False) is False
+assert in_range(5) is True and in_range(20) is False
+```
+
+### 1.3 指针
+
+`syntax.Ptr[T]`（可变单指针）、`ConstPtr[T]`（只读单指针）、`MultiPtr[T]` / `ConstMultiPtr[T]`
+（多指针，可像数组一样下标）。
+
+- 单指针写 `p[...]`（解引用，C 的 `*p`），多指针写 `p[i]`（第 i 个元素的 place）。
+- 指针是**非空**的；`Option[Ptr[T]]` 才是可空指针。
+- 可变指针可隐式转 const（`Ptr[T]` → `ConstPtr[T]`）；反之不行。
+- 指向数组的指针（`*[N]T`）可当成元素的多指针。
+- 指向 ZST 的指针是「dangling 但非空」，不是空指针。
+- `syntax.ref(a)` 取地址；`syntax.ptr_cast(p, T)` 重解释指针类型（不做检查）；`p[...]` 解引用。
+
+```python
+@func()
+def incr(p: Ptr[i32]) -> i32:
+    p[...] = p[...] + 1          # ``p[...]`` is an lvalue
+    return p[...]
+
+@func()
+def use_incr(x: i32) -> i32:
+    v: i32 = x
+    incr(ref(v))                 # take the address of a local
+    return v
+
+@func()
+def pointer_demo(x: i32) -> i32:
+    v: i32 = x
+    p: Ptr[i32] = ref(v)
+    cp: ConstPtr[i32] = p        # mutable -> const is implicit
+    q: Ptr[i32] = ptr_cast(p, Ptr[i32])
+    q[...] = cp[...] + 1
+    return v
+
+@func()
+def low_byte(x: i32) -> u8:
+    v: i32 = x
+    return ptr_cast(ref(v), Ptr[u8])[...]   # reinterpret the address
+
+assert use_incr(5) == 6
+assert pointer_demo(5) == 6
+assert low_byte(0x41) == 0x41
+```
+
+### 1.4 数组与切片
+
+- `syntax.Array[T, N]`：`N` 个 `T` 排成一行；长度是**值**类型参数，注解里用 `Literal[N]` 写。
+  长度可以缺省为 `Array[T, None]`（**无长度数组**，DST）。
+- `syntax.array(a1, a2, ...)` 就地构造数组：长度取实参个数，元素类型取目标位置的类型、否则取所有元素的共同类型；
+  还有一个**只为类型检查器服务**的 `length=` 关键字（实际长度以实参个数为准）。
+- `a[i]` 是第 i 个元素的**左值**（可读/写/`+=`）；编译期常量下标检查越界，运行时下标不检查。
+- 切片类型在 `std`：`std.SlicePtr[T]` / `std.ConstSlicePtr[T]`（结构体 `{ptr, length}`）。
+  `std.arr_slice(p)` / `std.const_arr_slice(p)` 把指向数组的指针变成整段切片；
+  多指针切片 `p[a:b]` 得到 `SlicePtr(p+a, b-a)`（缺省下界 0、上界长度、step 必须为 1）。
+- 切片可迭代（元素值）与 `refs()`（元素 place）；越界会 `panic`。
+- `std.core.const_array(elem, length)`：`length` 个相同元素的数组（元素表达式只求值一次，可为运行时值）。
+- 数组**不能跨 Python 调用边界**（见 §10），因此下面用 spy 函数间接调用。
+
+```python
+@func()
+def sum_array(a: Array[i32, Literal[3]]) -> i32:
+    return a[0] + a[1] + a[2]
+
+@func()
+def use_sum(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, length=3)
+    return sum_array(a)
+
+@func()
+def build_array(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, length=3)
+    a[0] = 7
+    return a[0] + a[1] + a[2]
+
+@func()
+def slice_array(x: i32) -> i32:
+    a = array(x, x + 1, x + 2, length=3)
+    s = arr_slice(ref(a))
+    t = s.slice(1, 3)            # elements 1..2
+    return s[0] + t[0] + t[1]
+
+@func()
+def repeat(n: i32) -> i32:
+    a = const_array(n, 4)
+    return a[0] + a[3]
+
+assert use_sum(1) == 6
+assert build_array(1) == 12
+assert slice_array(1) == 6       # 1 + 2 + 3
+assert repeat(2) == 4
+```
+
+### 1.5 Option
+
+`syntax.Option[T]`（等价 `T | None`）：
+
+- 值要么是一个 `T`，要么是 `None`。
+- `T` 与 `None` 都能自动转成 `Option[T]`；同一个位置同时收到 `T` 与 `None` 时类型即 `Option[T]`。
+- 判断与解包：`expr is None` / `expr is not None`；海牙语法 `(name := expr) is not None` 把 `name`
+  绑定到内层值的可写位置；一般 `(name := expr)` 把 `name` 绑定到 option 本身。
+- **尚未实现**：模式匹配 option；借用式表示下还存在误判缺失的边界情况（见 `doc/implementation.md`）。
+
+```python
+@func()
+def maybe_add(x: i32, y: i32, c: bool) -> Option[i32]:
+    if c:
+        return x + y
+    return None
+
+@func()
+def bumped(x: i32, y: i32, c: bool) -> i32:
+    if (v := maybe_add(x, y, c)) is not None:
+        v += 1                   # writes the payload of the option
+        return v
+    return 0
+
+@func()
+def is_absent(o: Option[i32]) -> bool:
+    return o is None
+
+assert bumped(3, 4, True) == 8
+assert bumped(3, 4, False) == 0
+assert maybe_add(1, 2, True) == 3
+assert maybe_add(1, 2, False) is None    # an Option crosses as None
+assert is_absent(None) is True and is_absent(5) is False
+```
+
+### 1.6 元组（tuple）
+
+`tuple[T1, T2, ...]`：
+
+- 当所有元素都有运行时表示时，元组是一个普通运行时聚合值（可拷贝 ⇔ 所有元素可拷贝）。
+- 在**变量/字段/表达式值**位置是「一个元组值」：`t[i]` 是第 i 个元素的左值（`i` 为编译期整数，越界/负/运行时下标报错），
+  `len(t)` 是编译期整数，可整体拷贝（`b = a`）。
+- 在**形参/返回注解**位置被特殊解释：形参 `tuple[...]` 是**铺平传参**（见 §6.4），返回 `tuple[...]` 是**多返回值**（见 §6.5）。
+- 无运行时表示的元素（类型、字节串、DST 函数类型）使整个元组只能是编译期值。
+- **不再支持**元组 `+=` / `+`（元组现在是普通运行时聚合，元数固定）。
+
+```python
+@func()
+def tuple_use(a: i32, b: i32) -> i32:
+    t = (a, b)                   # a runtime tuple value
+    t[1] = t[1] + 1
+    return t[0] + t[1] + len(t)
+
+assert tuple_use(3, 4) == 3 + 5 + 2
+```
+
+### 1.7 无标签 union（`UnionType`）
+
+异常的 payload 是一个**无标签并集**（union）：同一块存储按不同变体解读，各变体共用同一空间。
+union **值之间不能转换**，只能重解释存储。不占存储的 union（无变体或变体全为 ZST）只是编译期值。
+它没有直接的源码语法，只在异常 payload 与反射中出现（见 §5.5、§8.8）。
+
+### 1.8 带标签 union（tagged union）
+
+`A | B | C`：
+
+- 值是恰好其中一个变体，附带变体标签（变体顺序属于类型身份）。
+- 判断/解包：`isinstance(u, A)`；海牙 `isinstance(e := u, A)` 把 `e` 绑定到变体值（可写）；
+  `match u:` + `case A():`（测变体）/ `case A() as e:`（绑定变体值）/ `case _:`（通配，必须最后）。
+- 子集 union 可转成超集 union；`A | A` 去重为单变体；
+  tag 运行时才知道的 union 一律是普通运行时值。
+
+```python
+@struct()
+class A:
+    x: i32
+
+@struct()
+class B:
+    y: f64
+
+@func()
+def tu_value(u: A | B) -> i32:
+    if isinstance(e := u, A):        # bind ``e`` to the variant payload
+        return e.x
+    return -1
+
+@func()
+def tu_make(c: bool) -> A | B:
+    if c:
+        return A(5)
+    return B(1.5)
+
+@func()
+def tu_match(u: A | B) -> i32:
+    match u:
+        case A() as a:
+            return a.x
+        case _:
+            return 0
+
+assert tu_value(A(7)) == 7
+assert tu_value(B(1.0)) == -1
+assert tu_make(True).x == 5         # the union unwraps to the variant value
+assert tu_make(False).y == 1.5
+assert tu_match(A(9)) == 9
+```
+
+### 1.9 复数
+
+复数类型 `spy.c64` / `spy.c128`：实部与虚部各是一个浮点元素。
+
+- Python `complex` 映射到 `c128`；实数/整数有一条隐式 `T → Complex[T]` 转换（虚部 0），`Complex[f32]` 可扩宽到 `Complex[f64]`。
+- 支持 `+ - * /`（逐分量）与字段 `z.real` / `z.imag`。
+- `std.reflect.type_info` 给出 `ComplexType` 反射变体。
+
+```python
+@func()
+def cmul(z: c128, w: c128) -> c128:
+    return z * w
+
+@func()
+def cparts(z: c128) -> f64:
+    return z.real + z.imag
+
+@func()
+def widen(x: f64) -> c128:
+    return x                     # implicit T -> Complex[T]
+
+assert cmul(1 + 2j, 3 + 4j) == (1 + 2j) * (3 + 4j)
+assert cparts(3 + 4j) == 7.0
+assert widen(2.5) == complex(2.5, 0.0)
+```
+
+### 1.10 整数枚举
+
+继承 `spy.Enum`（标准 `enum.Enum`）、成员值为整数的类声明一个 spy 类型：
+
+- 可直接作形参/返回值/字段注解；成员是编译期值。
+- **不是一个整数**：不参与算术/位运算、不与 `int` 或另一个枚举比较/转换；只支持同枚举之间的 `==`/`!=`（比较成员身份）。
+- 支持方法（`@func()` 编译、未装饰内联、`@staticmethod`）；方法的 `self` **默认按值**（可用 `@func(self_arg="ptr"/"const ptr")` 改按引用）。
+- Python 边界：成员入参识别为枚举值，枚举返回值/字段还原为 Python 成员。
+
+```python
+class TriState(Enum):
+    UNKNOWN = 0
+    TRUE = 1
+    FALSE = 2
+
+@func()
+def negate_state(s: TriState) -> TriState:
+    if s == TriState.TRUE:
+        return TriState.FALSE
+    if s == TriState.FALSE:
+        return TriState.TRUE
+    return TriState.UNKNOWN
+
+@func()
+def state_is_unknown(s: TriState) -> bool:
+    return s == TriState.UNKNOWN
+
+assert negate_state(TriState.TRUE) is TriState.FALSE
+assert negate_state(TriState.UNKNOWN) is TriState.UNKNOWN
+assert state_is_unknown(TriState.UNKNOWN) is True
+```
+
+### 1.11 结构体（struct）
+
+见 §7。
+
+### 1.12 ZST（零大小类型）与 DST
+
+- **ZST**：`-> None` 的 `void`、`u0`、字段全为 ZST 的结构体、元素为 ZST 或长度为 0 的数组、`Null`、`undefined`
+  等。ZST 不占运行时空间，但 ZST 结果照常交付单位值。
+- **DST（动态大小类型）**：DST 函数类型、`Opaque`、无长度数组；只有**指向它的指针**是值，不能按值传递/返回/整体读取。
+  结构体里第一个 DST 字段是弹性数组，后续 DST 字段不占位。
+- **无运行时表示的类型（纯编译期）**：类型值（`type`）、字节串（`bytes`）、DST 函数类型、空类型（`Never`）。
+- 指向 ZST 的指针是非空的（但不指向实际内存）。
+
+```python
+@func()
+def do_nothing(x: i32) -> None:
+    return None
+
+@func()
+def zero_bit(x: u0) -> i32:
+    return 1
+
+@func()
+def opaque_roundtrip(p: Ptr[Opaque]) -> Ptr[Opaque]:
+    return p
+
+@func()
+def take_opaque(x: i32, c: bool) -> bool:
+    v: i32 = x
+    p: Ptr[Opaque] = ptr_cast(ref(v), Ptr[Opaque])
+    if c:                        # ``opaque_roundtrip`` is compiled, not run
+        opaque_roundtrip(p)
+    return c
+
+assert do_nothing(1) is None
+assert zero_bit(spy_as(0, u0)) == 1
+assert take_opaque(1, False) is False
+```
+
+### 1.13 空类型（`Never`）
+
+空类型（`Never`）：一个值都没有。`typing.Never`/`NoReturn` 映射到它，用于声明永不返回的函数。
+它是「函数体从不交付值」的函数的结果类型：体内不能有 `return`，也不能落穿到末尾。
+空类型 + 不抛异常 ⇒ `noreturn` 函数（见 §5.6）。
+
+```python
+@struct()
+class MyError(Exception):
+    code: i32
+
+@func(exceptions=MyError)
+def always_raise() -> Never:
+    raise MyError(1)
+
+@func()
+def spins() -> Never:
+    while True:
+        pass
+
+@func()
+def maybe_spin(c: bool) -> bool:
+    if c:                        # ``spins`` is compiled (a noreturn call)
+        spins()
+    return c
+
+try:
+    always_raise()
+except Exception as e:          # a spy exception crosses as an Exception instance
+    assert e.code == 1
+assert maybe_spin(False) is False
+```
+
+---
+
+## 2. 运行时值与编译期值
+
+一个值要么是**运行时值**（有运行时表示），要么是**编译期值**（只在编译期存在）：
+
+- 编译期值涵盖：标量常量、类型值、编译期聚合值、编译期 Option/tagged union、`Null`/`Void`/undefined、
+  编译期指针，以及普通 Python `int/float/complex/bytes/bool`；此外还有函数值等编译期对象。
+
+**关键点**：不存在「以运行时值形式存在的编译期值」。任何一个组成部分是运行时值的聚合，
+**整体就是运行时值**，不能存进 `Comptime` 变量/参数（要持有它就用普通变量）。
+
+编译期变量的具体存储机制见 `doc/implementation.md`。
+
+```python
+@struct()
+class Small:
+    a: i32
+    b: i32
+
+@func()
+def runtime_aggregate(x: i32) -> i32:
+    s = Small(x, 2)              # a runtime struct lives in an ordinary variable
+    return s.a + s.b
+
+@func()
+def comptime_box(x: i32) -> i32:
+    c: Comptime[i32] = 5         # a compile-time box, not memory
+    return c + x
+
+@func()
+def inferred(x: i32) -> i32:
+    infer_comptime()
+    t = 3                        # an untyped literal stays a compile-time box
+    return t + x
+
+assert runtime_aggregate(1) == 3
+assert comptime_box(1) == 6
+assert inferred(1) == 4
+```
+
+---
+
+## 3. 变量与声明
+
+### 3.1 普通变量
+
+- `name = expr`：名字已绑定时赋值；完全没绑定过的名字才**声明**一个块局部变量。
+  声明不逃出所在块；对**外层**变量的赋值写的就是外层变量。
+- 无注解的普通声明 / 解构目标得到普通运行时变量。
+- 局部变量需要有能落到运行时的类型：`x = 1`（未注解、未定型整数字面量）报错，需写成 `x: i32 = 1` 或 `x: Comptime = 1`。
+- 支持 `name <算符>= expr`（全部二元算符）与元组解包赋值 `a, b = e`（可嵌套）。
+  解构**按下标顺序读源、写目标**，因此 `a, b = b, a` 是已知缺陷（右侧读到可能已被覆盖的值）。
+- 赋值仅支持 `=` 与 `+=`（无链式赋值 `a = b = e`）。
+
+```python
+@func()
+def locals_demo(x: i32) -> i32:
+    y: i32 = x + 1
+    z = y * 2                    # unannotated: runtime storage, type from the value
+    z += 1
+    return z
+
+@func()
+def destructure(a: i32, b: i32) -> i32:
+    x, y = a, b
+    x, y = y, x
+    return x * 10 + y            # the swap is a known flaw: reads source in order
+
+assert locals_demo(1) == 5
+assert destructure(1, 2) == 22
+```
+
+### 3.2 类型标注的局部变量
+
+- `name: T = expr`：声明一个新的块局部变量并给定类型 `T`（值转换到 `T`）。
+  标注即声明：同一个名字不能被标注两次。
+- 标注里的类型本身是编译期值表达式（可命名类型参数）。
+
+```python
+@func()
+def annotated_local(x: i32) -> i64:
+    y: i64 = x                   # the value is coerced to the declared type
+    return y + 1
+
+assert annotated_local(4) == 5
+```
+
+### 3.3 编译期变量
+
+- `x: Comptime = e` / `x: Comptime[T] = e`：**编译期变量**。
+  写入的值必须**完全编译时已知**；把运行时值写进 `Comptime` 变量是编译错误。
+- 语句标记 `syntax.comptime()` + 紧随其后的一条**新声明**等价于 `Comptime` 标注。
+  该标记必须**紧接在被标记的声明之前**，且只能标记**新声明**（不能标记对已绑定名字的赋值）。
+- 一个 `Comptime` 变量可持有：类型值、编译期标量、编译期聚合、编译期元组/字典、编译期 Option/union、编译期指针、函数值等。
+
+```python
+@func()
+def comptime_holds_type[T](x: T) -> i32:
+    comptime()
+    t = typeof(x)                # a type value, kept in a compile-time variable
+    if t == i32:                 # a compile-time ``if``
+        return 1
+    return 0
+
+@func()
+def comptime_marker_typed() -> i32:
+    comptime()
+    i: i32 = 0
+    i = i + 1                    # still a compile-time box
+    return i
+
+assert comptime_holds_type(spy_as(1, i32)) == 1
+assert comptime_holds_type(spy_as(1.5, f64)) == 0
+assert comptime_marker_typed() == 1
+```
+
+### 3.4 编译期常量 `ConstComptime`
+
+- `x: ConstComptime = e` / `x: ConstComptime[T] = e`（必须带初值），或标记 `syntax.const_comptime()` + 一条新声明。
+- 初始化后即只读；之后写它是编译错误。
+- 它是「编译期全局常量」的来源：初始化后 `ref(x)` 得到一个指向全局常量的指针。
+
+```python
+@func()
+def static_read() -> i32:
+    const_x: ConstComptime[i32] = 42
+    p = ref(const_x)             # automatically becomes a global constant
+    return p[...]
+
+assert static_read() == 42
+```
+
+### 3.5 `InferComptime`（推断存储）
+
+- `x: InferComptime = e` / `x: InferComptime[T] = e`，或标记 `syntax.infer_comptime()` + 一条新声明。
+- 存储形式**由写进去的值**决定：写入的值全是编译期值时为编译期变量，否则为普通运行时变量。
+- 用途：一条声明既能持有编译期专属值（未定型整数、类型值），又能落内存接受运行时值。
+- **仅限局部变量声明**：形参写 `InferComptime` 是编译错误。
+
+```python
+@func()
+def infer_literal(x: i32) -> i32:
+    n: InferComptime = 3         # the untyped literal -> a compile-time box
+    return n + x
+
+@func()
+def infer_runtime(x: i32) -> i32:
+    n: InferComptime = x         # a runtime value -> memory
+    n += 1
+    return n
+
+assert infer_literal(1) == 4
+assert infer_runtime(1) == 2
+```
+
+---
+
+## 4. 表达式与运算符
+
+- 算术 `+ - * / // % **`（整数与浮点）、位运算 `| & ^ << >> ~`、一元负号、`not`（仅 `spy.bool`）、
+  比较 `== != < <= > >=`（**不支持链式比较**）。
+- 两侧都是编译期常量时在编译期折叠；含运行时值时在运行时计算。
+- 整数 `/` 是真除法（结果默认为 `f64`）；整数 `//` 默认向下取整；浮点 `//` 是 `floor(a/b)`。
+- `**`：整数与浮点指数都支持。**浮点 `%` 未实现**（报错）。
+- 每个二元算符有对应的复合赋值 `a <算符>= b`。
+- 条件表达式 `a if c else b`：条件必须 `spy.bool`；编译期条件只保留选中分支。
+- 短路 `and`/`or`：操作数依次求值，按布尔值决定是否继续。
+- `cast(T, value)`：no-op；`len(x)`：元组/数组/切片/结构体的 `__len__`；`ord(b)`：单字节字节串的编码。
+- 下标 `expr[i]`：数组/元组/多指针/切片/字节串/字典/`$args`/`$kwargs`；`p[...]` 解引用单指针；
+  结构体可通过 `__spy_getitemptr__` 重载下标（见 §7.8）。
+- 运算符重载见 §7.2。
+
+```python
+@func()
+def operators(a: i32, b: i32) -> i32:
+    return (a + b) * 2 - a // b + a % b + (a << 1) - (b >> 1)
+
+@func()
+def choose(a: i32, b: i32, c: bool) -> i32:
+    return a if c else b
+
+@func()
+def logic(a: bool, b: bool) -> bool:
+    return a and not b
+
+@func()
+def true_div(a: i32, b: i32) -> f64:
+    return a / b
+
+@func()
+def pow_int(a: i32) -> i32:
+    return a ** 3
+
+@func()
+def pow_float(a: f64, b: f64) -> f64:
+    return a ** b
+
+@func()
+def byte_ord() -> i32:
+    return ord(b'A')
+
+assert operators(7, 3) == 32
+assert choose(1, 2, True) == 1 and choose(1, 2, False) == 2
+assert logic(True, False) is True
+assert true_div(3, 2) == 1.5
+assert pow_int(2) == 8
+assert pow_float(2.0, 10.0) == 1024.0
+assert byte_ord() == 65
+```
+
+---
+
+## 5. 语句与控制流
+
+### 5.1 `if` / `elif` / `else`
+
+条件为编译期常量时只保留选中分支（另一分支不编译、不分析）。
+条件里 `:=` 解包出的名字在其 body 里可见。**无真值转换**（条件必须是 `spy.bool`）。
+
+```python
+@func()
+def sign(x: i32) -> i32:
+    if x > 0:
+        return 1
+    elif x < 0:
+        return -1
+    else:
+        return 0
+
+assert sign(5) == 1 and sign(-5) == -1 and sign(0) == 0
+```
+
+### 5.2 `while` / `while-else`
+
+每轮重新求值条件；`break` 跳到循环后（跳过 `else`），`continue` 回到条件。
+编译期为假的 `while False:` 不生成循环体。
+
+```python
+@func()
+def count_down(n: i32) -> i32:
+    total: i32 = 0
+    while n > 0:
+        total += n
+        n -= 1
+    return total
+
+@func()
+def find_limit(limit: i32) -> i32:
+    i: i32 = 0
+    while i < limit:
+        if i * i >= limit:
+            break
+        i += 1
+    else:
+        return -1                # only on a natural exit (break skips it)
+    return i
+
+assert count_down(3) == 6
+assert find_limit(10) == 4
+assert find_limit(-1) == -1
+```
+
+### 5.3 `for`
+
+`for exprs in iter:` 基于迭代器协议：先取 `iter.__iter__()`，每轮调用 `__next__()` 并把结果绑到 `exprs`；
+遇到 `StopIteration` 结束循环（此时先跑 `else`）。`range` 与 `StopIteration` 来自 `std`。
+循环变量绑在循环体子作用域里，循环后不可见。
+
+```python
+@func()
+def sum_range(n: i32) -> i32:
+    total: i32 = 0
+    for i in range(n):
+        total += i
+    return total
+
+@func()
+def skip_odd(n: i32) -> i32:
+    total: i32 = 0
+    for i in range(n):
+        if i % 2 == 0:
+            continue
+        total += i
+    return total
+
+assert sum_range(4) == 6         # 0+1+2+3
+assert skip_odd(6) == 1 + 3 + 5
+```
+
+### 5.4 `break` / `continue`
+
+`break` 离开最内层循环；`continue` 回到循环条件。循环内的 `try` body 里的 `break`/`continue` 直接跳出/继续。
+（`break`/`continue` 的示例见 §5.2、§5.3。）
+
+### 5.5 异常 `raise` / `try` / `except`
+
+- `raise E(...)` 构造异常并抛出。
+- `except E as e` 把 `e` 绑定到异常值（不拷贝）。
+- 子句按顺序匹配；裸 `except:` 捕获本函数会抛出的所有异常；没被任何子句命中的 except 是死代码（不编译）。
+- `try-else`、`try-finally` **不支持**；必须有至少一个 except；**裸 `raise` 不支持**。
+- `@func(exceptions=...)` 声明异常集：单个类型、元组、或 `"infer"`（从函数体推断）。
+
+```python
+@struct()
+class MyError(Exception):
+    code: i32
+
+@func(exceptions=MyError)
+def may_fail(x: i32) -> i32:
+    if x < 0:
+        raise MyError(1)
+    return x
+
+@func()
+def catch_fail(x: i32) -> i32:
+    try:
+        return may_fail(x)
+    except MyError as e:
+        return e.code
+
+assert catch_fail(5) == 5
+assert catch_fail(-1) == 1
+```
+
+### 5.6 `noreturn`
+
+值部分是空类型且不抛异常的函数永远回不来（`noreturn`）：调用它是 `noreturn` 调用，调用点之后的代码是死代码。
+（示例见 §1.13 的 `spins`/`maybe_spin`。）
+
+### 5.7 `defer`
+
+- `with syntax.defer(): body` 把 `body` 登记到所在区域，在**离开该区域**时运行。
+- 触发哪些离开由 `defer(flags)` 位掩码决定：`OK`（正常离开）、`RAISE`（错误离开）、`UNWIND`（panic 展开）；
+  `okdefer()` = `defer(OK)`，`errdefer()` = `defer(ERR)`（`ERR = RAISE | UNWIND`），无参 `defer()` = `ALL`。
+- 同一区域多个 defer 按声明**反序**运行，内层区域先于外层。
+- `body` 不得跳出 defer 块（`return`/`break`/`continue`/`raise` 越出即报错）。
+
+```python
+@func()
+def add_on_exit(p: Ptr[i32]) -> i32:
+    with defer():
+        p[...] = p[...] + 100    # runs when the region is left
+    p[...] = p[...] + 1
+    return p[...]
+
+@func()
+def use_add_on_exit(x: i32) -> i32:
+    v: i32 = x
+    add_on_exit(ref(v))
+    return v
+
+assert use_add_on_exit(1) == 102
+```
+
+### 5.8 `panic` / `catch_unwind`
+
+- `std.core.panic(data)` 抛出一个携带 `PanicData` 的 panic。
+- `std.core.catch_unwind(fn)`（`fn` 必须是编译成运行时函数的**非内联闭包**）捕获 panic，把数据包成 `std.core.UnwindException`
+  沿普通异常路径抛出（`except UnwindException as e: e.data` 读取）。
+- `@func`/`@syntax.closure` 的 `may_panic` 默认 `True`。未捕获的 panic 展开到 Python 边界会中止进程。
+
+```python
+@func()
+def panic_i32(n: i32) -> i32:
+    panic(n)                     # never returns
+    return 0
+
+@func()
+def caught() -> i32:
+    @closure(inline=False)
+    def body() -> i32:
+        return panic_i32(7)
+
+    try:
+        return catch_unwind(body)
+    except UnwindException:
+        return 42
+
+assert caught() == 42
+```
+
+### 5.9 `match`
+
+对 tagged union：`match u:` + `case A():` / `case A() as e:` / `case _:`（通配必须最后）。
+不支持 case 守卫与子模式（`case A(x):` 报错）。（示例见 §1.8 的 `tu_match`。）
+
+---
+
+## 6. 函数
+
+### 6.1 定义与特化
+
+- `@spy.func()` 注册；首次调用按实参类型编译出一个**特化**，同函数可有多个特化。
+- 普通（未注册的）Python 函数在函数体内被调用时会被**内联**；未装饰的结构体方法同理。
+- 形参类型由：注解（替换已求解的泛型参数后）> 实参推断出的类型 > 默认值的类型决定。
+
+```python
+@func()
+def add_generic[T: Numeric](a: T, b: T) -> T:
+    return a + b
+
+def add_plain(a: i32, b: i32) -> i32:      # an ordinary Python function: inlined
+    return a + b
+
+@func()
+def use_inline(a: i32, b: i32) -> i32:
+    return add_plain(a, b)
+
+assert add_generic(1, 2) == 3              # a Python int marshals as i64
+assert add_generic(1.5, 2.5) == 4.0
+assert use_inline(2, 3) == 5
+```
+
+### 6.2 参数
+
+- 支持位置参数、关键字参数、默认参数、`*args`/`**kwargs`。
+- **仅位置/仅关键字参数不支持**（Python `posonlyargs`/`kwonlyargs` 报错）。
+- 编译期参数 `x: Comptime` / `x: Comptime[T]`：只在编译期传递，实参必须完全编译时已知。
+- **形参类型无运行时表示 ⇒ 隐式编译期形参**（类型值、字节串、DST 函数类型、空类型等）：
+  自动成为编译期形参，无需显式 `Comptime`（如 `def sstr(s: bytes)`）。
+- `type[X]` 形参：接受一个**类型值**。
+- `*args`/`**kwargs`：见 §8.3。
+
+```python
+@func()
+def with_default(a: i32, b: i32 = 10) -> i32:
+    return a + b
+
+@func()
+def comptime_param(x: Comptime[i32], y: i32) -> i32:
+    return x + y
+
+@func()
+def call_comptime_param(y: i32) -> i32:
+    return comptime_param(1, y)   # the first argument is a compile-time value
+
+assert with_default(1) == 11
+assert with_default(1, 2) == 3
+assert call_comptime_param(2) == 3
+```
+
+### 6.3 C 变参声明
+
+- `@decl_func()` / `@func_type(callconv='c')`：最后一个具名参数后一个**不带注解**的 `*args` 表示 C 的 `...`。
+- 调用可传任意多个额外实参，每个按值、以自身类型传递，并施加 **C 默认实参提升**（窄于 `int` 的整型提升为 `int`，`f32`→`f64`）。
+- `*args` 带注解、`**kwargs`、默认 callconv 的函数类型都不允许 C 变参。
+- **C 变参函数的定义**（用 `va_arg` 读实参）**尚未实现**（只能声明与调用）。
+
+```python
+@func()
+def c_vararg_call(n: i32) -> i32:
+    buf = typed_undefined(Array[u8, Literal[16]])
+    s = arr_slice(ref(buf))
+    fmt: ConstMultiPtr[u8] = ptr_cast(b'%d', ConstMultiPtr[u8])
+    return snprintf(s.ptr, s.length, fmt, n)   # ``n`` goes to ``*args``
+
+assert c_vararg_call(42) == 2
+```
+
+### 6.4 `tuple[...]` 形参（铺平传参）
+
+- 形参注解 `tuple[T1, ...]`：实参按元素**铺平**传递，callee 侧重组成一个元组值。
+- 函数体用编译期整数下标 `x[i]` 取元素，可嵌套。
+- 结构体元素**不**铺平（整体一个实参）。
+- 无注解参数接受调用点给的任意形状，编译期反射能读出形状。
+- 元组/字典类型字段（`Foo.t: tuple[i32, i32]`）与结构体字段**完全同规则**。
+
+```python
+@func()
+def sum_tuple(p: tuple[i32, i32, i32]) -> i32:
+    return p[0] + p[1] + p[2]
+
+@func()
+def sum_nested(p: tuple[i32, tuple[i32, i32]]) -> i32:
+    return p[0] + p[1][0] + p[1][1]
+
+@func()
+def use_tuple(a: i32, b: i32, c: i32) -> i32:
+    return sum_tuple((a, b, c))
+
+assert use_tuple(1, 2, 3) == 6
+assert sum_nested((1, (2, 3))) == 6        # a Python tuple is flattened too
+```
+
+### 6.5 多返回值
+
+- 返回注解 `tuple[T1, T2, ...]` = 返回多个值。
+- 调用侧：`a, b = f()` 解构；`return f()` 转发。
+- **打包**：全运行时结果可打包进**普通元组变量** `packed = f()`（之后可 `x, y = packed` 再解构、`len`、`packed[i]`）；
+  含编译期叶（类型值/const 指针/字节串/函数值）时打包出的元组无运行时表示，目标必须是 `Comptime` 变量。
+- **编译时返回值**：完全编译时已知的返回值不占运行时结果。
+  非 inline 调用取 callee **最后一条被分析的 `return`** 的值（不检查各 return 路径是否一致）。
+- `tuple[T, ...]`（变长）在任意嵌套层级报错。
+
+```python
+@func()
+def min_max(a: i32, b: i32) -> tuple[i32, i32]:
+    if a < b:
+        return a, b
+    return b, a
+
+@func()
+def use_min_max(a: i32, b: i32) -> i32:
+    lo, hi = min_max(a, b)     # destructuring
+    return lo * 10 + hi
+
+@func()
+def packed(a: i32, b: i32) -> i32:
+    p = min_max(a, b)          # pack the results into a plain tuple variable
+    lo, hi = p
+    return lo + hi
+
+assert min_max(3, 1) == (1, 3)   # the Python side gets a tuple
+assert use_min_max(3, 1) == 13
+assert packed(3, 1) == 4
+```
+
+### 6.6 泛型
+
+- PEP 695 `[T]` 语法（需 Python 3.13+）；`T` 由实参类型求解。
+- 形参注解为同一 `T` 的实参类型统一成一个共同类型，实参再转换到它。
+- **声明了返回注解时它决定该特化的返回类型**；递归函数必须有返回注解。
+- 直接递归、互递归、泛型多类型递归都支持。
+
+```python
+@func()
+def identity[T](x: T) -> T:
+    return x
+
+@func()
+def fact(n: i32) -> i32:       # recursion needs the return annotation
+    if n <= 1:
+        return 1
+    return n * fact(n - 1)
+
+assert identity(5) == 5
+assert identity(1.5) == 1.5
+assert fact(5) == 120
+```
+
+### 6.7 闭包（= 带 `__call__` 的匿名 struct）
+
+- 函数体内可再定义 `def`/`lambda`，它们**按引用**捕获外层变量（`move=False` 默认）或按值（`move=True`）。
+- `@syntax.closure(inline=True, exceptions=..., callconv='default', may_panic=True, move=False)`：
+  只允许的嵌套 def 装饰器；`inline=False` 编译成运行时函数。`lambda` 一律强制内联。
+- 闭包**就是一个值**（字段是捕获，`__call__` 是函数体）；`f(...)` 即调用 `f.__call__(...)`。
+- 因为闭包是 struct 值，旧限制全部取消：可存变量/字段、传参、返回、放进运行时存储。
+- **限制**：无 `nonlocal`；**互递归闭包不支持**（见 `doc/issues.md` #6）；闭包体引用外层函数的类型参数不支持。
+
+```python
+def apply_inline(f, x: i32) -> i32:        # an inlined plain Python function
+    return f(x)
+
+@func()
+def closure_capture(x: i32) -> i32:
+    @closure()
+    def add(y: i32) -> i32:
+        return x + y           # captures ``x`` by reference
+    return add(10)
+
+@func()
+def closure_compiled(x: i32) -> i32:
+    @closure(inline=False)
+    def add(y: i32) -> i32:
+        return x + y
+    return add(10)
+
+@func()
+def lambda_use(x: i32) -> i32:
+    return apply_inline(lambda y: y + 1, x)
+
+assert closure_capture(5) == 15
+assert closure_compiled(5) == 15
+assert lambda_use(5) == 6
+```
+
+### 6.8 `as_func_ptr`
+
+`syntax.as_func_ptr(T, f)`：`T` 只给 Python 类型检查器看（实现忽略）；`f` 必须是一个**有 `__call__` 且为 ZST 的 struct**；
+结果是**去掉 `self` 参数的 `__call__`**。普通 spy 函数与 extern 函数**直接用其名字**即可取到常函数指针。
+
+```python
+@func_type()
+class BinOp:
+    def __call__(self, a: i32, b: i32) -> i32: ...
+
+@func()
+def use_func_ptr(a: i32, b: i32) -> i32:
+    @closure(inline=False)
+    def add(x: i32, y: i32) -> i32:
+        return x + y
+    f: ConstPtr[BinOp] = as_func_ptr(BinOp, add)   # the first argument is ignored
+    return f[...](a, b)
+
+assert use_func_ptr(2, 3) == 5
+```
+
+### 6.9 递归
+
+- 直接递归、互递归、泛型多类型递归都支持；递归函数必须能由注解确定返回类型（见 §6.6）。
+
+---
+
+## 7. 结构体
+
+### 7.1 声明与字段
+
+- `@spy.struct(extern_c=False, copyable="inherit")` 把带注解的类变成 spy 结构体；注解字段构成其字段集。
+- 字段按声明顺序排列、支持嵌套（`p.inner.a`）；可读、可赋、可 `+=`（可任意嵌套）。
+- `y = x` 拷贝结构体。
+- 类体里给字段的值是默认值；没有默认值的字段必须构造时写全（ZST 字段也一样）。
+- 类里**不能**定义 `__init__`。
+- **`is_comptime` 字段**（Zig 语义）：不参与拷贝、构造时可省略；访问运行时 struct 的这类字段直接返回默认值。
+- **`is_ref` 字段**：逻辑上是引用，只可读、不可写透。
+
+```python
+@struct()
+class Point:
+    x: i32
+    y: i32
+
+@struct()
+class Cfg:
+    a: i32
+    b: i32 = 7
+
+@func()
+def use_point(a: i32) -> i32:
+    p = Point(a, 3)              # positional args by declaration order
+    p.y += 5
+    q = Point(y=1, x=2)          # keyword args by name
+    return p.x + p.y + q.x
+
+@func()
+def use_cfg(a: i32) -> i32:
+    c = Cfg(a)                   # ``b`` falls back to its default
+    return c.a + c.b
+
+assert use_point(2) == 12
+assert use_cfg(1) == 8
+```
+
+### 7.2 方法
+
+- 类里 `@spy.func()` 装饰的方法是编译成原生调用的 spy 方法；未装饰的方法在调用处**内联**。
+- 方法 `self` 默认是指向自身的可写指针（`Ptr[Self]`）；`@func(self_arg="const ptr")` 得只读指针，`"value"` 按值传。
+- 方法可继承（取自整个 MRO，子类覆盖优先）。
+- 通过类名调用 `Foo.m(...)`（含 `Foo[i32].m(x)`）**不隐式传 `self`**；`@staticmethod` 不带接收者。
+- `@struct()` 可省略：普通类可用 `Cls.fn(...)` 当命名空间。
+- 运算符重载：`__add__`/`__sub__`/…（各自反射版 `__r*__` 与原地版 `__i*__`）、比较 `__eq__`/`__lt__`/…、
+  一元 `__neg__`/`__invert__`、作为条件的 `__bool__`、以及 `__len__`；下标重载见 §7.8。
+
+```python
+@struct()
+class Point:
+    x: i32
+    y: i32
+
+    def total(self) -> i32:          # undecorated: inlined
+        return self.x + self.y
+
+    @func()
+    def doubled(self) -> i32:        # decorated: a native call through ``self``
+        return self.total() * 2
+
+@struct()
+class Math:
+    @staticmethod
+    def double(x: i32) -> i32:
+        return x * 2
+
+@func()
+def use_point(a: i32) -> i32:
+    p = Point(a, 3)
+    p.y += 5
+    return p.doubled()
+
+@func()
+def use_static(x: i32) -> i32:
+    return Math.double(x)
+
+assert use_point(2) == 20            # (2 + 8) * 2
+assert use_static(4) == 8
+assert Math.double(5) == 10          # class-name call: no implicit self
+```
+
+### 7.3 构造
+
+- `Point(a, b)` 就地构造：直接写入目标位置，嵌套构造就地写入（无拷贝）。
+- 位置实参按字段声明顺序，关键字实参按名；每个字段都要得到值（默认值可省）。
+- 默认值**不参与泛型参数推断**，只由提供的字段值决定。
+
+```python
+@struct()
+class Inner:
+    v: i32
+
+@struct()
+class Outer:
+    inner: Inner
+
+@func()
+def build(x: i32) -> i32:
+    o = Outer(Inner(x))          # the inner struct is built in place
+    o.inner.v += 1
+    return o.inner.v
+
+assert build(1) == 2
+```
+
+### 7.4 泛型结构体
+
+- `class Foo[T]` 是模板，`Foo[i32]` 是特化；字段注解里的 `T` 被替换进去（可递归）。
+- 构造可省略泛型参数：特化由目标位置的类型确定；类型未知时由写进各字段的值的类型推断。
+- 方法调用 `x.m(...)` ≡ `typeof(x).m(x, ...)`；方法可有自己的类型参数；结构体的类型参数可在体内当值使用。
+
+```python
+@struct()
+class Box[T]:
+    value: T
+
+    @func()
+    def get(self) -> T:
+        return self.value
+
+@func()
+def use_box(x: i32) -> i32:
+    b = Box[i32](x)              # explicit specialization
+    return b.get()
+
+assert use_box(5) == 5
+assert Box[i32](7).value == 7
+```
+
+### 7.5 布局
+
+- 非 `extern_c` 结构体的内存布局由编译器决定（字段可能被重排、ZST 字段不占空间）；`extern_c=True` 采用 C 布局
+  （保持声明顺序，可跨 C 边界）。
+- 布局可通过 `std.mem.layout_of`/`size_of`/`align_of` 查询（见 §8.8）。
+
+### 7.6 拷贝性与传参/返回
+
+- `copyable=True|False|"inherit"`（默认 `"inherit"` = 每字段可拷贝才可拷贝）；DST 一律不可拷贝。
+- 不可拷贝的值可就地构造、按引用传递、经返回位置返回、经地址读写字段，但**不能整体读出**。
+- **传参按值**（语义上总是拷贝）；不可拷贝的强制按引用。
+- **返回**：小结构体按值返回；大结构体经返回位置返回；不可拷贝的强制经返回位置返回。
+
+```python
+@struct(copyable=False)
+class Handle:
+    id: i32
+
+@func()
+def handle_id(h: Handle) -> i32:     # a non-copyable value is passed by reference
+    return h.id
+
+@func()
+def make_handle(x: i32) -> Handle:   # returned through a result pointer
+    return Handle(x)
+
+assert handle_id(make_handle(7)) == 7
+```
+
+### 7.7 Python 侧使用
+
+- `Point(1, 2)` 构造一个实例（省略字段取默认值；泛型特化由字段值推断或显式 `Foo[i32](...)`）。
+- 实例字段可读可写；方法可调用（`p.m()` 隐式传 `self`；`Foo.m(p, ...)` 不隐式传）。
+- 实例可作实参、返回值跨边界；布局由边界层处理。
+- 嵌套字段是父实例的**视图**（写入子字段即写入父实例）。
+
+```python
+@struct()
+class Pt:
+    x: i32
+    y: i32
+
+    def total(self) -> i32:
+        return self.x + self.y
+
+@func()
+def swap_xy(p: Pt) -> Pt:
+    return Pt(p.y, p.x)
+
+p = Pt(1, 2)
+assert p.x == 1 and p.y == 2         # a struct instance crosses the boundary
+assert p.total() == 3                # a bound method
+assert Pt.total(p) == 3              # class-name call passes ``self`` explicitly
+q = swap_xy(p)
+assert q.x == 2 and q.y == 1
+```
+
+### 7.8 下标重载（`__spy_getitemptr__`）
+
+一个结构体值可以像数组一样被下标（`expr[i]`）：定义方法 `__spy_getitemptr__(self, index) -> Ptr[T]`
+（或 `ConstPtr[T]` / `MultiPtr[T]` / `ConstMultiPtr[T]`），它**返回元素的指针**——即第 `i` 个元素所在的 place。
+
+- `expr[i]` 就是该方法返回值所**指向的那个 place**：可读、可赋值、可 `+=`，也可继续取字段/下标。
+- 方法可以未装饰（调用处内联）或用 `@func()` 编译成运行时方法；返回的必须是**指针**，返回一个值会报错。
+- 类里通常再写一对 `__getitem__`/`__setitem__`（放在 `if TYPE_CHECKING:` 里）**只为 Python 类型检查器**接受
+  `expr[i]` 的写法——编译器不调用它们（下标编译时走 `__spy_getitemptr__`）。
+- `std.SlicePtr`/`std.ConstSlicePtr`/`std.vec.Vec` 就用它实现下标。
+
+```python
+@struct()
+class IntArray:
+    ptr: MultiPtr[i32]
+
+    def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
+        return self.ptr + index          # the place of the i-th element
+
+    if TYPE_CHECKING:
+        # only so a type checker accepts ``v[i]``; never called by the compiler
+        def __getitem__(self, index: int) -> i32: ...
+        def __setitem__(self, index: int, value: i32) -> None: ...
+
+@func()
+def subscript_use(x: i32) -> i32:
+    a = array(x, x + 1, x + 2)
+    v = IntArray(arr_slice(ref(a)).ptr)
+    v[2] = 100                           # writes through the returned place
+    return v[0] + v[1] + v[2]
+
+assert subscript_use(1) == 1 + 2 + 100
+```
+
+---
+
+## 8. 编译期（comptime）
+
+### 8.1 类型探针与编译期日志
+
+- `spy.typeof(x)`：查询静态类型（返回类型值），是一个**类型探针**：只做类型化、无运行时行为；其中引用的 spy 函数会被触发编译。被探测的调用若抛错离开探针则报错。
+- `spy.compile_log(...)`：编译期打印（运行时无动作）；bytes 渲染为文本，运行时值渲染为 `<T>`。
+- `spy.as_`：只能在 Python 调用边界用（函数体内调用报错）。
+
+```python
+@func()
+def probe(x: i32) -> i32:
+    if typeof(x) == i32:         # a type probe: no code, no runtime effect
+        return 1
+    return 0
+
+@func()
+def logged(x: i32) -> i32:
+    compile_log('compiling logged')   # prints at compile time only
+    return x + 1
+
+assert probe(1) == 1
+assert logged(1) == 2
+```
+
+### 8.2 编译期参数（补充）
+
+- 无运行时表示的类型作形参 ⇒ 隐式编译期形参（见 §6.2）。
+- **仅 const**：指向编译期常量的指针可以作为 `Comptime` 实参传给**非内联**函数（按身份传递、可别名）；
+  非 const 的编译期指针不能跨非内联边界（见 §8.5）。
+
+```python
+@func()
+def read_const(p: Ptr[i32]) -> i32:
+    return p[...]                # the callee aliases the global constant
+
+@func()
+def use_const_ptr() -> i32:
+    const_x: ConstComptime[i32] = 99
+    return read_const(ref(const_x))
+
+assert use_const_ptr() == 99
+```
+
+### 8.3 `*args` / `**kwargs`
+
+- 函数体里 `args` 收集位置实参、`kwargs` 按名收集关键字实参。
+- `len(args)`、`args[i]`（编译期整数下标）、`kwargs[b'name']`（编译期字节串名）。
+- 元素/值类型可注解也可推断；`*args`/`**kwargs` 元素不支持 `type[X]`；需要时配 `syntax.unroll()` 遍历。
+- **调用点展开（`f(*args, **kwargs)`）尚未实现**：`**kw` 被静默忽略，`*x` 报错（见 `doc/issues.md` #1）。
+
+```python
+@func()
+def sum_all(*args: i32) -> i32:
+    total: i32 = 0
+    unroll()
+    for i in range(len(args)):
+        total += args[i]
+    return total
+
+@func()
+def named_sum(**kwargs: i32) -> i32:
+    return kwargs[b'a'] + kwargs[b'b']
+
+assert sum_all(1, 2, 3) == 6
+assert named_sum(a=1, b=2) == 3
+```
+
+### 8.4 `dict[str, T]` 形参
+
+- `**kwargs` 形参 / `dict[str, T]` 形参按名铺平传参；访问 `len(kwargs)`、`kwargs[b'name']`（仅编译期字节串名，**不支持运行时键查找**）。
+- 由于有运行时表示，字典值可存普通变量/字段、按值或引用传递。
+- `dict[str, T]` 注解本身尚未解析。
+
+### 8.5 编译期指针
+
+- 取址/偏移：`ref(a)`（`a` 是编译期位置）得到一个编译期指针；`p[...]` 读写它指向的位置。
+- **const 指针**可以跨非内联边界（作 `Comptime` 实参、被编译闭包捕获、作非内联函数返回值），按**身份**传递、可别名。
+- **非 const 编译期指针**跨非内联边界时会**物化一份拷贝**：callee 的写入影响不到原位置。
+- 经 `ptr_cast` 得到的编译期指针不能读写透。
+- 指向编译期常量的指针、字节串常量都会自动落成全局常量。
+
+```python
+@struct()
+class Small:
+    a: i32
+    b: i32
+
+@func()
+def aliasing() -> i32:
+    c: Comptime[Small] = Small(1, 2)
+    p: Comptime = ref(c)         # a compile-time pointer into the box
+    p[...].a = 10                # writes the aggregate (aliases the box)
+    return c.a + c.b
+
+assert aliasing() == 12
+```
+
+### 8.6 编译期聚合与循环
+
+- 完全编译时已知的聚合，字段/元素读写全部在编译期折叠；整体拷贝按值。
+- 编译期 `if`：条件必须是完全编译时已知；未选分支不编译、不分析（其中的 `compile_error` 不触发）。
+- 编译期循环 `syntax.unroll()`：标记紧跟其后的 `while`/`for`；条件必须是编译期值；循环体必须推进编译期状态，
+  否则超过 `max_loop_unroll`（默认 1024）报错。`syntax.unroll()` 必须紧接在被标记的循环之前。
+
+```python
+@struct()
+class Small:
+    a: i32
+    b: i32
+
+@func()
+def comptime_struct() -> i32:
+    c: Comptime[Small] = Small(1, 2)
+    c.a = c.a + 10               # a compile-time field write
+    return c.a + c.b
+
+@func()
+def unrolled_sum() -> i32:
+    total: i32 = 0
+    unroll()
+    for i in range(4):
+        total += i
+    return total
+
+assert comptime_struct() == 13
+assert unrolled_sum() == 6
+```
+
+### 8.7 其他编译期内建
+
+- `std.core.undefined()`：任意类型的 undefined，写进目标时按其类型定型；undefined 作条件报错。
+- `std.core.compile_error(msg)`：以编译期字节串为消息中止编译；非字节串/运行时消息报错；死分支不触发。
+- `std.core.coerce(value, T)`：把 value 具体化成类型 `T`（同 store 的转换）。
+- `std.core.compile_option(name)`：**已声明但未实现**（调用报错）。
+- `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
+- `std.core.bitcast(value, T)` / `std.int.truncate(value, T)`：标量的同位宽重解释 / 整数收窄。
+
+```python
+@func()
+def dead_branch() -> i32:
+    comptime()
+    c = False
+    if c:
+        compile_error('never compiled')   # a dead branch is not compiled
+    return 1
+
+@func()
+def pick(c: bool, a: i32, b: i32) -> i32:
+    v: i32 = undefined()
+    if c:
+        v = a
+    else:
+        v = b
+    return v
+
+@func()
+def narrowed(x: i32) -> i8:
+    return coerce(x, i8)
+
+@func()
+def same_bits(x: f32) -> u32:
+    return bitcast(x, u32)
+
+@func()
+def truncated(x: u32) -> u8:
+    return truncate(x, u8)
+
+assert dead_branch() == 1
+assert pick(True, 1, 2) == 1 and pick(False, 1, 2) == 2
+assert narrowed(128) == -128
+assert same_bits(1.0) == 0x3F800000
+assert truncated(300) == 44
+```
+
+### 8.8 反射
+
+- `std.reflect.type_info(type) -> TypeInfo` / `reify(info) -> type`；
+  变体 `IntType`/`PointerType`/`ArrayType`/`StructType`/`TaggedUnionType`/`OptionType`/`TupleType`/`StrDictType`/`ComplexType`/`UnionType`。
+- `reflect.StructField` 含 `is_comptime` / `is_ref` 标记；`reflect.StructType.head`（非泛型为 `None`）。
+- `reify` 一个 struct 会**重新构建**（与原始 struct 不 identity 相等，但字段/字段类型相同）。
+- `std.mem.layout_of`/`size_of`/`align_of`：也接受元组/字典类型。
+
+```python
+@func()
+def int_bits(t: type[i32]) -> i32:
+    comptime()
+    info = type_info(t)
+    if isinstance(i := info, IntType):
+        return i.bits
+    return 0
+
+@func()
+def reified() -> i32:
+    comptime()
+    t = reify(type_info(i32))
+    if t == i32:
+        return 1
+    return 0
+
+@func()
+def int_size() -> i32:
+    return coerce(size_of(i32), i32)
+
+assert int_bits(i32) == 32
+assert reified() == 1
+assert int_size() == 4
+```
+
+### 8.9 编译期字节串
+
+- `bytes` 只在编译期存在（无运行时表示）；`str` 字面量被编码成 `bytes`（spy 函数内不允许 `str`）。
+- 可下标 `b[i]` 与切片 `b[a:c]`（下界缺省 0、上界缺省长度、step 必须 1，越界报错）；`ord(b)` 取单字节字节串的编码。
+- 落成运行时：`ptr_cast(s, ConstMultiPtr[u8])` 或 `std.core.sstr(s) -> ConstSlicePtr[u8]`（长度不含 NUL）。
+- 内容相同的字节串共用一个全局常量；持有字节串的局部量必须是编译期变量。
+
+```python
+@func()
+def byte_at() -> i32:
+    s: Comptime = b'ABC'
+    return ord(s[1])
+
+@func()
+def second_byte() -> i32:
+    s: Comptime = b'xy'
+    p: ConstMultiPtr[u8] = ptr_cast(s, ConstMultiPtr[u8])
+    return coerce(p[1], i32)
+
+@func()
+def str_len() -> i32:
+    s = sstr(b'hello')
+    return coerce(s.length, i32)
+
+assert byte_at() == 66
+assert second_byte() == 121
+assert str_len() == 5
+```
+
+---
+
+## 9. 标准库
+
+| 模块 | 内容 |
+|---|---|
+| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option`（未实现） |
+| `std.reflect` | `TypeInfo` 及变体、`StructField`、`type_info`、`reify` |
+| `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast` |
+| `std.mem` | `Layout`、`layout_of`/`size_of`/`align_of`、`AllocError`、`Allocator`（协议）、`AllocatorVtable`、`DynamicAllocator`、`CAllocator` |
+| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf`（extern 声明）、`CError`、`FILE`、`fopen`/`fclose`/`fread`/`fwrite` |
+| `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`、`Writable`/`Readable`（协议） |
+| `std.vec` | `Vec[T, A]` 动态数组 |
+| `std.atomic` | `MemoryOrder`/`RmwOp`、`atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`、便捷包装 |
+| `std.openmp` | `load_openmp_runtime`、`parallel_loop` |
+
+### 9.1 原子操作
+
+- 操作对象（pointee）必须是整数、浮点或指针（不支持 `bool`；整数宽度须为字节大小的 2 的幂）。
+- `atomic_cmpxchg` 不接受浮点 pointee；返回 `(旧值, 是否交换)`，failure ordering 不能是 `RELEASE`/`ACQ_REL`、也不能强于 success。
+- `atomic_rmw` 的操作按 pointee 种类受限（整数全部；浮点只 `XCHG`/`ADD`/`SUB`；指针只 `XCHG`），还接受**复数** pointee。
+- 每个操作带一个 `MemoryOrder`；除 `atomic_fence` 外都有 `volatile` 开关。
+- 便捷包装：`atomic_swap`、`atomic_fetch_add/sub/and/or/xor`。
+
+```python
+@func()
+def bump(p: Ptr[i32]) -> i32:
+    return atomic_fetch_add(p, 1)     # returns the old value
+
+@func()
+def use_bump(x: i32) -> i32:
+    v: i32 = x
+    old = bump(ref(v))
+    return old * 10 + v
+
+assert use_bump(5) == 56
+```
+
+### 9.2 OpenMP
+
+`std.openmp.parallel_loop(length, kernel)` 实现 `#pragma omp parallel for`（static 调度）。
+使用前须 `load_openmp_runtime()`（幂等，加载 `libomp`）。
+
+---
+
+## 10. Python ↔ spy 调用边界
+
+- Python 值到 spy 类型的映射：`bool`→`bool`，`int`→`i64`，`float`→`f64`，`complex`→`c128`，
+  `bytes`→编译期字节串，`None`→`Null`，`syntax.Ptr[T]`→指针；用 `spy.as_(value, T)` 显式指定类型。
+- 结构体实例支持字段读写、方法调用与视图语义；指针是非空的。
+- `Option[T]` 与 tagged union 回到 Python 时**脱壳**：`Option[T]` 是 `T` 值或 `None`，union 是其具体变体的值。
+- 复数 ↔ Python `complex`；整数枚举 ↔ Python 枚举成员。
+- 可能 raise 的 spy 函数从 Python 调用时抛出一个继承 `Exception` 的结构体实例（`except Exception as e` 可捕获读字段）。
+- 多返回值打包成 Python `tuple`（嵌套结果嵌套 `tuple`），按值返回的聚合解包成实例。
+- 编译期结果：有自然 Python 镜像的标量转成 `int`/`float`，其余原样交出编译器对象。
+- **数组目前不能跨 Python 边界**（读取/写入时直接报错）。
+
+```python
+@struct()
+class Pt:
+    x: i32
+    y: i32
+
+@func()
+def swap_xy(p: Pt) -> Pt:
+    return Pt(p.y, p.x)
+
+@func()
+def id64(x: u64) -> u64:
+    return x
+
+p = Pt(1, 2)                          # a struct instance crosses the boundary
+assert p.x == 1 and p.y == 2
+q = swap_xy(p)
+assert q.x == 2 and q.y == 1
+assert id64(spy_as(2 ** 40, u64)) == 2 ** 40   # spy.as_ picks an explicit type
+```
+
+---
+
+## 11. 已实现 / 未实现边界
+
+**已实现（要点）**：见上文各节——标量/指针/数组/切片/Option/tagged union/union/complex/枚举/结构体；
+多返回值；泛型（函数与结构体）；闭包（即匿名 struct）；`Comptime`/`ConstComptime`/`InferComptime`；
+编译期指针（含 const 跨非内联边界）；编译期聚合/循环/反射；`defer`；异常与 `noreturn`；
+panic/`catch_unwind`；原子操作；OpenMP；Python 侧互操作（结构体/枚举/option/union/异常/多返回值）。
+
+**未实现 / 已知限制**：
+
+- 赋值仅 `=`（含元组解包）与 `+=`；**链式赋值 `a = b = e` 只处理第一个目标**（静默）。
+- 仅位置/仅关键字参数、链式比较、单指针下标 `p[i]`（单指针只有 `p[...]`）。
+- 调用点展开 `f(*args, **kwargs)`（`**kw` 被静默忽略、`*x` 报错）。
+- C 变参函数的**定义**（`va_arg`）。
+- 元组 `+=` / `+`（已移除）；浮点 `%`；字节串除下标/切片/`ord`/`ptr_cast`/`sstr` 外的运算。
+- 数组：运行时长度的数组、数组之间的转换、数组跨 Python 边界。
+- `dict[str, T]` 注解解析；option 的模式匹配；闭包 `nonlocal`；互递归闭包；闭包引用外层类型参数。
+- 声明的「编译期专属」返回类型（`-> bytes` / `-> type` 等，见 `doc/issues.md` #7）。
+- `std.core.compile_option`：声明了但未实现。
+- 破坏性 move 语义（`copyable=False` 只表示不可拷贝，不做 move 检查）。
+
+> 逐条实现缺陷与最小复现见 `doc/issues.md`。
