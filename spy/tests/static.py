@@ -1,3 +1,4 @@
+from typing import Any, Literal
 from unittest import TestCase
 
 from ..compiler import (
@@ -16,8 +17,10 @@ from ..compiler.syntax import (
     Ptr,
     array,
     comptime,
+    const_comptime,
     ref,
 )
+from ..std.core import coerce
 
 
 @func()
@@ -83,8 +86,8 @@ def static_nested_struct() -> i32:
 @func()
 def static_array() -> i32:
     comptime()
-    a: Array[i32, 3] = array(1, 2, 3)  # pyright: ignore
-    const_a: ConstComptime[Array[i32, 3]] = a
+    a: Array[i32, Literal[3]] = array(1, 2, 3, length=3)
+    const_a: ConstComptime[Array[i32, Literal[3]]] = a
     p = ref(const_a)
     return p[...][0] * 100 + p[...][1] * 10 + p[...][2]
 
@@ -302,9 +305,100 @@ def static_function_pointer(x: i32) -> i32:
 def static_rejects_a_type() -> i32:
     comptime()
     t = i32
-    const_t: ConstComptime[i32] = t
+    const_comptime()
+    const_t = t
     p = ref(const_t)
     return p[...]  # pyright: ignore[reportReturnType]
+
+
+# ---------------------------------------------------------------------------
+# the ``syntax.const_comptime()`` statement marker: the *unannotated* spelling of
+# ``x: ConstComptime = e`` (``x = e`` with the marker declares a read-only
+# compile-time constant of the type its value determines, see ``astgen``)
+# ---------------------------------------------------------------------------
+
+
+@func()
+def const_marker_scalar() -> i32:
+    # the value determines the type of the constant: a typed compile-time value
+    # (an untyped integer literal is compile-time-only and has no runtime
+    # representation to point at)
+    const_comptime()
+    x = coerce(42, i32)
+    p = ref(x)
+    return p[...]
+
+
+@func()
+def const_marker_typed_declaration() -> i32:
+    # the marker also combines with a plain annotation, like ``comptime()`` does
+    const_comptime()
+    x: i32 = 42
+    p = ref(x)
+    return p[...]
+
+
+@func()
+def const_marker_struct() -> i32:
+    const_comptime()
+    s = StaticPair(3, 4)
+    p = ref(s)
+    return p[...].a * 10 + p[...].b
+
+
+@struct()
+class ConstHolder:
+    p: ConstPtr[StaticPair]
+
+
+@func()
+def make_const_holder() -> ConstHolder:
+    # the reported shape: the constant's address ends up in a value the function
+    # *returns*, so it must name a global - a copy materialized on this frame's
+    # stack would dangle as soon as the function returned
+    const_comptime()
+    s = StaticPair(3, 4)
+    return ConstHolder(ref(s))
+
+
+@func()
+def const_marker_escapes() -> i32:
+    h = make_const_holder()
+    return h.p[...].a * 10 + h.p[...].b
+
+
+@func()
+def const_marker_rejects_a_write() -> i32:
+    # the constant's box is read-only once its declaration committed: the store
+    # below is a compile error.
+    const_comptime()
+    c = coerce(42, i32)
+    c = coerce(43, i32)
+    return c
+
+
+@func()
+def const_marker_rejects_a_bound_name() -> i32:
+    # the marker must precede a *fresh* declaration
+    x: i32 = 1
+    const_comptime()
+    x = 42
+    return x
+
+
+@func()
+def const_marker_rejects_a_runtime_value(x: i32) -> i32:
+    const_comptime()
+    y = x
+    return y
+
+
+@func()
+def const_marker_on_an_annotated_declaration() -> i32:
+    # the annotation already says ``ConstComptime``: the marker would repeat it
+    const_comptime()
+    x: ConstComptime[i32] = 42
+    return x
 
 
 class StaticPtrTest(TestCase):
@@ -360,6 +454,63 @@ class StaticPtrTest(TestCase):
             static_rejects_a_type()
 
 
+def _module_text(handle: Any) -> str:
+    """The LLVM IR of the module ``handle`` was compiled into; the handle's
+    Python-side call has to have run first (it is what compiles it)."""
+    entry = handle.get_entry()  # pyright: ignore
+    instance = next(iter(entry.specs.values()))
+    native = instance.wrapper_fn or instance.native_fn
+    assert native is not None
+    return '\n'.join(native.print_all())
+
+
+class ConstComptimeMarkerTest(TestCase):
+    """``syntax.const_comptime()`` marks the *unannotated* declaration that
+    follows as a read-only compile-time constant (``x = e`` with the marker is
+    ``x: ConstComptime = e``): ``ref(x)`` then lowers to a global static constant
+    the same way the annotated spelling does (see the behaviour doc §4.3)."""
+
+    def test_a_scalar(self) -> None:
+        self.assertEqual(const_marker_scalar(), 42)
+        self.assertEqual(const_marker_typed_declaration(), 42)
+        self.assertIn('constant i32 42', _module_text(const_marker_scalar))
+
+    def test_an_aggregate(self) -> None:
+        self.assertEqual(const_marker_struct(), 34)
+
+    def test_the_constant_lowers_to_a_global(self) -> None:
+        self.assertEqual(const_marker_struct(), 34)
+        text = _module_text(const_marker_struct)
+        # the value is a read-only global the pointer points at - not a copy
+        # materialized on the declaring frame's stack (which is what a *mutable*
+        # compile-time variable would lower to)
+        self.assertIn('constant %StaticPair', text)
+        self.assertNotIn('alloca %StaticPair', text)
+
+    def test_a_pointer_escaping_the_declaring_frame(self) -> None:
+        self.assertEqual(const_marker_escapes(), 34)
+        text = _module_text(make_const_holder)
+        self.assertIn('constant %StaticPair', text)
+        self.assertNotIn('alloca %StaticPair', text)
+
+    def test_a_write_after_the_commit_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            const_marker_rejects_a_write()
+
+    def test_the_marker_must_precede_a_fresh_declaration(self) -> None:
+        with self.assertRaises(CompileError):
+            const_marker_rejects_a_bound_name()
+
+    def test_a_runtime_value_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            const_marker_rejects_a_runtime_value(1)
+
+    def test_the_marker_may_not_repeat_the_annotation(self) -> None:
+        with self.assertRaises(CompileError):
+            const_marker_on_an_annotated_declaration()
+
+
 all_tests = [
     StaticPtrTest,
+    ConstComptimeMarkerTest,
 ]

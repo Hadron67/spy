@@ -49,16 +49,6 @@ def closure_lambda_arg(a: i32) -> i32:
 
 
 @func()
-def closure_forward_declaration() -> i32:
-    # the closure is written before the variable it captures is assigned: the
-    # body's pre-scan declares ``x`` up front
-    def f() -> i32:
-        return x
-    x: i32 = 7
-    return f()
-
-
-@func()
 def closure_after_runtime_control_flow(n: i32) -> i32:
     # a closure written after runtime control flow: its slot is declared where
     # the closure is written, so the ``Alloca`` and the closure value's store
@@ -295,9 +285,6 @@ class SpyClosureTest(TestCase):
 
     def test_lambda_as_an_argument(self) -> None:
         self.assertEqual(closure_lambda_arg(5), 15)
-
-    def test_forward_declaration(self) -> None:
-        self.assertEqual(closure_forward_declaration(), 7)
 
     def test_a_closure_after_runtime_control_flow(self) -> None:
         self.assertEqual(closure_after_runtime_control_flow(0), 1)

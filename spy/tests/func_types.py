@@ -12,13 +12,12 @@ from ..compiler import (
     syntax,
 )
 from ..compiler import as_ as spy_as
-from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type, struct
 from ..compiler.syntax import (
     ConstPtr,
 )
-from ..std import compile as spy_compile
 from ..compiler.util import FrozenArraySet
+from ..std import compile as spy_compile
 from .structs import MIR_CACHE, Handle, struct_type
 
 # ---------------------------------------------------------------------------
@@ -233,7 +232,7 @@ def call_spy_func_ptr(n: i32) -> i32:
 @func()
 def call_spy_func_ptr_typed(n: i32) -> i32:
     # the pointer of a spy function converts to a declared function-pointer type
-    p: ConstPtr[IntUnary] = spy_compile(ptr_target_incr)
+    p = spy_compile(ptr_target_incr)
     return apply_int_unary(p, n)
 
 

@@ -168,20 +168,15 @@ class _Scope:
     sees - and only a name that is bound *nowhere* is declared: it gets a
     fresh block-local slot, which is not visible outside its block.  The
     chain of enclosing blocks is the scope stack of the :class:`_Builder`
-    translating the function (see ``_Builder._lookup``).
+    translating the function (see ``_Builder._lookup``)."""
 
-    ``pending`` names the slots the body's pre-scan declared but whose
-    declaration statement has not run yet (see ``_Builder._predeclare``):
-    such a slot is committed by the first statement that initializes it."""
-
-    __slots__ = ('pending', 'vars')
+    __slots__ = ('vars',)
 
     def __init__(self) -> None:
         # every binding names a *pointer to the referenced object*: a
         # variable's slot, the option a ``:=`` binds, or the payload of one an
         # unwrap binds (see ``_Builder._gen_walrus``/``_gen_unwrap``)
         self.vars: dict[str, hir.Value] = {}
-        self.pending: set[str] = set()
 
 @dataclass(frozen=True, slots=True)
 class _CaptureField:
@@ -370,9 +365,9 @@ class _Builder:
                 fn = self._try_resolve_object(node.value.func)
             except CompileError:
                 # a name that does not resolve (yet) cannot be a marker: a
-                # ``def`` name is only declared where its sub-block begins, so a
-                # reference to it from an earlier sub-block is not a marker (its
-                # own error surfaces when the statement is generated)
+                # ``def`` name is only declared where its run begins, so a
+                # reference to it before that is not a marker (its own error
+                # surfaces when the statement is generated)
                 return None
             if fn is syntax.unroll:
                 return _UNROLL
@@ -385,130 +380,36 @@ class _Builder:
         return None
 
     def _gen_body(self, stmts: list[ast.stmt]) -> None:
-        """Generate a whole statement list, one *sub-block* at a time.  A
-        sub-block begins at the block's start or at a nested ``def`` that
-        follows a non-``def`` statement; every declaration of the sub-block - an
-        assignment target, an annotated declaration, a ``def`` - is
-        *pre-declared* just before the sub-block is generated (see
-        ``_predeclare``), so a nested closure written before a variable is
-        assigned can still capture it, and a name assigned in a closure body is
-        local to that closure.  Declaring a ``def``'s slot where the sub-block
-        begins (rather than at the block's head) keeps its ``Alloca`` in the
-        same runtime block as the closure value it stores, so a sub-block that
-        follows runtime control flow still compiles (see
-        ``pending-problems.md`` #5).  A marker that no loop or declaration
-        follows at its end is rejected."""
+        """Generate a statement list.  A run of consecutive nested ``def``s is
+        generated together: the slot of every ``def`` in the run is allocated
+        and bound first, so each closure can reference the others (self- and
+        mutual recursion), and the run is then generated in order.  Every other
+        statement is generated on its own.  Allocating a ``def``'s slot where
+        its run begins (rather than at the block's head) keeps its ``Alloca``
+        in the same runtime block as the closure value it stores, so a ``def``
+        written after runtime control flow still compiles.  A marker that no
+        statement follows at its end is rejected."""
         index = 0
         while index < len(stmts):
-            end = self._predeclare(stmts, index)
-            for stmt in stmts[index:end]:
+            stmt = stmts[index]
+            if isinstance(stmt, ast.FunctionDef):
+                # a run of consecutive ``def``s: every slot is declared up
+                # front, so a closure can reference a sibling - or itself
+                end = index
+                while end < len(stmts) and isinstance(stmts[end], ast.FunctionDef):
+                    end += 1
+                run = [s for s in stmts[index:end] if isinstance(s, ast.FunctionDef)]
+                for defn in run:
+                    if self._lookup_within_function(defn.name) is None:
+                        self._declare(defn.name, self.add(hir.Alloca(is_comptime=None)))
+                for defn in run:
+                    self._gen_stmt(defn)
+                index = end
+            else:
                 self._gen_stmt(stmt)
-            index = end
+                index += 1
         if self._pragmas:
             raise CompileError('unused pragmas')
-
-    def _predeclare(self, stmts: list[ast.stmt], start: int) -> int:
-        """Declare every name one *sub-block* of ``stmts`` - the run beginning
-        at ``start``, up to the next ``def`` that follows a non-``def`` - will
-        bind: an assignment target, an annotated declaration (its annotation is
-        evaluated here, so its type is fixed before the closure bodies below can
-        capture it) and a ``def`` name (a full compile-time slot the closure
-        value is written into).  A name bound already - by a parameter, an
-        enclosing block, or a preceding marker - is left alone.  Compound
-        statements are not descended into: their own bodies pre-declare the
-        names they bind.  Returns the index the next sub-block begins at, where
-        *its* declarations are pre-declared in turn (see ``_gen_body``)."""
-        comptime_marker: _Pragma | None = None
-        index = start
-        while index < len(stmts):
-            stmt = stmts[index]
-            if (
-                index > start
-                and isinstance(stmt, ast.FunctionDef)
-                and not isinstance(stmts[index - 1], ast.FunctionDef)
-            ):
-                # a ``def`` following a non-``def`` starts the next sub-block:
-                # its slots are allocated there, in that sub-block's own runtime
-                # block
-                break
-            marker = self._as_marker(stmt)
-            if marker is _COMPTIME or marker is _CONST_COMPTIME or marker is _INFER_COMPTIME:
-                comptime_marker = marker
-                index += 1
-                continue
-            if isinstance(stmt, ast.FunctionDef):
-                self._predeclare_name(stmt.name, None)
-            elif isinstance(stmt, ast.Assign):
-                # a ``syntax.comptime()`` marker makes the assignment declare a
-                # compile-time variable of no declared type (``a = e`` is
-                # ``a: Comptime = e``, see ``_gen_assign``): like the annotated
-                # case, such a slot is committed by its initializing store and
-                # declared where it is written - pre-declaring it here would put
-                # its ``Alloca`` in the wrong runtime block, before a later
-                # call's continuation (see ``_predeclare_ann`` and
-                # ``pending-problems.md`` #5)
-                if comptime_marker is None and len(stmt.targets) > 0:
-                    self._predeclare_target(stmt.targets[0], False)
-            elif isinstance(stmt, ast.AnnAssign):
-                self._predeclare_ann(stmt, comptime_marker)
-            comptime_marker = None
-            index += 1
-        return index
-
-    def _predeclare_name(self, name: str, is_comptime: bool | None) -> None:
-        if self._lookup_within_function(name) is not None:
-            return
-        slot = self.add(hir.Alloca(is_comptime=is_comptime))
-        self._declare(name, slot)
-        self._scopes[-1].pending.add(name)
-
-    def _predeclare_target(self, target: ast.expr, is_comptime: bool | None) -> None:
-        if isinstance(target, ast.Name):
-            self._predeclare_name(target.id, is_comptime)
-        elif isinstance(target, ast.Tuple):
-            for elt in target.elts:
-                self._predeclare_target(elt, is_comptime)
-
-    def _predeclare_ann(self, node: ast.AnnAssign, marker: _Pragma | None) -> None:
-        target = node.target
-        if not isinstance(target, ast.Name):
-            return
-        if self._lookup_within_function(target.id) is not None:
-            return
-        is_comptime, is_const, type_node = self._split_comptime(node.annotation)
-        if is_comptime is not False and marker is not None:
-            raise CompileError(
-                f"'{target.id}' is already declared by its annotation; drop the "
-                f"{_marker_call(marker)} before it"
-            )
-        if marker is _CONST_COMPTIME:
-            is_comptime = True
-            is_const = True
-        elif marker is _COMPTIME:
-            is_comptime = True
-        elif marker is _INFER_COMPTIME:
-            is_comptime = None
-        if is_comptime is not False and type_node is None:
-            # a compile-time slot with no declared type is committed by its
-            # initializing store, not at the pre-scan: declaring it here would
-            # put its ``Alloca`` in the wrong runtime block (see
-            # ``pending-problems.md`` #5).  It is declared where it is written
-            # instead, like any ordinary declaration.
-            return
-        declared = None if type_node is None else self._as_value(self._gen_expr(type_node)[0])
-        slot = self.add(hir.Alloca(is_comptime=is_comptime, is_const=is_const, type=declared))
-        self._declare(target.id, slot)
-        self._scopes[-1].pending.add(target.id)
-
-    def _consume_pending(self, name: str) -> bool:
-        """Whether ``name`` is a slot this body pre-declared and whose
-        declaration statement has not run yet; a consuming caller emits the
-        ``CommitSlot`` that materializes it."""
-        pending = self._scopes[-1].pending
-        if name in pending:
-            pending.discard(name)
-            return True
-        return False
 
     def _gen_stmt(self, node: ast.stmt) -> None:
         if (marker := self._as_marker(node)) is not None:
@@ -932,7 +833,7 @@ class _Builder:
 
     # -- variables ------------------------------------------------------------
 
-    def _gen_lhs(self, target: ast.expr, new_slots: list[hir.Value], is_comptime: bool | None = False) -> hir.FullResultLoc:
+    def _gen_lhs(self, target: ast.expr, new_slots: list[hir.Value], is_comptime: bool | None = False, is_const: bool = False) -> hir.FullResultLoc:
         """The place - or, for a destructuring target, the place *tree* - a
         target denotes, declaring every name it binds nowhere (their fresh slots
         are appended to ``new_slots``).  It is the first half of an assignment,
@@ -942,22 +843,20 @@ class _Builder:
 
         ``is_comptime`` is the storage decision of the fresh slots (see
         ``hir.Alloca``): the loop variable of a compile-time ``for`` is a
-        compile-time value, so it is bound to a compile-time slot."""
+        compile-time value, so it is bound to a compile-time slot.  ``is_const``
+        makes the fresh slots ``ConstComptime`` constants, whose box is read-only
+        after the declaration's commit (see ``_gen_assign``)."""
         if isinstance(target, ast.Tuple):
             # a destructuring target is a tree of places, one per element:
             # the right-hand side is generated straight into them (result-
             # location semantics), so no intermediate tuple value is built
-            return self._gen_target_tuple(target, new_slots, is_comptime)
+            return self._gen_target_tuple(target, new_slots, is_comptime, is_const)
         if isinstance(target, ast.Name):
             slot = self._lookup_within_function(target.id)
             if slot is None:
                 # the name is bound nowhere: declare it here, in the current block
-                slot = self.add(hir.Alloca(is_comptime=is_comptime))
+                slot = self.add(hir.Alloca(is_comptime=is_comptime, is_const=is_const))
                 self._declare(target.id, slot)
-                new_slots.append(slot)
-                return slot
-            if self._consume_pending(target.id):
-                # a slot the body pre-declared: commit it once initialized
                 new_slots.append(slot)
             return slot
         lhs = self._gen_expr(target, False)[0]
@@ -983,7 +882,9 @@ class _Builder:
         ``marker`` is the ``syntax.comptime()``/``syntax.const_comptime()``
         marker preceding the statement: the name it declares is a compile-time
         variable (a box rather than memory), exactly like ``name: Comptime`` (see
-        ``_gen_ann_assign``)."""
+        ``_gen_ann_assign``); ``syntax.const_comptime()`` declares a compile-time
+        *constant* instead, exactly like ``name: ConstComptime`` - its box is
+        read-only once the declaration's commit has run."""
         by_marker = marker is not None
         if by_marker and not self._declares_a_fresh_name(target):
             assert marker is not None
@@ -993,11 +894,13 @@ class _Builder:
             )
         new_slots: list[hir.Value] = []
         is_comptime: bool | None = False
+        is_const = False
         if marker is _COMPTIME or marker is _CONST_COMPTIME:
             is_comptime = True
+            is_const = marker is _CONST_COMPTIME
         elif marker is _INFER_COMPTIME:
             is_comptime = None
-        place = self._gen_lhs(target, new_slots, is_comptime)
+        place = self._gen_lhs(target, new_slots, is_comptime, is_const)
         self._gen_result_loc(value, place)
         for slot in new_slots:
             self.add(hir.CommitSlot(slot))
@@ -1006,18 +909,14 @@ class _Builder:
         """Whether an assignment to ``target`` declares a name that is bound
         nowhere - a declaration, which is what a ``syntax.comptime()`` marker
         marks (see ``_gen_assign`` and ``_gen_lhs``, whose declaration rule this
-        mirrors).  A slot the body pre-declared but has not initialized yet is
-        a declaration all the same."""
+        mirrors)."""
         match target:
             case ast.Name():
-                return self._lookup_within_function(target.id) is None or self._is_pending(target.id)
+                return self._lookup_within_function(target.id) is None
             case ast.Tuple():
                 return all(self._declares_a_fresh_name(elt) for elt in target.elts)
             case _:
                 return False
-
-    def _is_pending(self, name: str) -> bool:
-        return name in self._scopes[-1].pending
 
     def _gen_ann_assign(self, node: ast.AnnAssign, marker: _Pragma | None = None) -> None:
         """One annotated declaration ``name: T`` or ``name: T = expr``.  The
@@ -1041,15 +940,6 @@ class _Builder:
                 f"only a name can be annotated in spy function {fn_name}, "
                 f"got {ast.unparse(target)!r}"
             )
-        if self._is_pending(target.id):
-            # the body pre-declared it (its annotation was evaluated there):
-            # this statement only initializes the slot
-            slot = self._scopes[-1].vars[target.id]
-            self._consume_pending(target.id)
-            if node.value is not None:
-                self._gen_result_loc(node.value, slot)
-            self.add(hir.CommitSlot(slot))
-            return
         if self._lookup(target.id) is not None:
             raise CompileError(
                 f"'{target.id}' is already bound in spy function {fn_name}; "
@@ -1123,24 +1013,23 @@ class _Builder:
             return True, node.slice
         return False, node
 
-    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], is_comptime: bool | None = False) -> tuple[ResultLocTree, ...]:
+    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], is_comptime: bool | None = False, is_const: bool = False) -> tuple[ResultLocTree, ...]:
         """The place tree a destructuring target denotes (a ``ResultLocTree``
         node): a plain target contributes the place of its slot (or field), a
         nested tuple target contributes its own tree.  Only a name that is bound
         nowhere is declared (see ``_gen_assign``); its fresh slot uses the
-        storage decision ``is_comptime`` (see ``_gen_lhs``)."""
+        storage decision ``is_comptime`` and the constness ``is_const`` (see
+        ``_gen_lhs``)."""
         elems: list[ResultLocTree] = []
         for elt in target.elts:
             if isinstance(elt, ast.Tuple):
-                elems.append(self._gen_target_tuple(elt, new_slots, is_comptime))
+                elems.append(self._gen_target_tuple(elt, new_slots, is_comptime, is_const))
                 continue
             if isinstance(elt, ast.Name):
                 slot = self._lookup_within_function(elt.id)
                 if slot is None:
-                    slot = self.add(hir.Alloca(is_comptime=is_comptime))
+                    slot = self.add(hir.Alloca(is_comptime=is_comptime, is_const=is_const))
                     self._declare(elt.id, slot)
-                    new_slots.append(slot)
-                elif self._consume_pending(elt.id):
                     new_slots.append(slot)
             ref = self._gen_expr(elt, False)[0]
             if not ref.is_ref:
@@ -1954,9 +1843,9 @@ class _Builder:
     # -- closures -------------------------------------------------------------
 
     def _gen_function_def(self, node: ast.FunctionDef) -> None:
-        """Translate a nested ``def`` into a closure value.  The body's
-        pre-scan already declared the name (a full compile-time slot), so this
-        only writes the closure into that slot.  A ``@syntax.closure(...)``
+        """Translate a nested ``def`` into a closure value.  ``_gen_body`` has
+        already declared the name (a full compile-time slot), so this only
+        writes the closure into that slot.  A ``@syntax.closure(...)``
         decorator stands in for the ``@func`` decorator a closure cannot carry
         (see ``_parse_closure_decorators``)."""
         if len(node.decorator_list) == 0:
@@ -1978,7 +1867,7 @@ class _Builder:
             callconv=callconv, may_panic=may_panic, move=move,
         )
         slot = self._lookup(node.name)
-        assert slot is not None, 'the pre-scan declares every def name'
+        assert slot is not None, 'the run declares every def name'
         self.add(hir.Store(slot, closure))
         self.add(hir.CommitSlot(slot))
 

@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal, cast
 from unittest import TestCase
 
 from ..compiler import (
@@ -243,7 +243,7 @@ def unknown_array_keyword(x: i32) -> i32:
 def array_with_a_runtime_element(x: i32) -> i32:
     # a runtime element makes the whole array a runtime value: it is held in a
     # plain variable, not a compile-time one (see the behaviour doc §5.2)
-    a: Array[i32, Literal[2]] = array(x, 2)
+    a: Array[i32, Literal[2]] = array(x, 2, length=2)
     return a[0] + a[1]
 
 
@@ -251,7 +251,7 @@ def array_with_a_runtime_element(x: i32) -> i32:
 def array_from_a_runtime_value(x: i32) -> i32:
     # a whole runtime *array* value copied into another array variable
     a = array(x, x + 1)
-    c: Array[i32, Literal[2]] = a
+    c: Array[i32, Literal[2]] = cast(Any, a)
     return c[1]
 
 

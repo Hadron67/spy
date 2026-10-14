@@ -14,7 +14,15 @@ from ..compiler import (
     u8,
     usize,
 )
-from ..compiler.syntax import Comptime, ConstComptime, Opaque, as_func_ptr, closure, comptime, ptr_cast, ref
+from ..compiler.syntax import (
+    Opaque,
+    as_func_ptr,
+    closure,
+    comptime,
+    const_comptime,
+    ptr_cast,
+    ref,
+)
 from .c import free, malloc, realloc
 from .core import SlicePtr, panic, sstr, undefined
 
@@ -93,7 +101,8 @@ class DynamicAllocator(Allocator):
     @staticmethod
     @func()
     def create(allocator) -> DynamicAllocator:
-        t: Comptime = typeof(allocator[...])
+        comptime()
+        t = typeof(allocator[...])
 
         @closure(inline=False, exceptions=AllocError)
         def alloc(data: Ptr[Opaque], layout: Layout) -> SlicePtr[u8]:
@@ -103,16 +112,12 @@ class DynamicAllocator(Allocator):
         def resize(data: Ptr[Opaque], ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]:
             return ptr_cast(data, Ptr[t])[...].resize(ptr, layout, new_layout)
 
-        comptime()
+        const_comptime()
         vtable = AllocatorVtable(
             as_func_ptr(AllocFn, alloc),
             as_func_ptr(ResizeFn, resize),
         )
-        # the vtable becomes a global static constant: a read-only compile-time
-        # variable whose pointer lowers to it automatically (see the behaviour
-        # doc §4.3, replacing ``as_static_ptr``)
-        const_value: ConstComptime[AllocatorVtable] = vtable
-        return DynamicAllocator(ptr_cast(allocator, Ptr[Opaque]), ref(const_value))
+        return DynamicAllocator(ptr_cast(allocator, Ptr[Opaque]), ref(vtable))
 
     def alloc(self, layout: Layout) -> SlicePtr[u8]:
         return self.vtable[...].alloc[...](self.data, layout)
