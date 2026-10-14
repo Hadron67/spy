@@ -34,7 +34,7 @@ from .target import TargetInfo
 from .util import FrozenArraySet, IdentityObj, IndexedMap, TriState, frozendict
 
 if typing.TYPE_CHECKING:
-    from .fn import ArgList, RawArgList
+    from .fn import ArgList, FunctionValue, RawArgList
 
 INT_DEFAULT_BITS = 32
 """The signedness/width of the default spy integer type: the type a
@@ -54,7 +54,7 @@ type AnyValue = Value | int | float | complex | bytes | bool
 type ScalarValue = (
     Type | Void | Null | Int | Float | IntEnumValue | UndefinedScalar
     | UntypedUndefined | DeclareFunction | BoundMethod | BuiltinFn
-    | ComptimePtr | CastedPtr
+    | ComptimePtr | CastedPtr | FunctionValue
     | int | float | complex | bytes | bool
 )
 """The value union of the scalar types: every compile-time value that may
@@ -946,7 +946,8 @@ class StrDictType(AggregateType):
         return cache.strdict_struct(self).mirror_is_a_field(cache)
 
     def __str__(self) -> str:
-        return f'{{", ".join(f"{k}: {v}" for k, v in self.values.items())}}'
+        entries = ', '.join(f'{k}: {v}' for k, v in self.values.items())
+        return '{' + entries + '}'
 
 TYPE_TYPE = TypeType()
 
@@ -1370,7 +1371,7 @@ def _widest_variant_by_cells(types: frozenset[Type] | tuple[Type, ...] | FrozenA
     return best
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=2048)
 def scalar_leaves(type: Type) -> tuple[ScalarType, ...]:
     """The scalar *leaf* types of ``type``, in flattened (depth-first) order:
     the cells a value of ``type`` occupies in a :class:`Box`.  A scalar type
@@ -1429,6 +1430,7 @@ def scalar_leaves(type: Type) -> tuple[ScalarType, ...]:
             widest = _widest_variant_by_cells(current.types)
             if widest is None:
                 continue
+            # FIXME: recursion?
             leaves = scalar_leaves(widest)
             width = _union_cell_width(current.types)
             out.extend(leaves)

@@ -774,7 +774,7 @@ class _Builder:
 
         # the iterator: ``__iter__`` once, before the loop (a fresh iterator per
         # iteration would restart the iteration)
-        it = self.add(hir.Alloca(is_comptime=True if is_inline else False))
+        it = self.add(hir.Alloca(is_comptime=is_inline))
         if is_inline:
             # a compile-time iterable is evaluated into a compile-time slot of
             # its own (result-location semantics), so that it never goes through
@@ -794,7 +794,7 @@ class _Builder:
         self.add(hir.Loop(is_inline=is_inline))
         self.add(hir.Try((None,), (hir.Const(StopIteration),)))
         new_slots: list[hir.Value] = []
-        place = self._gen_lhs(node.target, new_slots, True if is_inline else False)
+        place = self._gen_lhs(node.target, new_slots, is_inline)
         self.add(hir.CallMethodInplace(it, '__next__', hir.CallArgs((), ()), place))
         for slot in new_slots:
             self.add(hir.CommitSlot(slot))
@@ -1102,7 +1102,8 @@ class _Builder:
             base = self._try_resolve_object(node.value)
             if base is syntax.Comptime or base is syntax.ConstComptime:
                 if isinstance(node.slice, ast.Tuple):
-                    raise CompileError(f'{base.__name__} takes exactly one type argument')
+                    name = 'ConstComptime' if base is syntax.ConstComptime else 'Comptime'
+                    raise CompileError(f'{name} takes exactly one type argument')
                 return True, base is syntax.ConstComptime, node.slice
             if base is syntax.InferComptime:
                 if isinstance(node.slice, ast.Tuple):
@@ -1122,13 +1123,13 @@ class _Builder:
             return True, node.slice
         return False, node
 
-    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], is_comptime: bool | None = False) -> tuple[hir.Value, ...]:
+    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], is_comptime: bool | None = False) -> tuple[ResultLocTree, ...]:
         """The place tree a destructuring target denotes (a ``ResultLocTree``
         node): a plain target contributes the place of its slot (or field), a
         nested tuple target contributes its own tree.  Only a name that is bound
         nowhere is declared (see ``_gen_assign``); its fresh slot uses the
         storage decision ``is_comptime`` (see ``_gen_lhs``)."""
-        elems: list[hir.Value | tuple[hir.Value, ...]] = []
+        elems: list[ResultLocTree] = []
         for elt in target.elts:
             if isinstance(elt, ast.Tuple):
                 elems.append(self._gen_target_tuple(elt, new_slots, is_comptime))
@@ -1535,7 +1536,7 @@ class _Builder:
         else:
             place = self._as_ref(self._gen_expr(value_node)[0])
         test = self.add(hir.IsInstance(ArgEntry(place, True), type_value))
-        self.add(hir.Store(result_loc, test))
+        self.add(hir.Store(self._single_loc(result_loc), test))
 
     def _gen_match(self, node: ast.Match) -> None:
         """``match union: case T1() as e: ... case T2(): ...`` over a tagged
@@ -1701,6 +1702,16 @@ class _Builder:
 
     # -- struct values ---------------------------------------------------------
 
+    def _single_loc(self, loc: hir.FullResultLoc) -> hir.Value | hir.ReturnLoc:
+        """The single result location ``loc`` is: a tree of several places has no
+        single place a one-value instruction can write into (``_gen_result_loc``
+        expands such a tree into per-element stores instead)."""
+        if isinstance(loc, (hir.Value, hir.ReturnLoc)):
+            return loc
+        raise CompileError(
+            'a single value cannot be written into a result location tree'
+        )
+
     def _gen_result_loc(self, node: ast.expr, result_loc: hir.FullResultLoc, allow_fall_back: bool = True) -> None:
         """Evaluate ``node`` writing its result into ``result_loc``
         (result-location semantics); no value register is produced."""
@@ -1758,10 +1769,10 @@ class _Builder:
                     place = self._as_ref(self._gen_expr(node)[0])
                     for index, leaf in enumerate(result_loc):
                         element = self.add(hir.Subscript(place, ArgEntry(hir.Const(index), False)))
-                        self.add(hir.Store(leaf, self._make_load(element)))
+                        self.add(hir.Store(self._single_loc(leaf), self._make_load(element)))
                     return
                 value = self._as_value(self._gen_expr(node)[0])
-                self.add(hir.Store(result_loc, value))
+                self.add(hir.Store(self._single_loc(result_loc), value))
 
     def _gen_boolop(self, node: ast.BoolOp, result_loc: hir.FullResultLoc) -> None:
         """Lower ``a and b``/``a or b`` (any length of chain) into a
@@ -1799,7 +1810,7 @@ class _Builder:
             self._scopes.append(_Scope())
             operand = self._gen_expr(value)[0]
             self._scopes.pop()
-            self.add(hir.Store(result_loc, self._as_value(operand)))
+            self.add(hir.Store(self._single_loc(result_loc), self._as_value(operand)))
             cond = self.add(hir.AsBool(operand))
             if op == 'and':
                 # ``and`` short-circuits on a *false* operand: break on it
@@ -1881,7 +1892,7 @@ class _Builder:
                 if len(node.args) != 1 or len(node.keywords) > 0:
                     raise CompileError('len takes exactly one argument')
                 operand = self._gen_expr(node.args[0])[0]
-                self.add(hir.Store(result_loc, self.add(hir.Len(operand))))
+                self.add(hir.Store(self._single_loc(result_loc), self.add(hir.Len(operand))))
                 return
         if isinstance(node.func, ast.Attribute) and isinstance(fn_global, types.FunctionType):
             # a *plain* Python function reached as an attribute of a global
@@ -2090,7 +2101,7 @@ class _Builder:
         args: ast.arguments,
         ret_node: ast.expr | None,
         body_gen: Callable[[], None],
-        *, 
+        *,
         force_inline: bool,
         exceptions: ArraySet[Type] | None,
         callconv: str,

@@ -4,7 +4,7 @@ import ctypes
 from abc import abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from typing import Any, override
+from typing import override
 
 from . import hir, mir, opt
 from .errors import CompileError, TypeMismatchError
@@ -838,7 +838,7 @@ class FunctionInstance:
     # per ``RetComptime`` leaf, indexed by the leaf's ``index`` - the value the
     # *last* analysed ``return`` delivered (later writes win), which the call site
     # reads and stores into its own result place
-    ret_comptime_values: list[sval.AnyValue | None] | None = None
+    ret_comptime_values: list[AnyValue | None] | None = None
 
 class FunctionValue(Value):
     """The function value of a registered function: only compiled - and

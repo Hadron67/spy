@@ -86,9 +86,9 @@ import types as pytypes
 from abc import abstractmethod
 from annotationlib import Format
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Any, Never, Self, override
+from typing import Any, Never, Self, TypeGuard, override
 
 from . import hir, mir, sval
 from .binop import BinaryOp, CompareOp, UnaryOp
@@ -285,6 +285,21 @@ class CompileVars:
 class InterpVal:
     pass
 
+type PlaceTree = InterpVal | tuple[PlaceTree, ...]
+"""A *(place) tree*: a single interpreter place, or a (nested) Python tuple of
+places mirroring the shape of a multi-value result location (see §7.2).  It is
+what the ``ResultLocTree`` of the HIR resolves to once its leaves have been
+evaluated."""
+
+@dataclass(frozen=True, slots=True)
+class _PlaceTreeVal(InterpVal):
+    """A register value that is a *place tree* rather than a single place: the
+    element a nested ``hir.TuplePtrElement`` denotes (see §7.2).  It only ever
+    occurs as the register of such an instruction, and ``HirRunner._loc_operand``
+    unwraps it - every other consumer of ``operand`` reads a single place."""
+
+    tree: PlaceTree
+
 @dataclass
 class ComptimeVal(InterpVal):
     obj: sval.AnyValue
@@ -473,7 +488,7 @@ class ComptimeResultPtr:
     world.  A call hands its own result location over as the separate
     ``ret_loc``/``err_loc`` places (see ``_deliver_result``)."""
 
-    value: ResultLocTree | None
+    value: PlaceTree
     code: InterpVal
     payload: InterpVal
 
@@ -905,6 +920,8 @@ def _flatten_natural(value: sval.AnyValue, type: sval.Type) -> list[sval.ScalarV
     """The natural (unpadded) flattened cells of the compile-time ``value`` of
     ``type`` (see :func:`_flatten_value`)."""
     if isinstance(type, sval.ScalarType):
+        if not _is_scalar_value(value):
+            raise CompileError(f'cannot flatten {value!r} as {type}')
         return [value]
     if isinstance(value, sval.AggregateValue):
         values = value.values
@@ -915,7 +932,9 @@ def _flatten_natural(value: sval.AnyValue, type: sval.Type) -> list[sval.ScalarV
         for index, field in enumerate(type.fields().values()):
             if field.is_ref:
                 # the cell holds the compile-time pointer itself
-                cells.append(values[index])
+                cell = values[index]
+                assert _is_scalar_value(cell)
+                cells.append(cell)
             else:
                 cells.extend(_flatten_value(values[index], field.type))
         return cells
@@ -935,7 +954,9 @@ def _flatten_natural(value: sval.AnyValue, type: sval.Type) -> list[sval.ScalarV
             cells.extend(_flatten_value(elem_value, type.elem))
         return cells
     if isinstance(type, sval.ComplexType):
-        return [values[0], values[1]]
+        re, im = values[0], values[1]
+        assert _is_scalar_value(re) and _is_scalar_value(im)
+        return [re, im]
     raise CompileError(f'cannot flatten {value!r} as {type}')
 
 
@@ -983,7 +1004,10 @@ def _unflatten_cells(cells: list[sval.ScalarValue], offset: int, type: sval.Type
             elif field.is_comptime:
                 cell = cells[field_offset]
                 # an unset compile-time field reads its default
-                values.append(field.default if isinstance(cell, sval.UndefinedScalar) else cell)
+                if isinstance(cell, sval.UndefinedScalar) and field.default is not None:
+                    values.append(field.default)
+                else:
+                    values.append(cell)
             else:
                 values.append(_unflatten_cells(cells, field_offset, field.type))
         return sval.AggregateValue(tuple(values), type)
@@ -1091,6 +1115,16 @@ def _to_comptime(value: InterpVal) -> sval.AnyValue | None:
         case _:
             return None
 
+def _is_scalar_value(value: sval.AnyValue) -> TypeGuard[sval.ScalarValue]:
+    """Whether ``value`` is one of the value forms a scalar type may hold (see
+    ``sval.ScalarValue``): every compile-time value except the aggregate value
+    forms - an aggregate, an option, a tagged union, a payload union, the typed
+    null, the undefined aggregate and the error-union success value."""
+    return not isinstance(value, (
+        sval.AggregateValue, sval.OptionValue, sval.TaggedUnionValue,
+        sval.UnionValue, sval.TypedNull, sval.UndefinedAggregate, sval.Success,
+    ))
+
 def _shallow_normalize(ev: InterpVal) -> InterpVal:
     """Follow a committed :class:`PendingSlot` to the pointer value it was
     materialized into (a :class:`RuntimeVal` pointer or a
@@ -1182,6 +1216,11 @@ def _vararg_field(child: ArgNode) -> tuple[sval.Type, sval.AnyValue | None, bool
         return child.type, None, False, child.is_ref
     if isinstance(child, (tuple, frozendict)):
         return _vararg_struct_type(child), None, False, False
+    if isinstance(child, CompoundArgNode):
+        # a container place is no longer produced by the interpreter (see §8.1)
+        raise CompileError(
+            f'a flattened aggregate argument cannot be rebuilt: {child!r}'
+        )
     type = child.type if isinstance(child, sval.ComptimePtr) else sval.type_of(child)
     if type is None:
         raise CompileError(f'cannot rebuild the compile-time argument {child!r}')
@@ -1365,10 +1404,10 @@ def _union_contains(superset: sval.UnionType, subset: sval.UnionType) -> bool:
     return all(exception in superset.types for exception in subset.types)
 
 
-def _flatten_result_tree(tree: InterpVal | tuple) -> tuple[InterpVal, ...]:
+def _flatten_result_tree(tree: PlaceTree) -> tuple[InterpVal, ...]:
     """The leaf places of a (nested) result-location tree, in depth-first order."""
     out: list[InterpVal] = []
-    work: list[InterpVal | tuple] = [tree]
+    work: list[PlaceTree] = [tree]
     while work:
         item = work.pop()
         if isinstance(item, tuple):
@@ -1376,6 +1415,16 @@ def _flatten_result_tree(tree: InterpVal | tuple) -> tuple[InterpVal, ...]:
         else:
             out.append(item)
     return tuple(out)
+
+def _single_place(place: PlaceTree) -> InterpVal:
+    """The single place ``place`` is - requiring it not to be a tree of several
+    places, which has no single place for a value to be written into (see
+    ``HirRunner._loc_place``)."""
+    if isinstance(place, tuple):
+        raise CompileError(
+            'a single value cannot be written into a result location tree'
+        )
+    return place
 
 def _array_elem_type_of(value: InterpVal) -> sval.ArrayType | None:
     """The array type ``value`` points at, or None when it points at
@@ -1890,6 +1939,12 @@ class HirRunner:
                 # a flattened ``*args``/``**kwargs``: the callee rebuilds it as a
                 # synthesized struct, one field per element/entry (see §8.1)
                 return self._build_vararg_struct(node, mir_args)
+            case CompoundArgNode():
+                # a container place is no longer produced by the interpreter
+                # (see §8.1): a flattened aggregate cannot be bound to a parameter
+                raise CompileError(
+                    f'a flattened aggregate argument cannot be bound to a parameter: {node!r}'
+                )
             case _:
                 # a compile-time leaf (an ``sval.Value`` or a plain Python
                 # scalar): a const box holding the value, which is its place (no
@@ -1915,7 +1970,12 @@ class HirRunner:
         head = sval.StructTypeHead('$kwargs' if is_named else '$args')
         for name, entry in items:
             if entry.is_ref:
-                head.add_field(name, _arg_type_of(entry), is_ref=True)
+                field_type = _arg_type_of(entry)
+                if field_type is None:
+                    raise CompileError(
+                        'cannot determine the type of a by-reference argument of a call'
+                    )
+                head.add_field(name, field_type, is_ref=True)
                 continue
             obj = _to_comptime(entry.value)
             if obj is not None:
@@ -2007,6 +2067,13 @@ class HirRunner:
             return ComptimeVal(sval.ComptimePtr(place.obj.box, offset, base_type))
         if isinstance(place, RuntimeVal):
             mir_index = struct_type.get_field_mir_indices(self._mir_cache)[index]
+            if mir_index is None:
+                # only the first dynamically-sized field (the struct's flexible
+                # member) has a mirror position; every further one is inaccessible
+                raise CompileError(
+                    f"only the first dynamically-sized field of {struct_type} "
+                    f"can be accessed"
+                )
             return RuntimeVal(self._emit(mir.Gep(place.value, mir_index)), base_type)
         raise CompileError(f'cannot take the field storage of {place!r}')
 
@@ -2098,7 +2165,7 @@ class HirRunner:
             # of it can ever come back, which its lowered form says outright
             self._fn_instance.mir.ret_type = mir.NORETURN
 
-    def _commit_ret_places(self, node: RetSpec, place: InterpVal) -> None:
+    def _commit_ret_places(self, node: RetSpec, place: PlaceTree) -> None:
         """Commit the value place(s) mirroring the spec node ``node``: a leaf
         place is committed (through a hidden result pointer when the leaf says
         so), a group by pairing it with the place tree the caller reserved for
@@ -2108,8 +2175,10 @@ class HirRunner:
             case RetComptime():
                 # a compile-time result leaf: the place is a compile-time box of
                 # the leaf's type, committed so its value can be read back (§7.3)
+                assert not isinstance(place, tuple)
                 self._commit_pending_slot(place, node.type)
             case RetValue():
+                assert not isinstance(place, tuple)
                 self._commit_pending_slot(place, node.type, ptr=self._ret_leaf_ptr(node))
             case RetTuple(type=type, values=values):
                 assert not isinstance(type, sval.ResultType)
@@ -2168,7 +2237,7 @@ class HirRunner:
         assert isinstance(ret, ComptimeResultPtr)
         return ret
 
-    def _result_loc(self) -> InterpVal:
+    def _result_loc(self) -> PlaceTree:
         """The place the current frame's result is delivered into: the value
         part of the frame's result location (its error places are separate)."""
         return self._current_result_loc().value
@@ -2191,7 +2260,7 @@ class HirRunner:
         # the result spreads into its value, its error code and its payload, in
         # that order (the stack is popped last-in-first-out, so it is pushed in
         # reverse)
-        work: list[object] = [location.payload, location.code, location.value]
+        work: list[PlaceTree] = [location.payload, location.code, location.value]
         while work:
             place = work.pop()
             if isinstance(place, tuple):
@@ -2878,34 +2947,34 @@ class HirRunner:
             case hir.TuplePtrElement():
                 regs[inst] = self.tuple_ptr_element(self._loc_operand(inst.tuple_ptr), inst.index)
             case hir.Binary():
-                return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self._loc_operand(inst.ret))
+                return self._eval_binary(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), self._loc_place(inst.ret))
             case hir.Compare():
                 return self._eval_cmp(inst.op, self.operand_arg(inst.lhs), self.operand_arg(inst.rhs), inst)
             case hir.Not():
                 return self._eval_not(self.operand(inst.value), inst)
             case hir.Unary():
-                return self._eval_unary(inst.op, self.operand_arg(inst.operand), self._loc_operand(inst.ret))
+                return self._eval_unary(inst.op, self.operand_arg(inst.operand), self._loc_place(inst.ret))
             case hir.Ord():
-                return self._eval_ord(self.operand(inst.operand), self._loc_operand(inst.ret))
+                return self._eval_ord(self.operand(inst.operand), self._loc_place(inst.ret))
             case hir.CallInplace():
                 return self.call(self.operand(inst.callee), self.eval_call_args(inst.args), self._loc_operand(inst.ret))
             case hir.CallMethodInplace():
                 return self.call_method(self.operand(inst.base), inst.name, self.eval_call_args(inst.args), self._loc_operand(inst.ret))
             case hir.FieldAddr():
-                regs[inst] = self.exec_field_name_addr(self._loc_operand(inst.base), inst.name, inst.is_aggregate_init)
+                regs[inst] = self.exec_field_name_addr(self._loc_place(inst.base), inst.name, inst.is_aggregate_init)
             case hir.FieldIndexAddr():
                 regs[inst] = self.field_index_addr(
-                    self._loc_operand(inst.base), _index_value(inst.index), inst.is_aggregate_init
+                    self._loc_place(inst.base), _index_value(inst.index), inst.is_aggregate_init
                 )
             case hir.FinishStruct():
                 self.finish_struct(
                     self.operand(inst.struct),
-                    self._loc_operand(inst.dest),
+                    self._loc_place(inst.dest),
                     tuple(self.operand(v) for v in inst.indices),
                     frozendict((k, self.operand(v)) for k, v in inst.names.items()),
                 )
             case hir.FinishArray():
-                self.finish_array(self._loc_operand(inst.array), tuple(self.operand(e) for e in inst.elements))
+                self.finish_array(self._loc_place(inst.array), tuple(self.operand(e) for e in inst.elements))
             case hir.CommitSlot():
                 self._commit_pending_slot(self.operand(inst.slot))
             case hir.Slice():
@@ -3691,10 +3760,10 @@ class HirRunner:
             return
 
         match ptr:
-            case ComptimeVal(sval.ComptimePtr(box, offset, _)):
-                if not ptr.obj.is_writable():
+            case ComptimeVal(sval.ComptimePtr(box, offset, _) as cptr):
+                if not cptr.is_writable():
                     raise CompileError(
-                        f'cannot store through the read-only pointer {ptr.obj.type}'
+                        f'cannot store through the read-only pointer {cptr.type}'
                     )
                 if isinstance(box, bytes):
                     raise CompileError('cannot write through a byte-string pointer')
@@ -3728,10 +3797,10 @@ class HirRunner:
         cells."""
         elem_unit = elem.get_unit_value()
         match ptr:
-            case ComptimeVal(sval.ComptimePtr(box, offset, _)):
-                if not ptr.obj.is_writable():
+            case ComptimeVal(sval.ComptimePtr(box, offset, _) as cptr):
+                if not cptr.is_writable():
                     raise CompileError(
-                        f'cannot store through the read-only pointer {ptr.obj.type}'
+                        f'cannot store through the read-only pointer {cptr.type}'
                     )
                 if isinstance(box, bytes):
                     raise CompileError('cannot write through a byte-string pointer')
@@ -3850,7 +3919,7 @@ class HirRunner:
             raise CompileError('a function that returns several values must return them')
         self.store(location, ComptimeVal(sval.Void()))
 
-    def _loc_operand(self, loc: hir.FullResultLoc) -> InterpVal | tuple:
+    def _loc_operand(self, loc: hir.FullResultLoc) -> PlaceTree:
         """The place (or place tree) a HIR result location denotes: a
         ``ReturnLoc`` resolves to the current frame's result location tree (see
         §7.2), a Python tuple is a ``ResultLocTree`` whose leaves each resolve in
@@ -3859,7 +3928,17 @@ class HirRunner:
             return self._result_loc()
         if isinstance(loc, tuple):
             return tuple(self._loc_operand(child) for child in loc)
-        return self.operand(loc)
+        place = self.operand(loc)
+        if isinstance(place, _PlaceTreeVal):
+            # a nested ``TuplePtrElement`` register: its element is a place tree
+            return place.tree
+        return place
+
+    def _loc_place(self, loc: hir.FullResultLoc) -> InterpVal:
+        """The single place a HIR result location denotes - ``_loc_operand`` for
+        the instructions that write one value: a location that resolves to a
+        tree of several places has no single place for them to write into."""
+        return _single_place(self._loc_operand(loc))
 
     def _store_return_loc(self, value: InterpVal) -> None:
         """Deliver ``value`` into the current frame's result location (a ``hir.Store``
@@ -3881,7 +3960,7 @@ class HirRunner:
                         f'returning {len(target)}'
                     )
                 for place, leaf in zip(target, leaves):
-                    self.store(place, leaf)
+                    self.store(_single_place(place), leaf)
                 return
             if isinstance(target, PendingSlot) and target.committed is None:
                 # an untyped result location: type it as the leaves' places
@@ -3928,7 +4007,7 @@ class HirRunner:
                 assert unit is not None
                 payload_value = ComptimeVal(unit)
             else:
-                payload_value = ComptimeVal(sval.UndefinedScalar(child))
+                payload_value = ComptimeVal(sval.coerce_const(sval.UntypedUndefined(), child))
             return RuntimeVal(self._option_parts_to_runtime(option, is_null, payload_value), option)
         payload = _to_comptime(ev)
         if payload is not None:
@@ -4139,7 +4218,7 @@ class HirRunner:
         if unit is not None:
             return ComptimeVal(unit)
         if isinstance(value, ComptimeVal) and isinstance(value.obj, (sval.UndefinedScalar, sval.UndefinedAggregate, sval.UnionValue)):
-            return ComptimeVal(sval.UndefinedScalar(to_union))
+            return ComptimeVal(sval.UndefinedAggregate(to_union))
         assert isinstance(value, RuntimeVal)
         if value.type == to_union:
             return value
@@ -4711,8 +4790,21 @@ class HirRunner:
             if not isinstance(option, sval.OptionType):
                 raise CompileError('cannot use a null value as a runtime value')
             child = option.child
-            payload = ComptimeVal(child.get_unit_value()) if child.is_zst() else ComptimeVal(sval.UndefinedScalar(child))
+            if child.is_zst():
+                unit = child.get_unit_value()
+                assert unit is not None
+                payload = ComptimeVal(unit)
+            else:
+                payload = ComptimeVal(sval.coerce_const(sval.UntypedUndefined(), child))
             return self._option_parts_to_runtime(option, ComptimeVal(True), payload)
+        if isinstance(obj, sval.UndefinedAggregate):
+            # the undefined of an aggregate type: an ``undef`` of its mirror (the
+            # typed undefined of a scalar takes the same shape, see
+            # ``_sval_to_runtime``)
+            mir_type = obj.type.to_mir_type(self._mir_cache)
+            if mir_type is None:
+                raise _no_runtime_type(obj.type)
+            return mir.UndefValue(mir_type)
         if isinstance(obj, FunctionValue):
             # a source function value lowers to the address of its compiled
             # specialization (see §4.3)
@@ -4737,7 +4829,9 @@ class HirRunner:
             return self._const_pointer_to_mir(ComptimeVal(cptr), cptr.type)
         mir_type = cptr.type.to_mir_type(self._mir_cache)
         assert isinstance(mir_type, mir.PointerType)
-        ptr = self._emit(mir.Alloca(mir_type.elem))
+        elem_mir = mir_type.elem
+        assert isinstance(elem_mir, mir.Type)
+        ptr = self._emit(mir.Alloca(elem_mir))
         self.store(RuntimeVal(ptr, cptr.type), self.load(ComptimeVal(cptr)))
         return ptr
 
@@ -5189,7 +5283,8 @@ class HirRunner:
         if unit is None:
             raise CompileError(f'cannot take the function pointer of the non-zero-sized closure {struct_type}')
         slot = hir.Alloca(is_comptime=True)
-        args = tuple(ArgEntry(hir.Arg(i), True) for i in range(len(positional.by_id)))
+        arg_values: list[hir.Value] = [hir.Arg(i) for i in range(len(positional.by_id))]
+        args = tuple(ArgEntry(value, True) for value in arg_values)
         body: tuple[hir.Inst, ...] = (
             slot,
             hir.Store(slot, hir.Const(unit)),
@@ -5895,7 +5990,7 @@ class HirRunner:
 
     # -- calls ----------------------------------------------------------------
 
-    def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None) -> PollResult:
+    def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: PlaceTree, on_return: Callable[[], None] | None = None) -> PollResult:
         """Resolve one call by its callee value and run it.  Spy
         functions compile to a native ``call`` producing a typed
         register, plain Python functions are inlined, and the spy
@@ -5951,7 +6046,7 @@ class HirRunner:
         )
 
     def _call_builtin(
-        self, fn: sval.BuiltinFn, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal
+        self, fn: sval.BuiltinFn, args: RawArgList[ArgEntry[InterpVal]], ret: PlaceTree
     ) -> PollResult:
         """Evaluate one ``spy.*`` builtin at compile time and hand its
         result to the call's result location.  The arguments are first bound
@@ -5960,6 +6055,11 @@ class HirRunner:
         per declared positional parameter (defaults filled in), the excess
         positionals in ``varargs`` and the trailing keywords in ``kwargs``."""
         binded = fn.signature.bind(args, lambda e: ArgEntry(ComptimeVal(e), False))
+        if fn.name == 'atomic_cmpxchg':
+            # the one builtin that delivers a *tuple* (``(old, swapped)``), so the
+            # one that may be given a place tree as its result location
+            return self._builtin_atomic_cmpxchg(binded, ret)
+        ret = _single_place(ret)
         if fn.name == 'compile_log':
             parts: list[str] = []
             for arg in binded.varargs:
@@ -6021,8 +6121,6 @@ class HirRunner:
             return self._builtin_atomic_store(binded, ret)
         if fn.name == 'atomic_rmw':
             return self._builtin_atomic_rmw(binded, ret)
-        if fn.name == 'atomic_cmpxchg':
-            return self._builtin_atomic_cmpxchg(binded, ret)
         if fn.name == 'atomic_fence':
             return self._builtin_atomic_fence(binded, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
@@ -6354,7 +6452,7 @@ class HirRunner:
         return PollResult.AGAIN
 
     def _builtin_atomic_cmpxchg(
-        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+        self, args: ArgList[ArgEntry[InterpVal]], ret: PlaceTree
     ) -> PollResult:
         """``std.atomic.atomic_cmpxchg(ptr, expected, desired, success, failure,
         volatile)``: compare the pointee of ``ptr`` against ``expected`` and, on
@@ -6390,9 +6488,9 @@ class HirRunner:
                     f'of {len(ret)} place(s)'
                 )
             for place, result in zip(ret, results):
-                self.store(place, result)
+                self.store(_single_place(place), result)
         else:
-            self.store(ret, self._build_tuple_value(
+            self.store(_single_place(ret), self._build_tuple_value(
                 tuple(ArgEntry(result, False) for result in results),
             ))
         return PollResult.AGAIN
@@ -6731,9 +6829,14 @@ class HirRunner:
         align = self._alignof_value(type)
         layout = self._resolve_layout_type()
         parts = (size, align)
-        objs = tuple(_to_comptime(part) for part in parts)
-        if all(obj is not None for obj in objs):
-            return ComptimeVal(sval.AggregateValue(objs, layout))
+        objs: list[sval.AnyValue] = []
+        for part in parts:
+            obj = _to_comptime(part)
+            if obj is None:
+                break
+            objs.append(obj)
+        if len(objs) == len(parts):
+            return ComptimeVal(sval.AggregateValue(tuple(objs), layout))
         mir_type = layout.to_mir_type(self._mir_cache)
         assert isinstance(mir_type, mir.StructType)
         indices = layout.get_field_mir_indices(self._mir_cache)
@@ -7118,7 +7221,7 @@ class HirRunner:
         callee: InterpVal,
         fn_type: sval.FunctionType,
         args: RawArgList[ArgEntry[InterpVal]],
-        ret: InterpVal,
+        ret: PlaceTree,
         on_return: Callable[[], None] | None,
     ) -> PollResult:
         """A call through a runtime function pointer: the callee value is an
@@ -7206,6 +7309,7 @@ class HirRunner:
             # a compile-time variable: a fresh ``Box`` the stored values are
             # flattened into
             self._commit_box_slot(val, type)
+            assert val.committed is not None
             self._commit_place_tree(val.committed)
             return
         unit = type.get_unit_value()
@@ -7257,7 +7361,7 @@ class HirRunner:
         self._commit_pending_slot(slot, type)
         return _shallow_normalize(slot)
 
-    def _result_place_tree(self, place: InterpVal) -> InterpVal | tuple:
+    def _result_place_tree(self, place: InterpVal) -> PlaceTree:
         """The result tree a multi-value result location is made of (see
         ``_finish_function``): the element places an uncommitted slot recorded (a
         ``_PendingTuple``), or the place as it is (a single value) - the shape
@@ -7747,12 +7851,10 @@ class HirRunner:
             if not isinstance(key_value, bytes):
                 raise CompileError('a dict element key has to be a compile-time byte string')
             name = key_value.decode()
-            entry_index = base_type.elem.values.by_key.get(name) if hasattr(base_type.elem.values, 'by_key') else None
-            if entry_index is None:
-                candidates = list(base_type.elem.values.keys())
-                if name not in candidates:
-                    raise CompileError(f'the dict has no element named {name!r}')
-                entry_index = candidates.index(name)
+            candidates = list(base_type.elem.values.keys())
+            if name not in candidates:
+                raise CompileError(f'the dict has no element named {name!r}')
+            entry_index = candidates.index(name)
             self._frames[-1].regs[ret] = self.field_index_addr(base, _index_value(entry_index))
             return PollResult.AGAIN
         if (
@@ -8332,9 +8434,12 @@ class HirRunner:
             if _to_comptime(value) is None:
                 all_comptime = False
         if all_comptime:
-            objs = tuple(_to_comptime(value) for value in values)
-            assert all(obj is not None for obj in objs)
-            return ComptimeVal(sval.AggregateValue(objs, tuple_type))
+            objs: list[sval.AnyValue] = []
+            for value in values:
+                obj = _to_comptime(value)
+                assert obj is not None
+                objs.append(obj)
+            return ComptimeVal(sval.AggregateValue(tuple(objs), tuple_type))
         mir_type = tuple_type.to_mir_type(self._mir_cache)
         if not isinstance(mir_type, mir.StructType):
             raise CompileError(f'a value of the tuple {tuple_type} has no runtime representation')
@@ -8343,7 +8448,7 @@ class HirRunner:
             result = self._emit(mir.InsertValue(result, self._to_runtime(value), index))
         return RuntimeVal(result, tuple_type)
 
-    def init_tuple(self, location: InterpVal, length: int) -> None:
+    def init_tuple(self, location: PlaceTree, length: int) -> None:
         # a tuple is initialized into a place of its own: a still uncommitted
         # location records a fresh tuple of element places as a pending action,
         # so that the slot's type - and the conflict another store into it would
@@ -8378,13 +8483,16 @@ class HirRunner:
                 _PendingTuple(tuple(self.alloca() for _ in range(length))),
             )
 
-    def tuple_ptr_element(self, location: InterpVal | tuple, index: int) -> InterpVal:
+    def tuple_ptr_element(self, location: PlaceTree, index: int) -> InterpVal:
         # the place the index-th element of the tuple being initialized in
         # ``location`` is written through (see ``init_tuple``)
         if isinstance(location, tuple):
             if index < 0 or index >= len(location):
                 raise CompileError(f'the tuple has no element at index {index}')
-            return location[index]
+            element = location[index]
+            # a nested element is itself a place tree: it is carried through a
+            # register as one (see ``_PlaceTreeVal``)
+            return _PlaceTreeVal(element) if isinstance(element, tuple) else element
         location = _shallow_normalize(location)
         if isinstance(location, PendingSlot) and location.committed is None:
             recorded = self._pending_tuple(location)
@@ -8480,7 +8588,7 @@ class HirRunner:
         obj: Any,
         method_name: str,
         args: RawArgList[ArgEntry[InterpVal]],
-        ret: InterpVal,
+        ret: PlaceTree,
         on_return: Callable[[], None] | None,
     ) -> PollResult:
         """Call the function ``method_name`` of the compile-time object ``obj``
@@ -8514,7 +8622,7 @@ class HirRunner:
             return self.call(ComptimeVal(target), args, ret, on_return)
         raise CompileError(f'cannot call a method on the type {obj}')
 
-    def call_method(self, ptr: InterpVal, method_name: str, args: RawArgList[ArgEntry[InterpVal]], ret: InterpVal, on_return: Callable[[], None] | None = None) -> PollResult:
+    def call_method(self, ptr: InterpVal, method_name: str, args: RawArgList[ArgEntry[InterpVal]], ret: PlaceTree, on_return: Callable[[], None] | None = None) -> PollResult:
         base = _shallow_normalize(ptr)
         # ``Foo.m(...)`` / ``Foo[i32].m(x)`` - a method accessed through the
         # class name (or a plain class used as a namespace) - resolves the
@@ -8615,7 +8723,7 @@ class HirRunner:
         if isinstance(elem, sval.StrDictType):
             names = list(elem.values.keys())
         elif isinstance(elem, sval.StructType) and elem.head.name_base == '$kwargs':
-            names = list(elem.fields().by_id.keys())
+            names = list(elem.fields().keys)
         else:
             raise CompileError(f'cannot unpack {elem} by keyword')
         return frozendict(
@@ -8855,7 +8963,7 @@ class HirRunner:
         self,
         fn: FunctionValue,
         args: RawArgList[ArgEntry[InterpVal]],
-        ret: InterpVal,
+        ret: PlaceTree,
         generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
         on_return: Callable[[], None] | None = None,
         catch_unwind: bool = False,
@@ -8970,7 +9078,7 @@ class HirRunner:
         self._fn_req_resumer = None
         return resumer(self, fn_mir, ret_sig)
 
-    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal, call_sig: CallSignature, ret_sig: ReturnSignature, catch_unwind: bool = False, comptime_values: list[sval.AnyValue | None] | None = None) -> PollResult:
+    def _make_runtime_call(self, callee: mir.Value, args: ArgList[ArgEntry[InterpVal]], ret: PlaceTree, call_sig: CallSignature, ret_sig: ReturnSignature, catch_unwind: bool = False, comptime_values: list[sval.AnyValue | None] | None = None) -> PollResult:
         """Emit the native call of an already-resolved callee and hand its
         result to the call's result location.  A callee that cannot return
         normally (no value and no error, or no value at all) ends the current
@@ -9158,7 +9266,7 @@ class HirRunner:
         self,
         callee: mir.Value,
         mir_args: list[mir.Value],
-        ret_loc: InterpVal,
+        ret_loc: PlaceTree,
         spec: RetSpec,
         err_loc: tuple[InterpVal, InterpVal] | None = None,
         noreturn: bool = False,
@@ -9183,7 +9291,7 @@ class HirRunner:
         written into its place.  A ``noreturn`` call (``mir.NoReturn``) ends the
         block it is emitted into."""
         places: list[InterpVal] = []
-        packed: list[tuple[InterpVal, InterpVal | tuple]] = []
+        packed: list[tuple[InterpVal, PlaceTree]] = []
         if err_loc is None:
             self._pair_places(spec, ArgEntry(ret_loc, True), places, packed)
         else:
@@ -9206,7 +9314,12 @@ class HirRunner:
                     raise CompileError(
                         'the call delivered no compile-time result the callee returned'
                     )
-                self.store(place, ComptimeVal(comptime_values[leaf.index]))
+                value = comptime_values[leaf.index]
+                if value is None:
+                    raise CompileError(
+                        'the call delivered no compile-time result the callee returned'
+                    )
+                self.store(place, ComptimeVal(value))
                 continue
             if leaf.via_result_ptr:
                 target = place
@@ -9288,7 +9401,7 @@ class HirRunner:
         for target, tree in packed:
             self._deliver_packed_tuple(target, tree)
 
-    def _deliver_packed_tuple(self, target: InterpVal, tree: InterpVal | tuple) -> None:
+    def _deliver_packed_tuple(self, target: InterpVal, tree: PlaceTree) -> None:
         """Deliver a multi-value result packed into the single place ``target``
         (a call the caller gave neither a place per result nor a tuple target, see
         ``_pair_places``).  A still uncommitted slot records the tree's leaf places
@@ -9304,9 +9417,9 @@ class HirRunner:
     def _pair_places(
         self,
         node: RetSpec,
-        entry: ArgEntry[InterpVal],
+        entry: ArgEntry[PlaceTree],
         places: list[InterpVal],
-        packed: list[tuple[InterpVal, InterpVal | tuple]],
+        packed: list[tuple[InterpVal, PlaceTree]],
     ) -> None:
         """Pair the results of ``node`` with the place tree the caller reserved: a
         single result takes the place ``entry`` denotes, a group takes a (nested)
@@ -9340,7 +9453,7 @@ class HirRunner:
                 tree = self._fresh_places(node, places)
                 packed.append((target, tree))
 
-    def _fresh_places(self, node: RetSpec, places: list[InterpVal]) -> InterpVal | tuple:
+    def _fresh_places(self, node: RetSpec, places: list[InterpVal]) -> PlaceTree:
         """Fresh places for a group packed into a single location: a (nested)
         Python tuple of places mirroring the shape of the results, with the leaf
         places appended to ``places`` in depth-first order."""
@@ -9380,7 +9493,7 @@ class HirRunner:
         body: tuple[hir.Inst, ...],
         arg_is_ref: tuple[bool, ...],
         args: ArgList[ArgEntry[InterpVal]],
-        ret: InterpVal,
+        ret: PlaceTree,
         fn_name: str,
         generic_var_values: frozendict[sval.TypeVar, sval.AnyValue] | None = None,
         value_is_empty: bool = False,
