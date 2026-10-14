@@ -1,8 +1,6 @@
 # spy 特性清单
 
 本文档列举 **当前代码**（`spy/spy/compiler` + `spy/spy/std`）已经实现的语言特性与可观察行为。
-它取代过时的 `README.md`，反映 comptime 重构之后的状态；行为规格的完整推导见
-`doc/archive/comptime-refactor/behaviour.md`（已归档），已知缺陷见 `doc/issues.md`。
 
 > 说明：本文按「语言表面」组织——即一个 spy 程序员能写出的东西及其语义。
 > 编译器内部各阶段如何实现这些行为见 `doc/implementation.md`。

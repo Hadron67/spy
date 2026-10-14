@@ -1,17 +1,19 @@
 # spy - System Python
 
-`spy` 是一个把 Python 函数 **JIT 编译成机器码**的包。写法和普通 Python 一样——用 `@spy.func()` 装饰一个函数即可注册；首次调用时按实参的类型编译出一个**特化**，之后的每次调用都是原生调用，不再经过 Python。函数体在编译期以具体类型「运行」，因此支持类似 Zig 的 **comptime** 语义（`spy.typeof`、编译期 `if`、泛型、内联普通 Python 函数等）。
+[中文文档](README_zh.md)
 
-函数必须定义在真实源码文件中（编译需要函数的源码，交互式环境里无法使用）。
+`spy` is a package that **JIT-compiles Python functions into machine code**. You write ordinary Python — just decorate a function with `@spy.func()` to register it; on the first call, a **specialized** version is compiled for the types of the actual arguments, and every call after that is a native call that never goes through Python again. The function body is "executed" at compile time with concrete types, so Zig-like **comptime** semantics are supported (`spy.typeof`, compile-time `if`, generics, inlining ordinary Python functions, etc.).
 
-## 示例
+Functions must be defined in real source files (compilation needs the function's source, so interactive environments are not supported).
+
+## Example
 
 ```python
 from spy.compiler import func, u64
 from spy.compiler import as_ as spy_as
 
 
-@func()                         # 注册；首次调用时编译
+@func()                         # register; compiled on first call
 def add[T](a: T, b: T) -> T:
     return a + b
 
@@ -21,19 +23,17 @@ def add_u64(a: u64, b: u64) -> u64:
     return a + b
 
 
-print(add(1, 2))                                  # 编译 add(i64, i64)
-print(add(1.5, 2.25))                             # 编译 add(f64, f64)
+print(add(1, 2))                                  # compiles add(i64, i64)
+print(add(1.5, 2.25))                             # compiles add(f64, f64)
 print(add_u64(spy_as(2**63 - 1, u64), spy_as(2, u64)))
 ```
 
-详细的特性文档见[doc/features.md](doc/features.md)。
+See [doc/en/features.md](doc/en/features.md) for detailed feature documentation.
 
-## 项目结构
+## Project structure
 
-- [doc/](doc/) — 文档
-- [doc/features.md](doc/features.md) — 语言特性清单（可观察行为）
-- [doc/implementation.md](doc/implementation.md) — 编译器实现说明
-- [spy/](spy/) — Python 包
-- [spy/compiler/](spy/compiler/) — 编译器：Python 源码 → 机器码
-- [spy/std/](spy/std/) — 标准库
-- [spy/tests/](spy/tests/) — 集成测试
+- [doc/](doc/) — documentation
+- [spy/](spy/) — the Python package
+- [spy/compiler/](spy/compiler/) — the compiler: Python source → machine code
+- [spy/std/](spy/std/) — standard library
+- [spy/tests/](spy/tests/) — integration tests
