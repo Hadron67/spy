@@ -3,15 +3,18 @@ from unittest import TestCase
 
 from ..compiler import i32, syntax
 from ..compiler.dsl import func, func_type, struct
-from ..compiler.syntax import Comptime, Option, Ptr, as_func_ptr, ref
+from ..compiler.syntax import Comptime, ConstComptime, Option, Ptr, as_func_ptr, ref
 
 # ---------------------------------------------------------------------------
-# compile-time pointers as arguments of a *non-inline* function: a compile-time
-# pointer (the address of a ``Comptime`` variable, of its field, or of a
-# compile-time aggregate/tuple/option/union) passed to a compiled function is
-# carried as a ``fn.ComptimePtrArg`` - the pointee is copied into the callee on
-# every call, so the callee can never alias (nor write back to) the caller's
-# place.  The same applies to a closure capture of a compiled closure.
+# compile-time pointers crossing a *non-inline* boundary: a compile-time pointer
+# to a mutable ``Comptime`` variable is a ``ComptimePtr`` into a mutable
+# compile-time box, and lowering it to a runtime value/address is now rejected
+# (``cannot use a pointer to a mutable compile-time variable as a runtime
+# value``).  A *const* pointer - the address of a ``ConstComptime`` variable -
+# does cross: it is lowered to a global static constant the callee points at
+# (see the behaviour doc §4.2/§4.3).  The old ``fn.ComptimePtrArg`` (which
+# copied the pointee into the callee on every call) is gone, so the callee
+# aliases the caller's global constant instead of a copy.
 # ---------------------------------------------------------------------------
 
 
@@ -40,30 +43,23 @@ def take_i32(p: Ptr[i32]) -> i32:
 
 
 @func()
-def bump_i32(p: Ptr[i32]) -> i32:
-    p[...] = p[...] + 1
-    return p[...]
-
-
-@func()
 def comptime_ptr_scalar() -> i32:
     n: Comptime = 5
-    return take_i32(ref(n))
-
-
-@func()
-def comptime_ptr_scalar_is_copied() -> i32:
-    # the callee writes to its own copy: ``n`` is left alone
-    n: Comptime = 5
-    bumped = bump_i32(ref(n))
-    return bumped * 100 + n
+    const_n: ConstComptime[i32] = n
+    return take_i32(ref(const_n))
 
 
 @func()
 def comptime_ptr_in_a_comptime_local() -> i32:
     n: Comptime = 5
-    p: Comptime = ref(n)
+    const_n: ConstComptime[i32] = n
+    p: Comptime = ref(const_n)
     return take_i32(p)
+
+
+# (the old ``comptime_ptr_scalar_is_copied`` / ``test_the_pointee_is_copied`` is
+# gone: the callee no longer gets a copy of the pointee - ``fn.ComptimePtrArg``
+# was removed - so there is no write-back-not-visible behavior to test)
 
 
 # -- aggregate pointee ------------------------------------------------------
@@ -77,13 +73,15 @@ def take_little(p: Ptr[Little]) -> i32:
 @func()
 def comptime_ptr_aggregate() -> i32:
     s: Comptime = Little(1, 2)
-    return take_little(ref(s))
+    const_s: ConstComptime[Little] = s
+    return take_little(ref(const_s))
 
 
 @func()
 def comptime_ptr_aggregate_in_a_local() -> i32:
     s: Comptime = Little(1, 2)
-    p: Comptime = ref(s)
+    const_s: ConstComptime[Little] = s
+    p: Comptime = ref(const_s)
     return take_little(p)
 
 
@@ -98,7 +96,8 @@ def take_ptr_ptr_i32(p: Ptr[Ptr[i32]]) -> i32:
 @func()
 def comptime_ptr_nested() -> i32:
     n: Comptime = 5
-    p: Comptime = ref(n)
+    const_n: ConstComptime[i32] = n
+    p: ConstComptime[Ptr[i32]] = ref(const_n)
     return take_ptr_ptr_i32(ref(p))
 
 
@@ -113,7 +112,8 @@ def take_tuple_ptr(p: Ptr[tuple[i32, i32]]) -> i32:
 @func()
 def comptime_ptr_tuple() -> i32:
     t: Comptime = (3, 4)
-    return take_tuple_ptr(ref(t))
+    const_t: ConstComptime = t
+    return take_tuple_ptr(ref(const_t))
 
 
 # -- option pointee ---------------------------------------------------------
@@ -129,16 +129,20 @@ def take_option_ptr(p: Ptr[Option[i32]]) -> i32:
 @func()
 def comptime_ptr_option_present() -> i32:
     o: Comptime[Option[i32]] = 5
-    return take_option_ptr(ref(o))
+    const_o: ConstComptime[Option[i32]] = o
+    return take_option_ptr(ref(const_o))
 
 
 @func()
 def comptime_ptr_option_absent() -> i32:
     o: Comptime[Option[i32]] = None
-    return take_option_ptr(ref(o))
+    const_o: ConstComptime[Option[i32]] = o
+    return take_option_ptr(ref(const_o))
 
 
 # -- tagged union pointee ---------------------------------------------------
+# a fully compile-time tagged union is a compile-time aggregate: build the
+# variant in a ``Comptime`` variable, then take a const pointer to it
 
 
 @func()
@@ -150,19 +154,23 @@ def take_union_ptr(p: Ptr[V_A | V_B]) -> i32:
 
 @func()
 def comptime_ptr_union() -> i32:
-    u: Comptime[V_A | V_B] = V_A(5)
-    return take_union_ptr(ref(u))
+    v: Comptime = V_A(5)
+    u: Comptime[V_A | V_B] = v
+    const_u: ConstComptime[V_A | V_B] = u
+    return take_union_ptr(ref(const_u))
 
 
 @func()
 def comptime_ptr_union_other_variant() -> i32:
-    u: Comptime[V_A | V_B] = V_B(9)
-    return take_union_ptr(ref(u))
+    v: Comptime = V_B(9)
+    u: Comptime[V_A | V_B] = v
+    const_u: ConstComptime[V_A | V_B] = u
+    return take_union_ptr(ref(const_u))
 
 
 # -- an option/union field whose tag is only known at runtime ---------------
-# a nested runtime-tag option/union is materialized as one runtime value (see
-# ``_val_to_node`` and ``pending-problems.md`` #1)
+# a runtime-tag option/union is a whole runtime value, so it lives in a plain
+# variable (see the behaviour doc §5.3)
 
 
 @struct()
@@ -185,9 +193,8 @@ def take_with_opt_ptr(p: Ptr[WithOpt]) -> i32:
 @func()
 def comptime_ptr_runtime_tag_option(n: i32) -> i32:
     # ``n`` coerces to a runtime ``Option[i32]`` (its tag is only known at
-    # runtime): the field of the compile-time ``s`` holds it, and ``ref(s)``
-    # carries the whole option over as one runtime value
-    s: Comptime = WithOpt(n)
+    # runtime): the field of the runtime ``s`` holds it
+    s: WithOpt = WithOpt(n)
     return take_with_opt_ptr(ref(s))
 
 
@@ -201,7 +208,7 @@ def take_with_union_ptr(p: Ptr[WithUnion]) -> i32:
 @func()
 def comptime_ptr_runtime_tag_union(u: V_A | V_B) -> i32:
     # ``u`` is a runtime tagged union (its tag is only known at runtime)
-    s: Comptime = WithUnion(u)
+    s: WithUnion = WithUnion(u)
     return take_with_union_ptr(ref(s))
 
 
@@ -234,22 +241,9 @@ def compiled_closure_captures_a_comptime_aggregate() -> i32:
 
 
 @func()
-def compiled_closure_mutates_its_captured_copy() -> i32:
-    # the closure writes to its own copy of ``s``: the outer ``s`` is left alone
-    s: Comptime = Little(1, 2)
-
-    @syntax.closure(inline=False)
-    def f() -> i32:
-        s.a = 100
-        return s.a + s.b
-
-    return f() * 1000 + s.a
-
-
-@func()
 def compiled_closure_captures_a_comptime_tuple() -> i32:
     # a captured tuple is a compile-time pointer of its own: the capture is
-    # rebuilt as a place tree (see ``ComptimeTuplePtr``)
+    # baked into the closure's struct type (see the behaviour doc §9.3)
     t: Comptime = (3, 4)
 
     @syntax.closure(inline=False)
@@ -259,11 +253,17 @@ def compiled_closure_captures_a_comptime_tuple() -> i32:
     return f()
 
 
+# (the old ``compiled_closure_mutates_its_captured_copy`` /
+# ``test_a_compiled_closure_mutates_its_captured_copy`` is gone: the capture no
+# longer copies the pointee, so a compiled closure cannot mutate a private
+# copy of a captured compile-time place)
+
+
 @func()
 def compiled_closure_captures_a_tuple_with_a_runtime_element(x: i32) -> i32:
-    # the tuple's runtime element is copied in as a MIR argument, its compile-time
-    # element rides along as compile-time content (see ``ComptimePtrArg``)
-    t: Comptime = (x, 5)
+    # a tuple of runtime values is a plain runtime value: the closure captures
+    # it like any other runtime variable
+    t = (x, x + 5)
 
     @syntax.closure(inline=False)
     def f() -> i32:
@@ -274,7 +274,7 @@ def compiled_closure_captures_a_tuple_with_a_runtime_element(x: i32) -> i32:
 
 @func()
 def compiled_closure_captures_an_aggregate_with_a_runtime_element(x: i32) -> i32:
-    s: Comptime = Little(x, 2)
+    s = Little(x, 2)
 
     @syntax.closure(inline=False)
     def f() -> i32:
@@ -294,7 +294,7 @@ class OneFn(Protocol):
 @func()
 def comptime_capture_as_func_ptr() -> i32:
     # a compile-time capture needs no runtime parameter, so it is baked into the
-    # specialization and the closure is still an ordinary runtime function
+    # specialization and the closure is an ordinary runtime function
     n: Comptime = 5
 
     @syntax.closure(inline=False)
@@ -306,16 +306,13 @@ def comptime_capture_as_func_ptr() -> i32:
 
 
 class SpyComptimePtrTest(TestCase):
-    """Compile-time pointers passed to a non-inline function (and closure
-    captures of a compiled closure): the pointee is copied at every call, so the
-    callee never aliases - nor writes back to - the caller's place."""
+    """Compile-time pointers crossing a non-inline boundary: a pointer to a
+    mutable ``Comptime`` variable cannot be lowered to a runtime value, while a
+    const pointer to a ``ConstComptime`` variable lowers to a global static
+    constant the callee aliases (see the behaviour doc §4.2/§4.3)."""
 
     def test_a_scalar_pointee(self) -> None:
         self.assertEqual(comptime_ptr_scalar(), 6)
-
-    def test_the_pointee_is_copied(self) -> None:
-        # ``bump_i32`` increments its own copy; the compile-time ``n`` is unchanged
-        self.assertEqual(comptime_ptr_scalar_is_copied(), 605)
 
     def test_a_pointer_in_a_comptime_local(self) -> None:
         self.assertEqual(comptime_ptr_in_a_comptime_local(), 6)
@@ -354,14 +351,11 @@ class SpyComptimePtrTest(TestCase):
     def test_a_compiled_closure_captures_a_comptime_aggregate(self) -> None:
         self.assertEqual(compiled_closure_captures_a_comptime_aggregate(), 3)
 
-    def test_a_compiled_closure_mutates_its_captured_copy(self) -> None:
-        self.assertEqual(compiled_closure_mutates_its_captured_copy(), 102001)
-
     def test_a_compiled_closure_captures_a_comptime_tuple(self) -> None:
         self.assertEqual(compiled_closure_captures_a_comptime_tuple(), 7)
 
     def test_a_compiled_closure_captures_a_tuple_with_a_runtime_element(self) -> None:
-        self.assertEqual(compiled_closure_captures_a_tuple_with_a_runtime_element(10), 15)
+        self.assertEqual(compiled_closure_captures_a_tuple_with_a_runtime_element(10), 25)
 
     def test_a_compiled_closure_captures_an_aggregate_with_a_runtime_element(self) -> None:
         self.assertEqual(

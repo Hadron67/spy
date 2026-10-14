@@ -9,9 +9,6 @@ from ..compiler import (
     void,
 )
 from ..compiler.dsl import func
-from ..compiler.syntax import (
-    Comptime,
-)
 from .structs import Large, Small, struct_mirror
 
 # ---------------------------------------------------------------------------
@@ -19,7 +16,10 @@ from .structs import Large, Small, struct_mirror
 # returns one value per element of the tuple.  The lowered function returns
 # one of them by value and delivers every other one through a hidden result
 # pointer (see ``sval.make_ret_spec``); the caller either destructures the
-# call (``a, b = f()``) or keeps the packed results in a ``Comptime`` variable.
+# call (``a, b = f()``) or keeps the packed results in a plain tuple variable
+# (a tuple has a runtime representation now, so packing is a plain assignment;
+# only when some result leaf is compile-time does the target have to be a
+# ``Comptime`` variable, see doc/comptime-refactor.task.md 7.3).
 # ---------------------------------------------------------------------------
 
 
@@ -58,10 +58,10 @@ def use_forward_min_max(a: i32, b: i32) -> i32:
 
 
 @func()
-def comptime_multi(a: i32) -> i32:
-    # the packed result of a call has no runtime type of its own: a ``Comptime``
-    # variable is the only place that can hold it
-    packed: Comptime = min_max(a, a + 1)
+def packed_multi(a: i32) -> i32:
+    # every result leaf is a runtime value, so the packed result is a plain
+    # tuple value: a plain variable can hold it
+    packed = min_max(a, a + 1)
     lo, hi = packed
     return lo * 100 + hi
 
@@ -140,10 +140,13 @@ def use_forward_nested_multi(x: i32) -> i32:
 
 
 @func()
-def comptime_nested_multi(x: i32) -> i32:
-    packed: Comptime = nested_multi(x)
-    n, (m, large), small = packed
-    return n * 100000 + m * 10000 + large.d * 100 + small.b
+def packed_nested_multi(x: i32) -> i32:
+    # a packed multi-value result is a tuple of the result *leaves*, so a nested
+    # result is packed flat (the grouping is only kept by a direct destructuring
+    # of the call, see ``test_nested_destructuring``)
+    packed = nested_multi(x)
+    n, m, large, small = packed  # pyright: ignore
+    return n * 100000 + m * 10000 + large.d * 100 + small.b  # pyright: ignore
 
 
 @func()
@@ -163,11 +166,12 @@ def python_nested_pair(a: i64, b: i64) -> tuple[i64, tuple[i64, i64], i64]:
 
 
 @func()
-def bad_group_target(x: i32) -> i32:
-    # a group the caller does not unpack into a tuple target: packing it into
-    # a single place of its own is not supported yet (pyright cannot tell)
-    _n, _inner, _small = nested_multi(x)
-    return x
+def group_target_held_whole(x: i32) -> i32:
+    # a group the caller does not unpack further: the inner ``tuple[...]`` is a
+    # runtime value of its own now, so it can be held in a plain variable (it
+    # used to have to be unpacked into a tuple target)
+    _n, inner, _small = nested_multi(x)
+    return inner[0] + inner[1].d
 
 
 @func()
@@ -182,11 +186,12 @@ def bad_nested_ellipsis(x: i32) -> tuple[i32, tuple[i32, ...]]:
 
 
 @func()
-def bad_multi_assign(x: i32) -> i32:
-    # a packed result into a variable that is not ``Comptime``: pyright cannot
-    # tell, hence the ignore
-    _packed = min_max(x, x + 1)
-    return x
+def packed_multi_assign(x: i32) -> i32:
+    # a packed multi-value result into a plain variable: allowed now that the
+    # tuple has a runtime representation (only a compile-time result leaf would
+    # force a ``Comptime`` variable)
+    packed = min_max(x, x + 1)
+    return packed[0] * 100 + packed[1]
 
 
 @func()
@@ -204,7 +209,7 @@ def bad_ellipsis_return(x: i32) -> tuple[i32, ...]:
 # the same multi-value returns without a declared annotation: the arity and the
 # types are inferred from the body's result location, exactly like a
 # single-value return (see ``interp``).  A tuple literal, a forwarded
-# multi-value call and a packed ``Comptime`` value all become the element places
+# multi-value call and a packed tuple value all become the element places
 # of the result location, which then takes the same convention an annotation
 # would have fixed.
 # ---------------------------------------------------------------------------
@@ -238,9 +243,9 @@ def use_infer_forward(a: i32, b: i32) -> i32:
 
 @func()
 def infer_packed(a: i32, b: i32):
-    # a packed ``Comptime`` value (pyright cannot tell)
-    packed: Comptime = min_max(a, b)
-    return packed  # pyright: ignore
+    # a packed tuple value returned from a function with no return annotation
+    packed = min_max(a, b)
+    return packed
 
 
 @func()
@@ -310,66 +315,70 @@ def bad_infer_falloff(a: i32):
 
 
 # ---------------------------------------------------------------------------
-# a packed tuple is a compile-time place tree: its element count is known with
+# a packed tuple is a runtime aggregate: its element count is known with
 # ``len`` (a compile-time integer), and its i-th element is a *place* read and
-# written with ``t[i]`` (a compile-time integer index, bounds-checked).
+# written with ``t[i]`` (a compile-time integer index, bounds-checked).  The
+# packed tuple is flat: one element per result leaf (a nested result is packed
+# leaf by leaf).
 # ---------------------------------------------------------------------------
 
 
 @func()
 def packed_len(x: i32) -> i32:
-    packed: Comptime = min_max(x, x + 1)
-    return len(packed)  # pyright: ignore
+    packed = min_max(x, x + 1)
+    return len(packed)
 
 
 @func()
 def nested_packed_len(x: i32) -> i32:
-    packed: Comptime = nested_multi(x)
-    return len(packed)  # pyright: ignore
+    # one element per result leaf: the nested result has four of them
+    packed = nested_multi(x)
+    return len(packed)
 
 
 @func()
 def packed_index(x: i32) -> i32:
-    packed: Comptime = min_max(x, x + 100)
-    return packed[0] * 1000 + packed[1]  # pyright: ignore
+    packed = min_max(x, x + 100)
+    return packed[0] * 1000 + packed[1]
 
 
 @func()
 def packed_nested_index(x: i32) -> i32:
-    packed: Comptime = nested_multi(x)
-    return packed[0] * 100 + packed[1][0]  # pyright: ignore
+    # a flat packed tuple: leaf 0 is the leading scalar, leaf 1 the inner one
+    packed = nested_multi(x)
+    return packed[0] * 100 + packed[1]  # pyright: ignore
 
 
 @func()
 def packed_index_write(x: i32) -> i32:
-    packed: Comptime = min_max(x, x + 1)
+    packed = min_max(x, x + 1)
     packed[0] = 100  # pyright: ignore
-    return packed[0] + packed[1]  # pyright: ignore
+    return packed[0] + packed[1]
 
 
 @func()
 def bad_packed_index_oob(x: i32) -> i32:
-    packed: Comptime = min_max(x, x + 1)
+    packed = min_max(x, x + 1)
     return packed[5]  # pyright: ignore
 
 
 @func()
 def bad_packed_index_runtime(x: i32) -> i32:
-    packed: Comptime = min_max(x, x + 1)
-    return packed[x]  # pyright: ignore
+    packed = min_max(x, x + 1)
+    return packed[x]
 
 
 @func()
 def bad_packed_index_negative(x: i32) -> i32:
-    packed: Comptime = min_max(x, x + 1)
-    return packed[-1]  # pyright: ignore
+    packed = min_max(x, x + 1)
+    return packed[-1]
 
 
 class SpyMultiReturnTest(TestCase):
     """A function annotated ``-> tuple[T1, T2, ...]`` returns several values:
     the lowered function returns one of them by value and delivers every other
     one through a hidden result pointer (see ``sval.make_ret_spec``), and the
-    caller destructures the call or keeps the packed results in a ``Comptime``
+    caller destructures the call or keeps the packed results in a plain tuple
     variable."""
 
     def test_destructuring_two_scalars(self) -> None:
@@ -390,8 +399,8 @@ class SpyMultiReturnTest(TestCase):
         # result into the enclosing function's own result location
         self.assertEqual(use_forward_min_max(2, 7), 207)
 
-    def test_packed_into_a_comptime_variable(self) -> None:
-        self.assertEqual(comptime_multi(2), 203)
+    def test_packed_into_a_plain_variable(self) -> None:
+        self.assertEqual(packed_multi(2), 203)
 
     def test_python_side_call(self) -> None:
         # the Python side allocates the storage of the result pointers and
@@ -436,15 +445,16 @@ class SpyMultiReturnTest(TestCase):
     def test_forwarding_a_nested_multi_value_call(self) -> None:
         self.assertEqual(use_forward_nested_multi(3), 340305)
 
-    def test_nested_packed_into_a_comptime_variable(self) -> None:
-        self.assertEqual(comptime_nested_multi(3), 340305)
+    def test_nested_packed_into_a_plain_variable(self) -> None:
+        self.assertEqual(packed_nested_multi(3), 340305)
 
     def test_python_side_call_of_a_nested_return(self) -> None:
         self.assertEqual(python_nested_pair(2, 7), (2, (7, 9), 7))
 
-    def test_a_group_target_that_is_not_a_tuple_is_rejected(self) -> None:
-        with self.assertRaises(CompileError):
-            bad_group_target(3)
+    def test_a_group_held_in_a_plain_variable(self) -> None:
+        # a nested tuple result kept whole in a plain variable (a tuple is a
+        # runtime value now); it used to have to be unpacked into a tuple target
+        self.assertEqual(group_target_held_whole(3), 7)
 
     def test_nested_arity_mismatch_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
@@ -492,9 +502,10 @@ class SpyMultiReturnTest(TestCase):
         self.assertEqual(args, (mir.IntType(32, True),))
         self.assertEqual(ret, mir.IntType(32, True))
 
-    def test_packing_into_a_plain_variable_is_rejected(self) -> None:
-        with self.assertRaises(CompileError):
-            bad_multi_assign(3)
+    def test_packing_into_a_plain_variable(self) -> None:
+        # every result is a runtime value, so the packed tuple goes into a plain
+        # variable (the old "only a ``Comptime`` variable" rule is gone)
+        self.assertEqual(packed_multi_assign(3), 304)
 
     def test_arity_mismatch_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
@@ -508,7 +519,8 @@ class SpyMultiReturnTest(TestCase):
         self.assertEqual(packed_len(3), 2)
 
     def test_len_of_a_nested_packed_tuple(self) -> None:
-        self.assertEqual(nested_packed_len(3), 3)
+        # a packed result is flat: one element per result leaf (four here)
+        self.assertEqual(nested_packed_len(3), 4)
 
     def test_indexing_a_packed_tuple(self) -> None:
         self.assertEqual(packed_index(3), 3103)
@@ -556,7 +568,7 @@ class SpyInferredMultiReturnTest(TestCase):
     def test_forwarding_a_multi_value_call(self) -> None:
         self.assertEqual(use_infer_forward(2, 7), 207)
 
-    def test_packed_into_a_comptime_variable(self) -> None:
+    def test_packed_into_a_plain_variable(self) -> None:
         self.assertEqual(use_infer_packed(2, 7), 207)
 
     def test_mixed_aggregate_results(self) -> None:

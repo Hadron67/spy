@@ -262,8 +262,8 @@ def tu_ptr_driver() -> i32:
 
 @func()
 def tu_comptime() -> i32:
-    # a declared ``Comptime`` tagged union: its own place form (see
-    # ``ComptimeTaggedUnionPtr``)
+    # a declared ``Comptime`` tagged union: a fully compile-time union value,
+    # held in the compile-time box (a ``sval.TaggedUnionValue``)
     u: Comptime[TU_A | TU_B] = TU_A(2)
     if isinstance(a := u, TU_A):
         return a.x
@@ -274,10 +274,10 @@ def tu_comptime() -> i32:
 
 @func()
 def tu_comptime_reassigned(x: i32) -> i32:
-    # a second assignment that switches the variant rebuilds the payload place,
-    # which has no ``CommitSlot`` of its own and is committed when the
-    # construction closes (a runtime payload lands in memory)
-    u: Comptime[TU_A | TU_B] = TU_A(2)
+    # switching a compile-time union to a variant with a *runtime* payload is
+    # rejected: a runtime value cannot be stored into a compile-time variable
+    u: Comptime[TU_A | TU_B]
+    u = TU_A(2)
     u = TU_B(x)
     if isinstance(b := u, TU_B):
         return b.y
@@ -445,8 +445,10 @@ class SpyTaggedUnionTest(TestCase):
         self.assertEqual(tu_comptime(), 2)
 
     def test_compile_time_storage_reassigned(self) -> None:
-        # a second assignment that switches the variant
-        self.assertEqual(tu_comptime_reassigned(7), 7)
+        # switching to a runtime payload is rejected; a compile-time payload may
+        # still switch the variant
+        with self.assertRaises(CompileError):
+            tu_comptime_reassigned(7)
         self.assertEqual(tu_comptime_reassigned_comptime(), 7)
 
     def test_typeof(self) -> None:

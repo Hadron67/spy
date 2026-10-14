@@ -207,11 +207,17 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
         # keeps the unsigned variants from wrapping ``n - 1``)
         if n > 0:
             lastiter: i32 = 0
-            lower = coerce(0, LT)
-            upper = int_cast(n - 1, LT)
-            stride = coerce(0, ST)
+            # the schedule bookkeeping and the index are runtime storage: the
+            # runtime writes ``lower``/``upper``/``stride`` through the pointers
+            # passed to ``init_fn``, and ``i`` advances in a runtime loop (an
+            # unannotated local whose stores are all compile-time would be a
+            # compile-time box, whose address cannot cross to a runtime call - see
+            # the behaviour doc §3.3/§4.2)
+            lower: LT = coerce(0, LT)
+            upper: LT = int_cast(n - 1, LT)
+            stride: ST = coerce(0, ST)
             init_fn(_ident(), gtid[...], _SCHED_STATIC, ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
-            i = lower
+            i: LT = lower
             while i <= upper:
                 ptr_cast(kernel, Ptr[K])[...](i)
                 i += 1

@@ -14,7 +14,7 @@ from ..compiler import (
     u8,
     usize,
 )
-from ..compiler.syntax import ConstComptime, Opaque, as_func_ptr, closure, comptime, ptr_cast
+from ..compiler.syntax import Comptime, ConstComptime, Opaque, as_func_ptr, closure, comptime, ptr_cast, ref
 from .c import free, malloc, realloc
 from .core import SlicePtr, panic, sstr, undefined
 

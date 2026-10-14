@@ -212,10 +212,12 @@ class FieldAddr(Inst):
 
     ``is_aggregate_init`` marks the field addresses a construction
     writes through: the base is then the storage the aggregate is built
-    in, which may still be an uncommitted slot - the field then gets a
-    pending place of its own (see ``FieldIndexAddr``)."""
+    in, which may still be an uncommitted slot - or the function's own result
+    location (a ``ReturnLoc``, a struct constructed straight into the result,
+    see ``FullResultLoc``) - the field then gets a pending place of its own
+    (see ``FieldIndexAddr``)."""
 
-    base: Value
+    base: FullResultLoc
     name: str
     is_aggregate_init: bool = False
 
@@ -234,9 +236,11 @@ class FieldIndexAddr(Inst):
     type of an aggregate being built is not known until it is closed -
     the field/element gets a pending place of its own, which the
     ``FinishStruct``/``FinishArray`` closing the construction turns into
-    the address of its field/element (see ``interp``)."""
+    the address of its field/element (see ``interp``).  The base may also be
+    the function's own result location (a ``ReturnLoc``, see
+    ``FullResultLoc``)."""
 
-    base: Value
+    base: FullResultLoc
     index: int
     is_aggregate_init: bool = False
 

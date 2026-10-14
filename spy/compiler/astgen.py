@@ -56,8 +56,10 @@ import ast
 import builtins
 import inspect
 import textwrap
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Literal, TypeVar, cast, get_args, get_origin
 
 from . import hir, syntax
@@ -310,6 +312,14 @@ class _Builder:
         enclosing ``_gen_closure`` invocation, so the place is recorded as a
         :class:`_CaptureField` and materialized when that invocation builds its
         ``hir.MakeClosure``."""
+        # the reader's own frame is the innermost *closure* scope, which is not
+        # necessarily the innermost scope: a plain block (an ``if`` branch, a
+        # loop body) opened inside the closure body sits above it
+        own_frame = -1
+        for i in range(len(self._scopes) - 1, -1, -1):
+            if isinstance(self._scopes[i], _ClosureScope):
+                own_frame = i
+                break
         for i in range(found + 1, len(self._scopes)):
             scope = self._scopes[i]
             if isinstance(scope, _ClosureScope):
@@ -318,7 +328,7 @@ class _Builder:
                     index = len(scope.captures)
                     scope.captures.append(slot)
                     scope.capture_index[name] = index
-                if i == len(self._scopes) - 1:
+                if i == own_frame:
                     # the reader's own frame: the field access is emitted here
                     slot = self.add(hir.FieldIndexAddr(hir.Arg(0), index))
                 else:
@@ -419,7 +429,7 @@ class _Builder:
                 # call's continuation (see ``_predeclare_ann`` and
                 # ``pending-problems.md`` #5)
                 if comptime_marker is None and len(stmt.targets) > 0:
-                    self._predeclare_target(stmt.targets[0], None)
+                    self._predeclare_target(stmt.targets[0], False)
             elif isinstance(stmt, ast.AnnAssign):
                 self._predeclare_ann(stmt, comptime_marker)
             comptime_marker = None
@@ -900,7 +910,7 @@ class _Builder:
 
     # -- variables ------------------------------------------------------------
 
-    def _gen_lhs(self, target: ast.expr, new_slots: list[hir.Value], is_comptime: bool | None = None) -> hir.FullResultLoc:
+    def _gen_lhs(self, target: ast.expr, new_slots: list[hir.Value], is_comptime: bool | None = False) -> hir.FullResultLoc:
         """The place - or, for a destructuring target, the place *tree* - a
         target denotes, declaring every name it binds nowhere (their fresh slots
         are appended to ``new_slots``).  It is the first half of an assignment,
@@ -961,7 +971,7 @@ class _Builder:
         new_slots: list[hir.Value] = []
         place = self._gen_lhs(
             target, new_slots,
-            True if by_marker else None,
+            True if by_marker else False,
         )
         self._gen_result_loc(value, place)
         for slot in new_slots:
@@ -1077,7 +1087,7 @@ class _Builder:
             return True, node.slice
         return False, node
 
-    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], is_comptime: bool | None = None) -> tuple[hir.Value, ...]:
+    def _gen_target_tuple(self, target: ast.Tuple, new_slots: list[hir.Value], is_comptime: bool | None = False) -> tuple[hir.Value, ...]:
         """The place tree a destructuring target denotes (a ``ResultLocTree``
         node): a plain target contributes the place of its slot (or field), a
         nested tuple target contributes its own tree.  Only a name that is bound
@@ -1838,6 +1848,23 @@ class _Builder:
                 operand = self._gen_expr(node.args[0])[0]
                 self.add(hir.Store(result_loc, self.add(hir.Len(operand))))
                 return
+        if isinstance(node.func, ast.Attribute) and isinstance(fn_global, types.FunctionType):
+            # a *plain* Python function reached as an attribute of a global
+            # object - a plain class used as a namespace of functions
+            # (``Foo.bar()``): it is not a spy method, so the call is emitted
+            # directly, the way the attribute folds as an expression (see
+            # ``_gen_expr``).  An ``enum.Enum`` class is left to the method
+            # dispatch below: its undecorated functions are spy methods, and a
+            # ``Foo.m(x)`` on a registered struct resolves to a spy declaration
+            # (never a plain function), so neither reaches this branch.
+            base_obj = self._try_resolve_object(node.func.value)
+            if not (isinstance(base_obj, type) and issubclass(base_obj, Enum)):
+                self.add(hir.CallInplace(
+                    hir.Const(fn_global),
+                    self._gen_arglist(node.args, node.keywords),
+                    result_loc,
+                ))
+                return
         if isinstance(node.func, ast.Attribute):
             # a method of the struct ``base``: the method and its self
             # parameter are resolved by the interpreter from the static
@@ -2002,7 +2029,7 @@ class _Builder:
         is_comptime = False
         annotation: hir.Value | None = None
         if arg.annotation is not None:
-            is_comptime, type_node = self._split_comptime(arg.annotation)
+            is_comptime, _is_const, type_node = self._split_comptime(arg.annotation)
             if type_node is not None:
                 is_type_value, type_node = self._split_type_value(type_node)
                 if is_type_value:
@@ -2059,7 +2086,7 @@ class _Builder:
             is_type_value = [False] * n
             for i, a in enumerate(args.args):
                 if a.annotation is not None:
-                    ct, type_node = self._split_comptime(a.annotation)
+                    ct, _is_const, type_node = self._split_comptime(a.annotation)
                     is_comptime[i] = ct
                     if type_node is not None:
                         tv, type_node = self._split_type_value(type_node)

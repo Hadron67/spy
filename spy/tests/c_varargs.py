@@ -13,10 +13,10 @@ from ..compiler import (
 )
 from ..compiler import as_ as spy_as
 from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type
-from ..compiler.syntax import closure, ref
+from ..compiler.syntax import closure, ptr_cast, ref
 from ..std import Array
 from ..std.c import snprintf
-from ..std.core import const_arr_ptr, gstr, undefined
+from ..std.core import const_arr_ptr, undefined
 from .structs import MIR_CACHE
 
 # ---------------------------------------------------------------------------
@@ -82,7 +82,7 @@ def snprintf_len(n: i32) -> i32:
     # written); ``const_arr_ptr`` turns ``&buf`` into the ``MultiPtr[u8]`` the C
     # signature asks for, and ``len(buf)`` is the array's compile-time length
     buf: Array[u8, Literal[10]] = undefined()
-    r = snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'%d'), n)
+    r = snprintf(const_arr_ptr(ref(buf)), len(buf), ptr_cast(b'%d', ConstMultiPtr[u8]), n)
     return r
 
 
@@ -90,7 +90,7 @@ def snprintf_len(n: i32) -> i32:
 def snprintf_first_digit(n: i32) -> i32:
     # the formatted text really lands in the buffer: the first byte of ``n``
     buf: Array[u8, Literal[10]] = undefined()
-    snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'%d'), n)
+    snprintf(const_arr_ptr(ref(buf)), len(buf), ptr_cast(b'%d', ConstMultiPtr[u8]), n)
     return buf[0] - 48
 
 
@@ -98,7 +98,7 @@ def snprintf_first_digit(n: i32) -> i32:
 def snprintf_no_vararg() -> i32:
     # a call that passes no extra argument: the ``...`` takes zero
     buf: Array[u8, Literal[10]] = undefined()
-    r = snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'hi'))
+    r = snprintf(const_arr_ptr(ref(buf)), len(buf), ptr_cast(b'hi', ConstMultiPtr[u8]))
     return r
 
 
@@ -106,7 +106,7 @@ def snprintf_no_vararg() -> i32:
 def snprintf_narrow(n: i8) -> i32:
     # an ``i8`` is a byte: C promotes it to ``int`` (the callee reads an int)
     buf: Array[u8, Literal[10]] = undefined()
-    r = snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'%d'), n)
+    r = snprintf(const_arr_ptr(ref(buf)), len(buf), ptr_cast(b'%d', ConstMultiPtr[u8]), n)
     return r
 
 
@@ -114,7 +114,7 @@ def snprintf_narrow(n: i8) -> i32:
 def snprintf_float(x: f32) -> i32:
     # an ``f32`` is promoted to ``double`` (the callee reads a double)
     buf: Array[u8, Literal[10]] = undefined()
-    r = snprintf(const_arr_ptr(ref(buf)), len(buf), gstr(b'%.1f'), x)
+    r = snprintf(const_arr_ptr(ref(buf)), len(buf), ptr_cast(b'%.1f', ConstMultiPtr[u8]), x)
     return r
 
 

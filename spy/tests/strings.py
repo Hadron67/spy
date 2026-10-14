@@ -10,19 +10,20 @@ from ..compiler.dsl import func
 from ..compiler.syntax import (
     Comptime,
     ConstMultiPtr,
+    ptr_cast,
 )
 from ..std import (
     ConstSlicePtr,
-    gstr,
     sstr,
 )
 
 # ---------------------------------------------------------------------------
 # byte strings: a ``bytes`` literal/value exists only at compile time (it has no
 # runtime representation), a string literal is encoded to ``bytes`` at parse
-# time, and a byte string may be subscripted / sliced at compile time.  The
-# ``std.core.gstr``/``std.core.sstr`` builtins turn one into a runtime
-# ``ConstMultiPtr[u8]``/``ConstSlicePtr[u8]``, and ``ord`` yields the encoding of
+# time, and a byte string may be subscripted / sliced at compile time.  A byte
+# string lowers into a runtime ``ConstMultiPtr[u8]`` through ``ptr_cast`` (see
+# the behaviour doc §4.3, replacing the old ``std.core.gstr``) or into a
+# ``ConstSlicePtr[u8]`` through ``sstr``, and ``ord`` yields the encoding of
 # a one-byte byte string.
 # ---------------------------------------------------------------------------
 
@@ -63,7 +64,7 @@ def str_literal_is_encoded() -> i32:
 @func()
 def gstr_read() -> i32:
     s: Comptime = b'AB'
-    p: ConstMultiPtr[u8] = gstr(s)
+    p: ConstMultiPtr[u8] = ptr_cast(s, ConstMultiPtr[u8])
     return p[1]
 
 
@@ -85,8 +86,8 @@ def sstr_length() -> usize:
 def gstr_twice() -> i32:
     # both calls name the same bytes: they share one global constant
     s: Comptime = b'dup'
-    a: ConstMultiPtr[u8] = gstr(s)
-    b: ConstMultiPtr[u8] = gstr(s)
+    a: ConstMultiPtr[u8] = ptr_cast(s, ConstMultiPtr[u8])
+    b: ConstMultiPtr[u8] = ptr_cast(s, ConstMultiPtr[u8])
     return a[0] + b[1]
 
 
@@ -114,7 +115,7 @@ def bytes_slice_out_of_bounds() -> i32:
 
 
 class SpyBytesTest(TestCase):
-    """Compile-time byte strings and the ``gstr``/``sstr``/``ord`` builtins."""
+    """Compile-time byte strings and the ``ptr_cast``/``sstr``/``ord`` spellings."""
 
     def test_a_byte_string_can_be_indexed(self) -> None:
         self.assertEqual(bytes_index(), ord('a') * 100 + ord('c'))

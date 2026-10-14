@@ -22,7 +22,11 @@ from .structs import Blank, Holder, Small, sum_small
 # own compile-time places, so a field is read and written at compile time: a
 # field assignment is folded in Python, a field read may condition a
 # compile-time loop marked with ``syntax.unroll()``, and a whole aggregate is
-# copied field by field (see ``interp.ComptimeAggregatePtr``)
+# copied field by field (see ``sval.Box``).
+#
+# A struct with *any* runtime part is a whole runtime value now: a ``Comptime``
+# variable only holds compile-time values, so such a struct lives in a plain
+# variable (memory) instead.
 # ---------------------------------------------------------------------------
 
 
@@ -41,9 +45,9 @@ def comptime_struct_field_read(x: i32) -> i32:
 
 @func()
 def comptime_struct_with_a_runtime_field(x: i32) -> i32:
-    # a field that holds a runtime value is a runtime place of its own: the
-    # other field is still compile-time
-    s: Comptime = Small(x, 2)
+    # a struct with a runtime part is a whole runtime value: it lives in a plain
+    # variable rather than a ``Comptime`` one
+    s: Small = Small(x, 2)
     return s.a + s.b
 
 
@@ -97,21 +101,18 @@ def comptime_struct_ref_aliases() -> i32:
     return s.b
 
 
-@func()
-def comptime_struct_ref_in_memory() -> i32:
-    # ... a plain local has no compile-time storage for the pointer: the
-    # aggregate is materialized and the local points at that copy (an aggregate
-    # has no address of its own)
-    s: Comptime = Small(1, 2)
-    p = ref(s)
-    p[...].b = 5
-    return s.b
+# (the old ``comptime_struct_ref_in_memory`` / ``test_a_pointer_in_memory_points_at_a_copy``
+# is gone: a compile-time pointer now aliases the box globally, so there is no
+# "the local points at a copy" behavior - a plain local holding ``ref(s)`` is
+# inferred compile-time storage and aliases ``s`` just like an annotated one)
 
 
 @func()
 def comptime_struct_method() -> i32:
-    # a native method takes the aggregate's address: the value is materialized
-    return Pair[i32](1, 2).total()
+    # a compiled method takes the aggregate's address: the aggregate lives in a
+    # plain variable, so that address is a real runtime pointer
+    p: Pair[i32] = Pair[i32](1, 2)
+    return p.total()
 
 
 @func()
@@ -121,10 +122,9 @@ def comptime_struct_argument() -> i32:
 
 @func()
 def comptime_struct_choose(c: spy_bool) -> i32:
-    # both branches build into one storage, but they are two runtime regions, so
-    # the field places cross a runtime block and land in memory: each branch
-    # keeps its own value
-    s: Comptime = Small(1, 1) if c else Small(2, 2)
+    # both branches are runtime regions, so the aggregate lives in one runtime
+    # storage: each branch keeps its own value
+    s: Small = Small(1, 1) if c else Small(2, 2)
     return s.b
 
 
@@ -144,8 +144,10 @@ def comptime_struct_unroll() -> i32:
 @func()
 def runtime_struct_unroll() -> i32:
     # ... a runtime struct's field is a runtime value, so it cannot: the unroll
-    # cap reports it instead of unrolling forever (see ``inline_bad_cond``)
-    s = Toggle(True, 0)
+    # cap reports it instead of unrolling forever (see ``inline_bad_cond``).
+    # The declared type keeps the struct in memory (an unannotated ``Toggle``
+    # of compile-time values would be inferred compile-time)
+    s: Toggle = Toggle(True, 0)
 
     syntax.unroll()
     while s.on:
@@ -156,7 +158,7 @@ def runtime_struct_unroll() -> i32:
 @func()
 def comptime_struct_nested_copy() -> i32:
     # a whole-aggregate copy of a struct with a struct field: the field place is
-    # an aggregate of its own (see ``init_inline_aggregate``)
+    # an aggregate of its own
     h: Comptime = StructHolder(Pair[i32](1, 2), 3)
     b: Comptime = h
     return b.p.a * 100 + b.p.b * 10 + b.extra
@@ -164,50 +166,46 @@ def comptime_struct_nested_copy() -> i32:
 
 @func()
 def comptime_struct_from_a_runtime_value(x: i32) -> i32:
-    # a whole *runtime* struct value assigned to a compile-time variable: such a
-    # variable holds its fields as places of their own (see
-    # ``ComptimeAggregatePtr``), so the value is split into one store per field -
-    # the runtime field lands in memory, a compile-time one in a box
-    s = Small(x, 2)
-    c: Comptime = s
+    # a whole *runtime* struct value is an ordinary runtime value: a plain
+    # variable holds it (there is no more splitting into one store per field)
+    s: Small = Small(x, 2)
+    c = s
     return c.a + c.b
 
 
 @func()
 def comptime_struct_declared_from_a_runtime_value(x: i32) -> i32:
-    # ... the same into a declared compile-time variable, whose field places
-    # already exist
-    s = Small(x, 2)
-    c: Comptime[Small] = s
+    # ... the same into a declared plain variable
+    s: Small = Small(x, 2)
+    c: Small = s
     return c.a + c.b
 
 
 @func()
 def comptime_struct_reassigned_from_a_runtime_value(x: i32) -> i32:
-    # ... and a whole runtime value assigned after a construction wrote the
-    # field places
-    c: Comptime = Small(x, 1)
-    s = Small(x, 3)
+    # a whole runtime value assigned after a construction: the plain variable
+    # holds the new value
+    c: Small = Small(x, 1)
+    s: Small = Small(x, 3)
     c = s
     return c.a + c.b
 
 
 @func()
 def comptime_struct_of_one_field_from_a_runtime_value(x: i64) -> i64:
-    # a struct whose mirror *is* its one stored field (see ``mirror_is_a_field``):
-    # a whole runtime value of it is still split into one place per field, and
-    # that field is the value itself
+    # a struct whose mirror *is* its one stored field: a runtime value of it is
+    # an ordinary runtime value
     o = OuterTwo(TwoI64(x, 1))
-    c: Comptime = o
+    c: OuterTwo = o
     return c.inner.b
 
 
 @func()
 def comptime_struct_runtime_field_by_ref(x: i32) -> i32:
-    # the runtime field of a compile-time aggregate lands in memory (a
-    # ``ComptimeBox`` never holds a runtime value), so handing its address to a
-    # native function hands it a real pointer and the write reaches the field
-    s: Comptime = Small(x, 2)
+    # a runtime field of a runtime aggregate lives in memory, so handing its
+    # address to a native function hands it a real pointer and the write reaches
+    # the field
+    s: Small = Small(x, 2)
     incr_ptr(ref(s.a))
     return s.a
 
@@ -217,7 +215,7 @@ def comptime_struct_field_written_in_branches(c: spy_bool, x: i32) -> i32:
     # the field holds the runtime value ``x`` in memory, so writing it in both
     # branches of a runtime ``if`` merges in that memory and the choice is a
     # runtime one (the last write of the walk no longer wins)
-    s: Comptime = Small(x, 1)
+    s: Small = Small(x, 1)
     if c:
         s.a = 5
     else:
@@ -227,30 +225,28 @@ def comptime_struct_field_written_in_branches(c: spy_bool, x: i32) -> i32:
 
 @func()
 def comptime_struct_from_a_nested_runtime_value(x: i32) -> i32:
-    # a nested aggregate field holding a runtime struct is split the same way,
-    # recursively
-    inner = Pair[i32](x, 2)
-    h: Comptime = StructHolder(inner, 3)
+    # a nested aggregate field holding a runtime struct is an ordinary runtime
+    # value too
+    inner: Pair[i32] = Pair[i32](x, 2)
+    h: StructHolder = StructHolder(inner, 3)
     return h.p.a + h.p.b + h.extra
 
 
 @func()
 def comptime_struct_from_a_runtime_choice(c: spy_bool, x: i32) -> i32:
-    # both branches assign a whole runtime value into one compile-time variable:
-    # the field places are the ones the first store recorded, and each runtime
-    # branch writes its own value into them (unlike the compile-time values of
-    # ``comptime_struct_choose``, whose last write wins)
-    a = Small(x, 2)
-    b = Small(x, 3)
-    s: Comptime = a if c else b
+    # both branches assign a whole runtime value: each runtime branch writes its
+    # own value into the runtime storage
+    a: Small = Small(x, 2)
+    b: Small = Small(x, 3)
+    s: Small = a if c else b
     return s.a + s.b
 
 
 @func()
 def comptime_struct_argument_from_a_variable(x: i32) -> i32:
-    # a compile-time aggregate with a runtime field handed to a native function:
-    # its fields are materialized into memory (see ``_materialize_aggregate``)
-    s: Comptime = Small(x, 2)
+    # a runtime aggregate handed to a native function: its fields are read out
+    # of memory
+    s: Small = Small(x, 2)
     return sum_small(s)
 
 
@@ -264,9 +260,8 @@ def comptime_struct_field_comparison() -> spy_bool:
 
 @func()
 def comptime_struct_field_written_in_a_runtime_loop(x: i32) -> i32:
-    # a runtime field of a compile-time aggregate is memory, so a runtime loop
-    # may write it (see pending-problems.md #3)
-    s: Comptime = Small(x, 1)
+    # a runtime field is memory, so a runtime loop may write it
+    s: Small = Small(x, 1)
     y: i32 = 0
     while y < 3:
         s.a = s.a + 1
@@ -276,8 +271,8 @@ def comptime_struct_field_written_in_a_runtime_loop(x: i32) -> i32:
 
 @func()
 def comptime_struct_declared_field_written_in_a_runtime_loop(x: i32) -> i32:
-    # ... likewise for a declared compile-time variable
-    s: Comptime[Small] = Small(x, 1)
+    # ... likewise for a declared plain variable
+    s: Small = Small(x, 1)
     y: i32 = 0
     while y < 3:
         s.a = s.a + 1
@@ -298,7 +293,8 @@ class SpyComptimeStructTest(TestCase):
     temporary or a ``Comptime`` variable - is an aggregate whose fields are
     their own compile-time places, so a field read or write is folded in
     Python (a field value may condition a compile-time loop marked with
-    ``syntax.unroll()``)."""
+    ``syntax.unroll()``).  A struct with a runtime part is a whole runtime
+    value and lives in a plain variable instead."""
 
     def test_field_read(self) -> None:
         self.assertEqual(comptime_struct_field_read(0), 1)
@@ -327,9 +323,6 @@ class SpyComptimeStructTest(TestCase):
     def test_a_pointer_to_an_aggregate_aliases_it(self) -> None:
         self.assertEqual(comptime_struct_ref_aliases(), 5)
 
-    def test_a_pointer_in_memory_points_at_a_copy(self) -> None:
-        self.assertEqual(comptime_struct_ref_in_memory(), 2)
-
     def test_native_argument(self) -> None:
         self.assertEqual(comptime_struct_argument(), 3)
 
@@ -338,20 +331,18 @@ class SpyComptimeStructTest(TestCase):
 
     def test_a_runtime_branch_writes_the_aggregate(self) -> None:
         # the two branches of the runtime ``if`` are two runtime regions, so the
-        # field places cross a runtime block and land in memory: each branch
-        # keeps its own value
+        # aggregate lives in one runtime storage: each branch keeps its own value
         self.assertEqual(comptime_struct_choose(True), 1)
         self.assertEqual(comptime_struct_choose(False), 2)
 
     def test_nested_aggregate_copy(self) -> None:
         self.assertEqual(comptime_struct_nested_copy(), 123)
 
-    def test_a_whole_runtime_value_into_a_comptime_variable(self) -> None:
-        # the value is split into one store per field, so the variable is still
-        # an aggregate of places rather than a struct in memory
+    def test_a_whole_runtime_value_into_a_plain_variable(self) -> None:
+        # a whole runtime struct value is an ordinary runtime value
         self.assertEqual(comptime_struct_from_a_runtime_value(5), 7)
 
-    def test_a_whole_runtime_value_into_a_declared_comptime_variable(self) -> None:
+    def test_a_whole_runtime_value_into_a_declared_plain_variable(self) -> None:
         self.assertEqual(comptime_struct_declared_from_a_runtime_value(5), 7)
 
     def test_a_whole_runtime_value_after_a_construction(self) -> None:
@@ -375,12 +366,12 @@ class SpyComptimeStructTest(TestCase):
         self.assertEqual(comptime_struct_from_a_nested_runtime_value(5), 10)
 
     def test_a_runtime_choice_of_whole_values(self) -> None:
-        # each branch writes its own whole value into the recorded field places,
-        # so the choice is a runtime one here (the values are runtime values)
+        # each branch writes its own whole value into the runtime storage, so the
+        # choice is a runtime one
         self.assertEqual(comptime_struct_from_a_runtime_choice(True, 5), 7)
         self.assertEqual(comptime_struct_from_a_runtime_choice(False, 5), 8)
 
-    def test_a_native_argument_from_a_comptime_variable(self) -> None:
+    def test_a_native_argument_from_a_plain_variable(self) -> None:
         self.assertEqual(comptime_struct_argument_from_a_variable(5), 7)
 
     def test_field_comparison(self) -> None:
@@ -390,8 +381,8 @@ class SpyComptimeStructTest(TestCase):
         self.assertTrue(comptime_struct_zst_in_a_comptime_local())
 
     def test_a_struct_whose_mirror_is_its_field(self) -> None:
-        # a struct of one stored field mirrors to that field itself: splitting a
-        # whole runtime value of it still reads the field out of the value
+        # a struct of one stored field mirrors to that field itself: a runtime
+        # value of it still reads the field out of the value
         self.assertEqual(comptime_struct_of_one_field_from_a_runtime_value(4), 1)
 
 

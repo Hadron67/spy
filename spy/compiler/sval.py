@@ -1890,6 +1890,14 @@ class ComplexType(AggregateType):
             return 1
         return None
 
+    def get_field_mir_indices(self, cache: MirLowerCache) -> tuple[int | None, ...]:
+        """A complex number mirrors to a struct of its real and imaginary parts,
+        in field order, with no reordering (see ``MirLowerCache.complex_mir``)."""
+        return (0, 1)
+
+    def mirror_is_a_field(self, cache: MirLowerCache) -> bool:
+        return False
+
     def __str__(self) -> str:
         return f'c{self.elem.bits * 2}'
 

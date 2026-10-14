@@ -12,10 +12,13 @@ from ..compiler.syntax import (
 
 # ---------------------------------------------------------------------------
 # ``*args``/``**kwargs``: a spy function may declare them, and a call's excess
-# positional/keyword arguments are bound to them.  The body sees ``args`` as a
-# tuple of its element places and ``kwargs`` as a dictionary of its value
-# places (``interp.ComptimeTuplePtr``/``ComptimeDictPtr``), read with ``t[i]``
-# (a compile-time integer index) and ``d[key]`` (a byte-string key).
+# positional/keyword arguments are bound to them.  The body sees ``args``/
+# ``kwargs`` as a synthesized struct - one field per element, a positional one
+# named ``_0``/``_1``/... and a named one by its name - read with ``t[i]`` (a
+# compile-time integer index) and ``d[key]`` (a byte-string key).  A
+# compile-time element is baked into the field's type (an ``is_comptime``
+# field); a runtime element is a plain field (an ``is_ref`` one when the call
+# passes it by reference).
 # ---------------------------------------------------------------------------
 
 
@@ -87,7 +90,8 @@ def bad_vararg_type(*args: type[i32]) -> i32:  # pyright: ignore
 
 class SpyVarargsTest(TestCase):
     """``*args``/``**kwargs`` parameters: a call's excess arguments bind to
-    them, and the body reads them as a tuple/dictionary of places."""
+    them, and the body reads the synthesized struct through
+    ``t[i]``/``d[name]``."""
 
     def test_varargs(self) -> None:
         self.assertEqual(sum_args(1, 2, 3), 6)

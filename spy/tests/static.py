@@ -10,6 +10,7 @@ from ..compiler import bool as spy_bool
 from ..compiler.dsl import decl_func, func, struct
 from ..compiler.syntax import (
     Array,
+    ConstComptime,
     ConstPtr,
     Option,
     Ptr,
@@ -17,16 +18,17 @@ from ..compiler.syntax import (
     comptime,
     ref,
 )
-from ..std.core import as_static_ptr
 
 
 @func()
 def static_i32() -> i32:
-    # a compile-time value turned into a global static constant: the pointer is
-    # a ``ConstPtr`` to the location the value is stored in
+    # a compile-time value turned into a global static constant: a read-only
+    # ``ConstComptime`` variable's pointer lowers to it automatically (see the
+    # behaviour doc §4.3, replacing ``as_static_ptr``)
     comptime()
     x: i32 = 42
-    p = as_static_ptr(x)
+    const_x: ConstComptime[i32] = x
+    p = ref(const_x)
     return p[...]
 
 
@@ -34,7 +36,8 @@ def static_i32() -> i32:
 def static_f64() -> f64:
     comptime()
     x: f64 = 1.5
-    p = as_static_ptr(x)
+    const_x: ConstComptime[f64] = x
+    p = ref(const_x)
     return p[...]
 
 
@@ -42,7 +45,8 @@ def static_f64() -> f64:
 def static_bool() -> spy_bool:
     comptime()
     x: spy_bool = True
-    p = as_static_ptr(x)
+    const_x: ConstComptime[spy_bool] = x
+    p = ref(const_x)
     return p[...]
 
 
@@ -62,7 +66,8 @@ class StaticNested:
 def static_struct() -> i32:
     comptime()
     s: StaticPair = StaticPair(3, 4)
-    p = as_static_ptr(s)
+    const_s: ConstComptime[StaticPair] = s
+    p = ref(const_s)
     return p[...].a * 10 + p[...].b
 
 
@@ -70,7 +75,8 @@ def static_struct() -> i32:
 def static_nested_struct() -> i32:
     comptime()
     s: StaticNested = StaticNested(StaticPair(1, 2), 3)
-    p = as_static_ptr(s)
+    const_s: ConstComptime[StaticNested] = s
+    p = ref(const_s)
     return p[...].p.a * 100 + p[...].p.b * 10 + p[...].n
 
 
@@ -78,7 +84,8 @@ def static_nested_struct() -> i32:
 def static_array() -> i32:
     comptime()
     a: Array[i32, 3] = array(1, 2, 3)  # pyright: ignore
-    p = as_static_ptr(a)
+    const_a: ConstComptime[Array[i32, 3]] = a
+    p = ref(const_a)
     return p[...][0] * 100 + p[...][1] * 10 + p[...][2]
 
 
@@ -86,7 +93,8 @@ def static_array() -> i32:
 def static_option_present() -> i32:
     comptime()
     o: Option[i32] = 7
-    p = as_static_ptr(o)
+    const_o: ConstComptime[Option[i32]] = o
+    p = ref(const_o)
     if (v := p[...]) is not None:
         return v
     return -1
@@ -96,7 +104,8 @@ def static_option_present() -> i32:
 def static_option_absent() -> i32:
     comptime()
     o: Option[i32] = None
-    p = as_static_ptr(o)
+    const_o: ConstComptime[Option[i32]] = o
+    p = ref(const_o)
     if (v := p[...]) is not None:
         return v
     return -1
@@ -108,7 +117,8 @@ def static_option_pointer_absent() -> spy_bool:
     # absent tag: the constant is a null pointer
     comptime()
     o: Option[Ptr[i32]] = None
-    p = as_static_ptr(o)
+    const_o: ConstComptime[Option[Ptr[i32]]] = o
+    p = ref(const_o)
     return p[...] is None
 
 
@@ -117,7 +127,8 @@ def static_option_struct() -> i32:
     # an option whose child is an aggregate: the payload is a struct value
     comptime()
     o: Option[StaticPair] = StaticPair(3, 4)
-    p = as_static_ptr(o)
+    const_o: ConstComptime[Option[StaticPair]] = o
+    p = ref(const_o)
     if (v := p[...]) is not None:
         return v.a * 10 + v.b
     return -1
@@ -127,7 +138,8 @@ def static_option_struct() -> i32:
 def static_option_struct_absent() -> i32:
     comptime()
     o: Option[StaticPair] = None
-    p = as_static_ptr(o)
+    const_o: ConstComptime[Option[StaticPair]] = o
+    p = ref(const_o)
     if (v := p[...]) is not None:
         return v.a
     return -1
@@ -165,7 +177,8 @@ def static_union_storage() -> i64:
     v: StaticUnionB = StaticUnionB(9, 0)
     comptime()
     u: StaticUnionA | StaticUnionB = v
-    p = as_static_ptr(u)
+    const_u: ConstComptime[StaticUnionA | StaticUnionB] = u
+    p = ref(const_u)
     if isinstance(b := p[...], StaticUnionB):
         return b.y
     return -1
@@ -179,7 +192,8 @@ def static_union_smaller() -> i32:
     v: StaticUnionA = StaticUnionA(5, 0)
     comptime()
     u: StaticUnionA | StaticUnionB = v
-    p = as_static_ptr(u)
+    const_u: ConstComptime[StaticUnionA | StaticUnionB] = u
+    p = ref(const_u)
     if isinstance(a := p[...], StaticUnionA):
         return a.x
     return -1
@@ -193,7 +207,8 @@ def static_union_field() -> i32:
     v: StaticUnionA = StaticUnionA(5, 0)
     comptime()
     h: StaticUnionHolder = StaticUnionHolder(1, v, 9)
-    p = as_static_ptr(h)
+    const_h: ConstComptime[StaticUnionHolder] = h
+    p = ref(const_h)
     if isinstance(a := p[...].u, StaticUnionA):
         return a.x * 100 + p[...].tail
     return -1
@@ -207,7 +222,8 @@ def static_union_zst_variant() -> i32:
     v: StaticUnionEmpty = StaticUnionEmpty()
     comptime()
     u: StaticUnionEmpty | StaticUnionB = v
-    p = as_static_ptr(u)
+    const_u: ConstComptime[StaticUnionEmpty | StaticUnionB] = u
+    p = ref(const_u)
     if isinstance(_ := p[...], StaticUnionEmpty):
         return 1
     return -1
@@ -215,7 +231,8 @@ def static_union_zst_variant() -> i32:
 
 @func()
 def static_rejects_runtime(x: i32) -> i32:
-    p = as_static_ptr(x)
+    const_x: ConstComptime[i32] = x
+    p = ref(const_x)
     return p[...]
 
 
@@ -225,9 +242,11 @@ def static_pointer_to_struct() -> i32:
     # a global of its own and the pointer points at it
     comptime()
     v: StaticPair = StaticPair(3, 4)
+    const_v: ConstComptime[StaticPair] = v
     comptime()
-    p: Ptr[StaticPair] = ref(v)
-    q = as_static_ptr(p)
+    p: Ptr[StaticPair] = ref(const_v)
+    const_p: ConstComptime[Ptr[StaticPair]] = p
+    q = ref(const_p)
     return q[...][...].a * 10 + q[...][...].b
 
 
@@ -241,11 +260,13 @@ class StaticPtrHolder:
 def static_struct_with_pointer() -> i32:
     comptime()
     v: StaticPair = StaticPair(3, 4)
+    const_v: ConstComptime[StaticPair] = v
     comptime()
-    ptr: Ptr[StaticPair] = ref(v)
+    ptr: Ptr[StaticPair] = ref(const_v)
     comptime()
     h: StaticPtrHolder = StaticPtrHolder(ptr, 7)
-    q = as_static_ptr(h)
+    const_h: ConstComptime[StaticPtrHolder] = h
+    q = ref(const_h)
     return q[...].p[...].a * 10 + q[...].n
 
 
@@ -255,9 +276,11 @@ def static_static_pointer() -> i32:
     # the value: the global holds the pointer to the first one
     comptime()
     v: i32 = 9
+    const_v: ConstComptime[i32] = v
     comptime()
-    p: ConstPtr[i32] = as_static_ptr(v)
-    q = as_static_ptr(p)
+    p: ConstPtr[i32] = ref(const_v)
+    const_p: ConstComptime[ConstPtr[i32]] = p
+    q = ref(const_p)
     return q[...][...]
 
 
@@ -270,7 +293,8 @@ def c_abs(x: i32) -> i32:
 def static_function_pointer(x: i32) -> i32:
     # a function pointer is a global reference, not a register: it may stand in
     # a static constant
-    q = as_static_ptr(c_abs)
+    const_f: ConstComptime = c_abs
+    q = ref(const_f)
     return q[...](x)
 
 
@@ -278,13 +302,15 @@ def static_function_pointer(x: i32) -> i32:
 def static_rejects_a_type() -> i32:
     comptime()
     t = i32
-    p = as_static_ptr(t)
+    const_t: ConstComptime[i32] = t
+    p = ref(const_t)
     return p[...]  # pyright: ignore[reportReturnType]
 
 
 class StaticPtrTest(TestCase):
-    """``std.core.as_static_ptr``: a compile-time value turned into a global
-    static constant (see ``mir.GlobalConstant``)."""
+    """A compile-time value turned into a global static constant through a
+    read-only ``ConstComptime`` variable and ``ref`` (see the behaviour doc §4.3;
+    it replaces the old ``std.core.as_static_ptr``)."""
 
     def test_a_scalar(self) -> None:
         self.assertEqual(static_i32(), 42)

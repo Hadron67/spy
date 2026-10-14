@@ -1,57 +1,58 @@
-"""``t += u`` on a tuple: a tuple has no storage of its own, so a tuple variable
-*is* its tuple of element places (an ``interp.ComptimeTuplePtr``).  ``+=`` grows
-it *in place* by aliasing ``u``'s elements onto it - nothing is copied, not even
-for an element of a non-copyable type - while ``t = t + u`` is not supported
-(there is no tuple ``+``): only the augmented assignment extends a tuple.
+"""Tuples as runtime values.  A tuple now has a real runtime representation - it
+is a runtime aggregate of its elements, laid out like a struct - so a tuple
+value can be stored in a plain variable, assigned and read element by element.
+``t[i]`` (``i`` a compile-time integer) is the *lvalue* of its i-th element, and
+``len(t)`` is the arity (a compile-time integer).
 
-The accumulation below is the ``reduce`` shape this exists for: a compile-time
-loop appending one (runtime) element per iteration, which a plain assignment
-could not do because a committed tuple variable has a fixed arity.
+A tuple's arity is fixed once it is built: the old ``t += u`` - the in-place,
+zero-copy extension of a tuple place that grew the arity by aliasing ``u``'s
+element places onto it - is *gone* (the tuple it relied on, "a tuple is its
+tuple of element places", is not the model any more; see
+``doc/comptime-refactor.task.md`` 7.5).  A tuple is built element by element
+instead, and ``t = t + u`` was never supported (there is no tuple ``+``).
 """
 
 from unittest import TestCase
 
 from ..compiler import CompileError, i32, syntax
 from ..compiler.dsl import func, struct
-from ..compiler.syntax import Comptime, array
+from ..compiler.syntax import Comptime
 
 # ---------------------------------------------------------------------------
-# extending a tuple place in place
+# building a tuple value element by element
 # ---------------------------------------------------------------------------
 
 
 @func()
 def sum_accumulated() -> i32:
-    # the ``reduce`` shape: a compile-time loop appending one runtime element per
-    # iteration; each iteration's ``v`` is a fresh place, aliased into ``t``
-    t: Comptime = ()
+    # the ``reduce`` shape: a compile-time loop filling one element per
+    # iteration.  The tuple is built first (its arity is fixed), then filled
+    t: Comptime = (0, 0, 0)
     syntax.unroll()
     for i in range(3):
-        v: i32 = i * 10
-        t += (v,)
-        i = i + 1
+        t[i] = i * 10  # pyright: ignore
     return t[0] + t[1] + t[2]
 
 
 @func()
 def concat_two(x: i32, y: i32) -> i32:
-    # ``t += u`` where ``u`` is another tuple place: its elements are aliased
-    a: Comptime = (x,)
-    b: Comptime = (y,)
-    a += b
-    return a[0] + a[1]
+    # concatenating two tuples: with a fixed arity the result is built from the
+    # elements of both
+    a = (x, x + 1)
+    b = (y, y + 1)
+    t = (a[0], b[0])
+    return t[0] + t[1]
 
 
 @func()
 def append_literal() -> i32:
-    # a bare (compile-time) element is materialized in a fresh place of its own
-    t: Comptime = ()
-    t += (5, 6)
+    # a tuple literal is the value itself
+    t: Comptime = (5, 6)
     return t[0] + t[1]
 
 
 # ---------------------------------------------------------------------------
-# a non-copyable element is never copied out of its place
+# a non-copyable element is constructed in the tuple's storage, never copied
 # ---------------------------------------------------------------------------
 
 
@@ -62,67 +63,11 @@ class Handle:
 
 @func()
 def sum_handles_via_tuple(x: i32, y: i32) -> i32:
-    # a non-copyable element is aliased into the tuple, never copied: were ``+=``
-    # to copy, this would fail to compile (loading a non-copyable is rejected,
-    # see ``sval.Type.is_copyable``), and the whole value is never read - only
-    # its ``id`` field, through the element's own place
-    h1 = Handle(x)
-    h2 = Handle(y)
-    t: Comptime = ()
-    t += (h1,)
-    t += (h2,)
+    # the non-copyable elements are *constructed* directly in the tuple's
+    # storage; they are never copied (the whole value is never read - only its
+    # ``id`` field, through the element's own place)
+    t = (Handle(x), Handle(y))
     return t[0].id + t[1].id
-
-
-# ---------------------------------------------------------------------------
-# a block-local element place is copied, a stable one is aliased
-# ---------------------------------------------------------------------------
-
-
-@struct(copyable=True)
-class Two:
-    x: i32
-    y: i32
-
-
-@func()
-def append_runtime_indexed_element(n: i32) -> i32:
-    # a tuple element whose address is *block-local* - the subscript's ``Gep``
-    # with a runtime index, inside the branch - is copied into a place of its
-    # own, so reading the tuple after the join is dominated (the bug of a raw
-    # aliased register; see ``_tuple_extend_element``)
-    a = array(n, n + 1, n + 2, n + 3)
-    t: Comptime = ()
-    if n > 0:
-        t += (a[n - 1],)
-    return t[0]
-
-
-@func()
-def appended_variable_stays_aliased(x: i32) -> i32:
-    # a whole variable's address is stable (an ``Alloca``), so it is aliased: a
-    # later write to the variable is seen through the tuple
-    v: i32 = x
-    t: Comptime = ()
-    t += (v,)
-    v = 100
-    return t[0]
-
-
-@func()
-def appended_field_is_copied(x: i32) -> i32:
-    # a field's address is block-local (a ``Gep``), so the element is copied: a
-    # later write to the field is *not* seen through the tuple
-    val = Two(x, x + 1)
-    t: Comptime = ()
-    t += (val.x,)
-    val.x = 100
-    return t[0]
-
-
-# ---------------------------------------------------------------------------
-# a non-copyable block-local element place can be neither copied nor aliased
-# ---------------------------------------------------------------------------
 
 
 @struct(copyable=False)
@@ -137,35 +82,83 @@ class HolderBox:
 
 
 @func()
-def append_noncopyable_block_local_place(x: i32) -> i32:
-    # a non-copyable field's address is block-local, so it has no copy to be
-    # made and is rejected (see ``_tuple_extend_element``)
+def copy_noncopyable_field_into_a_tuple(x: i32) -> i32:
+    # a tuple element is storage: filling it *copies* the value in, so a
+    # non-copyable source is rejected (see ``sval.Type.is_copyable``)
     w = HolderBox(0, Holder(x))
-    t: Comptime = ()
-    t += (w.h,)
+    t = (w.h,)
     return t[0].id
 
 
 # ---------------------------------------------------------------------------
-# only ``+=`` extends a tuple
+# an element holds the written value: a stable source is copied, not aliased
+# ---------------------------------------------------------------------------
+
+
+@struct(copyable=True)
+class Two:
+    x: i32
+    y: i32
+
+
+@func()
+def element_written_in_a_branch(n: i32) -> i32:
+    # a runtime write into a tuple element inside a branch: the element is the
+    # tuple's own storage, so reading it after the join is dominated
+    t = (n, n)
+    if n > 0:
+        t[0] = n + 1  # pyright: ignore
+    return t[0]
+
+
+@func()
+def element_copies_the_value(x: i32) -> i32:
+    # writing a variable into an element copies it: a later write to the
+    # variable is not seen through the tuple (there is no aliasing)
+    v: i32 = x
+    t = (v,)
+    v = 100
+    return t[0]
+
+
+@func()
+def field_element_copies_the_value(x: i32) -> i32:
+    # likewise for a field: the element holds the value the field had
+    val = Two(x, x + 1)
+    t = (val.x,)
+    val.x = 100
+    return t[0]
+
+
+# ---------------------------------------------------------------------------
+# only ``+=`` used to extend a tuple; there is no tuple ``+``/``+=`` now
 # ---------------------------------------------------------------------------
 
 
 @func()
 def plain_tuple_plus(a: tuple[i32, i32], b: tuple[i32, i32]) -> i32:
-    # ``a + b`` is not implemented: there is no tuple ``+``, only ``+=``
+    # ``a + b`` is not implemented: there is no tuple ``+``
     return (a + b)[0]
 
 
 @func()
-def tuple_inplace_sub(a: tuple[i32, i32]) -> i32:
-    # the augmented assignment only knows ``+=`` for a tuple
-    a -= (1, 2)  # pyright: ignore
-    return a[0]
+def tuple_inplace_add(x: i32) -> i32:
+    # the augmented assignment knows no ``+=`` for a tuple any more
+    t = (x, x)
+    t += (1, 2)  # pyright: ignore
+    return t[0]
+
+
+@func()
+def tuple_inplace_sub(x: i32) -> i32:
+    # neither does it know ``-=`` (it reports the one tuple form it knows)
+    t = (x, x)
+    t -= (1, 2)  # pyright: ignore
+    return t[0]
 
 
 # ---------------------------------------------------------------------------
-# a runtime control flow write into a tuple element place
+# a runtime control flow write into a tuple element
 # ---------------------------------------------------------------------------
 
 
@@ -177,29 +170,82 @@ def pair2(x: i32) -> tuple[i32, i32]:
 @func()
 def tuple_literal_loop(x: i32) -> i32:
     # a tuple built from runtime values holds its elements in memory, so a
-    # runtime loop may write them (see pending-problems.md #3)
-    t: Comptime = (x, x + 1)
+    # runtime loop may write them
+    t = (x, x + 1)
     y: i32 = 0
     while y < 3:
-        t[0] = t[0] + 1
+        t[0] = t[0] + 1  # pyright: ignore
         y = y + 1
     return t[0]
 
 
 @func()
 def multi_value_result_loop(x: i32) -> i32:
-    # likewise for a tuple a multi-value call packed into the variable
-    t: Comptime = pair2(x)
+    # likewise for a tuple a multi-value call packed into a plain variable
+    t = pair2(x)
     y: i32 = 0
     while y < 3:
-        t[0] = t[0] + 1
+        t[0] = t[0] + 1  # pyright: ignore
         y = y + 1
     return t[0]
 
 
+class SpyTupleBuildTest(TestCase):
+    """Building a tuple value element by element (the old in-place extension
+    ``t += u`` is gone)."""
+
+    def test_a_compile_time_loop_filling_elements(self) -> None:
+        self.assertEqual(sum_accumulated(), 30)
+
+    def test_building_from_two_tuple_places(self) -> None:
+        self.assertEqual(concat_two(3, 4), 7)
+
+    def test_a_literal(self) -> None:
+        self.assertEqual(append_literal(), 11)
+
+    def test_a_non_copyable_element_is_constructed_in_place(self) -> None:
+        # a successful compile is the assertion: a copy would be rejected
+        self.assertEqual(sum_handles_via_tuple(9, 5), 14)
+
+    def test_an_element_written_in_a_runtime_branch(self) -> None:
+        # the write happens in a branch and is read after the join
+        self.assertEqual(element_written_in_a_branch(3), 4)
+
+    def test_an_element_copies_the_written_value(self) -> None:
+        self.assertEqual(element_copies_the_value(7), 7)
+
+    def test_a_field_element_copies_the_written_value(self) -> None:
+        self.assertEqual(field_element_copies_the_value(7), 7)
+
+
+class SpyTupleInplaceRejectedTest(TestCase):
+    """There is no tuple ``+``/``+=``: the old in-place extension is gone."""
+
+    def test_plain_tuple_plus_is_not_supported(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            plain_tuple_plus((1, 2), (3, 4))
+        self.assertIn("unsupported operator '+'", str(ctx.exception))
+
+    def test_tuple_inplace_add_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            tuple_inplace_add(1)
+        self.assertIn('a tuple does not support ``+=``', str(ctx.exception))
+
+    def test_another_augmented_operator_is_rejected(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            tuple_inplace_sub(1)
+        self.assertIn('a tuple does not support ``+=``', str(ctx.exception))
+
+    def test_copying_a_non_copyable_field_into_a_tuple_is_rejected(self) -> None:
+        # a tuple element is storage: the non-copyable source cannot be copied in
+        with self.assertRaises(CompileError) as ctx:
+            copy_noncopyable_field_into_a_tuple(9)
+        self.assertIn('non-copyable type', str(ctx.exception))
+
+
 class SpyTupleRuntimeLoopTest(TestCase):
-    """A tuple's element places hold runtime values in memory, so a runtime
-    loop can write them (the bug of pending-problems.md #3)."""
+    """A tuple's elements hold runtime values in memory, so a runtime loop can
+    write them."""
 
     def test_a_tuple_literal(self) -> None:
         self.assertEqual(tuple_literal_loop(10), 13)
@@ -208,60 +254,8 @@ class SpyTupleRuntimeLoopTest(TestCase):
         self.assertEqual(multi_value_result_loop(10), 13)
 
 
-class SpyTupleExtendTest(TestCase):
-    """``t += u``: the in-place extension of a tuple place."""
-
-    def test_accumulating_a_runtime_element_per_iteration(self) -> None:
-        self.assertEqual(sum_accumulated(), 30)
-
-    def test_extending_by_another_tuple_place(self) -> None:
-        self.assertEqual(concat_two(3, 4), 7)
-
-    def test_appending_a_bare_value(self) -> None:
-        self.assertEqual(append_literal(), 11)
-
-    def test_a_non_copyable_element_is_not_copied(self) -> None:
-        # a successful compile is the assertion: a copy would be rejected
-        self.assertEqual(sum_handles_via_tuple(9, 5), 14)
-
-    def test_a_block_local_place_is_copied(self) -> None:
-        # a runtime subscript's address is block-local, so the element is copied
-        # (the register-dominance fix): the tuple reads fine after the join
-        self.assertEqual(append_runtime_indexed_element(3), 5)
-
-    def test_a_whole_variable_element_stays_aliased(self) -> None:
-        # a stable address is aliased, not copied
-        self.assertEqual(appended_variable_stays_aliased(7), 100)
-
-    def test_a_field_element_is_copied(self) -> None:
-        # a field's address is block-local, so the element is copied
-        self.assertEqual(appended_field_is_copied(7), 7)
-
-
-class SpyTupleExtendRejectedTest(TestCase):
-    """Only the augmented ``+=`` extends a tuple; everything else is rejected."""
-
-    def test_plain_tuple_plus_is_not_supported(self) -> None:
-        with self.assertRaises(CompileError) as ctx:
-            plain_tuple_plus((1, 2), (3, 4))
-        self.assertIn("unsupported operator '+'", str(ctx.exception))
-
-    def test_another_augmented_operator_is_rejected(self) -> None:
-        with self.assertRaises(CompileError) as ctx:
-            tuple_inplace_sub((1, 2))
-        self.assertIn("only supports in-place extension with '+='", str(ctx.exception))
-
-    def test_a_noncopyable_block_local_place_is_rejected(self) -> None:
-        # a block-local place of a non-copyable type cannot be appended: it can
-        # be neither aliased (its address does not dominate later reads) nor
-        # copied
-        with self.assertRaises(CompileError) as ctx:
-            append_noncopyable_block_local_place(9)
-        self.assertIn('non-copyable type', str(ctx.exception))
-
-
 all_tests = [
-    SpyTupleExtendTest,
-    SpyTupleExtendRejectedTest,
+    SpyTupleBuildTest,
+    SpyTupleInplaceRejectedTest,
     SpyTupleRuntimeLoopTest,
 ]

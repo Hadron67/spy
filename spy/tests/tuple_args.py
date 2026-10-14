@@ -9,18 +9,20 @@ from ..compiler import (
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
 from ..std import Numeric
+from ..std.core import coerce
 from ..std.reflect import (
-    StrDictType,
+    StructType,
     TupleType,
     type_info,
 )
 
 # ---------------------------------------------------------------------------
-# a parameter whose annotation is a ``tuple[...]`` has no runtime
-# representation of its own (``sval.TupleType``): its elements are passed
-# separately (flattened) and rebound as one place tree at the callee, exactly
-# like ``*args``.  The body reads the tuple with a compile-time integer index,
-# ``x[i]``, and it nests.
+# a parameter whose annotation is a ``tuple[...]`` is passed *flattened*: the
+# elements of the argument are separate arguments and are rebound at the callee
+# as the parameter's own place, exactly like ``*args``.  A tuple value has a
+# runtime representation now, so the callee rebuilds an aggregate from the
+# flattened elements (see ``doc/comptime-refactor`` 7.4/8.1).  The body reads
+# the parameter with a compile-time integer index, ``x[i]``, and it nests.
 # ---------------------------------------------------------------------------
 
 
@@ -59,9 +61,10 @@ def forward(x: tuple[i32, i32]) -> i32:
 
 
 @func()
-def call_with_comptime(a: i32) -> i32:
-    # the second element is a compile-time value: it is carried as a value and
-    # not passed in MIR (see ``ArgNode``)
+def call_with_a_literal_element(a: i32) -> i32:
+    # the second element is an untyped literal beside a runtime value: it is
+    # coerced to the peer type (``i32``), so the whole argument is a runtime
+    # tuple value, passed flattened
     return sum_pair((a, 5))
 
 
@@ -122,8 +125,10 @@ def total_big(x: tuple[Big, i64]) -> i64:
 
 @func()
 def call_big(a: i64, b: i64, c: i64) -> i64:
-    # a large struct element built in spy and passed on
-    return total_big((Big(a, b, c), 100))
+    # a large struct element built in spy and passed on (the literal is spelled
+    # ``i64`` so the tuple stays runtime-representable - an untyped literal has
+    # no runtime type of its own)
+    return total_big((Big(a, b, c), coerce(100, i64)))
 
 
 @func()
@@ -133,13 +138,13 @@ def forward_big(x: tuple[Big, i64]) -> i64:
 
 @func()
 def call_forward_big(a: i64, b: i64, c: i64) -> i64:
-    return forward_big((Big(a, b, c), 7))
+    return forward_big((Big(a, b, c), coerce(7, i64)))
 
 
 @func()
-def call_big_comptime(a: i64, b: i64, c: i64) -> i64:
-    # a large struct element beside a compile-time element
-    return sum_big((Big(a, b, c), 5))
+def call_big_with_a_literal_element(a: i64, b: i64, c: i64) -> i64:
+    # a large struct element beside an ``i64`` element
+    return sum_big((Big(a, b, c), coerce(5, i64)))
 
 
 # ---------------------------------------------------------------------------
@@ -151,14 +156,25 @@ def call_big_comptime(a: i64, b: i64, c: i64) -> i64:
 # ---------------------------------------------------------------------------
 
 
+def is_tuple_shape(v: StructType) -> spy_bool:
+    # a ``tuple[...]``/``*args`` parameter binds a synthesized struct whose
+    # positional fields are named ``_0, _1, ...``; a ``dict[str, T]``/``**kwargs``
+    # one names its fields after its entries (see the behaviour doc §7.4/§8.1).
+    # The two are told apart by the first field's name (``v`` is an already
+    # narrowed ``reflect.StructType``).
+    if v.fields.length == 0:
+        return False
+    return v.fields.ptr[0].name == b'_0'
+
+
 @func()
 def classify(x) -> i32:
     syntax.comptime()
     info = type_info(spy_typeof(x))
-    if isinstance(v := info, TupleType):
-        return 10 + v.types.length
-    if isinstance(v := info, StrDictType):
-        return 30 + v.entries.length
+    if isinstance(v := info, StructType):
+        if is_tuple_shape(v):
+            return 10 + v.fields.length
+        return 30 + v.fields.length
     return -1
 
 
@@ -166,31 +182,32 @@ def classify(x) -> i32:
 def reflect_sum(x) -> i64:
     syntax.comptime()
     info = type_info(spy_typeof(x))
-    if isinstance(v := info, TupleType):
-        if v.types.length == 2:
-            # the second element is a tuple itself: read its elements too
+    if isinstance(v := info, StructType):
+        if is_tuple_shape(v):
+            if v.fields.length == 2:
+                # the second element is a tuple itself: read its elements too
+                syntax.comptime()
+                second = type_info(v.fields.ptr[1].type)
+                if isinstance(s := second, StructType):
+                    if is_tuple_shape(s):
+                        return 20 + x[0] + x[1][0] + x[1][1]
+            # a flat tuple: walk it by the length the reflection gives
+            total: i64 = 0
             syntax.comptime()
-            second = type_info(v.types.ptr[1])
-            if isinstance(second, TupleType):
-                return 20 + x[0] + x[1][0] + x[1][1]
-        # a flat tuple: walk it by the length the reflection gives
-        total: i64 = 0
-        syntax.comptime()
-        i: i32 = 0
-        syntax.unroll()
-        while i < v.types.length:
-            total = total + x[i]
-            i = i + 1
-        return total
-    if isinstance(v := info, StrDictType):
+            i: i32 = 0
+            syntax.unroll()
+            while i < v.fields.length:
+                total = total + x[i]
+                i = i + 1
+            return total
         # a dictionary: walk its entries and read each by its reflected name
         dict_total: i64 = 0
         syntax.comptime()
         j: i32 = 0
         syntax.unroll()
-        while j < v.entries.length:
+        while j < v.fields.length:
             syntax.comptime()
-            entry = v.entries.ptr[j]
+            entry = v.fields.ptr[j]
             dict_total = dict_total + x[entry.name]
             j = j + 1
         return 100 + dict_total
@@ -206,9 +223,9 @@ def call_reflect_sum() -> i64:
 def first_dict_entry_name(x) -> i32:
     syntax.comptime()
     info = type_info(spy_typeof(x))
-    if isinstance(v := info, StrDictType):
+    if isinstance(v := info, StructType):
         syntax.comptime()
-        entry = v.entries.ptr[0]
+        entry = v.fields.ptr[0]
         return ord(entry.name[0:1])
     return -1
 
@@ -217,9 +234,9 @@ def first_dict_entry_name(x) -> i32:
 def first_dict_entry_is_i64(x) -> spy_bool:
     syntax.comptime()
     info = type_info(spy_typeof(x))
-    if isinstance(v := info, StrDictType):
+    if isinstance(v := info, StructType):
         syntax.comptime()
-        entry = v.entries.ptr[0]
+        entry = v.fields.ptr[0]
         return entry.type == i64
     return False
 
@@ -228,21 +245,22 @@ def first_dict_entry_is_i64(x) -> spy_bool:
 def dict_value_is_tuple(x) -> spy_bool:
     syntax.comptime()
     info = type_info(spy_typeof(x))
-    if isinstance(v := info, StrDictType):
+    if isinstance(v := info, StructType):
         syntax.comptime()
-        entry = v.entries.ptr[0]
+        entry = v.fields.ptr[0]
         syntax.comptime()
         child = type_info(entry.type)
-        if isinstance(child, TupleType):
-            syntax.comptime()
-            value = x[entry.name]
-            return value[0] + value[1] == 3
+        if isinstance(c := child, StructType):
+            if is_tuple_shape(c):
+                syntax.comptime()
+                value = x[entry.name]
+                return value[0] + value[1] == 3
     return False
 
 
 class SpyTupleArgTest(TestCase):
     """A ``tuple[...]`` parameter: the elements of the argument are passed
-    separately and rebound as the parameter's tuple."""
+    separately and rebound at the callee as the parameter's own place."""
 
     def test_a_pair(self) -> None:
         self.assertEqual(sum_pair((20, 22)), 42)
@@ -262,8 +280,8 @@ class SpyTupleArgTest(TestCase):
     def test_forwarding_a_tuple(self) -> None:
         self.assertEqual(forward((3, 4)), 7)
 
-    def test_a_compile_time_element(self) -> None:
-        self.assertEqual(call_with_comptime(10), 15)
+    def test_a_literal_element_beside_a_runtime_value(self) -> None:
+        self.assertEqual(call_with_a_literal_element(10), 15)
 
     def test_an_inlined_function(self) -> None:
         self.assertEqual(call_inline(2, 3), 5)
@@ -284,8 +302,8 @@ class SpyTupleArgTest(TestCase):
     def test_forwarding_a_large_struct(self) -> None:
         self.assertEqual(call_forward_big(1, 2, 3), 13)
 
-    def test_a_large_struct_beside_a_compile_time_element(self) -> None:
-        self.assertEqual(call_big_comptime(1, 2, 3), 11)
+    def test_a_large_struct_beside_a_literal_element(self) -> None:
+        self.assertEqual(call_big_with_a_literal_element(1, 2, 3), 11)
 
     def test_classify_a_tuple(self) -> None:
         self.assertEqual(classify((1, 2, 3)), 13)

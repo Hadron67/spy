@@ -20,7 +20,8 @@ from .structs import Small
 # variable (its slot is materialized right away, and the value is coerced to
 # the declared type), and ``name: Comptime``/``name: Comptime[T]`` mark it
 # compile-time - a box rather than memory, which is what lets it hold a
-# compile-time-only value such as a type
+# compile-time-only value such as a type (and, in the new model, *only*
+# compile-time values)
 # ---------------------------------------------------------------------------
 
 
@@ -70,8 +71,10 @@ def comptime_local_holds_a_type(x: i32) -> spy_bool:
 
 @func()
 def comptime_typed_local(x: i32) -> i32:
-    c: Comptime[i32] = x
-    return c + 1
+    # a declared compile-time type: the box only ever holds a compile-time
+    # value (the runtime ``x`` is added afterwards)
+    c: Comptime[i32] = 5
+    return c + x
 
 
 @func()
@@ -82,14 +85,12 @@ def annotated_comptime_param(x: Comptime[void]) -> spy_bool:
 
 
 @func()
-def comptime_local_holds_a_tuple(x: i32) -> i32:
-    # a ``Comptime`` variable may hold anything that is *not* a runtime
-    # value, a tuple included: the tuple is a compile-time structure of the
-    # places of its elements, even though the elements themselves are runtime
-    # values here
+def local_holds_a_runtime_tuple(x: i32) -> i32:
+    # a tuple now has a runtime representation, so a tuple of runtime values is
+    # an ordinary runtime variable, unpacked through the runtime tuple place
     a = x
     b = x + 1
-    t: Comptime = a, b
+    t = a, b
     p, q = t
     return p * 100 + q
 
@@ -119,7 +120,7 @@ class SpyAnnotationTest(TestCase):
     variable and its slot is materialized right away, while ``name:
     Comptime``/``name: Comptime[T]`` declare it compile-time - a box rather
     than memory, which is what lets it hold a compile-time-only value such as
-    a type."""
+    a type (and only compile-time values)."""
 
     def test_typed_local(self) -> None:
         self.assertEqual(annotated_local(3), 8)
@@ -142,10 +143,10 @@ class SpyAnnotationTest(TestCase):
         self.assertTrue(comptime_local_holds_a_type(1))
 
     def test_comptime_typed_local(self) -> None:
-        self.assertEqual(comptime_typed_local(3), 4)
+        self.assertEqual(comptime_typed_local(3), 8)
 
-    def test_comptime_local_holds_a_tuple(self) -> None:
-        self.assertEqual(comptime_local_holds_a_tuple(3), 304)
+    def test_a_local_holds_a_runtime_tuple(self) -> None:
+        self.assertEqual(local_holds_a_runtime_tuple(3), 304)
 
     def test_compile_time_parameter(self) -> None:
         self.assertTrue(annotated_comptime_param(None))

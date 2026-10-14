@@ -219,9 +219,11 @@ def struct_defaults_partial(x: i32) -> i32:
 
 
 @func()
-def struct_defaults_comptime(x: i32) -> i32:
-    # the defaults fill an inline (compile-time) aggregate too
-    p: Comptime = Defaulted(x, 1)
+def struct_defaults_comptime() -> i32:
+    # the defaults fill a compile-time aggregate too - every field is a
+    # compile-time value here (a runtime one would make the whole struct a
+    # runtime value, held in a plain variable, see the behaviour doc §5.2)
+    p: Comptime = Defaulted(1, 1)
     return p.x + p.y + p.z
 
 
@@ -605,7 +607,7 @@ class SpyStructDefaultsTest(TestCase):
         self.assertEqual(struct_defaults_partial(1), 1 + 100 + 9)
 
     def test_defaults_in_a_compile_time_aggregate(self) -> None:
-        self.assertEqual(struct_defaults_comptime(1), 1 + 1 + 9)
+        self.assertEqual(struct_defaults_comptime(), 1 + 1 + 9)
 
     def test_a_zero_sized_default_stores_nothing(self) -> None:
         self.assertEqual(struct_defaults_zst(), 3)

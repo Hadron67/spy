@@ -28,6 +28,7 @@ from ..compiler.syntax import (
     ref,
 )
 from ..compiler.util import TriState
+from ..std import compile
 from ..std.mem import align_of, layout_of, size_of
 from .cross_context import _CROSS_CONTEXT
 from .func_types import IntUnary
@@ -40,17 +41,51 @@ def dst_target_fn(x: i32) -> i32:
 
 
 @func()
+def dst_uncalled_fn(x: i32) -> i32:
+    # a target never compiled by any test: its value has nothing to lower to
+    return x + 1
+
+
+@func()
+def dst_return_uncalled_fn(x: i32) -> i32:
+    # another never-compiled target, kept apart so the two rejection tests do
+    # not depend on each other's compilation side effects
+    return x + 1
+
+
+@func()
 def dst_local(n: i32) -> i32:
-    # a function value has no runtime representation of its own: a runtime
-    # location (the local's memory) cannot hold one
-    _f: spy_typeof(dst_target_fn) = dst_target_fn  # pyright: ignore
+    # a function value is a first-class constant function pointer: a runtime
+    # local can hold one, the value lowering to the compiled function that
+    # ``std.core.compile`` forces
+    _f: spy_typeof(dst_target_fn) = compile(dst_target_fn)  # pyright: ignore
     return n
 
 
 @func()
 def dst_return():
-    # ... and neither can a return deliver one
-    return dst_target_fn
+    # ... and a return can deliver one the same way
+    return compile(dst_target_fn)
+
+
+@func()
+def dst_call_returned(n: i32) -> i32:
+    # the delivered value is a runtime function pointer: call through it
+    f = dst_return()
+    return f[...](n)
+
+
+@func()
+def dst_local_uncompiled(n: i32) -> i32:
+    # a function value that was never compiled has nothing to lower to
+    _f: spy_typeof(dst_uncalled_fn) = dst_uncalled_fn  # pyright: ignore
+    return n
+
+
+@func()
+def dst_return_uncompiled():
+    # ... and neither can a return deliver an uncompiled one
+    return dst_return_uncalled_fn
 
 
 @func()
@@ -241,10 +276,23 @@ class SpyTypeClassifyTest(TestCase):
 
     def test_compile_time_only_types(self) -> None:
         for type in (sval.TypeType(), sval.TypeVar('C'), sval.AnyIntType(),
-                     sval.TupleType((sval.IntType(32, True),), False),
+                     # a tuple with a compile-time-only element stays compile-time,
+                     # as does a varying-length (ellipsis) tuple
+                     sval.TupleType((sval.TypeType(),), False),
+                     sval.TupleType((sval.IntType(32, True),), True),
                      sval.ResultType(sval.VoidType(), sval.FrozenArraySet()), sval.AnyFunction()):
             self.assertEqual(type.classify(), sval.SpecialTypeKind.COMPTIME)
             self.assertFalse(type.is_zst())
+
+    def test_a_tuple_has_a_runtime_representation(self) -> None:
+        # a tuple now mirrors to a synthesised struct: one whose elements all
+        # have a runtime representation is an ordinary runtime type ...
+        i32_type = sval.IntType(32, True)
+        tuple_type = sval.TupleType((i32_type,), False)
+        self.assertEqual(tuple_type.classify(), sval.SpecialTypeKind.NONE)
+        self.assertFalse(tuple_type.is_zst())
+        # ... while one whose elements are all zero-sized is zero-sized
+        self.assertTrue(sval.TupleType((sval.VoidType(),), False).is_zst())
 
     def test_a_function_type_is_dynamically_sized(self) -> None:
         self.assertEqual(_fn_type().classify(), sval.SpecialTypeKind.DST)
@@ -341,18 +389,27 @@ class SpyTypeClassifyTest(TestCase):
 
 
 class SpyDstTest(TestCase):
-    """A dynamically-sized type (a function type) has no runtime value: a
-    runtime location cannot hold one and a return cannot deliver one."""
+    """A function *type* is dynamically sized, but a function *value* is a
+    first-class constant function pointer: a runtime location can hold one and a
+    return can deliver one, the value lowering to the compiled function.  An
+    uncompiled function value has nothing to lower to and is rejected."""
 
-    def test_a_local_of_a_function_type_is_rejected(self) -> None:
-        with self.assertRaises(CompileError) as ctx:
-            dst_local(3)
-        self.assertIn('dynamically-sized', str(ctx.exception))
+    def test_a_compiled_function_value_is_stored_in_a_local(self) -> None:
+        # ``std.core.compile`` forces the compilation the lowering needs
+        self.assertEqual(dst_local(3), 3)
 
-    def test_returning_a_function_value_is_rejected(self) -> None:
+    def test_a_compiled_function_value_is_returned(self) -> None:
+        self.assertEqual(dst_call_returned(3), 4)
+
+    def test_an_uncompiled_function_value_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:
-            dst_return()
-        self.assertIn('dynamically-sized', str(ctx.exception))
+            dst_local_uncompiled(3)
+        self.assertIn('not compiled yet', str(ctx.exception))
+
+    def test_an_uncompiled_function_value_cannot_be_returned(self) -> None:
+        with self.assertRaises(CompileError) as ctx:
+            dst_return_uncompiled()
+        self.assertIn('not compiled yet', str(ctx.exception))
 
 
 class SpyOpaqueAndUnsizedTest(TestCase):

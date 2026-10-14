@@ -16,8 +16,8 @@ from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type, struct
 from ..compiler.syntax import (
     ConstPtr,
-    as_func_ptr,
 )
+from ..std import compile as spy_compile
 from ..compiler.util import FrozenArraySet
 from .structs import MIR_CACHE, Handle, struct_type
 
@@ -211,13 +211,6 @@ def ptr_target_incr(n: i32) -> i32:
     return n + 1
 
 
-@func()
-def call_spy_func_ptr(n: i32) -> i32:
-    # ``as_func_ptr`` materializes the address of a spy function
-    p = as_func_ptr(spy_typeof(ptr_target_incr), ptr_target_incr)  # pyright: ignore
-    return p[...](n)
-
-
 @func_type()
 class IntUnary(Protocol):
     def __call__(self, n: i32) -> i32: ...
@@ -229,9 +222,18 @@ def apply_int_unary(p: ConstPtr[IntUnary], n: i32) -> i32:
 
 
 @func()
+def call_spy_func_ptr(n: i32) -> i32:
+    # a spy function value *is* a constant function pointer now: it lowers to its
+    # own symbol automatically, so no ``as_func_ptr`` is needed - ``std.core.compile``
+    # forces the specialization it lowers to (see the behaviour doc §4.3/§9.5)
+    p = spy_compile(ptr_target_incr)
+    return p[...](n)
+
+
+@func()
 def call_spy_func_ptr_typed(n: i32) -> i32:
     # the pointer of a spy function converts to a declared function-pointer type
-    p = as_func_ptr(spy_typeof(ptr_target_incr), ptr_target_incr)  # pyright: ignore
+    p: ConstPtr[IntUnary] = spy_compile(ptr_target_incr)
     return apply_int_unary(p, n)
 
 

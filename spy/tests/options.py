@@ -18,6 +18,7 @@ from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
     Array,
     Comptime,
+    ConstComptime,
     Option,
     Ptr,
     array,
@@ -702,11 +703,18 @@ def unwrap_deep_opt(x: i32, c: spy_bool) -> i32:
 
 
 @func()
-def unwrap_comptime_field(x: i32, c: spy_bool) -> i32:
-    # an option field of a compile-time aggregate: its payload pointer is taken
-    # out of the compile-time storage (a ``ComptimeOptionPtr``)
-    h = OptHolder(x if c else None, 1)
-    ch: Comptime = h
+def unwrap_comptime_field_present() -> i32:
+    # an option field of a compile-time aggregate holds a compile-time option
+    # value: unwrapping it reads the payload out of the compile-time storage
+    ch: Comptime = OptHolder(10, 1)
+    if (o := ch.o) is not None:
+        return o + 100
+    return -1
+
+
+@func()
+def unwrap_comptime_field_absent() -> i32:
+    ch: Comptime = OptHolder(None, 1)
     if (o := ch.o) is not None:
         return o + 100
     return -1
@@ -769,20 +777,21 @@ class PtrMixedHolder:
 
 
 @func()
-def pass_declared_ptr_mixed(x: i32, c: spy_bool) -> i32:
-    y = x
-    pm = maybe_ptr_mixed(ref(y), 1, c)
-    ch: Comptime[Option[PtrMixed]] = pm
+def pass_declared_ptr_mixed() -> i32:
+    # a declared compile-time option of a pointer struct, absent: the absent
+    # value is a compile-time null, which lowers into the pointer the child's
+    # first pointer field names when it crosses into runtime
+    ch: Comptime[Option[PtrMixed]] = None
     return take_ptr_mixed(ch)
 
 
 @func()
-def comptime_option_ref_in_memory() -> i32:
-    # a plain local has no compile-time storage for the pointer: the option is
-    # materialized and the local points at that copy (the ``_to_runtime`` of a
-    # ``ComptimeOptionPtr``), so writing through it does not touch ``ch``
+def comptime_option_ref_aliases() -> i32:
+    # a compile-time pointer aliases its storage by identity (it is not copied):
+    # the local ``p`` holds the pointer itself, so writing through it writes
+    # ``ch`` as well
     ch: Comptime[Option[i32]] = 5
-    p = ref(ch)
+    p: Comptime = ref(ch)
     p[...] = 7
     if (v := p[...]) is not None and (w := ch) is not None:
         return v * 10 + w
@@ -859,32 +868,40 @@ def ptr_opt_through_ptr(p: Ptr[Option[Ptr[i32]]]) -> i32:
 
 @func()
 def comptime_option_ptr_present() -> i32:
-    # ``ref`` of compile-time option storage: the option is materialized and
-    # the pointer to that copy is what is passed (``_to_runtime`` of a
-    # ``ComptimeOptionPtr``)
-    ch: Comptime[Option[i32]] = 5
+    # a ``ConstComptime`` option is a compile-time constant: ``ref`` gives a
+    # const compile-time pointer, auto-lowered into a global constant when it
+    # crosses into runtime
+    ch: ConstComptime[Option[i32]] = 5
     return opt_through_ptr(ref(ch))
 
 
 @func()
 def comptime_option_ptr_absent() -> i32:
-    ch: Comptime[Option[i32]] = None
+    ch: ConstComptime[Option[i32]] = None
     return opt_through_ptr(ref(ch))
 
 
 @func()
 def comptime_option_ptr_runtime(x: i32, c: spy_bool) -> i32:
-    # the tag comes from a runtime option value
+    # an option whose tag comes from a runtime value is a runtime value: it
+    # cannot be stored into compile-time storage
     o = maybe_add(x, 1, c)
-    ch: Comptime[Option[i32]] = o
+    ch: ConstComptime[Option[i32]] = o
     return opt_through_ptr(ref(ch))
 
 
 @func()
-def comptime_option_ptr_of_ptr(x: i32, c: spy_bool) -> i32:
-    y = x
-    o = maybe_ptr(ref(y), c)
-    ch: Comptime[Option[Ptr[i32]]] = o
+def comptime_option_ptr_of_ptr_present() -> i32:
+    # the payload is a compile-time pointer (to a ``ConstComptime`` constant):
+    # the option is a compile-time value and its lowering points at that global
+    y: ConstComptime[i32] = 7
+    ch: ConstComptime[Option[Ptr[i32]]] = ref(y)
+    return ptr_opt_through_ptr(ref(ch))
+
+
+@func()
+def comptime_option_ptr_of_ptr_absent() -> i32:
+    ch: ConstComptime[Option[Ptr[i32]]] = None
     return ptr_opt_through_ptr(ref(ch))
 
 
@@ -921,8 +938,8 @@ class SpyOptionUnwrapTest(TestCase):
         self.assertEqual(unwrap_deep_opt(10, False), -1)
 
     def test_a_compile_time_option_field(self) -> None:
-        self.assertEqual(unwrap_comptime_field(10, True), 110)
-        self.assertEqual(unwrap_comptime_field(10, False), -1)
+        self.assertEqual(unwrap_comptime_field_present(), 110)
+        self.assertEqual(unwrap_comptime_field_absent(), -1)
 
     def test_a_zero_sized_child(self) -> None:
         self.assertEqual(unwrap_u0(True), 7)
@@ -932,25 +949,25 @@ class SpyOptionUnwrapTest(TestCase):
         self.assertEqual(unwrap_declared(), 5)
 
     def test_an_absent_pointer_option_in_compile_time_storage(self) -> None:
-        self.assertEqual(pass_declared_ptr_mixed(10, True), 4)
-        self.assertEqual(pass_declared_ptr_mixed(10, False), 4)
+        self.assertEqual(pass_declared_ptr_mixed(), 4)
 
     def test_a_pointer_to_compile_time_option_storage(self) -> None:
-        # a ``Comptime[Option[T]]`` addressed by ``ref`` is materialized: what
-        # is passed is a pointer to a fresh copy of the option
+        # a ``ConstComptime[Option[T]]`` addressed by ``ref`` lowers to a global
+        # constant pointer when it crosses into runtime
         self.assertEqual(comptime_option_ptr_present(), 5)
         self.assertEqual(comptime_option_ptr_absent(), -1)
-        self.assertEqual(comptime_option_ptr_runtime(10, True), 11)
-        self.assertEqual(comptime_option_ptr_runtime(10, False), -1)
+        # a runtime option value cannot be stored into compile-time storage
+        with self.assertRaises(CompileError):
+            comptime_option_ptr_runtime(10, True)
 
     def test_a_pointer_to_compile_time_pointer_option_storage(self) -> None:
-        self.assertEqual(comptime_option_ptr_of_ptr(7, True), 7)
-        self.assertEqual(comptime_option_ptr_of_ptr(7, False), -1)
+        self.assertEqual(comptime_option_ptr_of_ptr_present(), 7)
+        self.assertEqual(comptime_option_ptr_of_ptr_absent(), -1)
 
     def test_a_pointer_to_a_compile_time_option(self) -> None:
-        # ``ref`` of a compile-time option: the option is materialized and the
-        # pointer points at that copy
-        self.assertEqual(comptime_option_ref_in_memory(), 75)
+        # ``ref`` of a compile-time option aliases it (no copy): writing through
+        # the pointer writes the option itself
+        self.assertEqual(comptime_option_ref_aliases(), 77)
 
     def test_an_if_else_guarded_by_a_chain(self) -> None:
         self.assertEqual(unwrap_opt_else(10, True), 23)

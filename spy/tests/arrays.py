@@ -239,10 +239,26 @@ def unknown_array_keyword(x: i32) -> i32:
     return a[0] + x
 
 
+@func()
+def array_with_a_runtime_element(x: i32) -> i32:
+    # a runtime element makes the whole array a runtime value: it is held in a
+    # plain variable, not a compile-time one (see the behaviour doc §5.2)
+    a: Array[i32, Literal[2]] = array(x, 2)
+    return a[0] + a[1]
+
+
+@func()
+def array_from_a_runtime_value(x: i32) -> i32:
+    # a whole runtime *array* value copied into another array variable
+    a = array(x, x + 1)
+    c: Array[i32, Literal[2]] = a
+    return c[1]
+
+
 # ---------------------------------------------------------------------------
-# compile-time arrays: an array built in an inline slot - an expression
-# temporary or a ``Comptime`` variable - is an aggregate (like a struct) whose
-# elements are their own compile-time places (see ``interp.ComptimeAggregatePtr``)
+# compile-time arrays: an array built in a ``Comptime`` variable is an aggregate
+# (like a struct) whose elements are their own compile-time places - a ``Box``
+# the value is flattened into (see ``interp``)
 # ---------------------------------------------------------------------------
 
 
@@ -270,23 +286,6 @@ def comptime_array_of_structures() -> i32:
 def comptime_nested_array() -> i32:
     a: Comptime = array(array(1, 2), array(3, 4))
     return a[1][0]
-
-
-@func()
-def comptime_array_with_a_runtime_element(x: i32) -> i32:
-    # a runtime element is a runtime place of its own: the other element is
-    # still compile-time
-    a: Comptime = array(x, 2)
-    return a[0] + a[1]
-
-
-@func()
-def comptime_array_from_a_runtime_value(x: i32) -> i32:
-    # a whole runtime *array* value assigned to a compile-time variable: its
-    # elements are read out of the value itself (``mir.ExtractValue``)
-    a = array(x, x + 1)
-    c: Comptime = a
-    return c[1]
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +374,9 @@ def const_array_wrong_length(x: i32) -> Array[i32, Literal[3]]:
 
 
 class SpyComptimeArrayTest(TestCase):
-    """Compile-time arrays: an array built in an inline slot - an expression
-    temporary or a ``Comptime`` variable - is an aggregate whose elements are
-    their own compile-time places, like a struct's fields."""
+    """Compile-time arrays: an array built in a ``Comptime`` variable is an
+    aggregate whose elements are their own compile-time places, like a struct's
+    fields."""
 
     def test_element_read(self) -> None:
         self.assertEqual(comptime_array_element(), 2)
@@ -390,14 +389,6 @@ class SpyComptimeArrayTest(TestCase):
 
     def test_nested_array(self) -> None:
         self.assertEqual(comptime_nested_array(), 3)
-
-    def test_runtime_element(self) -> None:
-        self.assertEqual(comptime_array_with_a_runtime_element(5), 7)
-
-    def test_a_whole_runtime_value(self) -> None:
-        # a whole runtime array value into a compile-time variable: the elements
-        # are read out of the value itself
-        self.assertEqual(comptime_array_from_a_runtime_value(3), 4)
 
     def test_a_runtime_struct_cannot_unroll(self) -> None:
         with self.assertRaises(CompileError):
@@ -474,6 +465,12 @@ class SpyArrayTest(TestCase):
 
     def test_array_value_is_copied(self) -> None:
         self.assertEqual(copy_array(5), 11)
+
+    def test_a_runtime_element(self) -> None:
+        self.assertEqual(array_with_a_runtime_element(5), 7)
+
+    def test_a_whole_runtime_value(self) -> None:
+        self.assertEqual(array_from_a_runtime_value(3), 4)
 
     def test_array_argument_and_result(self) -> None:
         self.assertEqual(call_pass_array(5), 6)
