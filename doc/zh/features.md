@@ -386,8 +386,8 @@ assert state_is_unknown(TriState.UNKNOWN) is True
 
 ### 1.12 ZST（零大小类型）与 DST
 
-- **ZST**：`-> None` 的 `void`、`u0`、字段全为 ZST 的结构体、元素为 ZST 或长度为 0 的数组、`Null`、`undefined`
-  等。ZST 不占运行时空间，但 ZST 结果照常交付单位值。
+- **ZST**：`-> None` 的 `void`、`u0`、字段全为 ZST 的结构体、元素全为 ZST 的元组/`dict[str, T]`、元素为 ZST 或长度为 0 的数组、`Null`、`undefined`
+  等。ZST 不占运行时空间，但 ZST 结果照常交付单位值（`sval.Type.get_unit_value`）。
 - **DST（动态大小类型）**：DST 函数类型、`Opaque`、无长度数组；只有**指向它的指针**是值，不能按值传递/返回/整体读取。
   结构体里第一个 DST 字段是弹性数组，后续 DST 字段不占位。
 - **无运行时表示的类型（纯编译期）**：类型值（`type`）、字节串（`bytes`）、DST 函数类型、空类型（`Never`）。

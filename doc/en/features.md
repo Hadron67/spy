@@ -386,8 +386,8 @@ See §7.
 
 ### 1.12 ZST (zero-sized type) and DST
 
-- **ZST**: the `void` of `-> None`, `u0`, structs whose fields are all ZST, arrays whose elements are ZST or whose length is 0, `Null`, `undefined`,
-  and so on. A ZST takes no runtime space, but a ZST result still delivers a unit value as usual.
+- **ZST**: the `void` of `-> None`, `u0`, structs whose fields are all ZST, tuples and `dict[str, T]`s whose elements are all ZST, arrays whose elements are ZST or whose length is 0, `Null`, `undefined`,
+  and so on. A ZST takes no runtime space, but a ZST result still delivers a unit value as usual (see `sval.Type.get_unit_value`).
 - **DST (dynamically-sized type)**: DST function types, `Opaque`, unsized arrays; only **a pointer to it** is a value, and it cannot be passed/returned by value or read as a whole.
   The first DST field in a struct is a flexible array member, and later DST fields occupy no slot.
 - **Types with no runtime representation (purely compile time)**: type values (`type`), byte strings (`bytes`), DST function types, the empty type (`Never`).

@@ -421,6 +421,21 @@ class TupleType(AggregateType):
         return self.types
 
     @override
+    def get_unit_value(self) -> AnyValue | None:
+        """The unit value of a zero-sized tuple: the aggregate of its elements'
+        unit values (a tuple is zero-sized when they all are, like a struct).  A
+        varying-length tuple has no fixed layout, so it has none."""
+        if self.has_ellipsis:
+            return None
+        values: list[AnyValue] = []
+        for type in self.types:
+            val = type.get_unit_value()
+            if val is None:
+                return None
+            values.append(val)
+        return AggregateValue(tuple(values), self)
+
+    @override
     def classify(self) -> SpecialTypeKind:
         if self.has_ellipsis:
             # a varying-length tuple has no fixed runtime layout
@@ -909,6 +924,19 @@ class StrDictType(AggregateType):
     @override
     def get_type_children(self) -> tuple[Type, ...]:
         return tuple(self.values.values())
+
+    @override
+    def get_unit_value(self) -> AnyValue | None:
+        """The unit value of a zero-sized string dictionary: the aggregate of
+        its entries' unit values (a ``dict[str, T]`` is zero-sized when all of
+        them are, like a struct)."""
+        values: list[AnyValue] = []
+        for type in self.values.values():
+            val = type.get_unit_value()
+            if val is None:
+                return None
+            values.append(val)
+        return AggregateValue(tuple(values), self)
 
     @override
     def classify(self) -> SpecialTypeKind:

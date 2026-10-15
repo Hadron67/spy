@@ -18,6 +18,7 @@ from ..compiler.syntax import (
     Comptime,
     ConstComptime,
     ConstMultiPtr,
+    InferComptime,
     MultiPtr,
     Opaque,
     Option,
@@ -97,6 +98,30 @@ def typed_undefined_const_array_element(x: i32) -> i32:
     # with the array length inferred (see ``std.core.const_array``)
     a = const_array(typed_undefined(Ptr[Opaque]), 3)
     return len(a)
+
+
+@struct()
+class ZeroSized:
+    pass
+
+
+@func()
+def typed_undefined_of_a_zero_sized_tuple() -> i32:
+    # a zero-sized tuple has a unit value, exactly like a zero-sized struct: an
+    # inferred (runtime) local of the type therefore holds no storage instead of
+    # failing for want of a runtime representation
+    t: InferComptime = (ZeroSized(), ZeroSized())
+    u = typed_undefined(spy_typeof(t))
+    spy_typeof(u)
+    return 1
+
+
+@func()
+def zero_sized_tuple_local() -> i32:
+    # the same for a plain inferred local: the tuple is a zero-sized value
+    t = (ZeroSized(), ZeroSized())
+    spy_typeof(t)
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +293,14 @@ class SpyCoerceTest(TestCase):
 
     def test_typed_undefined_as_a_const_array_element(self) -> None:
         self.assertEqual(typed_undefined_const_array_element(0), 3)
+
+    def test_typed_undefined_of_a_zero_sized_tuple(self) -> None:
+        # a zero-sized tuple carries a unit value, so a runtime local of it is
+        # legal even though it holds no storage (see ``sval.TupleType``)
+        self.assertEqual(typed_undefined_of_a_zero_sized_tuple(), 1)
+
+    def test_a_zero_sized_tuple_local(self) -> None:
+        self.assertEqual(zero_sized_tuple_local(), 1)
 
     def test_a_compile_time_pointer(self) -> None:
         self.assertEqual(coerce_comptime_pointer(), 5)
