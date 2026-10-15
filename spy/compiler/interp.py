@@ -375,13 +375,15 @@ class _PendingPtrConvertion(_PendingActionData):
 
 @dataclass
 class _PendingTuple(_PendingActionData):
-    # one tuple initialization recorded by a PendingSlot (see ``init_tuple``):
-    # the places the tuple's elements are written into.  The slot holds the tree
-    # of element places itself, and its type - the tuple of the types of those
-    # places - is read when the slot is committed, once the elements have been
-    # written.  Recording it as an action (rather than committing the slot
-    # right away) keeps the slot's type resolution - and the conflict it
-    # reports against any other store into the slot - intact.
+    # one tuple initialization recorded by a PendingSlot (see ``init_tuple`` and
+    # ``HirRunner._deliver_packed_tuple``): the places the tuple's elements are
+    # written into - one per element, a nested group's being a place of its own
+    # that recorded its elements in turn.  The slot holds the tree of element
+    # places itself, and its type - the tuple of the types of those places - is
+    # read when the slot is committed, once the elements have been written.
+    # Recording it as an action (rather than committing the slot right away)
+    # keeps the slot's type resolution - and the conflict it reports against any
+    # other store into the slot - intact.
     places: tuple[InterpVal, ...]
 
     @override
@@ -1403,18 +1405,6 @@ def _union_contains(superset: sval.UnionType, subset: sval.UnionType) -> bool:
     other's (see ``HirRunner._convert_result_ptr``)."""
     return all(exception in superset.types for exception in subset.types)
 
-
-def _flatten_result_tree(tree: PlaceTree) -> tuple[InterpVal, ...]:
-    """The leaf places of a (nested) result-location tree, in depth-first order."""
-    out: list[InterpVal] = []
-    work: list[PlaceTree] = [tree]
-    while work:
-        item = work.pop()
-        if isinstance(item, tuple):
-            work.extend(reversed(item))
-        else:
-            out.append(item)
-    return tuple(out)
 
 def _single_place(place: PlaceTree) -> InterpVal:
     """The single place ``place`` is - requiring it not to be a tree of several
@@ -9283,15 +9273,18 @@ class HirRunner:
         code and payload union of the callee in ``err_loc`` (``None`` for a
         callee that raises nothing) - or, when a result (or a group of them) is
         given a single place of its own, into fresh places whose tuple is then
-        stored in that place.  A tuple may be inlined, so such a place has to be
-        able to hold its value inline (a ``Comptime`` variable); a plain slot
-        rejects the tuple when it is committed (see ``_no_runtime_type``).
+        stored in that place (see ``_fresh_places``/``_deliver_packed_tuple``):
+        one fresh place per element, a nested group taking a slot of its own, so
+        the packed tuple keeps the nesting of the results.  The place holds the
+        tuple as a value of its own type; a tuple that has no runtime
+        representation (a compile-time leaf) requires a ``Comptime`` variable
+        (see ``_no_runtime_type``).
 
         A zero-sized result occupies no place of its own: its unit value is
         written into its place.  A ``noreturn`` call (``mir.NoReturn``) ends the
         block it is emitted into."""
         places: list[InterpVal] = []
-        packed: list[tuple[InterpVal, PlaceTree]] = []
+        packed: list[tuple[InterpVal, tuple[InterpVal, ...]]] = []
         if err_loc is None:
             self._pair_places(spec, ArgEntry(ret_loc, True), places, packed)
         else:
@@ -9398,37 +9391,44 @@ class HirRunner:
 
         if len(packed) == 0:
             return
-        for target, tree in packed:
-            self._deliver_packed_tuple(target, tree)
+        for target, elements in packed:
+            self._deliver_packed_tuple(target, elements)
 
-    def _deliver_packed_tuple(self, target: InterpVal, tree: PlaceTree) -> None:
+    def _deliver_packed_tuple(self, target: InterpVal, elements: tuple[InterpVal, ...]) -> None:
         """Deliver a multi-value result packed into the single place ``target``
         (a call the caller gave neither a place per result nor a tuple target, see
-        ``_pair_places``).  A still uncommitted slot records the tree's leaf places
-        as its own tuple storage (see ``_PendingTuple``); any other place receives
-        the elements, one per field."""
-        leaves = _flatten_result_tree(tree)
+        ``_pair_places``).  ``elements`` holds one place per result element, a
+        nested group's being a slot that recorded its own element places (see
+        ``_fresh_places``), so the tuple ``target`` receives keeps the nesting of
+        the results.  A still uncommitted slot records the tree as its own tuple
+        storage (see ``_PendingTuple``); any other place receives the elements, one
+        per field."""
         if isinstance(target, PendingSlot) and target.committed is None:
-            self._record_pending_action(target, _PendingTuple(leaves))
+            self._record_pending_action(target, _PendingTuple(elements))
             return
-        for index, place in enumerate(leaves):
-            self.store(self.field_index_addr(target, _index_value(index)), self.load(place))
+        for index, place in enumerate(elements):
+            element_type = _place_type(place)
+            if element_type is None:
+                raise CompileError('a tuple element has no type yet')
+            self._store_into_element(target, index, place, element_type)
 
     def _pair_places(
         self,
         node: RetSpec,
         entry: ArgEntry[PlaceTree],
         places: list[InterpVal],
-        packed: list[tuple[InterpVal, PlaceTree]],
+        packed: list[tuple[InterpVal, tuple[InterpVal, ...]]],
     ) -> None:
         """Pair the results of ``node`` with the place tree the caller reserved: a
         single result takes the place ``entry`` denotes, a group takes a (nested)
         tuple of places nested exactly like the results (see ``astgen``), and the
         leaves are appended to ``places`` in depth-first order.  A group the caller
-        gives a single non-tuple place is *packed*: fresh places are reserved and
-        their (nested) tuple is stored in that place after the call (see
-        ``_deliver_result``).  The root result-type group is unwrapped by the
-        caller (``_deliver_result``), so ``node`` is never one here."""
+        gives a single non-tuple place is *packed*: one fresh place per element is
+        reserved - a nested group taking a slot that records its own element places
+        - and the tuple they make up is stored in that place after the call (see
+        ``_fresh_places``/``_deliver_packed_tuple``).  The root result-type group
+        is unwrapped by the caller (``_deliver_result``), so ``node`` is never one
+        here."""
         target = entry.value
         match node:
             case RetValue() | RetComptime():
@@ -9450,20 +9450,30 @@ class HirRunner:
                     for child, sub in zip(values, target):
                         self._pair_places(child, ArgEntry(sub, True), places, packed)
                     return
-                tree = self._fresh_places(node, places)
-                packed.append((target, tree))
+                packed.append((target, self._fresh_tuple_places(values, places)))
 
-    def _fresh_places(self, node: RetSpec, places: list[InterpVal]) -> PlaceTree:
-        """Fresh places for a group packed into a single location: a (nested)
-        Python tuple of places mirroring the shape of the results, with the leaf
-        places appended to ``places`` in depth-first order."""
+    def _fresh_tuple_places(self, values: tuple[RetSpec, ...], places: list[InterpVal]) -> tuple[InterpVal, ...]:
+        """The element places of a group packed into a single location: one place
+        per element, with the leaf places appended to ``places`` in depth-first
+        order (see ``_fresh_places``)."""
+        return tuple(self._fresh_places(child, places) for child in values)
+
+    def _fresh_places(self, node: RetSpec, places: list[InterpVal]) -> InterpVal:
+        """A fresh place for one element of a group packed into a single location
+        (see ``_fresh_tuple_places``).  A value takes a fresh slot; a nested group
+        takes a slot of its own that records its element places as a
+        ``_PendingTuple`` (the shape ``init_tuple`` gives a tuple location), so
+        that the group is delivered as a nested tuple value of its own and the
+        result keeps its nesting (see ``_deliver_packed_tuple``)."""
         match node:
             case RetValue() | RetComptime():
                 place = self.alloca()
                 places.append(place)
                 return place
             case RetTuple(values=values):
-                return tuple(self._fresh_places(child, places) for child in values)
+                place = self.alloca()
+                self._record_pending_action(place, _PendingTuple(self._fresh_tuple_places(values, places)))
+                return place
         raise CompileError(f'cannot reserve fresh places for {node!r}')
 
     def _inline_arg_place(self, arg: ArgEntry[InterpVal], declared: sval.Type | None = None) -> InterpVal:

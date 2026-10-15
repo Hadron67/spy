@@ -141,12 +141,11 @@ def use_forward_nested_multi(x: i32) -> i32:
 
 @func()
 def packed_nested_multi(x: i32) -> i32:
-    # a packed multi-value result is a tuple of the result *leaves*, so a nested
-    # result is packed flat (the grouping is only kept by a direct destructuring
-    # of the call, see ``test_nested_destructuring``)
+    # a packed multi-value result is a tuple of the result *elements*, a nested
+    # result being a tuple value of its own: indexed nested (see
+    # ``test_nested_packed_into_a_plain_variable``)
     packed = nested_multi(x)
-    n, m, large, small = packed  # pyright: ignore
-    return n * 100000 + m * 10000 + large.d * 100 + small.b  # pyright: ignore
+    return packed[0] * 100000 + packed[1][0] * 10000 + packed[1][1].d * 100 + packed[2].b
 
 
 @func()
@@ -318,8 +317,9 @@ def bad_infer_falloff(a: i32):
 # a packed tuple is a runtime aggregate: its element count is known with
 # ``len`` (a compile-time integer), and its i-th element is a *place* read and
 # written with ``t[i]`` (a compile-time integer index, bounds-checked).  The
-# packed tuple is flat: one element per result leaf (a nested result is packed
-# leaf by leaf).
+# packed tuple mirrors the *result elements*: one element per result element, a
+# nested result being a tuple value of its own (so ``packed[1][0]`` picks into
+# the middle group of ``nested_multi``), and its length is the top-level arity.
 # ---------------------------------------------------------------------------
 
 
@@ -331,7 +331,8 @@ def packed_len(x: i32) -> i32:
 
 @func()
 def nested_packed_len(x: i32) -> i32:
-    # one element per result leaf: the nested result has four of them
+    # one element per result element: the nested result is a single one of the
+    # three
     packed = nested_multi(x)
     return len(packed)
 
@@ -344,9 +345,100 @@ def packed_index(x: i32) -> i32:
 
 @func()
 def packed_nested_index(x: i32) -> i32:
-    # a flat packed tuple: leaf 0 is the leading scalar, leaf 1 the inner one
+    # a nested packed tuple: element 0 is the leading scalar, element 1 the inner
+    # tuple (indexed again)
     packed = nested_multi(x)
-    return packed[0] * 100 + packed[1]  # pyright: ignore
+    return packed[0] * 100 + packed[1][0]
+
+
+@func()
+def nested_tail(x: i32) -> tuple[i32, i32, tuple[i32, i32]]:
+    return x, x + 1, (x + 2, x + 3)
+
+
+@func()
+def use_packed_nested_tail(x: i32) -> i32:
+    # the packed result keeps the nesting: ``ret[2]`` is the inner tuple
+    ret = nested_tail(x)
+    return ret[0] * 1000 + ret[1] * 100 + ret[2][0] * 10 + ret[2][1]
+
+
+@func()
+def packed_nested_tail_len(x: i32) -> i32:
+    ret = nested_tail(x)
+    return len(ret)
+
+
+@func()
+def repacked_nested(x: i32) -> i32:
+    # the first assignment commits the slot (its ``CommitSlot`` runs at the end of
+    # the statement), so the packed result of the second call is delivered into
+    # an already materialized (nested) tuple place
+    ret = nested_tail(x)
+    ret = nested_tail(x + 10)
+    return ret[0] * 100 + ret[2][0]
+
+
+@func()
+def write_packed_nested(x: i32) -> i32:
+    ret = nested_tail(x)
+    ret[2][1] = 99  # pyright: ignore
+    return ret[2][0] * 1000 + ret[2][1]
+
+
+@func()
+def nested_struct(x: i32) -> tuple[i32, i32, tuple[Large, Small]]:
+    # the nested group is a tuple of two structs: the packed result keeps it
+    # whole, so both are reached through ``ret[2]``
+    return x, x + 1, (Large(x, x, x, x), Small(x + 2, x + 3))
+
+
+@func()
+def use_packed_nested_struct(x: i32) -> i32:
+    ret = nested_struct(x)
+    return ret[0] * 10000 + ret[1] * 1000 + ret[2][0].d * 10 + ret[2][1].b
+
+
+@func()
+def nested_struct_len(x: i32) -> i32:
+    ret = nested_struct(x)
+    return len(ret)
+
+
+@func()
+def nested_groups(x: i32) -> tuple[tuple[Large, i32], i32, tuple[Small, i32]]:
+    # two nested groups, each holding a struct, and one of them leading
+    return (Large(x, x, x, x), x + 1), x + 2, (Small(x + 3, x + 4), x + 5)
+
+
+@func()
+def use_packed_nested_groups(x: i32) -> i32:
+    ret = nested_groups(x)
+    return ret[0][0].d * 100000 + ret[0][1] * 10000 + ret[1] * 100 + ret[2][0].b
+
+
+@func()
+def use_destructured_nested_groups(x: i32) -> i32:
+    # the same shape destructured: each struct group is bound whole
+    (large, n), m, (small, k) = nested_groups(x)
+    return large.d * 1000 + n * 100 + m * 10 + small.b + k
+
+
+@func()
+def nested_deep_struct(x: i32) -> tuple[i32, tuple[Small, tuple[Large, i32]]]:
+    # two levels of nesting, the innermost group ending in a struct
+    return x, (Small(x + 1, x + 2), (Large(x, x, x, x), x + 3))
+
+
+@func()
+def use_packed_nested_deep_struct(x: i32) -> i32:
+    ret = nested_deep_struct(x)
+    return (
+        ret[0] * 100000
+        + ret[1][0].b * 10000
+        + ret[1][1][0].d * 1000
+        + ret[1][1][1] * 100
+    )
 
 
 @func()
@@ -519,14 +611,62 @@ class SpyMultiReturnTest(TestCase):
         self.assertEqual(packed_len(3), 2)
 
     def test_len_of_a_nested_packed_tuple(self) -> None:
-        # a packed result is flat: one element per result leaf (four here)
-        self.assertEqual(nested_packed_len(3), 4)
+        # the length is the top-level arity, not the number of leaves
+        self.assertEqual(nested_packed_len(3), 3)
 
     def test_indexing_a_packed_tuple(self) -> None:
         self.assertEqual(packed_index(3), 3103)
 
     def test_indexing_a_nested_packed_tuple(self) -> None:
         self.assertEqual(packed_nested_index(3), 304)
+
+    def test_a_packed_nested_tail_keeps_its_nesting(self) -> None:
+        # ``ret[2]`` is the inner ``tuple[i32, i32]`` of the packed result
+        self.assertEqual(use_packed_nested_tail(1), 1234)
+
+    def test_len_of_a_packed_nested_tail(self) -> None:
+        self.assertEqual(packed_nested_tail_len(1), 3)
+
+    def test_repacking_a_committed_nested_place(self) -> None:
+        # the target slot is committed by the first assignment, so the second
+        # packed call delivers into a materialized place
+        self.assertEqual(repacked_nested(1), 1113)
+
+    def test_writing_a_nested_packed_tuple_element(self) -> None:
+        self.assertEqual(write_packed_nested(1), 3099)
+
+    def test_a_packed_nested_tuple_with_structs(self) -> None:
+        # the nested group holds the two structs whole: ``ret[2][0]``/``ret[2][1]``
+        self.assertEqual(use_packed_nested_struct(3), 34036)
+        self.assertEqual(nested_struct_len(3), 3)
+
+    def test_packing_nested_groups_with_structs(self) -> None:
+        self.assertEqual(use_packed_nested_groups(1), 120305)
+
+    def test_destructuring_nested_groups_with_structs(self) -> None:
+        self.assertEqual(use_destructured_nested_groups(1), 1241)
+
+    def test_packing_a_deeply_nested_struct_tuple(self) -> None:
+        self.assertEqual(use_packed_nested_deep_struct(2), 242500)
+
+    def test_lowered_signature_of_a_nested_struct_return(self) -> None:
+        # the leaves are delivered depth first across the nesting: the first
+        # scalar returns by value, the large struct and every other leaf through
+        # a result pointer each
+        self.assertEqual(use_packed_nested_groups(1), 120305)
+        args, ret = mir_signature(nested_groups)
+        i32_mir = mir.IntType(32, True)
+        self.assertEqual(ret, i32_mir)
+        self.assertEqual(args[0], i32_mir)
+        self.assertEqual(
+            args[1:],
+            (
+                mir.PointerType(struct_mirror(Large), False),
+                mir.PointerType(i32_mir, False),
+                mir.PointerType(struct_mirror(Small), False),
+                mir.PointerType(i32_mir, False),
+            ),
+        )
 
     def test_writing_a_packed_tuple_element(self) -> None:
         self.assertEqual(packed_index_write(3), 104)
