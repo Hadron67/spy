@@ -128,7 +128,7 @@ assert in_range(5) is True and in_range(20) is False
 `syntax.Ptr[T]`（可变单指针）、`ConstPtr[T]`（只读单指针）、`MultiPtr[T]` / `ConstMultiPtr[T]`
 （多指针，可像数组一样下标）。
 
-- 单指针写 `p[...]`（解引用，C 的 `*p`），多指针写 `p[i]`（第 i 个元素的 place）。
+- 单指针写 `p[...]`（解引用，C 的 `*p`），多指针写 `p[i]`（第 i 个元素的指针）。
 - 指针是**非空**的；`Option[Ptr[T]]` 才是可空指针。
 - 可变指针可隐式转 const（`Ptr[T]` → `ConstPtr[T]`）；反之不行。
 - 指向数组的指针（`*[N]T`）可当成元素的多指针。
@@ -176,7 +176,7 @@ assert low_byte(0x41) == 0x41
 - 切片类型在 `std`：`std.SlicePtr[T]` / `std.ConstSlicePtr[T]`（结构体 `{ptr, length}`）。
   `std.arr_slice(p)` / `std.const_arr_slice(p)` 把指向数组的指针变成整段切片；
   多指针切片 `p[a:b]` 得到 `SlicePtr(p+a, b-a)`（缺省下界 0、上界长度、step 必须为 1）。
-- 切片可迭代（元素值）与 `refs()`（元素 place）；越界会 `panic`。
+- 切片可迭代（元素值）与 `refs()`（元素指针）；越界会 `panic`。
 - `std.core.const_array(elem, length)`：`length` 个相同元素的数组（元素表达式只求值一次，可为运行时值）。
 - 数组**不能跨 Python 调用边界**（见 §10），因此下面用 spy 函数间接调用。
 
@@ -1167,7 +1167,7 @@ class Outer:
 
 @func()
 def build(x: i32) -> i32:
-    o = Outer(Inner(x))          # the inner struct is built in place
+    o = Outer(Inner(x))          # the inner struct is built into its destination
     o.inner.v += 1
     return o.inner.v
 
@@ -1258,9 +1258,9 @@ assert q.x == 2 and q.y == 1
 ### 7.8 下标重载（`__spy_getitemptr__`）
 
 一个结构体值可以像数组一样被下标（`expr[i]`）：定义方法 `__spy_getitemptr__(self, index) -> Ptr[T]`
-（或 `ConstPtr[T]` / `MultiPtr[T]` / `ConstMultiPtr[T]`），它**返回元素的指针**——即第 `i` 个元素所在的 place。
+（或 `ConstPtr[T]` / `MultiPtr[T]` / `ConstMultiPtr[T]`），它**返回元素的指针**——即第 `i` 个元素的地址。
 
-- `expr[i]` 就是该方法返回值所**指向的那个 place**：可读、可赋值、可 `+=`，也可继续取字段/下标。
+- `expr[i]` 就是该方法返回值**指向的那个元素**（编译器在需要值的地方自动解引用）：可读、可赋值、可 `+=`，也可继续取字段/下标。
 - 方法可以未装饰（调用处内联）或用 `@func()` 编译成运行时方法；返回的必须是**指针**，返回一个值会报错。
 - 类里通常再写一对 `__getitem__`/`__setitem__`（放在 `if TYPE_CHECKING:` 里）**只为 Python 类型检查器**接受
   `expr[i]` 的写法——编译器不调用它们（下标编译时走 `__spy_getitemptr__`）。
@@ -1272,7 +1272,7 @@ class IntArray:
     ptr: MultiPtr[i32]
 
     def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
-        return self.ptr + index          # the place of the i-th element
+        return self.ptr + index          # the address of the i-th element
 
     if TYPE_CHECKING:
         # only so a type checker accepts ``v[i]``; never called by the compiler
@@ -1283,7 +1283,7 @@ class IntArray:
 def subscript_use(x: i32) -> i32:
     a = array(x, x + 1, x + 2)
     v = IntArray(arr_slice(ref(a)).ptr)
-    v[2] = 100                           # writes through the returned place
+    v[2] = 100                           # writes through the returned pointer
     return v[0] + v[1] + v[2]
 
 assert subscript_use(1) == 1 + 2 + 100
@@ -1366,7 +1366,7 @@ assert named_sum(a=1, b=2) == 3
 
 ### 8.5 编译期指针
 
-- 取址/偏移：`ref(a)`（`a` 是编译期位置）得到一个编译期指针；`p[...]` 读写它指向的位置。
+- 取址/偏移：`ref(a)` 得到指向 `a` 的编译期指针；`p[...]` 读写它指向的位置。
 - **const 指针**可以跨非内联边界（作 `Comptime` 实参、被编译闭包捕获、作非内联函数返回值），按**身份**传递、可别名。
 - **非 const 编译期指针**跨非内联边界时会**物化一份拷贝**：callee 的写入影响不到原位置。
 - 经 `ptr_cast` 得到的编译期指针不能读写透。

@@ -91,16 +91,16 @@ Two layers of "type" run throughout:
 | `match` | For tagged unions: `case _:` wildcard (must be last), `case T():` (`IsInstance`), `case T() as e:` (`TaggedUnionPayloadPtr`); guards/subpatterns are not supported |
 | `return` | With a value: `_gen_result_loc(value, ReturnLoc())`; without: `StoreVoidRetloc()`; then `hir.Ret()` |
 | `raise` | New slot + `_gen_result_loc(exc, slot)` + `hir.Raise(slot)` |
-| `assign` | `_gen_lhs` (declares `Alloca` if the name is unbound) + `_gen_result_loc(value, place)` + `CommitSlot`; **handles only `targets[0]`** |
+| `assign` | `_gen_lhs` (declares `Alloca` if the name is unbound) + `_gen_result_loc(value, result_loc)` + `CommitSlot`; **handles only `targets[0]`** |
 | `annassign` | `_split_comptime` splits out `is_comptime`/`is_const`/the declared type; `ConstComptime` must carry an initial value; the name must not already be bound |
-| `augassign` | lhs must be an `is_ref` place; emits `hir.BinaryAssign(op, lhs, rhs)` |
+| `augassign` | lhs must be given by reference (`is_ref`, i.e. a pointer); emits `hir.BinaryAssign(op, lhs, rhs)` |
 | `break`/`continue`/`pass` | `hir.BreakLoop` / `hir.Continue` / nothing |
 | Expression statement | `_gen_expr` evaluates then discards (for side effects / forcing compile-time evaluation) |
 
 Expression highlights:
 
-- **Result location semantics (RLS)**: `_gen_result_loc(node, result_loc, allow_fall_back=True)` writes the result into the caller-provided place and produces no register.
-  `hir.ReturnLoc()` denotes the entire function result location tree. The fallback of `_gen_expr` allocates a temporary `Alloca` for expressions that need a "value", writes via RLS, and returns its place.
+- **Result location semantics (RLS)**: `_gen_result_loc(node, result_loc, allow_fall_back=True)` writes the result through the caller-provided **result location pointer** and produces no register.
+  `hir.ReturnLoc()` denotes the entire function result location tree (a tree of pointers for a multiple-value result). The fallback of `_gen_expr` allocates a temporary `Alloca` for expressions that need a "value", writes via RLS, and returns that pointer.
 - **Marker recognition** (by object identity): `_SYNTAX_CALLS = (ref, unroll, comptime, ptr_cast, as_func_ptr, typeof)` -> `_gen_syntax_call`;
   statement-level markers (`unroll`/`comptime`/`const_comptime`/`infer_comptime`) are buffered as a pragma by `_as_marker` and consumed by the next statement (a dangling pragma is an error).
 - Subscript dispatch for `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` is in `astgen._gen_expr`, `_gen_type_ctor`, `_gen_literal`.
@@ -111,7 +111,7 @@ Expression highlights:
 
 ### 2.4 Closure capture (`_gen_closure`)
 
-- Capture happens **lazily at lookup time** (`_tunnel_through_closures`): each `_ClosureScope` boundary crossed appends the current place into `captures` (deduplicated by name).
+- Capture happens **lazily at lookup time** (`_tunnel_through_closures`): each `_ClosureScope` boundary crossed appends the current pointer into `captures` (deduplicated by name).
   The reader's own layer emits `hir.FieldIndexAddr(hir.Arg(0), index)`; intermediate layers emit a `_CaptureField(index)` marker, which `_gen_closure` finally materializes into a field access.
 - `_gen_closure` evaluates the closure's annotations/defaults/return annotation in the **outer flow**, creates an `fn.ClosureFunction`, pushes a `_ClosureScope`,
   binds the parameters to `hir.Arg(i+1)` (`Arg(0)` is the closure's own anonymous struct), and finally emits `hir.MakeClosure(...)`.
@@ -217,7 +217,8 @@ Struct helpers (mostly iterative): `alignment_of`, `aggregate_type_length`, `sca
   `|` chains -> `OptionType`/`tagged_union_of`, `tuple[...]`/`Literal[X]`/pointer markers/`Array[T,L]`/`Option[T]`/`Union`, etc.).
 - `coerce_const(value, type)`: concretizes **any** compile-time value into a type constant, raising `CoerceError` when it cannot. It covers:
   `UntypedUndefined`/typed undefined (`_typed_undefined`, wrapped as the present payload/variant when it is a member of an option/union), `Any` (any value as it is),
-  `ComptimePtr` (a place: a pointer constant when the pointee matches, and read out of its box as the value of an option/union/tuple/`dict[str, T]`),
+  `ComptimePtr` (a pointer value: a pointer constant when the pointee matches; a pointer to an array also converts to the **multi pointer of its elements**
+  `*[N]T -> mptr T`, `_points_at_elements_of`, and the view is retyped to the target - the same address, read one element at a time),
   `AggregateValue` (its own type only) and the other aggregate/union/complex/option value forms, function values (as function pointers), enumeration members, integer range checks,
   and a value whose own type already is the target when that type is compile-time-only; `coerce_const_tagged_union` picks the variant and remaps the tag.
 - `TypeVarSolver`: constraint solving (equality/subtyping, structural decomposition of `StructType`/`OptionType`/`PointerType`/`ArrayType`, `finish` folds subtyping bounds).
@@ -295,15 +296,17 @@ each storage leaf is delivered through a trailing `$result` out-pointer; the thu
 
 This is the heart of the compiler: it **runs HIR instruction by instruction** with concrete argument types, emitting MIR as it goes.
 
-### 6.1 Value and place model
+### 6.1 Everything is a value
 
 - `InterpVal = ComptimeVal | RuntimeVal | PendingSlot | _PlaceTreeVal`; `PlaceTree = InterpVal | tuple[PlaceTree, ...]`.
+- Past HIR there are only values: evaluating a name/field/subscript yields a **pointer value** (`PointerType`), and `astgen` inserts the `hir.Load` where a "value" is needed (`_as_value`)
+  and materializes a pointer where one is needed (`_as_ref`), so the interpreter knows no "place vs value" distinction.
 - `ComptimeVal(obj)`: a fully Python-ized compile-time value ("no value" uses `Void()`, source `None` uses `Null()`).
 - `RuntimeVal(value: mir.Value, type: sval.Type)`: keeps only the spy type; the MIR type is produced on demand by `to_mir_type`.
 - `PendingSlot`: an executed but uncommitted `hir.Alloca` (see §6.2).
 - `ComptimeResultPtr(value, code, payload)`: the pointer form of a function result location (the three positions value/code/payload), **not** an `InterpVal`.
 - Predicates: `_is_comptime_val` (`RuntimeVal` is never one; the old "does not reference a register" relaxation has been removed), `_place_is_comptime`, `_references_register`.
-- `_coerce(ev, target)`: **every compile-time value goes to `sval.coerce_const`** (a `ComptimeVal`, the `ComptimePtr` place included), while a runtime value goes through `_convert_inst`
+- `_coerce(ev, target)`: **every compile-time value goes to `sval.coerce_const`** (a `ComptimeVal`, the `ComptimePtr` pointer value included), while a runtime value goes through `_convert_inst`
   (widening/narrowing); a failure raises `CoerceError` (which `_try_coerce` swallows). The `Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` target branches handle runtime values only.
 
 ### 6.2 Compile-time storage and pending slot
@@ -313,26 +316,26 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
   - `use_comptime_storage()`: uses `is_comptime` when it is fixed, otherwise it is compile-time only if "all writes are inline compile-time values".
 - `_PendingAction` variants: `_PendingStore`, `_PendingPtrConvertion`, `_PendingTuple`, `_PendingAggregate`, `_PendingErrorCodeWrite`.
 - Bookkeeping: `_record_pending_store` (rejects a runtime value into an `is_comptime=True` slot; `is_inline = does not cross a runtime block and is a compile-time value`), `_record_pending_action`.
-- commit: `_commit_pending_slot` -> compile-time (or ZST still needing a place) goes through `_commit_box_slot`, DST errors out, otherwise it emits `mir.Alloca` and goes through `_bind_slot`;
+- commit: `_commit_pending_slot` -> compile-time (or ZST still needing a pointer to address it) goes through `_commit_box_slot`, DST errors out, otherwise it emits `mir.Alloca` and goes through `_bind_slot`;
   `_exec_pending_action` delivers by variant (`_store_into_element` handles option layers / in-place writes); `_PendingAggregate` first peels the option layers with
   `_peel_option_layers` (a construction into an `Option[U]`, shared with the `is_aggregate_init` path of `field_index_addr`), and when the storage lands on a
   tagged union it sets the tag and writes the variant.  An option of a *zero-sized* child is its tag alone and is marked present the same way (`_option_payload_ptr`
   writes the tag, and the materialized paths of `finish_struct`/`finish_array` peel a zero-sized aggregate's option layers).
-- **`_is_union_delivery`**: in a tagged union held in *runtime* storage every construction records a `_PendingAggregate` of its own (the places a previous one recorded
+- **`_is_union_delivery`**: in a tagged union held in *runtime* storage every construction records a `_PendingAggregate` of its own (the field pointers a previous one recorded
   are not reused), so both branches of an `if` expression deliver their own variant at their own position; a compile-time `Box` holds one variant only, which stays the
   `incompatible types` error.
 - `Box` storage: the read/write helpers are in `sval` (`flatten_value`/`unflatten_cells`/`fill_comptime_defaults`/`load_box_cells`, see §4.3), and `interp` reads and writes `Box.cells` directly.
 - **`mir.Insertion`** is the mechanism for "emit an instruction at a place I have already passed": `PendingSlot.insertion` reserves the position of the alloca,
   `_PendingPtrConvertion`/`_PendingErrorCodeWrite` reserve the position of the delivery/throw point; `mir.normalize` splices them together later.
 
-### 6.3 place and field addressing
+### 6.3 Field and element addressing
 
-- `field_index_addr(ptr, index, is_aggregate_init, at=None)`: no automatic dereference; `is_aggregate_init` + uncommitted -> reuses the recorded `_PendingAggregate` place or a new alloca
+- `field_index_addr(ptr, index, is_aggregate_init, at=None)`: dereferences nothing further (the base type is a pointer to the container); `is_aggregate_init` + uncommitted -> reuses the recorded element pointer or a new alloca
   (a tagged union in runtime storage reuses nothing, see `_is_union_delivery`);
   passes through an outer option construction (sets the tag; a zero-sized child only has the tag); ZST field -> no storage address; compile-time box -> `sval.ComptimePtr(box, offset+field_scalar_offset)` (an `is_ref` field returns the cell);
   runtime -> `mir.Gep` (or the value itself when `mirror_is_a_field`).
 - `exec_field_name_addr`: resolves a field by name (**automatic dereference**); `ComplexType`'s `real`/`imag` are also treated as fields.
-- `_comptime_field_place`/`_const_box_place`: the read/write place of an `is_comptime` field (a compile-time struct is a box cell; a runtime struct is a read-only constant).
+- `_comptime_field_place`/`_const_box_place`: the read/write pointer of an `is_comptime` field (a compile-time struct is a box cell; a runtime struct is a read-only constant).
 - `operand`: resolves `Const` (type parameter value / global / `as_value`), `Arg(index)`, `Inst` (the register table).
 - `subscript` (big dispatch): array/tuple/dict/`$args`/`$kwargs`/byte string/pointer/slice/struct `__spy_getitemptr__`/struct template specialization.
 - `exec_ptr_cast`: runtime pointer -> `mir.BitCast`; a compile-time `ComptimePtr` that is a subtype of it -> retype; otherwise `sval.CastedPtr`; byte string pointer -> points at the byte store.
@@ -347,7 +350,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
   builds an `InlineFrame` whose `ComptimeResultPtr` **shares the function's own** error position — an error in the body leaves along the function's own path.
 - `_make_runtime_call`: pairs the `ArgNode` tree with the arguments; compile-time leaves are not passed; `is_ref` arguments are passed by pointer; landing pads are decided by `may_panic`;
   on error a code position is allocated (`_check_call_error` -> `mir.Switch`).
-- `_deliver_result`: pairs the `RetSpec` with the caller's place tree (`_pair_places`); a single place receiving multiple values is **packed** - one fresh place per result element, a nested group being a slot that records its own element places (`_fresh_places`/`_PendingTuple`), so the packed tuple keeps the nesting (`_deliver_packed_tuple`);
+- `_deliver_result`: pairs the `RetSpec` with the caller's **result location pointer tree** (`_pair_places`); a single result pointer receiving multiple values is **packed** - one fresh pointer per result element, a nested group being a slot that records its own element pointers (`_fresh_places`/`_PendingTuple`), so the packed tuple keeps the nesting (`_deliver_packed_tuple`);
   leaf-by-leaf delivery (`RetComptime` takes the value recorded by the callee, `via_result_ptr` appends an out-pointer, ZST stores the unit value, otherwise it stores by value).
 - `Analyser`: holds an explicit runner stack (`_analyse_stack`, non-recursive). `_request_function` has four cases:
   already in `specs` with a `native_fn` (an earlier module) -> `ExternAnonSymbol`; in `specs` with `mir.is_complete` (this round) -> an in-module `mir.Function`;
@@ -383,7 +386,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
   `_add_function_exception` (rejects outside the declared set, grows the inferred set); the error code write is deferred (`_defer_error_code_write`, filled in by `_finish_function`).
 - `_cut`: the unwinder at the end of a path (iterating `block_stack`): empty stack -> the function proper's `DONE` (park `pc`) / `_pop_frame`; a defer body that is not finished is an error; typeof with no produced value is an error;
   try -> the next live clause or continue; loop -> the next inline round or the exit block; plain block -> the exit block; if -> the selected pop, or a typed else and then merge.
-- `typeof` probe: `_exec_typeof_begin` switches to a **separate** MIR block (not wired into the CFG); `_exec_typeof_end` reads the spy type of the probed place, discards the block, and stores it as a `ComptimeVal`.
+- `typeof` probe: `_exec_typeof_begin` switches to a **separate** MIR block (not wired into the CFG); `_exec_typeof_end` reads the spy type of the probed value, discards the block, and stores it as a `ComptimeVal`.
 
 ### 6.8 Builtins and operators
 
@@ -510,9 +513,11 @@ The only place that turns Python values into spy values (and back); it does **no
 ## 11. Key design invariants
 
 1. **Open-loop typing**: the interpreter trusts only `sval` types; MIR types are produced at emit time by `to_mir_type(cache)` and never read back.
-2. **Hard comptime/runtime split**: `RuntimeVal` is never compile-time; a runtime value never enters a compile-time place (`store` rejects it).
-3. **place is a pointer**: a place's type is `PointerType`; where a value is needed, `Load` is explicit.
-4. **Result location is not a value**: `ComptimeResultPtr` is deliberately not an `InterpVal`; `PlaceTree` describes only the shape of the value part.
+2. **Hard comptime/runtime split**: `RuntimeVal` is never compile-time; a runtime value never enters compile-time storage (`store` rejects it).
+3. **Everything is a value**: HIR/the interpreter has no second kind of thing called a "place" - evaluating a name/field/subscript yields a **pointer value** (`PointerType`);
+   where a "value" is needed `astgen` **inserts the dereference** (`hir.Load`, see `_as_value`), and where a pointer is needed `_as_ref` materializes one.
+4. **The result location is a pointer**: RLS writes the result through the caller-provided **result location pointer** (a tree of pointers, `PlaceTree`, for a multiple-value result);
+   `ComptimeResultPtr` is the pointer form of a compile-time result location and is deliberately not an `InterpVal`.
 5. **No Python recursion**: `_run_machine`/`_step` are iterative; `_cut` is a block-stack loop; `Analyser._run` is an explicit runner stack;
    flatten/flatten out/reachability/constant collection/`TypeVarSolver` all use explicit stacks/worklists. Exception: `mir._clone_template` recurses with the nesting of the defer source (shallow).
 6. **Reachability is created by paths**: a block's exit is created only when a path actually reaches it; `_cut` decides whether the code after a block is dead.

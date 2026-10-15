@@ -4168,10 +4168,7 @@ def is_numeric_type(type: Type):
 def coerce_const_tagged_union(value: AnyValue, type: TaggedUnionType) -> AnyValue:
     """A constant of the tagged union ``type``: the value of the variant it
     belongs to under that variant's tag.  A ``TaggedUnionValue`` of a compatible
-    union (a subset/superset) is remapped to ``type``'s tag, and a compile-time
-    *place* of the union itself is read out of its box first (see
-    :func:`_place_value`)."""
-    value = _place_value(value, type)
+    union (a subset/superset) is remapped to ``type``'s tag."""
     if isinstance(value, TaggedUnionValue):
         if not value.type.is_subtype_of(type):
             raise CoerceError(f"cannot use {value!r} as a constant of {type}")
@@ -4191,16 +4188,6 @@ def coerce_const_tagged_union(value: AnyValue, type: TaggedUnionType) -> AnyValu
             return TaggedUnionValue(type, candidate, coerced)
         raise CoerceError(f"cannot use {value!r} as a constant of {type}")
     return TaggedUnionValue(type, index, coerce_const(value, type.types[index]))
-
-
-def _place_value(value: AnyValue, type: Type) -> AnyValue:
-    """The value a compile-time *place* holds when the place is a place of
-    exactly the type ``type`` (a ``ComptimePtr`` whose pointee is ``type``): the
-    value read out of its box.  Every other value - a place of anything else
-    included - is returned as it is."""
-    if isinstance(value, ComptimePtr) and value.type.elem == type:
-        return load_box_cells(value.box, value.offset, type)
-    return value
 
 
 def _typed_undefined(type: Type) -> AnyValue:
@@ -4274,12 +4261,8 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     builds out of it (the interpreter lowers it to a MIR constant later).  Every
     compile-time value converts here, whatever its shape: a plain Python scalar,
     an already-typed ``Int``/``Float``, a type, an enumeration member, the
-    null/void unit values, an aggregate or union value form - and a
-    ``ComptimePtr``, a compile-time *place*: a place is a value of the pointer
-    type it is viewed through, and of the aggregate type it points at where a
-    place is what the caller takes for a value of one (a tuple, a
-    ``dict[str, T]``, an option and a tagged union, whose contents have to be
-    read).
+    null/void unit values, an aggregate or union value form, a ``ComptimePtr``
+    (a pointer value) and a function value (a function pointer).
 
     Raises :class:`~spy.errors.CoerceError` when ``value`` has no such
     conversion."""
@@ -4309,9 +4292,8 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
     # -- the conversions the target type decides -------------------------------
     if isinstance(type, OptionType):
         # a value of an option is either the null value, or a value of the child
-        # type (which the interpreter then tags as present); a place of *this*
-        # option is read first - what it holds is the option value form
-        return _coerce_const_option(_place_value(value, type), type)
+        # type, which the interpreter then tags as present
+        return _coerce_const_option(value, type)
     if isinstance(type, TaggedUnionType):
         return coerce_const_tagged_union(value, type)
     if isinstance(type, UnionType):
@@ -4329,25 +4311,27 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
         return _coerce_const_complex(value, type)
     if isinstance(type, (TupleType, StrDictType)):
         # a tuple and a ``dict[str, T]`` have no other type to convert from: a
-        # value of the type - or the compile-time place of one, which the caller
-        # takes for a value of it - is its own constant
+        # value whose own type is the target is its own constant
         if type_of(value) == type:
-            return value
-        if isinstance(value, ComptimePtr) and value.type.elem == type:
             return value
         raise CoerceError(f"cannot use {value!r} as a constant of {type}")
 
     # -- the values that *are* their own value ---------------------------------
     if isinstance(value, ComptimePtr):
-        # a compile-time place is a pointer value of the type it is viewed
-        # through, so the pointee type has to be the same (a pointer does not
-        # convert between pointee types).  The constness is *not* checked: the
-        # writability of a place is decided by its box as well (see
-        # ``ComptimePtr.is_writable``), so the view is only a view, and the
-        # ``*const T`` of a read-only place still coerces to the ``*T`` a
+        # a compile-time pointer is a pointer value.  The pointee type has to be
+        # the same (a pointer does not convert between pointee types) - except a
+        # pointer to an array, which is also the *multi* pointer of its elements:
+        # the two carry the same address, and the view is what addressing goes by,
+        # so it is retyped (like ``ptr_cast`` does).  The constness is *not*
+        # checked: whether the pointee may be written is decided by the box as
+        # well (see ``ComptimePtr.is_writable``), so the view is only a view, and
+        # the ``*const T`` of a read-only pointer still coerces to the ``*T`` a
         # variable or a parameter declares
-        if isinstance(type, PointerType) and value.type.elem == type.elem:
-            return value
+        if isinstance(type, PointerType):
+            if value.type.elem == type.elem:
+                return value
+            if _points_at_elements_of(value.type, type):
+                return ComptimePtr(value.box, value.offset, type)
         raise CoerceError(f"cannot use {value!r} as a constant of {type}")
     if isinstance(value, CastedPtr):
         # a pointer reinterpreted by ``ptr_cast``: reading or writing through it

@@ -14,8 +14,10 @@ from ..compiler import (
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
+    Array,
     Comptime,
     ConstComptime,
+    MultiPtr,
     Opaque,
     Option,
     Ptr,
@@ -141,6 +143,32 @@ def coerce_comptime_pointer_of_another_pointee() -> u8:
 
 
 @func()
+def coerce_array_pointer_to_multi_pointer() -> i32:
+    # a pointer to an array converts to the multi pointer of its elements: the
+    # same address, now viewed one element at a time
+    a: ConstComptime[Array[i32, 3]] = const_array(7, 3)
+    m: Comptime = coerce(ref(a), MultiPtr[i32])
+    return m[0] * 100 + m[1] * 10 + m[2]
+
+
+@func()
+def coerce_multi_pointer_to_pointer() -> i32:
+    # and a multi pointer converts on to the single pointer of its element
+    a: ConstComptime[Array[i32, 3]] = const_array(4, 3)
+    m: Comptime = coerce(ref(a), MultiPtr[i32])
+    p: Comptime = coerce(m, Ptr[i32])
+    return p[...]
+
+
+@func()
+def coerce_array_pointer_of_a_runtime_array(x: i32) -> i32:
+    # the same conversion for a runtime array: the address is the same value
+    a = const_array(x, 3)
+    m = coerce(ref(a), MultiPtr[i32])
+    return m[2]
+
+
+@func()
 def coerce_any_takes_a_pointer() -> i32:
     # ``Any`` names no fixed type: a compile-time pointer is a value of it (it
     # used to be rejected - only a scalar converted to ``Any``)
@@ -176,27 +204,6 @@ def coerce_comptime_union_widens() -> i32:
     if isinstance(a := v, CoerceUA):
         return a.x
     return -1
-
-
-@func()
-def coerce_comptime_option_place() -> i32:
-    # the compile-time *place* of an option is read as the value of the option
-    ch: ConstComptime[Option[i32]] = 5
-    o: Option[i32] = coerce(ref(ch), Option[i32])  # pyright: ignore[reportArgumentType]
-    if (v := o) is not None:
-        return v
-    return -1
-
-
-@func()
-def coerce_comptime_union_place() -> i32:
-    # likewise for the place of a tagged union
-    u: ConstComptime[CoerceUA | CoerceUB] = CoerceUA(4)
-    v: CoerceUA | CoerceUB = coerce(ref(u), CoerceUA | CoerceUB)  # pyright: ignore[reportArgumentType]
-    if isinstance(a := v, CoerceUA):
-        return a.x
-    return -1
-
 
 class SpyCoerceTest(TestCase):
     """``std.core.coerce(value, T)`` materializes a value as the spy type ``T``,
@@ -239,6 +246,15 @@ class SpyCoerceTest(TestCase):
         with self.assertRaises(CompileError):
             coerce_comptime_pointer_of_another_pointee()
 
+    def test_a_pointer_to_an_array(self) -> None:
+        self.assertEqual(coerce_array_pointer_to_multi_pointer(), 100 * 7 + 10 * 7 + 7)
+
+    def test_a_multi_pointer(self) -> None:
+        self.assertEqual(coerce_multi_pointer_to_pointer(), 4)
+
+    def test_a_pointer_to_a_runtime_array(self) -> None:
+        self.assertEqual(coerce_array_pointer_of_a_runtime_array(9), 9)
+
     def test_any_takes_a_pointer(self) -> None:
         self.assertEqual(coerce_any_takes_a_pointer(), 7)
 
@@ -251,13 +267,6 @@ class SpyCoerceTest(TestCase):
 
     def test_a_compile_time_union_value(self) -> None:
         self.assertEqual(coerce_comptime_union_widens(), 3)
-
-    def test_a_compile_time_option_place(self) -> None:
-        self.assertEqual(coerce_comptime_option_place(), 5)
-
-    def test_a_compile_time_union_place(self) -> None:
-        self.assertEqual(coerce_comptime_union_place(), 4)
-
 
 all_tests = [
     SpyCoerceTest,

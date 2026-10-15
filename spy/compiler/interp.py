@@ -4360,18 +4360,14 @@ class HirRunner:
             # ``_coerce_tagged_union_value``)
             return self._coerce_tagged_union_value(ev, target)
         if isinstance(target, sval.TupleType):
-            # a tuple is a real aggregate now (see §7.1): a runtime value or
-            # place of the type is its own type
-            ev_type = _type_of(ev)
-            base = ev_type.elem if isinstance(ev_type, sval.PointerType) else ev_type
-            if base == target:
+            # a tuple is a real aggregate now (see §7.1): a runtime value of the
+            # type is its own type
+            if _type_of(ev) == target:
                 return ev
             raise CoerceError(f'cannot materialize a {target} from {ev!r}')
         if isinstance(target, sval.StrDictType):
             # likewise for a ``dict[str, T]`` (see §8)
-            ev_type = _type_of(ev)
-            base = ev_type.elem if isinstance(ev_type, sval.PointerType) else ev_type
-            if base == target:
+            if _type_of(ev) == target:
                 return ev
             raise CoerceError(f'cannot materialize a {target} from {ev!r}')
         if isinstance(target, sval.ComplexType):

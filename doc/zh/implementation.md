@@ -91,16 +91,16 @@ flowchart TD
 | `match` | 对 tagged union：`case _:` 通配（必须最后）、`case T():`（`IsInstance`）、`case T() as e:`（`TaggedUnionPayloadPtr`）；不支持守卫/子模式 |
 | `return` | 有值：`_gen_result_loc(value, ReturnLoc())`；无值：`StoreVoidRetloc()`；随后 `hir.Ret()` |
 | `raise` | 新 slot + `_gen_result_loc(exc, slot)` + `hir.Raise(slot)` |
-| `assign` | `_gen_lhs`（名字未绑定则声明 `Alloca`）+ `_gen_result_loc(value, place)` + `CommitSlot`；**只处理 `targets[0]`** |
+| `assign` | `_gen_lhs`（名字未绑定则声明 `Alloca`）+ `_gen_result_loc(value, result_loc)` + `CommitSlot`；**只处理 `targets[0]`** |
 | `annassign` | `_split_comptime` 拆出 `is_comptime`/`is_const`/声明类型；`ConstComptime` 必须带初值；名字不能已绑定 |
-| `augassign` | lhs 必须是 `is_ref` place；发 `hir.BinaryAssign(op, lhs, rhs)` |
+| `augassign` | lhs 必须按引用给出（`is_ref`，即一个指针）；发 `hir.BinaryAssign(op, lhs, rhs)` |
 | `break`/`continue`/`pass` | `hir.BreakLoop` / `hir.Continue` / 无 |
 | 表达式语句 | `_gen_expr` 求值后丢弃（用于副作用/强制编译期求值） |
 
 表达式要点：
 
-- **结果位置语义（RLS）**：`_gen_result_loc(node, result_loc, allow_fall_back=True)` 把结果写进调用方给的 place，不产生寄存器。
-  `hir.ReturnLoc()` 表示整棵函数结果位置树。`_gen_expr` 的 fallback 为需要「值」的表达式分配临时 `Alloca`、RLS 写入、返回其 place。
+- **结果位置语义（RLS）**：`_gen_result_loc(node, result_loc, allow_fall_back=True)` 把结果写进调用方给的**结果位置指针**，不产生寄存器。
+  `hir.ReturnLoc()` 表示整棵函数结果位置树（多返回值是一棵指针树）。`_gen_expr` 的 fallback 为需要「值」的表达式分配临时 `Alloca`、RLS 写入、返回该指针。
 - **标记识别**（按对象身份）：`_SYNTAX_CALLS = (ref, unroll, comptime, ptr_cast, as_func_ptr, typeof)` → `_gen_syntax_call`；
   语句级标记（`unroll`/`comptime`/`const_comptime`/`infer_comptime`）由 `_as_marker` 缓冲为 pragma，由下一条语句消费（悬空 pragma 报错）。
 - 下标 `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` 分派见 `astgen._gen_expr`、`_gen_type_ctor`、`_gen_literal`。
@@ -111,7 +111,7 @@ flowchart TD
 
 ### 2.4 闭包捕获（`_gen_closure`）
 
-- 捕获在**查找时惰性发生**（`_tunnel_through_closures`）：跨过的每个 `_ClosureScope` 边界把当前 place 追加进 `captures`（按名去重）。
+- 捕获在**查找时惰性发生**（`_tunnel_through_closures`）：跨过的每个 `_ClosureScope` 边界把当前的指针追加进 `captures`（按名去重）。
   读者自己那层发 `hir.FieldIndexAddr(hir.Arg(0), index)`；中间层发 `_CaptureField(index)` 标记，最后由 `_gen_closure` 物化成字段访问。
 - `_gen_closure` 在**外层流**里求值闭包的注解/默认值/返回注解，建 `fn.ClosureFunction`，push `_ClosureScope`，
   把形参绑到 `hir.Arg(i+1)`（`Arg(0)` 是闭包自身的匿名 struct），最后发 `hir.MakeClosure(...)`。
@@ -217,7 +217,7 @@ flowchart TD
   `|` 链 → `OptionType`/`tagged_union_of`、`tuple[...]`/`Literal[X]`/指针 marker/`Array[T,L]`/`Option[T]`/`Union` 等）。
 - `coerce_const(value, type)`：把**任意**编译期量具体化成类型常量，失败抛 `CoerceError`。覆盖：
   `UntypedUndefined`/typed undefined（`_typed_undefined`，是 option/union 的成员时包成 present）、`Any`（任意值原样）、
-  `ComptimePtr`（place：pointee 相同即可作指针常量，作 option/union/tuple/`dict[str, T]` 的值时读出内容）、`AggregateValue`（只能是自身类型）
+  `ComptimePtr`（一个指针值：pointee 相同即可作指针常量；指向数组的指针还可转成**元素的多指针** `*[N]T -> mptr T`，`_points_at_elements_of`，此时视图按目标重定型（地址相同、按元素看））、`AggregateValue`（只能是自身类型）
   与各种聚合/union/complex/option 值形式、函数值（作函数指针）、枚举成员、整数 range 检查，以及「自身类型即目标且该类型是编译期专属」的值；
   `coerce_const_tagged_union` 负责变体选择与 tag 重映射。
 - `TypeVarSolver`：约束求解（相等/子类型、结构分解 `StructType`/`OptionType`/`PointerType`/`ArrayType`、`finish` 折叠子类型界）。
@@ -295,15 +295,17 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 
 这是编译器的心脏：以具体实参类型**逐条运行** HIR，边跑边发 MIR。
 
-### 6.1 值与 place 模型
+### 6.1 一切皆值
 
 - `InterpVal = ComptimeVal | RuntimeVal | PendingSlot | _PlaceTreeVal`；`PlaceTree = InterpVal | tuple[PlaceTree, ...]`。
+- HIR 之后只有值：一个名字/字段/下标的求值结果就是一个**指针值**（类型 `PointerType`），`astgen` 在需要「值」的地方插入 `hir.Load`（`_as_value`）、
+  在需要指针的地方物化一个（`_as_ref`），所以解释器里没有「place / 值」之分。
 - `ComptimeVal(obj)`: 完全 Python 化的编译期值（「无值」用 `Void()`、源码 `None` 用 `Null()`）。
 - `RuntimeVal(value: mir.Value, type: sval.Type)`：只保留 spy 类型；MIR 类型按需由 `to_mir_type` 产生。
 - `PendingSlot`：已执行但未 commit 的 `hir.Alloca`（见 §6.2）。
 - `ComptimeResultPtr(value, code, payload)`：函数结果位置的指针形态（value/code/payload 三个位置），**不是** `InterpVal`。
 - 判定：`_is_comptime_val`（`RuntimeVal` 一律不是；旧的「不引用寄存器」放宽已删除）、`_place_is_comptime`、`_references_register`。
-- `_coerce(ev, target)`：**编译期量一律交给 `sval.coerce_const`**（`ComptimeVal`，含 `ComptimePtr` 这种 place），运行期量走 `_convert_inst`（拓宽/收窄）；
+- `_coerce(ev, target)`：**编译期量一律交给 `sval.coerce_const`**（`ComptimeVal`，含 `ComptimePtr` 这种指针值），运行期量走 `_convert_inst`（拓宽/收窄）；
   失败抛 `CoerceError`（`_try_coerce` 吞掉它）。`Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` 的目标分支只处理运行期值。
 
 ### 6.2 Compile-time 存储与 pending slot
@@ -313,24 +315,24 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
   - `use_comptime_storage()`：`is_comptime` 固定时用它，否则「所有写入都是 inline 编译期值」才为编译期。
 - `_PendingAction` 变体：`_PendingStore`、`_PendingPtrConvertion`、`_PendingTuple`、`_PendingAggregate`、`_PendingErrorCodeWrite`。
 - 记账：`_record_pending_store`（拒绝运行时值进 `is_comptime=True` 槽；`is_inline = 未跨运行期块 且 是编译期值`）、`_record_pending_action`。
-- commit：`_commit_pending_slot` → 编译期（或 ZST 仍需 place）走 `_commit_box_slot`，DST 报错，否则发 `mir.Alloca` 走 `_bind_slot`；
+- commit：`_commit_pending_slot` → 编译期（或 ZST 仍需要一个指针来寻址）走 `_commit_box_slot`，DST 报错，否则发 `mir.Alloca` 走 `_bind_slot`；
   `_exec_pending_action` 按变体交付（`_store_into_element` 应对 option 层/就地写）；`_PendingAggregate` 投递前先 `_peel_option_layers`
   剥掉 option 层（`Option[U]` 里的构造，`field_index_addr` 的 `is_aggregate_init` 路径共用），落点是 tagged union 时再设 tag + 写变体；
   零尺寸 child 的 option（表示就是一个 tag）也照样置 present——`_option_payload_ptr` 写 tag，`finish_struct`/`finish_array` 的已物化路径对零尺寸聚合补一次剥层。
-- **`_is_union_delivery`**：运行时存储里的 tagged union，每次构造记自己的 `_PendingAggregate`（`field_index_addr` 不复用已记录的 place），
+- **`_is_union_delivery`**：运行时存储里的 tagged union，每次构造记自己的 `_PendingAggregate`（`field_index_addr` 不复用已记录的字段指针），
   故 `if` 表达式两分支构造不同变体也各按自己的变体在各自位置交付；编译期 `Box` 只装得下一个变体，那种情形仍是 `incompatible types` 错误。
 - `Box` 存储：读写 helper 在 `sval`（`flatten_value`/`unflatten_cells`/`fill_comptime_defaults`/`load_box_cells`，见 §4.3），`Box.cells` 由 `interp` 直接读写。
 - **`mir.Insertion`** 是「在我已经走过的地方发射指令」的机制：`PendingSlot.insertion` 预留 alloca 的位置，
   `_PendingPtrConvertion`/`_PendingErrorCodeWrite` 预留交付/抛出点的位置；`mir.normalize` 稍后拼接。
 
-### 6.3 place 与字段寻址
+### 6.3 字段与元素寻址
 
-- `field_index_addr(ptr, index, is_aggregate_init, at=None)`：无自动解引用；`is_aggregate_init` + 未 commit → 复用记录的 `_PendingAggregate` place 或新 alloca
+- `field_index_addr(ptr, index, is_aggregate_init, at=None)`：不额外解引用（基类型就是指向容器的指针）；`is_aggregate_init` + 未 commit → 复用记录的元素指针或新 alloca
   （运行时存储的 tagged union 不复用，见 `_is_union_delivery`）；
   穿过外层 option 构造（设 tag；零尺寸 child 只写 tag）；ZST 字段 → 无存储地址；编译期 box → `sval.ComptimePtr(box, offset+field_scalar_offset)`（`is_ref` 字段返回 cell）；
   运行时 → `mir.Gep`（或 `mirror_is_a_field` 时该值本身）。
 - `exec_field_name_addr`：按名解析字段（**自动解引用**）；`ComplexType` 的 `real`/`imag` 也当字段。
-- `_comptime_field_place`/`_const_box_place`：`is_comptime` 字段的读写 place（编译期 struct 是 box cell；运行时 struct 是只读常量）。
+- `_comptime_field_place`/`_const_box_place`：`is_comptime` 字段的读写指针（编译期 struct 是 box cell；运行时 struct 是只读常量）。
 - `operand`：解析 `Const`（类型参数值 / 全局 / `as_value`）、`Arg(index)`、`Inst`（寄存器表）。
 - `subscript`（大分派）：数组/元组/字典/`$args`/`$kwargs`/字节串/指针/切片/结构体 `__spy_getitemptr__`/结构体模板特化。
 - `exec_ptr_cast`：运行时指针 → `mir.BitCast`；编译期 `ComptimePtr` 是其子类型 → 重定型；否则 `sval.CastedPtr`；字节串指针 → 指向字节 store。
@@ -345,8 +347,8 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
   建 `InlineFrame`，其 `ComptimeResultPtr` **共享函数本身**的 error 位置——体内错误沿函数自身的路径离开。
 - `_make_runtime_call`：按 `ArgNode` 树与实参配对；编译期叶不传；`is_ref` 实参按指针传；按 `may_panic` 决定 landing pad；
   有错时分配 code 位置（`_check_call_error` → `mir.Switch`）。
-- `_deliver_result`：把 `RetSpec` 与调用方的 place 树配对（`_pair_places`）；单 place 接多值则**打包**——每个结果元素一个 fresh place，
-  嵌套分组是一个记录了自身元素 place 的 slot（`_fresh_places`/`_PendingTuple`），故打包出的元组保留嵌套（`_deliver_packed_tuple`）；
+- `_deliver_result`：把 `RetSpec` 与调用方的**结果位置指针树**配对（`_pair_places`）；单个结果指针接多值则**打包**——每个结果元素一个 fresh 指针，
+  嵌套分组是一个记录了自身元素指针的 slot（`_fresh_places`/`_PendingTuple`），故打包出的元组保留嵌套（`_deliver_packed_tuple`）；
   逐叶交付（`RetComptime` 取 callee 记录的值、`via_result_ptr` 追加出指针、ZST 存单位值、否则按值存）。
 - `Analyser`：持有显式 runner 栈（`_analyse_stack`，非递归）。`_request_function` 分四种情形：
   已在 `specs` 且有 `native_fn`（早先模块）→ `ExternAnonSymbol`；在 `specs` 且 `mir.is_complete`（本轮）→ 模块内 `mir.Function`；
@@ -382,7 +384,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
   `_add_function_exception`（声明集外拒绝、推断集增长）；错误码写入推迟（`_defer_error_code_write`，`_finish_function` 填上）。
 - `_cut`：路径结束时的展开器（循环 `block_stack`）：空栈 → 函数 proper `DONE`（park `pc`）/`_pop_frame`；defer body 未完成报错；typeof 未产值报错；
   try → 下一个活子句或继续；loop → inline 下一轮或出口块；plain block → 出口块；if → 选中的 pop 或类型化 else 再汇合。
-- `typeof` 探针：`_exec_typeof_begin` 切到**分离的** MIR 块（不接入 CFG）；`_exec_typeof_end` 读取被探测 place 的 spy 类型、丢弃该块、存为 `ComptimeVal`。
+- `typeof` 探针：`_exec_typeof_begin` 切到**分离的** MIR 块（不接入 CFG）；`_exec_typeof_end` 读取被探测值的 spy 类型、丢弃该块、存为 `ComptimeVal`。
 
 ### 6.8 内建与运算符
 
@@ -509,9 +511,11 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
 ## 11. 关键设计不变量
 
 1. **开环类型化**：解释器只信任 `sval` 类型；MIR 类型在发射时由 `to_mir_type(cache)` 产生，从不回读。
-2. **comptime/runtime 硬划分**：`RuntimeVal` 一律非编译期；运行时值永不进编译期 place（`store` 拒绝）。
-3. **place 即指针**：place 的类型是 `PointerType`；需要值的地方显式 `Load`。
-4. **结果位置非值**：`ComptimeResultPtr` 刻意不是 `InterpVal`；`PlaceTree` 只描述值部分的形状。
+2. **comptime/runtime 硬划分**：`RuntimeVal` 一律非编译期；运行时值永不进编译期存储（`store` 拒绝）。
+3. **一切皆值**：HIR/解释器里没有「place」这种第二类东西——一个名字/字段/下标的求值结果就是一个**指针值**（类型 `PointerType`）；
+   需要「值」的地方由 `astgen` **自动插入解引用**（`hir.Load`，见 `_as_value`），需要指针的地方由 `_as_ref` 物化。
+4. **结果位置是一个指针**：RLS 把结果写进调用方给的**结果位置指针**（多返回值是一棵指针树，`PlaceTree`）；
+   `ComptimeResultPtr` 是编译期结果位置的指针形态，刻意不是 `InterpVal`。
 5. **无 Python 递归**：`_run_machine`/`_step` 迭代；`_cut` 是块栈循环；`Analyser._run` 是显式 runner 栈；
    铺平/展平/可达性/常量收集/`TypeVarSolver` 等均用显式栈/工作表。例外：`mir._clone_template` 随 defer 源嵌套递归（浅）。
 6. **可达性由路径创造**：块的出口只在真有路径到达时创建；`_cut` 决定块后代码是否死。

@@ -149,10 +149,10 @@ def f(c: bool) -> i32:
 
 ---
 
-## 9. 编译期 place 的视图可以丢 const（`*const T` → `*T` 被放行）
+## 9. 编译期指针可以丢 const（`*const T` → `*T` 被放行）
 
 `sval.coerce_const` 对 `ComptimePtr` 的目标判定只要求 **pointee 相同**（`value.type.elem == target.elem`），**不检查 const 性**，
-因此一个 const 视图的编译期 place 可以赋给声明为非 const 的指针位置：
+因此一个 const 视图的编译期指针可以赋给声明为非 const 的指针位置：
 
 ```python
 @func()
@@ -164,11 +164,31 @@ def f() -> i32:
     return take_i32(ref(const_n))    # ref(ConstComptime) 得到 *const i32，这里丢了 const
 ```
 
-- **原状**（本轮之前就有）：`interp.HirRunner._coerce` 对编译期指针只检查「目标是某个指针类型」，`sval.coerce_const` 沿用同一判定；
-  `spy/tests/` 里有 12 处用例依赖它（`comptime_ptrs.py`、`static.py`、`options.py`、`tagged_unions.py`）。
+- **原状**（本轮之前就有）：`interp.HirRunner._coerce` 对编译期指针只检查「目标是某个指针类型」（连 pointee 都不比），`sval.coerce_const` 原先沿用同一判定；
+  本轮已收紧为「pointee 相同」（const 仍不查），`spy/tests/` 里有 12 处用例依赖「丢 const」这一点（`comptime_ptrs.py`、`static.py`、`options.py`、`tagged_unions.py`）。
   运行时路径反而更严：`_convert_inst` 用 `PointerType.is_subtype_of`，`*const T -> *T` 会被拒。
 - **后果**：视图类型只影响类型层面，写入仍由 `ComptimePtr.is_writable()`（同时看 box 的 `is_const`）拦住，所以不会产生错误代码；
-  但把 const place 的地址交给一个声明为可写的 `*T` 位置，读起来像可以写。
+  但把 const 指针交给一个声明为可写的 `*T` 位置，读起来像可以写。
 - **更合理的规则**：pointee 相同的前提下只允许「加 const」（即运行时路径的 `is_subtype_of`）；那样上述 12 处用例需要改写
   （把 `Ptr[T]` 形参改成 `ConstPtr[T]` 等）。因为 `ref(ConstComptime)` 传给 `Ptr[T]` 形参是惯用写法，改动会波及用户代码，本轮不动。
+
+---
+
+## 10. 编译期「元素视图」指针物化成运行期指针时全局只按视图生成
+
+把一个**编译期数组**的元素指针（类型是 `MultiPtr[T]`，但指向的是 `Box` 里的整个 `Array[T, N]`）放进**运行期**位置时，自动物化（`interp._comptime_pointer_value`
+→ `_const_pointer_to_mir`）只按**视图**的 pointee（`T`）生成全局（或只 alloca 一个元素），数组长度丢失，于是 `m[1]` 起读到越界内存：
+
+```python
+@func()
+def f() -> i32:
+    a: ConstComptime[Array[i32, 3]] = const_array(7, 3)
+    m = coerce(ref(a), MultiPtr[i32])   # 或 ptr_cast(ref(a), MultiPtr[i32])（a: Comptime 数组）
+    return m[0] * 100 + m[1] * 10 + m[2]   # 实测得到无关内存（如 1104357117），不是 777
+```
+
+- **非本轮引入**：`ptr_cast(ref(a), MultiPtr[i32])`（`a` 是 `Comptime` 数组、视图非 const → 重定型）单独就能复现（实测与上面同值）；本轮的 `*[N]T -> MultiPtr[T]` 自动转换只是多了一条到达它的路径。
+- **正确的物化**：全局应按 **`Box` 的类型**（`Array[T, N]`）生成，指针再「数组转元素」得到 `*T`（地址相同）；这样步长与全局大小都正确。
+- **规避**：让指针留在编译期（如 `m: Comptime = coerce(ref(a), MultiPtr[i32])` 后 `m[i]`，此时索引全在 `Box` 里，正确），或干脆用 `std.arr_slice`/`std.core.const_arr_ptr` 的切片形式。
+- 与 #9 相关：都是编译期指针在 const/视图上的语义边界。
 

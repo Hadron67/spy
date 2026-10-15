@@ -72,7 +72,7 @@ from typing import TYPE_CHECKING, Literal, Never, NoReturn
 - `spy.usize` / `spy.isize`: integers determined by the target platform's pointer width.
 - C integer types `c_char/c_uchar`, `c_short/c_ushort`, `c_int/c_uint`, `c_long/c_ulong`, `c_longlong/c_ulonglong`:
   the width (and the signedness of `c_char`) is determined by the target platform (for example `c_long` is 32-bit on Windows and 64-bit on common 64-bit Unix).
-- Untyped integer literals: the literal `1` initially has no concrete type; it is determined by the place it is written into or the type it is paired with.
+- Untyped integer literals: the literal `1` initially has no concrete type; it is determined by the location it is written into or the type it is paired with.
 - Integer subtyping follows range inclusion: `i8` is a subtype of `i16`, and `u8` is not a subtype of `i8`. Integers are not floats.
 
 ```python
@@ -128,7 +128,7 @@ assert in_range(5) is True and in_range(20) is False
 `syntax.Ptr[T]` (mutable single pointer), `ConstPtr[T]` (read-only single pointer), `MultiPtr[T]` / `ConstMultiPtr[T]`
 (multi pointer, subscriptable like an array).
 
-- A single pointer is written `p[...]` (dereference, C's `*p`), a multi pointer is written `p[i]` (the place of the i-th element).
+- A single pointer is written `p[...]` (dereference, C's `*p`), a multi pointer is written `p[i]` (the pointer to the i-th element).
 - Pointers are **non-null**; `Option[Ptr[T]]` is what gives a nullable pointer.
 - A mutable pointer implicitly converts to const (`Ptr[T]` → `ConstPtr[T]`); the reverse does not hold.
 - A pointer to an array (`*[N]T`) can be treated as a multi pointer to its elements.
@@ -170,13 +170,13 @@ assert low_byte(0x41) == 0x41
 
 - `syntax.Array[T, N]`: `N` `T`s laid out in a row; the length is a **value** type parameter, written as `Literal[N]` in annotations.
   The length may be omitted as `Array[T, None]` (**unsized array**, DST).
-- `syntax.array(a1, a2, ...)` constructs an array in place: the length is the number of arguments, and the element type is the type of the target place, or otherwise the common type of all elements;
+- `syntax.array(a1, a2, ...)` constructs an array into its destination: the length is the number of arguments, and the element type is that of the target location, or otherwise the common type of all elements;
   there is also a `length=` keyword that exists **only for type checkers** (the actual length follows the number of arguments).
 - `a[i]` is an **lvalue** of the i-th element (readable/writable/`+=`); a compile-time constant subscript checks out of bounds, a runtime subscript does not.
 - Slice types live in `std`: `std.SlicePtr[T]` / `std.ConstSlicePtr[T]` (the struct `{ptr, length}`).
   `std.arr_slice(p)` / `std.const_arr_slice(p)` turn a pointer to an array into a slice of the whole thing;
   a multi-pointer slice `p[a:b]` yields `SlicePtr(p+a, b-a)` (lower bound defaults to 0, upper bound to the length, step must be 1).
-- A slice is iterable (element values) and has `refs()` (element places); going out of bounds `panic`s.
+- A slice is iterable (element values) and has `refs()` (element pointers); going out of bounds `panic`s.
 - `std.core.const_array(elem, length)`: an array of `length` equal elements (the element expression is evaluated only once and may be a runtime value).
 - Arrays **cannot cross the Python calling boundary** (see §10), so the examples below call indirectly through spy functions.
 
@@ -219,9 +219,9 @@ assert repeat(2) == 4
 `syntax.Option[T]` (equivalent to `T | None`):
 
 - A value is either a `T` or `None`.
-- Both `T` and `None` implicitly convert to `Option[T]`; when a single place receives both `T` and `None`, the type becomes `Option[T]`.
+- Both `T` and `None` implicitly convert to `Option[T]`; when a single location receives both `T` and `None`, the type becomes `Option[T]`.
 - Testing and unwrapping: `expr is None` / `expr is not None`; the walrus syntax `(name := expr) is not None` binds `name`
-  to the writable place of the inner value; plain `(name := expr)` binds `name` to the option itself.
+  to the writable location of the inner value; plain `(name := expr)` binds `name` to the option itself.
 - **Not yet implemented**: pattern matching an option; under the borrow-style representation there are still edge cases where absence is misjudged (see `doc/implementation.md`).
 
 ```python
@@ -1152,7 +1152,7 @@ assert Math.double(5) == 10          # class-name call: no implicit self
 
 ### 7.3 Construction
 
-- `Point(a, b)` constructs in place: it writes directly into the target place, and nested construction writes in place (no copy).
+- `Point(a, b)` constructs into its destination: it writes directly into the target location, and nested construction writes into its destination (no copy).
 - Positional arguments follow the field declaration order, keyword arguments go by name; every field must receive a value (a default value may be omitted).
 - Default values **do not take part in generic parameter inference**; it is determined only by the provided field values.
 
@@ -1167,7 +1167,7 @@ class Outer:
 
 @func()
 def build(x: i32) -> i32:
-    o = Outer(Inner(x))          # the inner struct is built in place
+    o = Outer(Inner(x))          # the inner struct is built into its destination
     o.inner.v += 1
     return o.inner.v
 
@@ -1177,7 +1177,7 @@ assert build(1) == 2
 ### 7.4 Generic structs
 
 - `class Foo[T]` is a template and `Foo[i32]` is a specialization; the `T` in field annotations is substituted in (recursively).
-- Generic parameters may be omitted at construction: the specialization is determined by the type of the target place; when the type is unknown it is inferred from the types of the values written into the fields.
+- Generic parameters may be omitted at construction: the specialization is determined by the type of the target location; when the type is unknown it is inferred from the types of the values written into the fields.
 - A method call `x.m(...)` ≡ `typeof(x).m(x, ...)`; a method may have its own type parameters; a struct's type parameters can be used as values inside the body.
 
 ```python
@@ -1207,7 +1207,7 @@ assert Box[i32](7).value == 7
 ### 7.6 Copyability and argument passing/return
 
 - `copyable=True|False|"inherit"` (the default `"inherit"` = copyable only if every field is copyable); a DST is never copyable.
-- A non-copyable value can be constructed in place, passed by reference, returned through the result location, and have its fields read/written through an address, but **cannot be read out as a whole**.
+- A non-copyable value can be constructed into its destination, passed by reference, returned through the result location, and have its fields read/written through an address, but **cannot be read out as a whole**.
 - **Arguments are passed by value** (semantically always a copy); non-copyable ones are forced to by reference.
 - **Return**: a small struct is returned by value; a large struct is returned through the result location; non-copyable ones are forced to return through the result location.
 
@@ -1258,9 +1258,9 @@ assert q.x == 2 and q.y == 1
 ### 7.8 Subscript overloading (`__spy_getitemptr__`)
 
 A struct value can be subscripted like an array (`expr[i]`): define the method `__spy_getitemptr__(self, index) -> Ptr[T]`
-(or `ConstPtr[T]` / `MultiPtr[T]` / `ConstMultiPtr[T]`), which **returns a pointer to the element** — that is, the place the `i`-th element lives in.
+(or `ConstPtr[T]` / `MultiPtr[T]` / `ConstMultiPtr[T]`), which **returns a pointer to the element** — that is, the address of the `i`-th element.
 
-- `expr[i]` is exactly **the place the method's return value points to**: readable, assignable, `+=`-able, and you can keep taking fields/subscripts.
+- `expr[i]` is exactly **the element the method's return value points to** (the compiler dereferences where a value is needed): readable, assignable, `+=`-able, and you can keep taking fields/subscripts.
 - The method may be undecorated (inlined at the call site) or compiled into a runtime method with `@func()`; it must return a **pointer**, and returning a value is an error.
 - The class usually also defines a pair of `__getitem__`/`__setitem__` (placed in `if TYPE_CHECKING:`) **only so that a Python type checker** accepts
   the `expr[i]` form — the compiler does not call them (at compile time a subscript goes through `__spy_getitemptr__`).
@@ -1272,7 +1272,7 @@ class IntArray:
     ptr: MultiPtr[i32]
 
     def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
-        return self.ptr + index          # the place of the i-th element
+        return self.ptr + index          # the address of the i-th element
 
     if TYPE_CHECKING:
         # only so a type checker accepts ``v[i]``; never called by the compiler
@@ -1283,7 +1283,7 @@ class IntArray:
 def subscript_use(x: i32) -> i32:
     a = array(x, x + 1, x + 2)
     v = IntArray(arr_slice(ref(a)).ptr)
-    v[2] = 100                           # writes through the returned place
+    v[2] = 100                           # writes through the returned pointer
     return v[0] + v[1] + v[2]
 
 assert subscript_use(1) == 1 + 2 + 100
@@ -1366,9 +1366,9 @@ assert named_sum(a=1, b=2) == 3
 
 ### 8.5 Compile-time pointers
 
-- Address-of/offset: `ref(a)` (`a` is a compile-time place) yields a compile-time pointer; `p[...]` reads/writes the place it points to.
+- Address-of/offset: `ref(a)` yields a compile-time pointer to `a`; `p[...]` reads/writes the location it points to.
 - A **const pointer** can cross a non-inline boundary (as a `Comptime` argument, captured by a compiled closure, as a non-inline function's return value); it is passed by **identity** and is aliasable.
-- A **non-const compile-time pointer** **materializes a copy** when crossing a non-inline boundary: the callee's writes do not affect the original place.
+- A **non-const compile-time pointer** **materializes a copy** when crossing a non-inline boundary: the callee's writes do not affect the original location.
 - A compile-time pointer obtained through `ptr_cast` cannot be read/written through.
 - A pointer to a compile-time constant and a byte string constant are both automatically materialized as global constants.
 
