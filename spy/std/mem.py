@@ -16,15 +16,13 @@ from ..compiler import (
 )
 from ..compiler.syntax import (
     Opaque,
-    as_func_ptr,
     closure,
     comptime,
     const_comptime,
-    ptr_cast,
     ref,
 )
 from .c import free, malloc, realloc
-from .core import SlicePtr, panic, sstr, undefined
+from .core import SlicePtr, as_func_ptr, panic, ptr_cast, sstr, undefined
 
 
 @struct()

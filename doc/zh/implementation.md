@@ -34,7 +34,7 @@ flowchart TD
 | 文件 | 职责 |
 |---|---|
 | `compiler/__init__.py` | 公开接口：`func`/`struct`/`func_type`/`decl_func`/`typeof`/`compile_log`/`as_` 与各类型常量 |
-| `compiler/syntax.py` | 函数体内的语法标记：指针类型、`ref`/`ptr_cast`/`as_func_ptr`、`Array`/`array`、`Option`、`Comptime`/`ConstComptime`/`InferComptime`、`typeof`、`unroll`、`comptime()`、`defer` 与 `OK/RAISE/UNWIND/ERR/ALL`、`closure`、`Opaque`、C 整数 marker |
+| `compiler/syntax.py` | 函数体内的语法标记：指针类型、`ref`、`Array`/`array`、`Option`、`Comptime`/`ConstComptime`/`InferComptime`、`typeof`、`unroll`、`comptime()`、`defer` 与 `OK/RAISE/UNWIND/ERR/ALL`、`closure`、`Opaque`、C 整数 marker |
 | `compiler/dsl.py` | 装饰器与注册：`_Context`（每宿主编译上下文）、`_RegisteredFn`/`_RegisteredClass`/`_FuncTypeDecl`/`_DeclFuncDecl`、各 Metadata、`IntEnum` 支持 |
 | `compiler/astgen.py` | Python `ast` → HIR；签名解析（`parse_function`）、作用域、闭包、RLS、标记识别 |
 | `compiler/hir.py` | HIR 指令集与结果位置类型（`ResultLocTree`/`FullResultLoc`/`ReturnLoc`） |
@@ -101,7 +101,7 @@ flowchart TD
 
 - **结果位置语义（RLS）**：`_gen_result_loc(node, result_loc, allow_fall_back=True)` 把结果写进调用方给的**结果位置指针**，不产生寄存器。
   `hir.ReturnLoc()` 表示整棵函数结果位置树（多返回值是一棵指针树）。`_gen_expr` 的 fallback 为需要「值」的表达式分配临时 `Alloca`、RLS 写入、返回该指针。
-- **标记识别**（按对象身份）：`_SYNTAX_CALLS = (ref, unroll, comptime, ptr_cast, as_func_ptr, typeof)` → `_gen_syntax_call`；
+- **标记识别**（按对象身份）：`_SYNTAX_CALLS = (ref, unroll, comptime, typeof)` → `_gen_syntax_call`；
   语句级标记（`unroll`/`comptime`/`const_comptime`/`infer_comptime`）由 `_as_marker` 缓冲为 pragma，由下一条语句消费（悬空 pragma 报错）。
 - 下标 `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` 分派见 `astgen._gen_expr`、`_gen_type_ctor`、`_gen_literal`。
 - `is None`/`is not None`（`_gen_is_none`）、海牙 `_gen_walrus`/`_gen_unwrap`、`isinstance`（`_gen_isinstance`）。
@@ -337,7 +337,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 - `operand`：解析 `Const`（类型参数值 / 全局 / `as_value`）、`Arg(index)`、`Inst`（寄存器表）。
 - `subscript`（大分派）：数组/元组/字典/`$args`/`$kwargs`/字节串/指针/切片/结构体 `__spy_getitemptr__`/结构体模板特化。
 - `_subscript_pointer`：切片 → `SlicePtr`；多指针 → 元素的 place——**单**指针（地址 `p + i`），编译期则取 `box` 中该元素的 cell。
-- `exec_ptr_cast`：运行时指针 → `mir.BitCast`；编译期 `ComptimePtr` 是其子类型 → 重定型；否则 `sval.CastedPtr`；字节串指针 → 指向字节 store。
+- `std.core.ptr_cast`（`_builtin_ptr_cast`/`_ptr_cast_value`）：运行时指针 → `mir.BitCast`；编译期 `ComptimePtr` 是其子类型 → 重定型；否则 `sval.CastedPtr`；字节串指针 → 指向字节 store。
 
 ### 6.4 调用
 
@@ -361,7 +361,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 
 - `exec_make_closure`：在外层求值注解/默认值 → 具体 `Signature`；建匿名 struct（字段=捕获，`__call__`=闭包体 + `self` 指针）；
   编译期捕获烘成字段的 `is_comptime` 默认值（`move=False` → `is_ref` 指针；`move=True` → 值），运行时捕获是普通字段（指针或拷贝）；用 `_aggregate_place` 构造实例。
-- `exec_as_func_ptr`：`T` 忽略；`DeclareFunction` 已是指针；否则闭包必须 **ZST** 且非 `force_inline`；
+- `std.core.as_func_ptr`（`_builtin_as_func_ptr`）：`T` 忽略；`DeclareFunction` 已是指针；否则闭包必须 **ZST** 且非 `force_inline`；
   `_as_func_ptr_wrapper` 建一个无 `self` 的函数（先 `typed_undefined` 携带类型级捕获，再调 `__call__`），并即时编译以支撑自动 lower。
 - 自动 lower：`_to_runtime` → `_comptime_value_to_runtime`/`_comptime_pointer_value`/`_function_value_to_mir`；
   `_const_to_mir` 家族（`_const_pointer_to_mir`/`_const_struct_to_mir`/`_const_tuple_to_mir`/`_const_option_to_mir`/`_const_array_to_mir`/`_const_tagged_union_to_mir` 等）
@@ -393,7 +393,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 ### 6.8 内建与运算符
 
 - `_call_builtin` 按 `fn.name` 分派：`compile_log`、`type_info`、`reify`、`undefined`、`layout_of`、`panic`、`catch_unwind`、
-  `compile`、`const_array`、`bitcast`、`truncate`、`coerce`、`compile_error`、`atomic_load/store/rmw/cmpxchg/fence`；
+  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`coerce`、`compile_error`、`atomic_load/store/rmw/cmpxchg/fence`；
   未知名字（如 `compile_option`）报 `cannot call the spy builtin ...`。
 - 运算符：`_eval_binary` 依序判定 `|` 的 union 含义 → struct 重载 → complex → `/` → `//` → `**` → 位运算 → 双常量折叠 → 指针算术 → 数值 peer 类型发 `mir.Arith`；
   `_eval_cmp`（struct 重载/枚举成员/双常量/数值 `mir.Cmp`）、`_eval_not`、`_eval_unary`、`_eval_ord`、`binary_assign`。

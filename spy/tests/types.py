@@ -24,10 +24,10 @@ from ..compiler.syntax import (
     Opaque,
     Ptr,
     array,
-    ptr_cast,
     ref,
 )
 from ..compiler.util import TriState
+from ..std.core import ptr_cast
 from ..std import compile
 from ..std.mem import align_of, layout_of, size_of
 from .cross_context import _CROSS_CONTEXT

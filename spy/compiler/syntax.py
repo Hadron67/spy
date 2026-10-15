@@ -104,9 +104,6 @@ def infer_comptime():
 def unroll():
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
-def ptr_cast[T](ptr: Any, target: type[T]) -> T:
-    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
-
 def typeof[T](value: T) -> type[T]:
     """The spy type of ``value``, evaluated at compile time.  The argument is
     not evaluated for runtime: its instructions are *typed* to resolve the value's
@@ -179,9 +176,6 @@ def okdefer():
 
 @contextmanager
 def errdefer():
-    raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
-
-def as_func_ptr[T](type: type[T], obj: T) -> ConstPtr[T]:
     raise RuntimeError("Cannot call directly: this function can only be used in spy functions")
 
 def closure(*, inline: bool = True, exceptions=None, callconv: str = 'default', may_panic: bool = True, move: bool = False):

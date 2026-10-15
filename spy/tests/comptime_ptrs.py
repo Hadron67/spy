@@ -3,8 +3,8 @@ from unittest import TestCase
 
 from ..compiler import i32, sval, syntax
 from ..compiler.dsl import func, func_type, struct
-from ..compiler.syntax import Comptime, ConstComptime, Option, Ptr, as_func_ptr, ref
-from ..std.core import coerce
+from ..compiler.syntax import Comptime, ConstComptime, Option, Ptr, ref
+from ..std.core import as_func_ptr, coerce
 
 # ---------------------------------------------------------------------------
 # compile-time pointers crossing a *non-inline* boundary: a compile-time pointer

@@ -13,8 +13,8 @@ from ..compiler import (
 )
 from ..compiler import as_ as spy_as
 from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type
-from ..compiler.syntax import closure, ptr_cast, ref
-from ..std import Array
+from ..compiler.syntax import closure, ref
+from ..std import Array, ptr_cast
 from ..std.c import snprintf
 from ..std.core import const_arr_ptr, undefined
 from .structs import MIR_CACHE

@@ -2351,7 +2351,7 @@ class ComptimePtr(Value):
 
 @dataclass(frozen=True, slots=True)
 class CastedPtr(Value):
-    """A compile-time pointer reinterpreted by ``syntax.ptr_cast``: the
+    """A compile-time pointer reinterpreted by ``std.core.ptr_cast``: the
     underlying :class:`ComptimePtr` together with the pointer type it is now
     viewed through.  The pointee cannot be read or written through it - a cast
     back to a readable type is needed first (see ``interp``)."""

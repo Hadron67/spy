@@ -35,7 +35,7 @@ from spy.compiler.syntax import (
     Array, Opaque, array,
     Comptime, ConstComptime, InferComptime,
     comptime, const_comptime, infer_comptime, unroll,
-    ref, ptr_cast, as_func_ptr, closure,
+    ref, closure,
     defer, okdefer, errdefer, OK, RAISE, UNWIND, ERR, ALL,
 )
 from spy.std import (
@@ -44,7 +44,7 @@ from spy.std import (
 )
 from spy.std.core import (
     panic, catch_unwind, UnwindException, coerce, typed_undefined, bitcast,
-    unwrap, unwrap_or, compile_error,
+    ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error,
 )
 from spy.std.c import snprintf
 from spy.std.mem import Layout, layout_of, size_of, align_of
@@ -133,7 +133,7 @@ assert in_range(5) is True and in_range(20) is False
 - 可变指针可隐式转 const（`Ptr[T]` → `ConstPtr[T]`）；反之不行。
 - 指向数组的指针（`*[N]T`）可当成元素的多指针。
 - 指向 ZST 的指针是「dangling 但非空」，不是空指针。
-- `syntax.ref(a)` 取地址；`syntax.ptr_cast(p, T)` 重解释指针类型（不做检查）；`p[...]` 解引用。
+- `syntax.ref(a)` 取地址；`std.core.ptr_cast(p, T)` 重解释指针类型（不做检查）；`p[...]` 解引用。
 
 ```python
 @func()
@@ -1043,7 +1043,7 @@ assert lambda_use(5) == 6
 
 ### 6.8 `as_func_ptr`
 
-`syntax.as_func_ptr(T, f)`：`T` 只给 Python 类型检查器看（实现忽略）；`f` 必须是一个**有 `__call__` 且为 ZST 的 struct**；
+`std.core.as_func_ptr(T, f)`：`T` 只给 Python 类型检查器看（实现忽略）；`f` 必须是一个**有 `__call__` 且为 ZST 的 struct**；
 结果是**去掉 `self` 参数的 `__call__`**。普通 spy 函数与 extern 函数**直接用其名字**即可取到常函数指针。
 
 ```python

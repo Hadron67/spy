@@ -366,23 +366,6 @@ class OptionType(Inst):
 
     child: Value
 
-@dataclass(eq=False)
-class PtrCast(Inst):
-    """``syntax.ptr_cast(ptr, T)``: reinterpret the pointer ``value`` as the
-    pointer type the value operand ``type`` names (see ``interp``)."""
-
-    value: Value
-    type: Value
-
-@dataclass(eq=False)
-class AsFuncPtr(Inst):
-    """``syntax.as_func_ptr(T, f)``: the runtime pointer to the spy function
-    ``f`` of the function type ``T`` (both value operands).  The result is a
-    ``ConstPtr[T]`` value (see ``interp``)."""
-
-    type: Value
-    obj: Value
-
 
 @dataclass(eq=False)
 class TypeOfBegin(Inst):

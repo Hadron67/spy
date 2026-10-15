@@ -9,7 +9,7 @@ from ..compiler import (
 )
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import _GLOBAL_CONTEXT, func, func_type, struct
-from ..compiler.syntax import as_func_ptr
+from ..std.core import as_func_ptr
 
 # ---------------------------------------------------------------------------
 # closures: a nested ``def`` (or ``lambda``) inside a spy function captures

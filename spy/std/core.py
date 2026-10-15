@@ -13,7 +13,6 @@ from ..compiler.syntax import (
     Option,
     Ptr,
     infer_comptime,
-    ptr_cast,
 )
 
 
@@ -267,6 +266,20 @@ def compile[T: Callable](fn: T) -> ConstPtr[T]: ...
 
 @builtin_func
 def bitcast[T](value: Any, typ: type[T]) -> T: ...
+
+# ``ptr_cast(ptr, T)``: reinterpret the pointer ``ptr`` as the pointer type ``T``
+# (no checks): a runtime pointer becomes a ``mir.BitCast`` and a compile-time one
+# keeps its place under the new view (see ``interp.HirRunner._builtin_ptr_cast``).
+@builtin_func
+def ptr_cast[T](ptr: Any, target: type[T]) -> T: ...
+
+# ``as_func_ptr(T, f)``: the runtime pointer to the spy function ``f`` of the
+# function type ``T``.  ``T`` is only for the Python type checker (the
+# implementation ignores it); ``f`` must be a **struct that has ``__call__`` and
+# is a ZST**, and the result is the ``__call__`` with the ``self`` parameter
+# removed (see ``interp.HirRunner._builtin_as_func_ptr``).
+@builtin_func
+def as_func_ptr[T](typ: type[T], obj: T) -> ConstPtr[T]: ...
 
 @func_type()
 class DestructorFn:

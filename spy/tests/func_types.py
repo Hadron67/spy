@@ -486,7 +486,7 @@ class SpyDeclFuncTest(TestCase):
 
 
 class SpyAsFuncPtrTest(TestCase):
-    """``syntax.as_func_ptr`` materializes the address of a spy function as a
+    """``std.core.as_func_ptr`` materializes the address of a spy function as a
     ``ConstPtr`` of its function type."""
 
     def test_the_pointer_of_a_spy_function_can_be_called(self) -> None:

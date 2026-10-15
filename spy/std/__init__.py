@@ -15,7 +15,6 @@ from ..compiler.syntax import (
     Option,
     Ptr,
     comptime,
-    ptr_cast,
 )
 from .core import (
     ConstSlicePtr,
@@ -23,9 +22,11 @@ from .core import (
     SlicePtr,
     StopIteration,
     arr_slice,
+    as_func_ptr,
     compile,
     const_arr_slice,
     const_array,
+    ptr_cast,
     range,
     slice,
     sstr,
@@ -44,6 +45,7 @@ __all__ = [
     'SlicePtr',
     'StopIteration',
     'arr_slice',
+    'as_func_ptr',
     'compile',
     'comptime',
     'const_arr_slice',

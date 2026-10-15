@@ -29,6 +29,7 @@ from ..std import (
     SlicePtr,
     arr_slice,
     const_arr_slice,
+    ptr_cast,
 )
 from ..std.core import (
     PanicData,
@@ -581,8 +582,8 @@ def runtime_index_into_comptime_storage(x: i32) -> i32:
 # type expressions as values: a ``syntax`` type marker (``Ptr[T]``,
 # ``Array[T, N]``, ``Option[T]``, ...) written in a body builds the type value
 # (``hir.PointerType``/``hir.ArrayType``/``hir.OptionType``), which a
-# ``spy.typeof`` comparison can name; ``syntax.ptr_cast`` reinterprets a
-# pointer as another pointer type (``hir.PtrCast``)
+# ``spy.typeof`` comparison can name; ``std.core.ptr_cast`` reinterprets a
+# pointer as another pointer type
 # ---------------------------------------------------------------------------
 
 
@@ -638,7 +639,7 @@ def call_option_type_is_a_value(x: i32) -> i32:
 @func()
 def ptr_cast_of_the_same_type(x: i32) -> i32:
     # ``ptr_cast`` to the very same pointer type is a no-op
-    p = syntax.ptr_cast(ref(x), Ptr[i32])
+    p = ptr_cast(ref(x), Ptr[i32])
     p[...] = p[...] + 1
     return x
 
@@ -647,7 +648,7 @@ def ptr_cast_of_the_same_type(x: i32) -> i32:
 def ptr_cast_to_another_pointee(x: i32) -> i32:
     # ``ptr_cast`` reinterprets the address: a ``Ptr[i32]`` viewed as the
     # ``MultiPtr[i32]`` of its element reads the same storage
-    p = syntax.ptr_cast(ref(x), MultiPtr[i32])
+    p = ptr_cast(ref(x), MultiPtr[i32])
     return p[0]
 
 
@@ -655,7 +656,7 @@ def ptr_cast_to_another_pointee(x: i32) -> i32:
 def ptr_cast_of_a_multi_pointer(p: MultiPtr[i32]) -> i32:
     # casting a multi pointer to a single one is allowed (the reverse is not an
     # implicit conversion, but ``ptr_cast`` is a reinterpretation)
-    q = syntax.ptr_cast(p, Ptr[i32])
+    q = ptr_cast(p, Ptr[i32])
     return q[...]
 
 
@@ -918,8 +919,7 @@ class SpySubscriptOverloadTest(TestCase):
 class SpyTypeValueTest(TestCase):
     """A ``syntax`` type marker written in a body builds its spy type as a value
     (``hir.PointerType``/``hir.ArrayType``/``hir.OptionType``), and
-    ``syntax.ptr_cast`` reinterprets a pointer as another pointer type
-    (``hir.PtrCast``)."""
+    ``std.core.ptr_cast`` reinterprets a pointer as another pointer type."""
 
     def test_a_pointer_type_is_a_value(self) -> None:
         self.assertEqual(ptr_type_is_a_value(3), 1)

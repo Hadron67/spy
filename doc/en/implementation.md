@@ -34,7 +34,7 @@ Two layers of "type" run throughout:
 | File | Responsibility |
 |---|---|
 | `compiler/__init__.py` | Public interface: `func`/`struct`/`func_type`/`decl_func`/`typeof`/`compile_log`/`as_` and the various type constants |
-| `compiler/syntax.py` | Syntax markers inside function bodies: pointer types, `ref`/`ptr_cast`/`as_func_ptr`, `Array`/`array`, `Option`, `Comptime`/`ConstComptime`/`InferComptime`, `typeof`, `unroll`, `comptime()`, `defer` and `OK/RAISE/UNWIND/ERR/ALL`, `closure`, `Opaque`, C integer markers |
+| `compiler/syntax.py` | Syntax markers inside function bodies: pointer types, `ref`, `Array`/`array`, `Option`, `Comptime`/`ConstComptime`/`InferComptime`, `typeof`, `unroll`, `comptime()`, `defer` and `OK/RAISE/UNWIND/ERR/ALL`, `closure`, `Opaque`, C integer markers |
 | `compiler/dsl.py` | Decorators and registration: `_Context` (per-host compile context), `_RegisteredFn`/`_RegisteredClass`/`_FuncTypeDecl`/`_DeclFuncDecl`, the various Metadata, `IntEnum` support |
 | `compiler/astgen.py` | Python `ast` -> HIR; signature parsing (`parse_function`), scopes, closures, RLS, marker recognition |
 | `compiler/hir.py` | HIR instruction set and result location types (`ResultLocTree`/`FullResultLoc`/`ReturnLoc`) |
@@ -101,7 +101,7 @@ Expression highlights:
 
 - **Result location semantics (RLS)**: `_gen_result_loc(node, result_loc, allow_fall_back=True)` writes the result through the caller-provided **result location pointer** and produces no register.
   `hir.ReturnLoc()` denotes the entire function result location tree (a tree of pointers for a multiple-value result). The fallback of `_gen_expr` allocates a temporary `Alloca` for expressions that need a "value", writes via RLS, and returns that pointer.
-- **Marker recognition** (by object identity): `_SYNTAX_CALLS = (ref, unroll, comptime, ptr_cast, as_func_ptr, typeof)` -> `_gen_syntax_call`;
+- **Marker recognition** (by object identity): `_SYNTAX_CALLS = (ref, unroll, comptime, typeof)` -> `_gen_syntax_call`;
   statement-level markers (`unroll`/`comptime`/`const_comptime`/`infer_comptime`) are buffered as a pragma by `_as_marker` and consumed by the next statement (a dangling pragma is an error).
 - Subscript dispatch for `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` is in `astgen._gen_expr`, `_gen_type_ctor`, `_gen_literal`.
 - `is None`/`is not None` (`_gen_is_none`), walrus `_gen_walrus`/`_gen_unwrap`, `isinstance` (`_gen_isinstance`).
@@ -340,7 +340,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - `operand`: resolves `Const` (type parameter value / global / `as_value`), `Arg(index)`, `Inst` (the register table).
 - `subscript` (big dispatch): array/tuple/dict/`$args`/`$kwargs`/byte string/pointer/slice/struct `__spy_getitemptr__`/struct template specialization.
 - `_subscript_pointer`: a slice -> `SlicePtr`; a multi pointer -> the element's place, a **single** pointer (the address `p + i`); a compile-time one picks the element's cell in the `box`.
-- `exec_ptr_cast`: runtime pointer -> `mir.BitCast`; a compile-time `ComptimePtr` that is a subtype of it -> retype; otherwise `sval.CastedPtr`; byte string pointer -> points at the byte store.
+- `std.core.ptr_cast` (`_builtin_ptr_cast`/`_ptr_cast_value`): runtime pointer -> `mir.BitCast`; a compile-time `ComptimePtr` that is a subtype of it -> retype; otherwise `sval.CastedPtr`; byte string pointer -> points at the byte store.
 
 ### 6.4 Calls
 
@@ -363,7 +363,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 
 - `exec_make_closure`: evaluates annotations/defaults in the outer scope -> a concrete `Signature`; builds an anonymous struct (fields = captures, `__call__` = the closure body + a `self` pointer);
   compile-time captures are baked into the fields' `is_comptime` defaults (`move=False` -> an `is_ref` pointer; `move=True` -> a value); runtime captures are ordinary fields (pointer or copy); the instance is constructed with `_aggregate_place`.
-- `exec_as_func_ptr`: `T` is ignored; `DeclareFunction` is already a pointer; otherwise the closure must be **ZST** and not `force_inline`;
+- `std.core.as_func_ptr` (`_builtin_as_func_ptr`): `T` is ignored; `DeclareFunction` is already a pointer; otherwise the closure must be **ZST** and not `force_inline`;
   `_as_func_ptr_wrapper` builds a function with no `self` (first a `typed_undefined` carrying the type-level captures, then a call to `__call__`), and compiles it immediately to support automatic lower.
 - Automatic lower: `_to_runtime` -> `_comptime_value_to_runtime`/`_comptime_pointer_value`/`_function_value_to_mir`;
   the `_const_to_mir` family (`_const_pointer_to_mir`/`_const_struct_to_mir`/`_const_tuple_to_mir`/`_const_option_to_mir`/`_const_array_to_mir`/`_const_tagged_union_to_mir`, etc.)
@@ -395,7 +395,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 ### 6.8 Builtins and operators
 
 - `_call_builtin` dispatches by `fn.name`: `compile_log`, `type_info`, `reify`, `undefined`, `layout_of`, `panic`, `catch_unwind`,
-  `compile`, `const_array`, `bitcast`, `truncate`, `coerce`, `compile_error`, `atomic_load/store/rmw/cmpxchg/fence`;
+  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `coerce`, `compile_error`, `atomic_load/store/rmw/cmpxchg/fence`;
   an unknown name (such as `compile_option`) raises `cannot call the spy builtin ...`.
 - Operators: `_eval_binary` decides in order the union meaning of `|` -> struct overload -> complex -> `/` -> `//` -> `**` -> bitwise -> fold both constants -> pointer arithmetic -> emit `mir.Arith` for numeric peer types;
   `_eval_cmp` (struct overload / enum member / both constants / numeric `mir.Cmp`), `_eval_not`, `_eval_unary`, `_eval_ord`, `binary_assign`.

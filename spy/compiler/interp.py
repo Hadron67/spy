@@ -1064,7 +1064,7 @@ def _arg_node_types(node: ArgNode) -> Iterator[sval.Type]:
 def _arg_node_needs_mir(node: ArgNode) -> bool:
     """Whether the argument tree ``node`` consumes a MIR argument: it holds a
     runtime leaf anywhere (a ``RuntimeArgNode``).  It is what a caller that can
-    only take a runtime-pointer-free argument reads (see ``exec_as_func_ptr``)."""
+    only take a runtime-pointer-free argument reads (see ``_builtin_as_func_ptr``)."""
     if isinstance(node, RuntimeArgNode):
         return True
     if isinstance(node, tuple):
@@ -1090,7 +1090,7 @@ def _provided_node_of_type(type: sval.Type) -> ArgNode:
     ``Signature.solve_param_types``): a compile-time-only aggregate is provided
     element by element, any other type as one runtime argument.  It is what a
     call that specializes a function pointer without passing values uses (see
-    ``exec_as_func_ptr``)."""
+    ``_builtin_as_func_ptr``)."""
     if isinstance(type, sval.TupleType):
         return tuple(_provided_node_of_type(child) for child in type.types)
     if isinstance(type, sval.StrDictType):
@@ -2780,10 +2780,6 @@ class HirRunner:
                 regs[inst] = ComptimeVal(sval.OptionType(
                     self.type_operand(inst.child, 'the child type of an option'),
                 ))
-            case hir.PtrCast():
-                regs[inst] = self.exec_ptr_cast(self.operand(inst.value), self.operand(inst.type))
-            case hir.AsFuncPtr():
-                return self.exec_as_func_ptr(inst)
             case hir.TypeOfBegin():
                 self._exec_typeof_begin()
             case hir.TypeOfEnd():
@@ -4322,7 +4318,7 @@ class HirRunner:
         """``_coerce`` without the error: ``None`` when the value cannot be
         materialized as ``target`` (see :class:`~spy.errors.CoerceError`).  It
         is what a caller that only has to decide *whether* a coercion is
-        possible uses (``exec_ptr_cast``)."""
+        possible uses (``_ptr_cast_value``)."""
         try:
             return self._coerce(ev, target)
         except CoerceError:
@@ -4709,7 +4705,7 @@ class HirRunner:
     def _operand_comptime_value(self, value: hir.Value) -> sval.AnyValue:
         """The compile-time object an operand denotes (a type value, or the
         value a type parameter stands for): what a ``syntax`` type constructor
-        and ``ptr_cast`` take their arguments as."""
+        takes its arguments as."""
         obj = _to_comptime(_shallow_normalize(self.operand(value)))
         if obj is None:
             raise CompileError('a type expression must be a compile-time value')
@@ -4723,9 +4719,20 @@ class HirRunner:
             raise CompileError(f'{what} is not a type: {obj!r}')
         return obj
 
-    def exec_ptr_cast(self, value: InterpVal, target: InterpVal) -> InterpVal:
-        """``syntax.ptr_cast(ptr, T)``: reinterpret the pointer ``value`` as the
-        pointer type ``T`` names.
+    def _builtin_ptr_cast(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+        """``std.core.ptr_cast(ptr, T)``: reinterpret the pointer the first
+        argument names as the pointer type the second (a type argument) names -
+        see :meth:`_ptr_cast_value`.  The result is written into the call's
+        result location."""
+        value = self._arg_value(args.positional[0])
+        target = self._type_value_arg(
+            args.positional[1], 'the type argument of std.core.ptr_cast'
+        )
+        self.store(ret, self._ptr_cast_value(value, target))
+        return PollResult.AGAIN
+
+    def _ptr_cast_value(self, value: InterpVal, target: sval.Type) -> InterpVal:
+        """The pointer ``value`` reinterpreted as the pointer type ``target``.
 
         A runtime pointer of another type is ``bit_cast`` (the address is what
         it is - only the pointee type changes, see ``mir.BitCast``) and one of
@@ -4733,38 +4740,37 @@ class HirRunner:
         materialized with ``_coerce`` when its place converts to the target and
         wrapped in a :class:`sval.CastedPtr` otherwise; recasting one of those
         drops the wrapper when the target converts the place it wraps."""
-        target_obj = _to_comptime(_shallow_normalize(target))
-        if not isinstance(target_obj, sval.PointerType):
-            raise CompileError(f'ptr_cast needs a pointer type, got {target_obj!r}')
+        if not isinstance(target, sval.PointerType):
+            raise CompileError(f'ptr_cast needs a pointer type, got {target!r}')
         from_type = _type_of(value)
-        if from_type == target_obj:
+        if from_type == target:
             return value
         ev = _shallow_normalize(value)
         if isinstance(ev, RuntimeVal):
             if not isinstance(from_type, sval.PointerType):
                 raise CompileError(f'cannot ptr_cast a {from_type} value')
-            mir_type = target_obj.to_mir_type(self._mir_cache)
+            mir_type = target.to_mir_type(self._mir_cache)
             assert isinstance(mir_type, mir.PointerType)
-            return RuntimeVal(self._emit(mir.BitCast(ev.value, mir_type)), target_obj)
+            return RuntimeVal(self._emit(mir.BitCast(ev.value, mir_type)), target)
         if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.CastedPtr):
             # a pointer already reinterpreted once: when the new target converts
             # the place it wraps, the place itself is the value (the wrapper is
             # dropped); otherwise it is wrapped with the new type
             inner = ev.obj.ptr
-            if inner.type.is_subtype_of(target_obj):
-                return ComptimeVal(sval.ComptimePtr(inner.box, inner.offset, target_obj))
-            return ComptimeVal(sval.CastedPtr(inner, target_obj))
+            if inner.type.is_subtype_of(target):
+                return ComptimeVal(sval.ComptimePtr(inner.box, inner.offset, target))
+            return ComptimeVal(sval.CastedPtr(inner, target))
         if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.ComptimePtr):
             # a compile-time pointer: the view type is what changes
             inner = ev.obj
-            if inner.type.is_subtype_of(target_obj):
-                return ComptimeVal(sval.ComptimePtr(inner.box, inner.offset, target_obj))
-            return ComptimeVal(sval.CastedPtr(inner, target_obj))
+            if inner.type.is_subtype_of(target):
+                return ComptimeVal(sval.ComptimePtr(inner.box, inner.offset, target))
+            return ComptimeVal(sval.CastedPtr(inner, target))
         if isinstance(ev, ComptimeVal) and isinstance(ev.obj, bytes):
             # a byte string: the pointer points into the byte-string store (see
             # the byte-string lowering, ``_string_global``)
-            return ComptimeVal(sval.ComptimePtr(ev.obj, 0, target_obj))
-        coerced = self._try_coerce(ev, target_obj)
+            return ComptimeVal(sval.ComptimePtr(ev.obj, 0, target))
+        coerced = self._try_coerce(ev, target)
         if coerced is not None:
             return coerced
         raise CompileError(f'cannot ptr_cast a {from_type} value')
@@ -4901,8 +4907,8 @@ class HirRunner:
                 self._commit_pending_slot(ev, declared)
         return _shallow_normalize(ev)
 
-    def exec_as_func_ptr(self, inst: hir.AsFuncPtr) -> PollResult:
-        """``syntax.as_func_ptr(T, closure)``: the runtime function pointer of a
+    def _builtin_as_func_ptr(self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal) -> PollResult:
+        """``std.core.as_func_ptr(T, closure)``: the runtime function pointer of a
         *closure* - an anonymous struct with a ``__call__`` - as a constant
         function pointer of the closure's own signature.  The first argument is a
         type only the Python type checker reads and is **ignored** (see §9.5).  A
@@ -4912,11 +4918,10 @@ class HirRunner:
         so it is an ordinary runtime function the automatic lowering turns into a
         ``mir.Function``.  A declared external function already is a pointer and
         is taken as it is."""
-        obj = self._operand_comptime_value(inst.obj)
-        regs = self._frames[-1].regs
+        obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[1])))
         if isinstance(obj, sval.DeclareFunction):
             # a declared external function already is a function pointer
-            regs[inst] = ComptimeVal(obj)
+            self.store(ret, ComptimeVal(obj))
             return PollResult.AGAIN
         struct_type: sval.Type | None = None
         if isinstance(obj, sval.ComptimePtr):
@@ -4938,7 +4943,7 @@ class HirRunner:
         wrapper = self._as_func_ptr_wrapper(struct_type, method)
         # compile the wrapper eagerly, so that the automatic lowering can turn
         # the function value into a ``mir.Function`` at its use (see §4.3); the
-        # instruction still yields the *value* (a ``ConstPtr[fn_type]``)
+        # call still yields the *value* (a ``ConstPtr[fn_type]``)
         sig = wrapper.hir.signature
         provided_args: list[ArgNode] = []
         for arg in sig.positional.by_id:
@@ -4948,7 +4953,7 @@ class HirRunner:
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
 
         def _resumer(self0: Self, fn_mir: mir.Value, ret_sig: ReturnSignature) -> PollResult:
-            regs[inst] = ComptimeVal(wrapper)
+            self.store(ret, ComptimeVal(wrapper))
             return PollResult.AGAIN
 
         return self._request_function(wrapper, call_sig, partial_ret_sig, _resumer)
@@ -5799,6 +5804,10 @@ class HirRunner:
             return self._builtin_const_array(binded, ret)
         if fn.name == 'bitcast':
             return self._builtin_bitcast(binded, ret)
+        if fn.name == 'ptr_cast':
+            return self._builtin_ptr_cast(binded, ret)
+        if fn.name == 'as_func_ptr':
+            return self._builtin_as_func_ptr(binded, ret)
         if fn.name == 'truncate':
             return self._builtin_truncate(binded, ret)
         if fn.name == 'coerce':

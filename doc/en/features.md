@@ -35,7 +35,7 @@ from spy.compiler.syntax import (
     Array, Opaque, array,
     Comptime, ConstComptime, InferComptime,
     comptime, const_comptime, infer_comptime, unroll,
-    ref, ptr_cast, as_func_ptr, closure,
+    ref, closure,
     defer, okdefer, errdefer, OK, RAISE, UNWIND, ERR, ALL,
 )
 from spy.std import (
@@ -44,7 +44,7 @@ from spy.std import (
 )
 from spy.std.core import (
     panic, catch_unwind, UnwindException, coerce, typed_undefined, bitcast,
-    unwrap, unwrap_or, compile_error,
+    ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error,
 )
 from spy.std.c import snprintf
 from spy.std.mem import Layout, layout_of, size_of, align_of
@@ -133,7 +133,7 @@ assert in_range(5) is True and in_range(20) is False
 - A mutable pointer implicitly converts to const (`Ptr[T]` → `ConstPtr[T]`); the reverse does not hold.
 - A pointer to an array (`*[N]T`) can be treated as a multi pointer to its elements.
 - A pointer to a ZST is "dangling but non-null", not a null pointer.
-- `syntax.ref(a)` takes an address; `syntax.ptr_cast(p, T)` reinterprets the pointer type (no checks); `p[...]` dereferences.
+- `syntax.ref(a)` takes an address; `std.core.ptr_cast(p, T)` reinterprets the pointer type (no checks); `p[...]` dereferences.
 
 ```python
 @func()
@@ -1043,7 +1043,7 @@ assert lambda_use(5) == 6
 
 ### 6.8 `as_func_ptr`
 
-`syntax.as_func_ptr(T, f)`: `T` is only for the Python type checker (the implementation ignores it); `f` must be a **struct that has `__call__` and is a ZST**;
+`std.core.as_func_ptr(T, f)`: `T` is only for the Python type checker (the implementation ignores it); `f` must be a **struct that has `__call__` and is a ZST**;
 the result is the **`__call__` with the `self` parameter removed**. An ordinary spy function and an extern function can be taken as a constant function pointer **just by using their name**.
 
 ```python

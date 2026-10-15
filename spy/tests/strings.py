@@ -10,10 +10,10 @@ from ..compiler.dsl import func
 from ..compiler.syntax import (
     Comptime,
     ConstMultiPtr,
-    ptr_cast,
 )
 from ..std import (
     ConstSlicePtr,
+    ptr_cast,
     sstr,
 )
 

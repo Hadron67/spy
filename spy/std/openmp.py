@@ -42,15 +42,15 @@ from ..compiler import (
 from ..compiler.syntax import (
     ConstComptime,
     Opaque,
-    as_func_ptr,
     closure,
     comptime,
-    ptr_cast,
     ref,
 )
 from .core import (
+    as_func_ptr,
     coerce,
     compile_error,
+    ptr_cast,
     typed_undefined,
 )
 
