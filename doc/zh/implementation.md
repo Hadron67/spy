@@ -164,8 +164,10 @@ flowchart TD
 ### 4.3 值域与 `Box`
 
 - `AnyValue = Value | int | float | complex | bytes | bool`；`ScalarValue` 是能占 `Box` 一个 cell 的子集
-  （聚合值形式 `AggregateValue`/`TaggedUnionValue`/`UnionValue`/`OptionValue`/`TypedNull`/`UndefinedAggregate` **不**在其中）。
+  （聚合值形式 `AggregateValue`/`TaggedUnionValue`/`UnionValue`/`OptionValue`/`TypedNull`/`UndefinedAggregate` **不**在其中，`is_scalar_value` 判定）。
 - `Box(name_base, type, is_const, cells)`：身份对象，把值**铺平**为 `list[ScalarValue]`；`reset(type)` 按 `scalar_leaves` 初始化每 cell 为 `UndefinedScalar`。
+- box 读写 helper（均在 `sval`，`interp` 直接读写 `Box.cells`）：`flatten_value`（含 padding；`undefined` → 每叶 `UndefinedScalar`）、
+  `unflatten_cells`（其逆）、`fill_comptime_defaults`（把 `is_comptime` 字段填默认，迭代）、`load_box_cells`（`bytes` box 特判）。
 
 ### 4.4 结构体布局（`StructType._calculate_mir`）
 
@@ -213,7 +215,11 @@ flowchart TD
 
 - `as_value(obj, ctx, type_vars)`：Python 对象 → spy 域（内建类型别名、`TypeVar`→已解值、`TypeAliasType` 解包、`StructTypeApplication` 特化、
   `|` 链 → `OptionType`/`tagged_union_of`、`tuple[...]`/`Literal[X]`/指针 marker/`Array[T,L]`/`Option[T]`/`Union` 等）。
-- `coerce_const(value, type)`：把值具体化成类型常量（含 `_typed_undefined`、整数 range 检查、`coerce_const_tagged_union`）。
+- `coerce_const(value, type)`：把**任意**编译期量具体化成类型常量，失败抛 `CoerceError`。覆盖：
+  `UntypedUndefined`/typed undefined（`_typed_undefined`，是 option/union 的成员时包成 present）、`Any`（任意值原样）、
+  `ComptimePtr`（place：pointee 相同即可作指针常量，作 option/union/tuple/`dict[str, T]` 的值时读出内容）、`AggregateValue`（只能是自身类型）
+  与各种聚合/union/complex/option 值形式、函数值（作函数指针）、枚举成员、整数 range 检查，以及「自身类型即目标且该类型是编译期专属」的值；
+  `coerce_const_tagged_union` 负责变体选择与 tag 重映射。
 - `TypeVarSolver`：约束求解（相等/子类型、结构分解 `StructType`/`OptionType`/`PointerType`/`ArrayType`、`finish` 折叠子类型界）。
 - `replace_type_var(s)`：结构替换（含 `StructType` 经 head 重新特化以保 identity）。
 - `type_of(value, int_literal_bits)`：边界处的 Python 值 → spy 类型（`int` → `AnyIntType` 或 `IntType(bits, True)`）。
@@ -297,6 +303,8 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 - `PendingSlot`：已执行但未 commit 的 `hir.Alloca`（见 §6.2）。
 - `ComptimeResultPtr(value, code, payload)`：函数结果位置的指针形态（value/code/payload 三个位置），**不是** `InterpVal`。
 - 判定：`_is_comptime_val`（`RuntimeVal` 一律不是；旧的「不引用寄存器」放宽已删除）、`_place_is_comptime`、`_references_register`。
+- `_coerce(ev, target)`：**编译期量一律交给 `sval.coerce_const`**（`ComptimeVal`，含 `ComptimePtr` 这种 place），运行期量走 `_convert_inst`（拓宽/收窄）；
+  失败抛 `CoerceError`（`_try_coerce` 吞掉它）。`Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` 的目标分支只处理运行期值。
 
 ### 6.2 Compile-time 存储与 pending slot
 
@@ -311,8 +319,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
   零尺寸 child 的 option（表示就是一个 tag）也照样置 present——`_option_payload_ptr` 写 tag，`finish_struct`/`finish_array` 的已物化路径对零尺寸聚合补一次剥层。
 - **`_is_union_delivery`**：运行时存储里的 tagged union，每次构造记自己的 `_PendingAggregate`（`field_index_addr` 不复用已记录的 place），
   故 `if` 表达式两分支构造不同变体也各按自己的变体在各自位置交付；编译期 `Box` 只装得下一个变体，那种情形仍是 `incompatible types` 错误。
-- `Box` 存储：`_flatten_value`（含 padding；`undefined` → 每叶 `UndefinedScalar`）、`_unflatten_cells`、
-  `_fill_comptime_defaults`（把 `is_comptime` 字段填默认，迭代）、`_load_box_cells`（`bytes` box 特判）。
+- `Box` 存储：读写 helper 在 `sval`（`flatten_value`/`unflatten_cells`/`fill_comptime_defaults`/`load_box_cells`，见 §4.3），`Box.cells` 由 `interp` 直接读写。
 - **`mir.Insertion`** 是「在我已经走过的地方发射指令」的机制：`PendingSlot.insertion` 预留 alloca 的位置，
   `_PendingPtrConvertion`/`_PendingErrorCodeWrite` 预留交付/抛出点的位置；`mir.normalize` 稍后拼接。
 

@@ -1,3 +1,4 @@
+from typing import Any
 from unittest import TestCase
 
 from ..compiler import (
@@ -5,13 +6,16 @@ from ..compiler import (
     f64,
     i8,
     i32,
+    i64,
     u8,
     u32,
     u64,
 )
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func
+from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
+    Comptime,
+    ConstComptime,
     Opaque,
     Option,
     Ptr,
@@ -91,6 +95,109 @@ def typed_undefined_const_array_element(x: i32) -> i32:
     return len(a)
 
 
+# ---------------------------------------------------------------------------
+# compile-time values other than the scalars: a compile-time pointer (a place),
+# an aggregate value, a union value and ``Any`` (see ``sval.coerce_const``)
+# ---------------------------------------------------------------------------
+
+
+@struct()
+class CoercePair:
+    a: i32
+    b: i32
+
+
+@struct()
+class CoerceOtherPair:
+    a: i32
+    b: i32
+
+
+@struct()
+class CoerceUA:
+    x: i32
+
+
+@struct()
+class CoerceUB:
+    y: i64
+
+
+@func()
+def coerce_comptime_pointer() -> i32:
+    # a compile-time pointer converts to a pointer type of the same pointee - a
+    # const place included (its writability is decided by its box, not by the
+    # view): ``ref`` of a ``ConstComptime`` gives a ``*const i32``
+    n: ConstComptime[i32] = 5
+    p = coerce(ref(n), Ptr[i32])
+    return p[...]
+
+
+@func()
+def coerce_comptime_pointer_of_another_pointee() -> u8:
+    # a pointer does not convert between pointee types
+    n: Comptime[i32] = 5
+    return coerce(ref(n), Ptr[u8])[...]
+
+
+@func()
+def coerce_any_takes_a_pointer() -> i32:
+    # ``Any`` names no fixed type: a compile-time pointer is a value of it (it
+    # used to be rejected - only a scalar converted to ``Any``)
+    n: Comptime[i32] = 7
+    p = coerce(ref(n), Any)  # pyright: ignore[reportArgumentType]
+    return p[...]
+
+
+@func()
+def coerce_comptime_aggregate() -> i32:
+    # a compile-time aggregate value converts to its own type
+    comptime()
+    p = CoercePair(2, 3)
+    q = coerce(p, CoercePair)
+    return q.a * 10 + q.b
+
+
+@func()
+def coerce_comptime_aggregate_of_another_type() -> i32:
+    # an aggregate is ever only its own type, whatever its fields are
+    comptime()
+    p = CoercePair(2, 3)
+    q = coerce(p, CoerceOtherPair)
+    return q.a
+
+
+@func()
+def coerce_comptime_union_widens() -> i32:
+    # a compile-time union value converts to a union that also holds its variants
+    comptime()
+    u: CoerceUA | CoerceUB = CoerceUA(3)
+    v = coerce(u, CoerceUA | CoerceUB | u8)  # pyright: ignore[reportArgumentType]
+    if isinstance(a := v, CoerceUA):
+        return a.x
+    return -1
+
+
+@func()
+def coerce_comptime_option_place() -> i32:
+    # the compile-time *place* of an option is read as the value of the option
+    ch: ConstComptime[Option[i32]] = 5
+    o: Option[i32] = coerce(ref(ch), Option[i32])  # pyright: ignore[reportArgumentType]
+    if (v := o) is not None:
+        return v
+    return -1
+
+
+@func()
+def coerce_comptime_union_place() -> i32:
+    # likewise for the place of a tagged union
+    u: ConstComptime[CoerceUA | CoerceUB] = CoerceUA(4)
+    v: CoerceUA | CoerceUB = coerce(ref(u), CoerceUA | CoerceUB)  # pyright: ignore[reportArgumentType]
+    if isinstance(a := v, CoerceUA):
+        return a.x
+    return -1
+
+
 class SpyCoerceTest(TestCase):
     """``std.core.coerce(value, T)`` materializes a value as the spy type ``T``,
     folding a compile-time value in Python and emitting the numeric conversion
@@ -124,6 +231,32 @@ class SpyCoerceTest(TestCase):
 
     def test_typed_undefined_as_a_const_array_element(self) -> None:
         self.assertEqual(typed_undefined_const_array_element(0), 3)
+
+    def test_a_compile_time_pointer(self) -> None:
+        self.assertEqual(coerce_comptime_pointer(), 5)
+
+    def test_a_pointer_of_another_pointee(self) -> None:
+        with self.assertRaises(CompileError):
+            coerce_comptime_pointer_of_another_pointee()
+
+    def test_any_takes_a_pointer(self) -> None:
+        self.assertEqual(coerce_any_takes_a_pointer(), 7)
+
+    def test_a_compile_time_aggregate(self) -> None:
+        self.assertEqual(coerce_comptime_aggregate(), 23)
+
+    def test_an_aggregate_of_another_type(self) -> None:
+        with self.assertRaises(CompileError):
+            coerce_comptime_aggregate_of_another_type()
+
+    def test_a_compile_time_union_value(self) -> None:
+        self.assertEqual(coerce_comptime_union_widens(), 3)
+
+    def test_a_compile_time_option_place(self) -> None:
+        self.assertEqual(coerce_comptime_option_place(), 5)
+
+    def test_a_compile_time_union_place(self) -> None:
+        self.assertEqual(coerce_comptime_union_place(), 4)
 
 
 all_tests = [

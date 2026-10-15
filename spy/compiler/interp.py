@@ -88,7 +88,7 @@ from annotationlib import Format
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Any, Never, Self, TypeGuard, override
+from typing import Any, Never, Self, override
 
 from . import hir, mir, sval
 from .binop import BinaryOp, CompareOp, UnaryOp
@@ -583,13 +583,6 @@ def _references_register(value: mir.Value) -> bool:
             todo.extend(children)
     return False
 
-def _is_aggregate(type: sval.Type) -> bool:
-    """Whether ``type`` is an *aggregate* type (a struct, array, tuple, string
-    dictionary, complex, option, tagged union or payload union): a value of one
-    is flattened into a cell per scalar leaf when it is stored in a ``Box`` (see
-    ``sval.scalar_leaves``)."""
-    return isinstance(type, sval.AggregateType)
-
 def _is_union_unit(val: InterpVal) -> bool:
     """Whether ``val`` is a union value that carries no storage
     (:class:`sval.UnionValue`): it says only which union it belongs to, so a
@@ -918,198 +911,6 @@ def _sval_to_runtime(value: sval.AnyValue, cache: sval.MirLowerCache) -> mir.Val
             raise CompileError(f"cannot return the compile-time value {value!r}")
 
 
-def _flatten_natural(value: sval.AnyValue, type: sval.Type) -> list[sval.ScalarValue]:
-    """The natural (unpadded) flattened cells of the compile-time ``value`` of
-    ``type`` (see :func:`_flatten_value`)."""
-    if isinstance(type, sval.ScalarType):
-        if not _is_scalar_value(value):
-            raise CompileError(f'cannot flatten {value!r} as {type}')
-        return [value]
-    if isinstance(value, sval.AggregateValue):
-        values = value.values
-    else:
-        raise CompileError(f'cannot flatten {value!r} as {type}')
-    if isinstance(type, sval.StructType):
-        cells: list[sval.ScalarValue] = []
-        for index, field in enumerate(type.fields().values()):
-            if field.is_ref:
-                # the cell holds the compile-time pointer itself
-                cell = values[index]
-                assert _is_scalar_value(cell)
-                cells.append(cell)
-            else:
-                cells.extend(_flatten_value(values[index], field.type))
-        return cells
-    if isinstance(type, sval.TupleType):
-        cells = []
-        for index, elem in enumerate(type.types):
-            cells.extend(_flatten_value(values[index], elem))
-        return cells
-    if isinstance(type, sval.StrDictType):
-        cells = []
-        for index, elem in enumerate(type.values.values()):
-            cells.extend(_flatten_value(values[index], elem))
-        return cells
-    if isinstance(type, sval.ArrayType):
-        cells = []
-        for elem_value in values:
-            cells.extend(_flatten_value(elem_value, type.elem))
-        return cells
-    if isinstance(type, sval.ComplexType):
-        re, im = values[0], values[1]
-        assert _is_scalar_value(re) and _is_scalar_value(im)
-        return [re, im]
-    raise CompileError(f'cannot flatten {value!r} as {type}')
-
-
-def _flatten_value(value: sval.AnyValue, type: sval.Type) -> list[sval.ScalarValue]:
-    """The flattened cell sequence of the compile-time ``value`` of ``type``
-    (see ``sval.scalar_leaves``), padded to the type's width with an
-    ``UndefinedScalar`` of each remaining leaf type."""
-    if isinstance(value, (sval.UndefinedAggregate, sval.UndefinedScalar, sval.UntypedUndefined)):
-        # an undefined value flattens to undefined cells (one per leaf)
-        return [sval.UndefinedScalar(leaf) for leaf in sval.scalar_leaves(type)]
-    if isinstance(type, sval.OptionType):
-        if isinstance(value, sval.OptionValue):
-            cells: list[sval.ScalarValue] = [True]
-            cells.extend(_flatten_value(value.value, type.child))
-        elif isinstance(value, (sval.Null, sval.TypedNull)):
-            cells = [False]
-        else:
-            raise CompileError(f'cannot flatten the option value {value!r}')
-    elif isinstance(type, sval.TaggedUnionType):
-        if not isinstance(value, sval.TaggedUnionValue):
-            raise CompileError(f'cannot flatten the tagged union value {value!r}')
-        cells = [sval.Int(value.index, type.tag_type())]
-        cells.extend(_flatten_value(value.value, type.types[value.index]))
-    else:
-        cells = _flatten_natural(value, type)
-    leaves = sval.scalar_leaves(type)
-    while len(cells) < len(leaves):
-        cells.append(sval.UndefinedScalar(leaves[len(cells)]))
-    if len(cells) != len(leaves):
-        raise CompileError(f'cannot flatten {value!r} as {type}')
-    return cells
-
-
-def _unflatten_cells(cells: list[sval.ScalarValue], offset: int, type: sval.Type) -> sval.AnyValue:
-    """Reconstruct a compile-time value of ``type`` from the flattened cells at
-    ``offset`` (the inverse of :func:`_flatten_value`)."""
-    if isinstance(type, sval.ScalarType):
-        return cells[offset]
-    if isinstance(type, sval.StructType):
-        values: list[sval.AnyValue] = []
-        for index, field in enumerate(type.fields().values()):
-            field_offset = offset + sval.field_scalar_offset(type, index)
-            if field.is_ref:
-                values.append(cells[field_offset])
-            elif field.is_comptime:
-                cell = cells[field_offset]
-                # an unset compile-time field reads its default
-                if isinstance(cell, sval.UndefinedScalar) and field.default is not None:
-                    values.append(field.default)
-                else:
-                    values.append(cell)
-            else:
-                values.append(_unflatten_cells(cells, field_offset, field.type))
-        return sval.AggregateValue(tuple(values), type)
-    if isinstance(type, sval.TupleType):
-        return sval.AggregateValue(
-            tuple(
-                _unflatten_cells(cells, offset + sval.field_scalar_offset(type, index), elem)
-                for index, elem in enumerate(type.types)
-            ),
-            type,
-        )
-    if isinstance(type, sval.StrDictType):
-        return sval.AggregateValue(
-            tuple(
-                _unflatten_cells(cells, offset + sval.field_scalar_offset(type, index), elem)
-                for index, elem in enumerate(type.values.values())
-            ),
-            type,
-        )
-    if isinstance(type, sval.ArrayType):
-        length = type.length_int
-        if length is None:
-            raise CompileError(f'cannot flatten the unsized array {type}')
-        step = sval.scalar_count(type.elem)
-        return sval.AggregateValue(
-            tuple(
-                _unflatten_cells(cells, offset + index * step, type.elem)
-                for index in range(length)
-            ),
-            type,
-        )
-    if isinstance(type, sval.ComplexType):
-        return sval.AggregateValue((cells[offset], cells[offset + 1]), type)
-    if isinstance(type, sval.OptionType):
-        if cells[offset] is True:
-            return sval.OptionValue(_unflatten_cells(cells, offset + 1, type.child))
-        return sval.TypedNull(type.child)
-    if isinstance(type, sval.TaggedUnionType):
-        tag = cells[offset]
-        index = tag.value if isinstance(tag, sval.Int) else 0
-        return sval.TaggedUnionValue(
-            type, index, _unflatten_cells(cells, offset + 1, type.types[index]),
-        )
-    if isinstance(type, sval.UnionType):
-        unit = type.get_unit_value()
-        if unit is None:
-            raise CompileError(f'cannot build a value of the union {type}')
-        return unit
-    raise CompileError(f'cannot unflatten {type}')
-
-
-def _fill_comptime_defaults(box: sval.Box, type: sval.Type, offset: int) -> None:
-    """Fill the cell of every ``is_comptime`` struct field reachable from
-    ``(type, offset)`` with that field's declared default: a box's cells start as
-    the flattened undefined, so a compile-time field would otherwise read
-    undefined instead of its default (see ``_comptime_field_place``).  Iterative
-    (an explicit stack), so type nesting costs no Python stack."""
-    stack: list[tuple[sval.Type, int]] = [(type, offset)]
-    while stack:
-        current, base = stack.pop()
-        if isinstance(current, sval.StructType):
-            for index, field0 in enumerate(current.fields().values()):
-                field_offset = base + sval.field_scalar_offset(current, index)
-                if field0.is_comptime:
-                    if field0.default is not None:
-                        decl = (
-                            sval.PointerType(field0.type, is_const=True)
-                            if field0.is_ref else field0.type
-                        )
-                        cells = _flatten_value(field0.default, decl)
-                        box.cells[field_offset:field_offset + len(cells)] = cells
-                elif not field0.is_ref:
-                    stack.append((field0.type, field_offset))
-        elif isinstance(current, sval.TupleType):
-            for index, elem in enumerate(current.types):
-                stack.append((elem, base + sval.field_scalar_offset(current, index)))
-        elif isinstance(current, sval.StrDictType):
-            for index, elem in enumerate(current.values.values()):
-                stack.append((elem, base + sval.field_scalar_offset(current, index)))
-        elif isinstance(current, sval.ArrayType):
-            length = current.length_int
-            if length is None:
-                continue
-            step = sval.scalar_count(current.elem)
-            for index in range(length):
-                stack.append((current.elem, base + index * step))
-
-def _load_box_cells(box: sval.Box | bytes, offset: int, type: sval.Type) -> sval.AnyValue:
-    """Read a compile-time value of ``type`` out of the compile-time storage
-    ``box`` at ``offset`` (a byte-string store holds raw bytes)."""
-    if isinstance(box, bytes):
-        if isinstance(type, sval.BytesType):
-            # a byte-string store holds the bytes themselves
-            return box[offset:]
-        if isinstance(type, sval.IntType):
-            return sval.Int(box[offset], type)
-        raise CompileError(f'cannot read {type} out of a byte string')
-    return _unflatten_cells(box.cells, offset, type)
-
-
 def _to_comptime(value: InterpVal) -> sval.AnyValue | None:
     match value:
         case ComptimeVal():
@@ -1117,15 +918,6 @@ def _to_comptime(value: InterpVal) -> sval.AnyValue | None:
         case _:
             return None
 
-def _is_scalar_value(value: sval.AnyValue) -> TypeGuard[sval.ScalarValue]:
-    """Whether ``value`` is one of the value forms a scalar type may hold (see
-    ``sval.ScalarValue``): every compile-time value except the aggregate value
-    forms - an aggregate, an option, a tagged union, a payload union, the typed
-    null, the undefined aggregate and the error-union success value."""
-    return not isinstance(value, (
-        sval.AggregateValue, sval.OptionValue, sval.TaggedUnionValue,
-        sval.UnionValue, sval.TypedNull, sval.UndefinedAggregate, sval.Success,
-    ))
 
 def _shallow_normalize(ev: InterpVal) -> InterpVal:
     """Follow a committed :class:`PendingSlot` to the pointer value it was
@@ -1360,7 +1152,7 @@ def _callee_object(callee: InterpVal) -> sval.AnyValue | None:
                 if isinstance(obj, sval.ComptimePtr):
                     # a callee boxed by ``_as_ref`` (a struct template, a builtin
                     # kept in a compile-time variable): read it back out of its box
-                    todo.append(ComptimeVal(_load_box_cells(obj.box, obj.offset, obj.type.elem)))
+                    todo.append(ComptimeVal(sval.load_box_cells(obj.box, obj.offset, obj.type.elem)))
                     continue
                 return obj
             case PendingSlot() if ev.committed is not None:
@@ -3689,7 +3481,7 @@ class HirRunner:
         match ptr:
             case ComptimeVal(sval.ComptimePtr(box, offset, _)):
                 # a compile-time place: rebuild the value from the box's cells
-                return ComptimeVal(_load_box_cells(box, offset, type.elem))
+                return ComptimeVal(sval.load_box_cells(box, offset, type.elem))
             case ComptimeVal(sval.CastedPtr()):
                 # a pointer reinterpreted by ``ptr_cast`` cannot be read through
                 raise CompileError('cannot read through a pointer cast')
@@ -3764,7 +3556,7 @@ class HirRunner:
                     )
                 obj = _to_comptime(value)
                 assert obj is not None
-                cells = _flatten_value(obj, elem)
+                cells = sval.flatten_value(obj, elem)
                 box.cells[offset:offset + len(cells)] = cells
             case ComptimeVal(sval.CastedPtr()):
                 raise CompileError('cannot write through a pointer cast')
@@ -3794,7 +3586,7 @@ class HirRunner:
                     )
                 if isinstance(box, bytes):
                     raise CompileError('cannot write through a byte-string pointer')
-                cells = _flatten_value(sval.coerce_const(sval.UntypedUndefined(), elem), elem)
+                cells = sval.flatten_value(sval.coerce_const(sval.UntypedUndefined(), elem), elem)
                 box.cells[offset:offset + len(cells)] = cells
             case RuntimeVal():
                 if elem_unit is not None:
@@ -3975,38 +3767,19 @@ class HirRunner:
         return self._emit(mir.Cmp('==', self._to_runtime(value), mir.BoolValue(False)))
 
     def _coerce_option_value(self, ev: InterpVal, option: sval.OptionType) -> InterpVal:
-        """Materialize ``ev`` as a value of the option type ``option``: a value
-        that already is one passes through, the null value becomes the absent one
-        and anything else a present value of the child type.
+        """Materialize the *runtime* value ``ev`` as a value of the option type
+        ``option``: a value that already is one passes through, the absent value
+        the tag it carries denotes becomes the absent option and anything else a
+        present value of the child type.  (A compile-time value never gets here:
+        ``_coerce`` hands every one of them to ``sval.coerce_const``, which
+        builds the ``sval.OptionValue``/``sval.TypedNull`` value form of it.)
 
-        A fully compile-time result is the value form - ``sval.OptionValue`` for a
-        present option, ``sval.TypedNull`` for an absent one (see §5.3); a result
-        with a runtime part is materialized into the option's runtime
-        representation (see ``_option_parts_to_runtime``)."""
+        The result is materialized into the option's runtime representation (see
+        ``_option_parts_to_runtime``)."""
         ev = _shallow_normalize(ev)
         if _type_of(ev) == option:
             return ev
-        child = option.child
-        is_null = self._is_null(ev)
-        if _to_comptime(is_null) is True:
-            # absent: the payload is discarded, and the child type is only named
-            if isinstance(is_null, ComptimeVal):
-                return ComptimeVal(sval.TypedNull(child))
-            if child.is_zst():
-                unit = child.get_unit_value()
-                assert unit is not None
-                payload_value = ComptimeVal(unit)
-            else:
-                payload_value = ComptimeVal(sval.coerce_const(sval.UntypedUndefined(), child))
-            return RuntimeVal(self._option_parts_to_runtime(option, is_null, payload_value), option)
-        payload = _to_comptime(ev)
-        if payload is not None:
-            if isinstance(payload, sval.OptionValue):
-                payload = payload.value
-            coerced = _to_comptime(self._coerce(ComptimeVal(payload), child))
-            assert coerced is not None
-            return ComptimeVal(sval.OptionValue(coerced))
-        return RuntimeVal(self._option_parts_to_runtime(option, is_null, ev), option)
+        return RuntimeVal(self._option_parts_to_runtime(option, self._is_null(ev), ev), option)
 
     # -- tagged unions -------------------------------------------------------
 
@@ -4024,22 +3797,12 @@ class HirRunner:
         return index
 
     def _tagged_union_variant_index(self, ev: InterpVal, type: sval.TaggedUnionType) -> int:
-        """Which variant of ``type`` the value ``ev`` is: the variant its spy
-        type is (or a subtype of), or - for an untyped compile-time literal -
-        the first variant it coerces to."""
+        """Which variant of ``type`` the *runtime* value ``ev`` is: the variant
+        its spy type is (or a subtype of)."""
         ev_type = _type_of(ev)
-        if ev_type is not None:
-            index = type.variant_index_for(ev_type)
-            if index is not None:
-                return index
-        if isinstance(_shallow_normalize(ev), ComptimeVal):
-            for index, variant in enumerate(type.types):
-                try:
-                    self._coerce(ev, variant)
-                except (CoerceError, CompileError):
-                    # a variant the literal does not fit (a pointer, say)
-                    continue
-                return index
+        index = None if ev_type is None else type.variant_index_for(ev_type)
+        if index is not None:
+            return index
         raise CoerceError(f'cannot materialize a {type} from {ev!r}')
 
     def _tagged_union_tag(self, ev: InterpVal) -> InterpVal:
@@ -4217,37 +3980,20 @@ class HirRunner:
         return RuntimeVal(self._emit(mir.UnionCast(value.value, to_mir)), to_union)
 
     def _coerce_tagged_union_value(self, ev: InterpVal, type: sval.TaggedUnionType) -> InterpVal:
-        """Materialize ``ev`` as a value of the tagged union ``type``: a value of
-        a compatible union is converted, anything else is the variant it belongs
-        to, tagged.
-
-        A fully compile-time result is ``sval.TaggedUnionValue`` (see §5.3); one
-        with a runtime part is materialized into the union's representation."""
+        """Materialize the *runtime* value ``ev`` as a value of the tagged union
+        ``type``: a value of a compatible union is converted, anything else is the
+        variant it belongs to, tagged and materialized into the union's runtime
+        representation.  (A compile-time value never gets here: ``_coerce`` hands
+        every one of them to ``sval.coerce_const``, which builds the
+        ``sval.TaggedUnionValue`` of it.)"""
         ev = _shallow_normalize(ev)
         ev_type = _type_of(ev)
         if ev_type == type:
             return ev
-        obj = _to_comptime(ev)
-        if isinstance(obj, sval.ComptimePtr):
-            return self._coerce_tagged_union_value(self.load(ev), type)
-        if isinstance(obj, sval.TaggedUnionValue):
-            # a compile-time union of a compatible type: remap the tag and re-coerce
-            # the variant value
-            if isinstance(ev_type, sval.TaggedUnionType):
-                index = self._tagged_union_index(type, ev_type.types[obj.index])
-            else:
-                index = self._tagged_union_variant_index(ComptimeVal(obj.value), type)
-            variant_value = self._coerce(ComptimeVal(obj.value), type.types[index])
-            variant_obj = _to_comptime(variant_value)
-            assert variant_obj is not None
-            return ComptimeVal(sval.TaggedUnionValue(type, index, variant_obj))
         if isinstance(ev, RuntimeVal) and isinstance(ev_type, sval.TaggedUnionType):
             return self._convert_union_runtime(ev, ev_type, type)
         index = self._tagged_union_variant_index(ev, type)
         variant_value = self._coerce(ev, type.types[index])
-        variant_obj = _to_comptime(variant_value)
-        if variant_obj is not None:
-            return ComptimeVal(sval.TaggedUnionValue(type, index, variant_obj))
         return RuntimeVal(
             self._tagged_union_parts_to_runtime(type, ComptimeVal(sval.Int(index, type.tag_type())), variant_value),
             type,
@@ -4509,16 +4255,16 @@ class HirRunner:
         const ``Box`` a compile-time field's default (or a global's value) is read
         through (see §4.3)."""
         box = self._new_box(type, is_const=True)
-        box.cells = _flatten_value(value, type)
+        box.cells = sval.flatten_value(value, type)
         return ComptimeVal(sval.ComptimePtr(box, 0, sval.PointerType(type, is_const=True)))
 
     def _new_box(self, type: sval.Type, is_const: bool) -> sval.Box:
         """A fresh ``Box`` of ``type``: its cells start as the flattened undefined
         and every ``is_comptime`` field cell is then filled with its declared
-        default (see ``_fill_comptime_defaults``)."""
+        default (see ``sval.fill_comptime_defaults``)."""
         box = sval.Box(self._frames[-1].fn_name, type, is_const=is_const)
         box.reset(type)
-        _fill_comptime_defaults(box, type, 0)
+        sval.fill_comptime_defaults(box, type, 0)
         return box
 
     def _emit(self, inst: mir.Inst, at: mir.Insertion | None = None) -> mir.Value:
@@ -4587,34 +4333,35 @@ class HirRunner:
             return None
 
     def _coerce(self, ev: InterpVal, target: sval.Type) -> InterpVal:
-        """A value of the spy type ``target``: a compile-time value is
-        converted with ``sval.coerce_const``, a runtime value gets whatever
-        numeric conversion the target needs - widening or narrowing, see
-        ``_convert_inst``.  A committed slot is the address of the value it
-        holds (``_shallow_normalize``), which is what an operation that takes a
-        value without loading it (taking an address, ``ref``) hands over.
-
-        An aggregate has no runtime representation of its own, so a
-        compile-time aggregate is only *type-checked* here and returned as it
-        is; building the runtime value of one is ``_to_runtime``'s job (the
-        callers that need a runtime value wrap the result with it).
+        """A value of the spy type ``target``: every compile-time value is
+        converted by ``sval.coerce_const``, which understands the whole
+        compile-time domain - a ``ComptimePtr`` (a compile-time *place*), an
+        aggregate value form, a function value and the scalar values included -
+        while a runtime value gets whatever numeric conversion the target needs -
+        widening or narrowing, see ``_convert_inst``.  A committed slot is the
+        address of the value it holds (``_shallow_normalize``), which is what an
+        operation that takes a value without loading it (taking an address,
+        ``ref``) hands over.
 
         Raises :class:`~spy.errors.CoerceError` when the value has no
         materialization as ``target`` (see ``_try_coerce`` for the failing
         variant)."""
         ev = _shallow_normalize(ev)
+        if isinstance(ev, ComptimeVal):
+            # a compile-time value: the compile-time domain converts it in full
+            return ComptimeVal(sval.coerce_const(ev.obj, target))
         if isinstance(target, sval.OptionType):
-            # a ``T``/``Null`` value is coerced through the option's
+            # a runtime ``T``/``Null`` value is coerced through the option's
             # representation (see ``_coerce_option_value``)
             return self._coerce_option_value(ev, target)
         if isinstance(target, sval.TaggedUnionType):
-            # a variant value (or a compatible tagged union value) is coerced
-            # through the union's representation (see
+            # a runtime variant value (or a compatible tagged union value) is
+            # coerced through the union's representation (see
             # ``_coerce_tagged_union_value``)
             return self._coerce_tagged_union_value(ev, target)
         if isinstance(target, sval.TupleType):
-            # a tuple is a real aggregate now (see §7.1): a value or place of the
-            # type is its own type
+            # a tuple is a real aggregate now (see §7.1): a runtime value or
+            # place of the type is its own type
             ev_type = _type_of(ev)
             base = ev_type.elem if isinstance(ev_type, sval.PointerType) else ev_type
             if base == target:
@@ -4633,78 +4380,23 @@ class HirRunner:
             # (see ``_coerce_complex``)
             return self._coerce_complex(ev, target)
         match ev:
-            case ComptimeVal(obj=sval.ComptimePtr()):
-                # a compile-time pointer as a value of a pointer type: it *is* a
-                # pointer already (see ``_type_of``); its pointee is compile-time
-                # storage, so becoming an address of real memory happens only
-                # where a MIR value is needed (see ``_to_runtime``/§4.3)
-                if not isinstance(target, sval.PointerType):
-                    raise CoerceError(
-                        f'cannot materialize a {target} from a compile-time pointer'
-                    )
-                return ev
-            case ComptimeVal(obj=sval.CastedPtr()):
-                # a pointer reinterpreted by ``ptr_cast``: reading or writing
-                # through it is not supported yet (see ``sval.CastedPtr``)
-                raise CoerceError(
-                    f'cannot materialize a {target} from a pointer cast'
-                )
-            case ComptimeVal(obj) if isinstance(obj, (FunctionValue, sval.DeclareFunction)):
-                # a function value or an external declaration *is* a const function
-                # pointer (see ``FunctionValue.get_type``): its concrete type is
-                # checked where it is lowered (see ``_function_value_to_mir``)
-                if not isinstance(target, (sval.PointerType, sval.AnyType)):
-                    raise CoerceError(
-                        f'cannot materialize a {target} from a function value'
-                    )
-                return ev
-            case ComptimeVal(obj) if isinstance(obj, sval.AggregateValue):
-                # an aggregate held as one compile-time object (see
-                # ``_as_aggregate``): like an interpreter aggregate value, it is
-                # only type-checked and returned (see ``_coerce_aggregate``)
-                aggregate = _as_aggregate(ev)
-                assert aggregate is not None
-                return self._coerce_aggregate(aggregate, target)
-            case ComptimeVal(obj) if isinstance(obj, sval.Value):
-                # a compile-time object that already *is* a value of the target
-                # type (a closure, ...): there is nothing to build a constant
-                # from - it is its own value.  Only a compile-time-only type has
-                # such a value; a dynamically-sized one (a function type) is
-                # still rejected by ``coerce_const``
-                value_type = sval.type_of(obj)
-                if value_type == target and target.classify() == sval.SpecialTypeKind.COMPTIME:
-                    return ev
-                return ComptimeVal(sval.coerce_const(obj, target))
-            case ComptimeVal(obj):
-                return ComptimeVal(sval.coerce_const(obj, target))
             case RuntimeVal(value, type):
                 return RuntimeVal(self._convert(value, type, target), target)
             case _:
                 raise CoerceError('cannot materialize this value')
 
-    def _coerce_aggregate(self, aggregate: sval.AggregateValue, target: sval.Type) -> InterpVal:
-        """A compile-time aggregate as a value of the aggregate type ``target``:
-        only the type is checked here - an aggregate is ever only its own type -
-        and the value is returned as it is; its runtime representation is built
-        by ``_to_runtime`` where one is actually needed."""
-        if not _is_aggregate(target) or aggregate.type != target:
-            raise CoerceError(f'cannot convert a {aggregate.type} value to {target}')
-        return ComptimeVal(aggregate)
-
     def _coerce_complex(self, ev: InterpVal, target: sval.ComplexType) -> InterpVal:
-        """A value of the complex type ``target``: a compile-time value is
-        converted with ``sval.coerce_const`` (an ``AggregateValue`` of the type);
-        a runtime value is rebuilt part by part - a real (float or integer) value
-        becomes a complex one with a zero imaginary part, and a complex one of a
-        narrower element type is widened.  This is the implicit ``T ->
-        Complex[T]`` conversion.
+        """A *runtime* value of the complex type ``target``, rebuilt part by
+        part: a real (float or integer) value becomes a complex one with a zero
+        imaginary part, and a complex one of a narrower element type is widened.
+        This is the implicit ``T -> Complex[T]`` conversion.  (A compile-time
+        value never gets here: ``_coerce`` hands every one of them to
+        ``sval.coerce_const``.)
 
         Raises :class:`~spy.errors.CoerceError` when the value has no
         materialization as ``target``."""
         ev = _shallow_normalize(ev)
         match ev:
-            case ComptimeVal(obj):
-                return ComptimeVal(sval.coerce_const(obj, target))
             case RuntimeVal(_, from_type):
                 if from_type == target:
                     return ev
@@ -7035,7 +6727,7 @@ class HirRunner:
         (see §4.2)."""
         array_type = sval.ArrayType(elem, len(values))
         box = sval.Box('slice', array_type, is_const=True)
-        box.cells = _flatten_value(sval.AggregateValue(tuple(values), array_type), array_type)
+        box.cells = sval.flatten_value(sval.AggregateValue(tuple(values), array_type), array_type)
         ptr = sval.ComptimePtr(
             box, 0,
             sval.PointerType(array_type, is_const=True, variant=sval.PointerVariant.MULTI),
@@ -7156,7 +6848,7 @@ class HirRunner:
         ptr = obj.values[0]
         if not (isinstance(ptr, sval.ComptimePtr) and isinstance(ptr.type.elem, sval.ArrayType)):
             raise CompileError('a reflected slice does not point at a compile-time array')
-        array = _load_box_cells(ptr.box, ptr.offset, ptr.type.elem)
+        array = sval.load_box_cells(ptr.box, ptr.offset, ptr.type.elem)
         if not isinstance(array, sval.AggregateValue):
             raise CompileError('a reflected slice is not a compile-time slice')
         return array.values
@@ -8216,7 +7908,7 @@ class HirRunner:
             # a slice is a view, not a place to write the slice itself through: a
             # const box (see §4.2)
             box = self._new_box(slice_type, is_const=True)
-            box.cells = _flatten_value(
+            box.cells = sval.flatten_value(
                 sval.AggregateValue((element_obj, length_obj), slice_type), slice_type,
             )
             return ComptimeVal(sval.ComptimePtr(box, 0, sval.PointerType(slice_type, is_const=True)))
@@ -8632,7 +8324,7 @@ class HirRunner:
                     if isinstance(obj, sval.ComptimePtr):
                         # a class name boxed by ``_as_ref`` (a struct type kept in
                         # a compile-time box): read it back out of its box
-                        todo.append(ComptimeVal(_load_box_cells(obj.box, obj.offset, obj.type.elem)))
+                        todo.append(ComptimeVal(sval.load_box_cells(obj.box, obj.offset, obj.type.elem)))
                         continue
                     if isinstance(obj, (sval.Type, type)):
                         return obj

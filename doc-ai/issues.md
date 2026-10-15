@@ -147,3 +147,28 @@ def f(c: bool) -> i32:
   `s: Comptime[S] = S(1) if c else S(2)` 报 `cannot store a runtime value into a compile-time variable` 一致；
   编译期条件会折叠成单次构造，正常。
 
+---
+
+## 9. 编译期 place 的视图可以丢 const（`*const T` → `*T` 被放行）
+
+`sval.coerce_const` 对 `ComptimePtr` 的目标判定只要求 **pointee 相同**（`value.type.elem == target.elem`），**不检查 const 性**，
+因此一个 const 视图的编译期 place 可以赋给声明为非 const 的指针位置：
+
+```python
+@func()
+def take_i32(p: Ptr[i32]) -> i32: ...
+
+@func()
+def f() -> i32:
+    const_n: ConstComptime[i32] = 5
+    return take_i32(ref(const_n))    # ref(ConstComptime) 得到 *const i32，这里丢了 const
+```
+
+- **原状**（本轮之前就有）：`interp.HirRunner._coerce` 对编译期指针只检查「目标是某个指针类型」，`sval.coerce_const` 沿用同一判定；
+  `spy/tests/` 里有 12 处用例依赖它（`comptime_ptrs.py`、`static.py`、`options.py`、`tagged_unions.py`）。
+  运行时路径反而更严：`_convert_inst` 用 `PointerType.is_subtype_of`，`*const T -> *T` 会被拒。
+- **后果**：视图类型只影响类型层面，写入仍由 `ComptimePtr.is_writable()`（同时看 box 的 `is_const`）拦住，所以不会产生错误代码；
+  但把 const place 的地址交给一个声明为可写的 `*T` 位置，读起来像可以写。
+- **更合理的规则**：pointee 相同的前提下只允许「加 const」（即运行时路径的 `is_subtype_of`）；那样上述 12 处用例需要改写
+  （把 `Ptr[T]` 形参改成 `ConstPtr[T]` 等）。因为 `ref(ConstComptime)` 传给 `Ptr[T]` 形参是惯用写法，改动会波及用户代码，本轮不动。
+

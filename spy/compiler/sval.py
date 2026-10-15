@@ -29,7 +29,7 @@ from types import NoneType
 from typing import Any, Literal, TypeGuard, cast, override
 
 from . import mir, syntax
-from .errors import CompileError
+from .errors import CoerceError, CompileError
 from .target import TargetInfo
 from .util import FrozenArraySet, IdentityObj, IndexedMap, TriState, frozendict
 
@@ -1479,6 +1479,211 @@ def field_scalar_offset(type: AggregateType, index: int) -> int:
     elif isinstance(type, UnionType):
         return 0
     raise CompileError(f'{type} has no field {index}')
+
+
+def is_scalar_value(value: AnyValue) -> TypeGuard[ScalarValue]:
+    """Whether ``value`` is one of the value forms a scalar type may hold (see
+    :data:`ScalarValue`): every compile-time value except the aggregate value
+    forms - an aggregate, an option, a tagged union, a payload union, the typed
+    null, the undefined aggregate and the error-union success value."""
+    return not isinstance(value, (
+        AggregateValue, OptionValue, TaggedUnionValue,
+        UnionValue, TypedNull, UndefinedAggregate, Success,
+    ))
+
+
+def flatten_natural(value: AnyValue, type: Type) -> list[ScalarValue]:
+    """The natural (unpadded) flattened cells of the compile-time ``value`` of
+    ``type`` (see :func:`flatten_value`)."""
+    if isinstance(type, ScalarType):
+        if not is_scalar_value(value):
+            raise CompileError(f'cannot flatten {value!r} as {type}')
+        return [value]
+    if isinstance(value, AggregateValue):
+        values = value.values
+    else:
+        raise CompileError(f'cannot flatten {value!r} as {type}')
+    if isinstance(type, StructType):
+        cells: list[ScalarValue] = []
+        for index, field in enumerate(type.fields().values()):
+            if field.is_ref:
+                # the cell holds the compile-time pointer itself
+                cell = values[index]
+                assert is_scalar_value(cell)
+                cells.append(cell)
+            else:
+                cells.extend(flatten_value(values[index], field.type))
+        return cells
+    if isinstance(type, TupleType):
+        cells = []
+        for index, elem in enumerate(type.types):
+            cells.extend(flatten_value(values[index], elem))
+        return cells
+    if isinstance(type, StrDictType):
+        cells = []
+        for index, elem in enumerate(type.values.values()):
+            cells.extend(flatten_value(values[index], elem))
+        return cells
+    if isinstance(type, ArrayType):
+        cells = []
+        for elem_value in values:
+            cells.extend(flatten_value(elem_value, type.elem))
+        return cells
+    if isinstance(type, ComplexType):
+        re, im = values[0], values[1]
+        assert is_scalar_value(re) and is_scalar_value(im)
+        return [re, im]
+    raise CompileError(f'cannot flatten {value!r} as {type}')
+
+
+def flatten_value(value: AnyValue, type: Type) -> list[ScalarValue]:
+    """The flattened cell sequence of the compile-time ``value`` of ``type``
+    (see :func:`scalar_leaves`), padded to the type's width with an
+    ``UndefinedScalar`` of each remaining leaf type."""
+    if isinstance(value, (UndefinedAggregate, UndefinedScalar, UntypedUndefined)):
+        # an undefined value flattens to undefined cells (one per leaf)
+        return [UndefinedScalar(leaf) for leaf in scalar_leaves(type)]
+    if isinstance(type, OptionType):
+        if isinstance(value, OptionValue):
+            cells: list[ScalarValue] = [True]
+            cells.extend(flatten_value(value.value, type.child))
+        elif isinstance(value, (Null, TypedNull)):
+            cells = [False]
+        else:
+            raise CompileError(f'cannot flatten the option value {value!r}')
+    elif isinstance(type, TaggedUnionType):
+        if not isinstance(value, TaggedUnionValue):
+            raise CompileError(f'cannot flatten the tagged union value {value!r}')
+        cells = [Int(value.index, type.tag_type())]
+        cells.extend(flatten_value(value.value, type.types[value.index]))
+    else:
+        cells = flatten_natural(value, type)
+    leaves = scalar_leaves(type)
+    while len(cells) < len(leaves):
+        cells.append(UndefinedScalar(leaves[len(cells)]))
+    if len(cells) != len(leaves):
+        raise CompileError(f'cannot flatten {value!r} as {type}')
+    return cells
+
+
+def unflatten_cells(cells: list[ScalarValue], offset: int, type: Type) -> AnyValue:
+    """Reconstruct a compile-time value of ``type`` from the flattened cells at
+    ``offset`` (the inverse of :func:`flatten_value`)."""
+    if isinstance(type, ScalarType):
+        return cells[offset]
+    if isinstance(type, StructType):
+        values: list[AnyValue] = []
+        for index, field in enumerate(type.fields().values()):
+            field_offset = offset + field_scalar_offset(type, index)
+            if field.is_ref:
+                values.append(cells[field_offset])
+            elif field.is_comptime:
+                cell = cells[field_offset]
+                # an unset compile-time field reads its default
+                if isinstance(cell, UndefinedScalar) and field.default is not None:
+                    values.append(field.default)
+                else:
+                    values.append(cell)
+            else:
+                values.append(unflatten_cells(cells, field_offset, field.type))
+        return AggregateValue(tuple(values), type)
+    if isinstance(type, TupleType):
+        return AggregateValue(
+            tuple(
+                unflatten_cells(cells, offset + field_scalar_offset(type, index), elem)
+                for index, elem in enumerate(type.types)
+            ),
+            type,
+        )
+    if isinstance(type, StrDictType):
+        return AggregateValue(
+            tuple(
+                unflatten_cells(cells, offset + field_scalar_offset(type, index), elem)
+                for index, elem in enumerate(type.values.values())
+            ),
+            type,
+        )
+    if isinstance(type, ArrayType):
+        length = type.length_int
+        if length is None:
+            raise CompileError(f'cannot flatten the unsized array {type}')
+        step = scalar_count(type.elem)
+        return AggregateValue(
+            tuple(
+                unflatten_cells(cells, offset + index * step, type.elem)
+                for index in range(length)
+            ),
+            type,
+        )
+    if isinstance(type, ComplexType):
+        return AggregateValue((cells[offset], cells[offset + 1]), type)
+    if isinstance(type, OptionType):
+        if cells[offset] is True:
+            return OptionValue(unflatten_cells(cells, offset + 1, type.child))
+        return TypedNull(type.child)
+    if isinstance(type, TaggedUnionType):
+        tag = cells[offset]
+        index = tag.value if isinstance(tag, Int) else 0
+        return TaggedUnionValue(
+            type, index, unflatten_cells(cells, offset + 1, type.types[index]),
+        )
+    if isinstance(type, UnionType):
+        unit = type.get_unit_value()
+        if unit is None:
+            raise CompileError(f'cannot build a value of the union {type}')
+        return unit
+    raise CompileError(f'cannot unflatten {type}')
+
+
+def fill_comptime_defaults(box: Box, type: Type, offset: int) -> None:
+    """Fill the cell of every ``is_comptime`` struct field reachable from
+    ``(type, offset)`` with that field's declared default: a box's cells start as
+    the flattened undefined, so a compile-time field would otherwise read
+    undefined instead of its default.  Iterative (an explicit stack), so type
+    nesting costs no Python stack."""
+    stack: list[tuple[Type, int]] = [(type, offset)]
+    while stack:
+        current, base = stack.pop()
+        if isinstance(current, StructType):
+            for index, field0 in enumerate(current.fields().values()):
+                field_offset = base + field_scalar_offset(current, index)
+                if field0.is_comptime:
+                    if field0.default is not None:
+                        decl = (
+                            PointerType(field0.type, is_const=True)
+                            if field0.is_ref else field0.type
+                        )
+                        cells = flatten_value(field0.default, decl)
+                        box.cells[field_offset:field_offset + len(cells)] = cells
+                elif not field0.is_ref:
+                    stack.append((field0.type, field_offset))
+        elif isinstance(current, TupleType):
+            for index, elem in enumerate(current.types):
+                stack.append((elem, base + field_scalar_offset(current, index)))
+        elif isinstance(current, StrDictType):
+            for index, elem in enumerate(current.values.values()):
+                stack.append((elem, base + field_scalar_offset(current, index)))
+        elif isinstance(current, ArrayType):
+            length = current.length_int
+            if length is None:
+                continue
+            step = scalar_count(current.elem)
+            for index in range(length):
+                stack.append((current.elem, base + index * step))
+
+
+def load_box_cells(box: Box | bytes, offset: int, type: Type) -> AnyValue:
+    """Read a compile-time value of ``type`` out of the compile-time storage
+    ``box`` at ``offset`` (a byte-string store holds raw bytes)."""
+    if isinstance(box, bytes):
+        if isinstance(type, BytesType):
+            # a byte-string store holds the bytes themselves
+            return box[offset:]
+        if isinstance(type, IntType):
+            return Int(box[offset], type)
+        raise CompileError(f'cannot read {type} out of a byte string')
+    return unflatten_cells(box.cells, offset, type)
+
 
 @dataclass(frozen=True, slots=True)
 class BuiltinSignature:
@@ -3963,10 +4168,13 @@ def is_numeric_type(type: Type):
 def coerce_const_tagged_union(value: AnyValue, type: TaggedUnionType) -> AnyValue:
     """A constant of the tagged union ``type``: the value of the variant it
     belongs to under that variant's tag.  A ``TaggedUnionValue`` of a compatible
-    union (a subset/superset) is remapped to ``type``'s tag."""
+    union (a subset/superset) is remapped to ``type``'s tag, and a compile-time
+    *place* of the union itself is read out of its box first (see
+    :func:`_place_value`)."""
+    value = _place_value(value, type)
     if isinstance(value, TaggedUnionValue):
         if not value.type.is_subtype_of(type):
-            raise CompileError(f"cannot use {value!r} as a constant of {type}")
+            raise CoerceError(f"cannot use {value!r} as a constant of {type}")
         index = type.variant_index(value.type.types[value.index])
         assert index is not None
         return TaggedUnionValue(type, index, coerce_const(value.value, type.types[index]))
@@ -3981,8 +4189,18 @@ def coerce_const_tagged_union(value: AnyValue, type: TaggedUnionType) -> AnyValu
             except CompileError:
                 continue
             return TaggedUnionValue(type, candidate, coerced)
-        raise CompileError(f"cannot use {value!r} as a constant of {type}")
+        raise CoerceError(f"cannot use {value!r} as a constant of {type}")
     return TaggedUnionValue(type, index, coerce_const(value, type.types[index]))
+
+
+def _place_value(value: AnyValue, type: Type) -> AnyValue:
+    """The value a compile-time *place* holds when the place is a place of
+    exactly the type ``type`` (a ``ComptimePtr`` whose pointee is ``type``): the
+    value read out of its box.  Every other value - a place of anything else
+    included - is returned as it is."""
+    if isinstance(value, ComptimePtr) and value.type.elem == type:
+        return load_box_cells(value.box, value.offset, type)
+    return value
 
 
 def _typed_undefined(type: Type) -> AnyValue:
@@ -3996,35 +4214,177 @@ def _typed_undefined(type: Type) -> AnyValue:
         return UndefinedScalar(type)
     if isinstance(type, AggregateType):
         return UndefinedAggregate(type)
-    raise CompileError(f'cannot create an undefined value of {type}')
+    raise CoerceError(f'cannot create an undefined value of {type}')
+
+
+def _coerce_const_option(value: AnyValue, type: OptionType) -> AnyValue:
+    """A constant of the option ``type``: the absent value is the *typed* null
+    of this very option - the untyped ``Null`` names the option it is absent for -
+    and anything else is a present value of the child type, the ``OptionValue`` of
+    the child constant (which is what the interpreter reads the payload out of,
+    see ``interp._option_payload``)."""
+    if isinstance(value, TypedNull):
+        if value.child != type.child:
+            raise CoerceError(f"cannot use {value!r} as a constant of {type}")
+        return value
+    if isinstance(value, Null):
+        return TypedNull(type.child)
+    if isinstance(value, OptionValue):
+        return OptionValue(coerce_const(value.value, type.child))
+    return OptionValue(coerce_const(value, type.child))
+
+
+def _coerce_const_complex(value: AnyValue, type: ComplexType) -> AnyValue:
+    """A constant of the complex type ``type``: a Python ``complex`` (or a real
+    value, whose imaginary part is zero) as an aggregate of its two parts.  A
+    complex aggregate of another element type is re-coerced part by part (the
+    element widens or narrows)."""
+    if isinstance(value, AggregateValue) and isinstance(value.type, ComplexType):
+        return AggregateValue(
+            (
+                coerce_const(value.values[0], type.elem),
+                coerce_const(value.values[1], type.elem),
+            ),
+            type,
+        )
+    if isinstance(value, complex):
+        re, im = value.real, value.imag
+    elif isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CoerceError(f"cannot use {value!r} as a complex constant")
+    else:
+        re, im = value, 0.0
+    return AggregateValue(
+        (Float(float(re), type.elem), Float(float(im), type.elem)),
+        type,
+    )
+
+
+def _is_function_value(value: AnyValue) -> bool:
+    """Whether ``value`` is the value of a registered function (a
+    :class:`fn.FunctionValue`).  ``sval`` cannot name that class at import time -
+    ``fn`` imports ``sval`` - so it is imported here (the same local import
+    ``BuiltinSignature.bind`` makes)."""
+    from .fn import FunctionValue
+    return isinstance(value, FunctionValue)
 
 
 def coerce_const(value: AnyValue, type: Type) -> AnyValue:
-    """Turn a Python value into the typed spy value of the spy type
-    ``type`` (an ``Int``/``Float``/``Void``/``Type``/``bool``, or the value
-    itself for the untyped type of an integer literal); the interpreter
-    builds the MIR constant from it later."""
+    """The constant of the spy type ``type`` the compile-time value ``value``
+    converts to - what an assignment, a call argument or a ``std.core.coerce``
+    builds out of it (the interpreter lowers it to a MIR constant later).  Every
+    compile-time value converts here, whatever its shape: a plain Python scalar,
+    an already-typed ``Int``/``Float``, a type, an enumeration member, the
+    null/void unit values, an aggregate or union value form - and a
+    ``ComptimePtr``, a compile-time *place*: a place is a value of the pointer
+    type it is viewed through, and of the aggregate type it points at where a
+    place is what the caller takes for a value of one (a tuple, a
+    ``dict[str, T]``, an option and a tagged union, whose contents have to be
+    read).
+
+    Raises :class:`~spy.errors.CoerceError` when ``value`` has no such
+    conversion."""
+    # -- a value of any type ---------------------------------------------------
     if isinstance(value, UntypedUndefined):
         # the undefined literal is the value of any type: of a zero-sized type it
         # is that type's unit value, of any other the typed undefined of it
         return _typed_undefined(type)
     if isinstance(value, (UndefinedScalar, UndefinedAggregate)):
         # an *undetermined* value - the value of a place that holds nothing yet,
-        # or of one that holds no storage at all - is a value of any type, so
-        # the coercion only re-tags it with the type of its new location
+        # or of one that holds no storage at all - is a value of any type, so the
+        # coercion re-tags it with the type of its new location.  A value of the
+        # very type the target names is already the one it wants, and a value of
+        # a *member* of an option or a union is the present payload/variant of one
+        if value.type == type:
+            return value
+        if isinstance(type, OptionType):
+            return _coerce_const_option(value, type)
+        if isinstance(type, TaggedUnionType):
+            return coerce_const_tagged_union(value, type)
         return _typed_undefined(type)
+    if isinstance(type, AnyType):
+        # an ``Any`` location names no fixed type, so every value is a value of
+        # it: it is taken as it is
+        return value
+
+    # -- the conversions the target type decides -------------------------------
+    if isinstance(type, OptionType):
+        # a value of an option is either the null value, or a value of the child
+        # type (which the interpreter then tags as present); a place of *this*
+        # option is read first - what it holds is the option value form
+        return _coerce_const_option(_place_value(value, type), type)
+    if isinstance(type, TaggedUnionType):
+        return coerce_const_tagged_union(value, type)
+    if isinstance(type, UnionType):
+        # a union value carries no variant (the error code next to the
+        # payload is the tag), and a constant of it exists only for a
+        # union without storage: any such value is the unit value.  A
+        # union *value* is never converted to another union - the storage
+        # is reinterpreted through a pointer instead (see ``interp.store``)
+        if type.get_unit_value() is None:
+            raise CoerceError(f"cannot create a constant of the union {type}")
+        if isinstance(value, UnionValue):
+            return UnionValue(type)
+        raise CoerceError(f"cannot use {value!r} as a constant of the union {type}")
+    if isinstance(type, ComplexType):
+        return _coerce_const_complex(value, type)
+    if isinstance(type, (TupleType, StrDictType)):
+        # a tuple and a ``dict[str, T]`` have no other type to convert from: a
+        # value of the type - or the compile-time place of one, which the caller
+        # takes for a value of it - is its own constant
+        if type_of(value) == type:
+            return value
+        if isinstance(value, ComptimePtr) and value.type.elem == type:
+            return value
+        raise CoerceError(f"cannot use {value!r} as a constant of {type}")
+
+    # -- the values that *are* their own value ---------------------------------
+    if isinstance(value, ComptimePtr):
+        # a compile-time place is a pointer value of the type it is viewed
+        # through, so the pointee type has to be the same (a pointer does not
+        # convert between pointee types).  The constness is *not* checked: the
+        # writability of a place is decided by its box as well (see
+        # ``ComptimePtr.is_writable``), so the view is only a view, and the
+        # ``*const T`` of a read-only place still coerces to the ``*T`` a
+        # variable or a parameter declares
+        if isinstance(type, PointerType) and value.type.elem == type.elem:
+            return value
+        raise CoerceError(f"cannot use {value!r} as a constant of {type}")
+    if isinstance(value, CastedPtr):
+        # a pointer reinterpreted by ``ptr_cast``: reading or writing through it
+        # is not supported yet (see ``CastedPtr``)
+        raise CoerceError(f"cannot use {value!r} as a constant of {type}")
+    if isinstance(value, DeclareFunction) or _is_function_value(value):
+        # a registered function value or an external declaration *is* a const
+        # function pointer (see ``FunctionValue.get_type``): its concrete type is
+        # checked where it is lowered (see ``interp``)
+        if isinstance(type, PointerType):
+            return value
+        raise CoerceError(f"cannot use {value!r} as a constant of {type}")
+    if isinstance(value, AggregateValue):
+        # an aggregate is ever only its own type: its value is the tree of its
+        # field values, and no other type has one
+        if isinstance(type, AggregateType) and value.type == type:
+            return value
+        raise CoerceError(f"cannot use {value!r} as a constant of {type}")
     if isinstance(value, (Int, Float)):
         # an already-typed constant (the value a compile-time location holds):
         # the target type governs, like the constant of any other location
         value = value.value
+    if type.classify() == SpecialTypeKind.COMPTIME and type_of(value) == type:
+        # a value of a type only compile-time values have (a closure, an
+        # error-union success, an untyped function pointer, ...) is its own
+        # constant: there is no other value to build it from
+        return value
+
+    # -- the scalar types ------------------------------------------------------
     match type:
         case BoolType():
             if not isinstance(value, bool):
-                raise CompileError(f"cannot use {value!r} as a bool constant")
+                raise CoerceError(f"cannot use {value!r} as a bool constant")
             return value
         case BytesType():
             if not isinstance(value, bytes):
-                raise CompileError(f"cannot use {value!r} as a bytes constant")
+                raise CoerceError(f"cannot use {value!r} as a bytes constant")
             return value
         case AnyIntType():
             # the type of an untyped integer literal: its values are the plain
@@ -4034,118 +4394,64 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             # representation, so a *runtime* location of it is rejected instead
             # (see ``_no_runtime_type``).
             if isinstance(value, bool) or not isinstance(value, int):
-                raise CompileError(
+                raise CoerceError(
                     f"cannot use {value!r} as an untyped integer constant"
                 )
             return value
         case IntType():
             if isinstance(value, bool) or not isinstance(value, int):
-                raise CompileError(f"cannot use {value!r} as an integer constant")
+                raise CoerceError(f"cannot use {value!r} as an integer constant")
             if type.signed:
                 lo, hi = (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
             else:
                 lo, hi = (0, 2 ** type.bits - 1)
             if not lo <= value <= hi:
-                raise CompileError(
+                raise CoerceError(
                     f"integer constant {value} is out of range for {type}"
                 )
             return Int(value, type)
         case FloatType():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise CompileError(f"cannot use {value} as a float constant")
+                raise CoerceError(f"cannot use {value} as a float constant")
             return Float(float(value), type)
-        case ComplexType():
-            # a complex constant: a Python ``complex`` (or a real value, whose
-            # imaginary part is zero) as an aggregate of its two parts.  A
-            # complex aggregate of another element type is re-coerced part by
-            # part (the element widens or narrows)
-            if isinstance(value, AggregateValue) and isinstance(value.type, ComplexType):
-                return AggregateValue(
-                    (
-                        coerce_const(value.values[0], type.elem),
-                        coerce_const(value.values[1], type.elem),
-                    ),
-                    type,
-                )
-            if isinstance(value, complex):
-                re, im = value.real, value.imag
-            elif isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise CompileError(f"cannot use {value!r} as a complex constant")
-            else:
-                re, im = value, 0.0
-            return AggregateValue(
-                (Float(float(re), type.elem), Float(float(im), type.elem)),
-                type,
-            )
         case TypeType():
             if not isinstance(value, Type):
-                raise CompileError(f"cannot use {value} as a type constant")
+                raise CoerceError(f"cannot use {value} as a type constant")
             if value.get_type() != type:
-                raise CompileError(f"cannot use {value} as a type constant")
+                raise CoerceError(f"cannot use {value} as a type constant")
             return value
-        case AnyType():
-            # an ``Any`` value takes the value as it is: it names no fixed type
-            return value
-        case OptionType():
-            # a value of an option is either the null value, or a value of the
-            # child type (which the interpreter then tags as present).  A
-            # *typed* null has to be the absent value of this very option
-            if isinstance(value, TypedNull):
-                if value.child != type.child:
-                    raise CompileError(
-                        f"cannot use {value!r} as a constant of {type}"
-                    )
-                return value
+        case NullType():
+            # the null value's own type: only the null literal is a value of it
             if isinstance(value, Null):
-                return value
-            if isinstance(value, OptionValue):
-                return OptionValue(coerce_const(value.value, type.child))
-            return OptionValue(coerce_const(value, type.child))
-        case TaggedUnionType():
-            return coerce_const_tagged_union(value, type)
-        case UnionType():
-            # a union value carries no variant (the error code next to the
-            # payload is the tag), and a constant of it exists only for a
-            # union without storage: any such value is the unit value.  A
-            # union *value* is never converted to another union - the storage
-            # is reinterpreted through a pointer instead (see ``interp.store``)
-            if type.get_unit_value() is None:
-                raise CompileError(f"cannot create a constant of the union {type}")
-            if isinstance(value, UnionValue):
-                return UnionValue(type)
-            raise CompileError(f"cannot use {value!r} as a constant of the union {type}")
+                return Null()
+            raise CoerceError(f"cannot use {value!r} as a null constant")
         case VoidType():
             # the void type's unit value is what ``None`` used to be: a null
             # value converts to it (``NullType`` is a subtype of ``VoidType``)
             if isinstance(value, (Void, Null)):
                 return Void()
-            raise CompileError(f"cannot use {value!r} as a void constant")
-        case NullType():
-            # the null value's own type: only the null literal is a value of it
-            if isinstance(value, Null):
-                return Null()
-            raise CompileError(f"cannot use {value!r} as a null constant")
+            raise CoerceError(f"cannot use {value!r} as a void constant")
         case IntEnumType():
             # a value of the enumeration is one of its members: a typed member
             # value of this very enumeration, or one of its Python members (a
             # plain integer is never accepted - an enumeration is not an integer)
             if isinstance(value, IntEnumValue):
                 if value.type is not type:
-                    raise CompileError(f"cannot use {value!r} as a constant of {type}")
+                    raise CoerceError(f"cannot use {value!r} as a constant of {type}")
                 return value
             if isinstance(value, _INT_ENUM_BASE):
                 index = type.index_of(value.name)
                 if index is None or type.value_of(index) != value.value:
-                    raise CompileError(f"cannot use {value!r} as a constant of {type}")
+                    raise CoerceError(f"cannot use {value!r} as a constant of {type}")
                 return IntEnumValue(type, index)
-            raise CompileError(f"cannot use {value!r} as a constant of {type}")
+            raise CoerceError(f"cannot use {value!r} as a constant of {type}")
         case _ if type.classify() == SpecialTypeKind.DST:
             # a dynamically-sized type has no value of its own to build one from
-            raise CompileError(
+            raise CoerceError(
                 f"cannot create a constant of the dynamically-sized type {type}"
             )
         case _:
-            raise CompileError(
+            raise CoerceError(
                 f"cannot create a constant of type {type} from {value}"
             )
 

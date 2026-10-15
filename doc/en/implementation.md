@@ -164,8 +164,10 @@ Key types: `IntType` (subtyped by range), `FloatType` (narrow -> wide subtyping)
 ### 4.3 Value domain and `Box`
 
 - `AnyValue = Value | int | float | complex | bytes | bool`; `ScalarValue` is the subset that can occupy one `Box` cell
-  (the aggregate forms `AggregateValue`/`TaggedUnionValue`/`UnionValue`/`OptionValue`/`TypedNull`/`UndefinedAggregate` are **not** among them).
+  (the aggregate forms `AggregateValue`/`TaggedUnionValue`/`UnionValue`/`OptionValue`/`TypedNull`/`UndefinedAggregate` are **not** among them; `is_scalar_value` decides).
 - `Box(name_base, type, is_const, cells)`: identity object that **flattens** a value into a `list[ScalarValue]`; `reset(type)` initializes each cell to `UndefinedScalar` according to `scalar_leaves`.
+- The box read/write helpers (all in `sval`; `interp` reads and writes `Box.cells` directly): `flatten_value` (including padding; `undefined` -> `UndefinedScalar` per leaf),
+  `unflatten_cells` (its inverse), `fill_comptime_defaults` (fills `is_comptime` fields with defaults, iterative), `load_box_cells` (`bytes` box special case).
 
 ### 4.4 Struct layout (`StructType._calculate_mir`)
 
@@ -213,7 +215,11 @@ Struct helpers (mostly iterative): `alignment_of`, `aggregate_type_length`, `sca
 
 - `as_value(obj, ctx, type_vars)`: Python object -> spy domain (builtin type aliases, `TypeVar` -> its solved value, `TypeAliasType` unwrapping, `StructTypeApplication` specialization,
   `|` chains -> `OptionType`/`tagged_union_of`, `tuple[...]`/`Literal[X]`/pointer markers/`Array[T,L]`/`Option[T]`/`Union`, etc.).
-- `coerce_const(value, type)`: concretizes a value into a type constant (including `_typed_undefined`, integer range checks, `coerce_const_tagged_union`).
+- `coerce_const(value, type)`: concretizes **any** compile-time value into a type constant, raising `CoerceError` when it cannot. It covers:
+  `UntypedUndefined`/typed undefined (`_typed_undefined`, wrapped as the present payload/variant when it is a member of an option/union), `Any` (any value as it is),
+  `ComptimePtr` (a place: a pointer constant when the pointee matches, and read out of its box as the value of an option/union/tuple/`dict[str, T]`),
+  `AggregateValue` (its own type only) and the other aggregate/union/complex/option value forms, function values (as function pointers), enumeration members, integer range checks,
+  and a value whose own type already is the target when that type is compile-time-only; `coerce_const_tagged_union` picks the variant and remaps the tag.
 - `TypeVarSolver`: constraint solving (equality/subtyping, structural decomposition of `StructType`/`OptionType`/`PointerType`/`ArrayType`, `finish` folds subtyping bounds).
 - `replace_type_var(s)`: structural substitution (including re-specializing `StructType` through its head to preserve identity).
 - `type_of(value, int_literal_bits)`: Python value at the boundary -> spy type (`int` -> `AnyIntType` or `IntType(bits, True)`).
@@ -297,6 +303,8 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - `PendingSlot`: an executed but uncommitted `hir.Alloca` (see §6.2).
 - `ComptimeResultPtr(value, code, payload)`: the pointer form of a function result location (the three positions value/code/payload), **not** an `InterpVal`.
 - Predicates: `_is_comptime_val` (`RuntimeVal` is never one; the old "does not reference a register" relaxation has been removed), `_place_is_comptime`, `_references_register`.
+- `_coerce(ev, target)`: **every compile-time value goes to `sval.coerce_const`** (a `ComptimeVal`, the `ComptimePtr` place included), while a runtime value goes through `_convert_inst`
+  (widening/narrowing); a failure raises `CoerceError` (which `_try_coerce` swallows). The `Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` target branches handle runtime values only.
 
 ### 6.2 Compile-time storage and pending slot
 
@@ -313,8 +321,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - **`_is_union_delivery`**: in a tagged union held in *runtime* storage every construction records a `_PendingAggregate` of its own (the places a previous one recorded
   are not reused), so both branches of an `if` expression deliver their own variant at their own position; a compile-time `Box` holds one variant only, which stays the
   `incompatible types` error.
-- `Box` storage: `_flatten_value` (including padding; `undefined` -> `UndefinedScalar` per leaf), `_unflatten_cells`,
-  `_fill_comptime_defaults` (fills `is_comptime` fields with defaults, iterative), `_load_box_cells` (`bytes` box special case).
+- `Box` storage: the read/write helpers are in `sval` (`flatten_value`/`unflatten_cells`/`fill_comptime_defaults`/`load_box_cells`, see §4.3), and `interp` reads and writes `Box.cells` directly.
 - **`mir.Insertion`** is the mechanism for "emit an instruction at a place I have already passed": `PendingSlot.insertion` reserves the position of the alloca,
   `_PendingPtrConvertion`/`_PendingErrorCodeWrite` reserve the position of the delivery/throw point; `mir.normalize` splices them together later.
 
