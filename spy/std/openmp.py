@@ -17,6 +17,7 @@ the process, and they become visible only once the library is loaded with
 import ctypes
 import ctypes.util
 import os
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from spy.std.int import int_cast
@@ -25,7 +26,9 @@ from ..compiler import (
     ConstMultiPtr,
     ConstPtr,
     Ptr,
+    bool,
     decl_func,
+    func,
     func_type,
     i32,
     i64,
@@ -34,6 +37,7 @@ from ..compiler import (
     u8,
     u32,
     u64,
+    void,
 )
 from ..compiler.syntax import (
     ConstComptime,
@@ -45,9 +49,9 @@ from ..compiler.syntax import (
     ref,
 )
 from .core import (
-    Numeric,
     coerce,
     compile_error,
+    typed_undefined,
 )
 
 # the ``kmp_sch_static`` schedule kind the runtime entry points take (see
@@ -131,6 +135,17 @@ class _Microtask(Protocol):
     def __call__(self, gtid: Ptr[i32], bound_tid: Ptr[i32], n: i64, kernel: Ptr[Opaque]) -> None: ...
 
 
+@func_type(callconv='c')
+class _MicrotaskReduce(Protocol):
+    # the reducing variant of ``_Microtask``: the extra pointers carry the
+    # reduction's reducer (a ``reduce_op`` closure), its shared accumulator, the
+    # flag that says the accumulator has a value and the critical-section name;
+    # the names must match ``parallel_loop.outlined_reduce`` exactly
+    def __call__(self, gtid: Ptr[i32], bound_tid: Ptr[i32], n: i64, kernel: Ptr[Opaque],
+                 reduce_op: Ptr[Opaque], acc: Ptr[Opaque], has: Ptr[Opaque],
+                 crit: Ptr[Opaque]) -> None: ...
+
+
 @decl_func()
 def __kmpc_fork_call(loc: ConstPtr[_Ident], argc: i32,
                      microtask: ConstPtr[_Microtask], *args) -> None: ...
@@ -158,10 +173,22 @@ def __kmpc_for_static_init_8u(loc: ConstPtr[_Ident], gtid: i32, schedtype: i32,
 @decl_func()
 def __kmpc_for_static_fini(loc: ConstPtr[_Ident], gtid: i32) -> None: ...
 
-# the index type parameter appears once in the signature (the kernel it types is
-# an unannotated closure), but it is what ``typeof(length)`` reflects on to pick
-# the runtime entry point, so it stays generic
-def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
+# the named critical section a thread enters while it combines its partial into
+# the shared accumulator; ``crit`` points at an 8-byte, 8-aligned name the
+# runtime uses as the lock's identity (``kmp_critical_name``)
+@decl_func()
+def __kmpc_critical(loc: ConstPtr[_Ident], gtid: i32, crit: Ptr[Opaque]) -> None: ...
+
+@decl_func()
+def __kmpc_end_critical(loc: ConstPtr[_Ident], gtid: i32, crit: Ptr[Opaque]) -> None: ...
+
+# the index type is ``typeof(length)``: the parameters carry no spy type - the
+# signature is ignored (``ignore_signature``), so ``length``'s type is inferred
+# from the call's argument, the kernel's return type is ``typeof(kernel(0))``,
+# and the result is inferred from the body.  The annotations serve the Python
+# type checker only, and the function is inlined at its call sites.
+@func(inline=True, ignore_signature=True)
+def parallel_loop[R](length: int, kernel: Callable[[int], R], reduce_op: Callable[[R, R], R] | None = None) -> R:
     """
     #pragma omp parallel loop
     for (typeof(length) i = 0; i < length; i++) {
@@ -174,6 +201,18 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
     ``i32``/``u32``/``i64``/``u64``), which selects the matching runtime entry
     point.  The exit of the last ``__kmpc_fork_call`` joins the team, so no
     barrier is needed after the loop.
+
+    When ``kernel`` returns a value (a single one, or several for a
+    ``tuple[...]`` annotation) and ``reduce_op`` is given, the results are
+    reduced and the reduced value is returned: each thread folds its own slice
+    with ``reduce_op``, and the partial results are combined under a critical
+    section, so ``reduce_op`` must be associative (and commutative, since the
+    order the partials are combined in is not specified).  ``reduce_op`` is
+    called ``reduce_op(acc, v)`` - each operand is a kernel result: a single
+    value, or the whole tuple of them for a several-valued kernel (it is *not*
+    spread into one argument per element).  With a ``length`` of
+    zero no iteration runs, so there is nothing to reduce and the accumulator
+    is left as its initial (undefined) value.
     """
     rtc = kernel
     comptime()
@@ -208,26 +247,92 @@ def parallel_loop[T: Numeric](length: T, kernel) -> None:  # pyright: ignore
     else:
         compile_error('parallel_loop: the index type must be i32/u32/i64/u64')
 
+    # a kernel that returns nothing just runs its body; a kernel that returns a
+    # value is reduced (the two paths differ in their result, their microtask
+    # and the arguments ``__kmpc_fork_call`` is given, so the choice is
+    # compile-time - the condition is a compile-time constant, so only the
+    # selected branch is kept)
+    if RET == void:
+
+        @closure(inline=False, callconv='c')
+        def outlined(gtid: Ptr[i32], bound_tid: Ptr[i32], n: i64, kernel: Ptr[Opaque]) -> None:
+            # a zero length makes no iterations (the guard clang also emits, and what
+            # keeps the unsigned variants from wrapping ``n - 1``)
+            if n > 0:
+                lastiter: i32 = 0
+                # the schedule bookkeeping and the index are runtime storage: the
+                # runtime writes ``lower``/``upper``/``stride`` through the pointers
+                # passed to ``init_fn``, and ``i`` advances in a runtime loop (an
+                # unannotated local whose stores are all compile-time would be a
+                # compile-time box, whose address cannot cross to a runtime call - see
+                # the behaviour doc §3.3/§4.2)
+                lower = coerce(0, LT)
+                upper = int_cast(n - 1, LT)
+                stride = coerce(0, ST)
+                init_fn(_ident(), gtid[...], _SCHED_STATIC, ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
+                i = lower
+                while i <= upper:
+                    ptr_cast(kernel, Ptr[K])[...](i)
+                    i += 1
+                __kmpc_for_static_fini(_ident(), gtid[...])
+
+        __kmpc_fork_call(_ident(), 2, as_func_ptr(_Microtask, outlined), int_cast(length, i64), ptr_cast(ref(rtc), Ptr[Opaque]))
+        return # pyright: ignore
+
+    # the reducing path: ``acc`` is the shared accumulator the microtask fills
+    # (``has`` says whether any thread has written it yet), and ``crit`` is the
+    # critical section's name - a per-call, zero-initialized 8-byte slot
+    rro = reduce_op
+    comptime()
+    RSO = typeof(rro)
+
+    acc = typed_undefined(RET)
+    has: bool = False
+    crit: u64 = 0
+
     @closure(inline=False, callconv='c')
-    def outlined(gtid: Ptr[i32], bound_tid: Ptr[i32], n: i64, kernel: Ptr[Opaque]) -> None:
-        # a zero length makes no iterations (the guard clang also emits, and what
-        # keeps the unsigned variants from wrapping ``n - 1``)
+    def outlined_reduce(gtid: Ptr[i32], bound_tid: Ptr[i32], n: i64, kernel: Ptr[Opaque],
+                        reduce_op: Ptr[Opaque], acc: Ptr[Opaque], has: Ptr[Opaque],
+                        crit: Ptr[Opaque]) -> None:
         if n > 0:
             lastiter: i32 = 0
-            # the schedule bookkeeping and the index are runtime storage: the
-            # runtime writes ``lower``/``upper``/``stride`` through the pointers
-            # passed to ``init_fn``, and ``i`` advances in a runtime loop (an
-            # unannotated local whose stores are all compile-time would be a
-            # compile-time box, whose address cannot cross to a runtime call - see
-            # the behaviour doc §3.3/§4.2)
             lower = coerce(0, LT)
             upper = int_cast(n - 1, LT)
             stride = coerce(0, ST)
             init_fn(_ident(), gtid[...], _SCHED_STATIC, ref(lastiter), ref(lower), ref(upper), ref(stride), 1, 1)
-            i = lower
-            while i <= upper:
-                ptr_cast(kernel, Ptr[K])[...](i)
-                i += 1
+            # a thread the schedule gave no iteration has nothing to fold
+            if lower <= upper:
+                # each runtime value is a pointer cast once and reused
+                kn = ptr_cast(kernel, Ptr[K])
+                rs = ptr_cast(reduce_op, Ptr[RSO])
+                acc_ptr = ptr_cast(acc, Ptr[RET])
+                has_ptr = ptr_cast(has, Ptr[bool])
+
+                # fold the thread's own slice: the first result seeds the partial
+                part = kn[...](lower)
+                i = lower + 1
+                while i <= upper:
+                    part = rs[...](part, kn[...](i))  # pyright: ignore
+                    i += 1
+
+                # combine the partial into the shared accumulator: the first
+                # thread to get here seeds it, the rest fold onto it
+                __kmpc_critical(_ident(), gtid[...], crit)
+                if has_ptr[...]:
+                    acc_ptr[...] = rs[...](acc_ptr[...], part)  # pyright: ignore
+                else:
+                    acc_ptr[...] = part
+                    has_ptr[...] = True
+                __kmpc_end_critical(_ident(), gtid[...], crit)
             __kmpc_for_static_fini(_ident(), gtid[...])
 
-    __kmpc_fork_call(_ident(), 2, as_func_ptr(_Microtask, outlined), int_cast(length, i64), ptr_cast(ref(rtc), Ptr[Opaque]))
+    __kmpc_fork_call(
+        _ident(), 6, as_func_ptr(_MicrotaskReduce, outlined_reduce),  # pyright: ignore
+        int_cast(length, i64),
+        ptr_cast(ref(rtc), Ptr[Opaque]),
+        ptr_cast(ref(rro), Ptr[Opaque]),
+        ptr_cast(ref(acc), Ptr[Opaque]),
+        ptr_cast(ref(has), Ptr[Opaque]),
+        ptr_cast(ref(crit), Ptr[Opaque]),
+    )
+    return acc # pyright: ignore

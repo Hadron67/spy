@@ -488,7 +488,8 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
 - `std.atomic` 的 `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence` 分别降成 LLVM 的
   `load atomic`/`store atomic`/`atomicrmw`/`cmpxchg`/`fence`（`MemoryOrder.RELAXED` 落成 LLVM 的 `monotonic`）。
 - `std.openmp.parallel_loop` 用 `__kmpc_fork_call` 组建并行域，用 `__kmpc_for_static_init_*`/`__kmpc_for_static_fini`
-  分发每线程的切片（static 调度）。
+  分发每线程的切片（static 调度）。带返回值 kernel 的归约时，每线程先在本地折叠出 partial，再在
+  `__kmpc_critical`/`__kmpc_end_critical` 临界区内并入被指针传入的共享累加器。
 
 ---
 

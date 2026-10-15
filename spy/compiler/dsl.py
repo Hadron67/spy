@@ -151,6 +151,13 @@ class FnMetadata:
     # whether the function may panic (a call of one may unwind through the
     # enclosing deferred bodies); a function may panic by default
     may_panic: bool = True
+    # ignore the parameter and return type annotations (they are read only by
+    # the Python type checker; spy infers every parameter's type from the
+    # argument and the return type from the body), and the type parameters the
+    # function declares with them.  A ``Comptime``/``Comptime[T]`` parameter
+    # annotation still marks a compile-time parameter (see
+    # ``astgen.parse_function``)
+    ignore_signature: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +269,7 @@ class _RegisteredFn:
                 self.fn, self.context, self.cls,
                 self_arg, self.context_type_vars, self.meta.exceptions,
                 self.meta.callconv, self.meta.may_panic,
+                ignore_signature=self.meta.ignore_signature,
             )
             self.entry = FunctionValue(self.fn.__qualname__, hir, force_inline=self.meta.inline)
         return self.entry
@@ -817,11 +825,11 @@ class _Context(CompileContext):
         sym = analyser.finish()
         sym.compile(self._symbol_table, self.backend, self.target_info())
 
-    def func(self, self_arg: Literal["const ptr", "ptr", "value"] | None = None, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = True):
+    def func(self, self_arg: Literal["const ptr", "ptr", "value"] | None = None, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = True, inline: bool = False, ignore_signature: bool = False):
         meta = FnMetadata(
-            self_arg=self_arg, extern=extern, linkname=linkname,
+            self_arg=self_arg, extern=extern, linkname=linkname, inline=inline,
             exceptions=_normalize_exceptions(exceptions),
-            callconv=callconv, may_panic=may_panic,
+            callconv=callconv, may_panic=may_panic, ignore_signature=ignore_signature,
         )
 
         def wrapper[T](fn: T) -> T:

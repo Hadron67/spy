@@ -1,3 +1,4 @@
+from typing import Any
 from unittest import TestCase
 
 from ..compiler import (
@@ -115,6 +116,43 @@ def bad_redeclare(x: i32) -> i32:
     return y
 
 
+# ---------------------------------------------------------------------------
+# ``@func(ignore_signature=True)``: the parameter and return annotations are
+# read by the Python type checker only - spy infers every parameter's type from
+# the call's argument and the return type from the body.  A ``Comptime`` marker
+# is not a type and is kept.
+# ---------------------------------------------------------------------------
+
+
+@func(ignore_signature=True)
+def ignored_signature_inferred(x: Any) -> Any:
+    # ``Any`` is not what spy sees: ``x`` is typed by the argument (``i32``
+    # here) and the body's ``+ 1`` only type-checks against that inferred type
+    return x + 1
+
+
+@func()
+def use_ignored_signature_inferred(x: i32) -> i32:
+    return ignored_signature_inferred(x)
+
+
+@func(ignore_signature=True)
+def ignored_signature_keeps_comptime(x: Comptime[i32], y: Any) -> Any:
+    # the ``Comptime`` marker is kept even though the rest of the signature is
+    # ignored, so ``x`` is still a compile-time parameter
+    return x + y
+
+
+@func()
+def use_ignored_signature_keeps_comptime(v: i32) -> i32:
+    return ignored_signature_keeps_comptime(2, v)  # ``2`` is compile-time
+
+
+@func()
+def pass_runtime_to_ignored_comptime(v: i32) -> i32:
+    return ignored_signature_keeps_comptime(v, v)  # a runtime value: rejected
+
+
 class SpyAnnotationTest(TestCase):
     """Annotated local variables: ``name: T`` declares the type of a fresh
     variable and its slot is materialized right away, while ``name:
@@ -161,6 +199,18 @@ class SpyAnnotationTest(TestCase):
     def test_redeclaration_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
             bad_redeclare(3)
+
+    def test_an_ignored_signature_is_inferred_from_the_call(self) -> None:
+        # the parameter carries no spy type (``Any`` is only the checker's), so
+        # its type is the argument's and the return type the body's
+        self.assertEqual(use_ignored_signature_inferred(4), 5)
+
+    def test_an_ignored_signature_keeps_a_comptime_parameter(self) -> None:
+        self.assertEqual(use_ignored_signature_keeps_comptime(5), 7)
+
+    def test_a_runtime_argument_to_an_ignored_comptime_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            pass_runtime_to_ignored_comptime(5)
 
 
 all_tests = [

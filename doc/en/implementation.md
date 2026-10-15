@@ -490,7 +490,9 @@ Construction-time peephole: `BasicBlock.emit` calls `try_evaluate` to fold const
 - `std.atomic`'s `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence` lower respectively to LLVM's
   `load atomic`/`store atomic`/`atomicrmw`/`cmpxchg`/`fence` (`MemoryOrder.RELAXED` becomes LLVM's `monotonic`).
 - `std.openmp.parallel_loop` uses `__kmpc_fork_call` to set up the parallel region, and `__kmpc_for_static_init_*`/`__kmpc_for_static_fini`
-  to distribute each thread's slice (static schedule).
+  to distribute each thread's slice (static schedule).  When a value-returning kernel is reduced, each thread first folds its own slice
+  into a partial locally, then combines the partials under the `__kmpc_critical`/`__kmpc_end_critical` critical section into the shared
+  accumulator the call passed by pointer.
 
 ---
 

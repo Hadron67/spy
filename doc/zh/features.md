@@ -846,8 +846,9 @@ assert caught() == 42
 ### 6.1 定义与特化
 
 - `@spy.func()` 注册；首次调用按实参类型编译出一个**特化**，同函数可有多个特化。
-- 普通（未注册的）Python 函数在函数体内被调用时会被**内联**；未装饰的结构体方法同理。
+- 普通（未注册的）Python 函数在函数体内被调用时会被**内联**；未装饰的结构体方法同理。`@func(inline=True)` 可把注册的函数也标成内联。
 - 形参类型由：注解（替换已求解的泛型参数后）> 实参推断出的类型 > 默认值的类型决定。
+- `@func(ignore_signature=True)` 忽略形参与返回**类型**注解（它们只供 Python 类型检查器阅读）：形参类型一律由实参推断、返回类型由函数体推断。`Comptime`/`Comptime[T]` 不是类型，其标记仍保留（参数仍是编译期参数）。
 
 ```python
 @func()
@@ -1568,8 +1569,40 @@ assert use_bump(5) == 56
 
 ### 9.2 OpenMP
 
-`std.openmp.parallel_loop(length, kernel)` 实现 `#pragma omp parallel for`（static 调度）。
+`std.openmp.parallel_loop(length, kernel, reduce_op=None)` 实现 `#pragma omp parallel for`（static 调度）。
 使用前须 `load_openmp_runtime()`（幂等，加载 `libomp`）。
+
+- `kernel` 是接收下标 `i`（类型 `typeof(length)`，`i32`/`u32`/`i64`/`u64` 之一）的闭包；每个线程拿到 `[0, length)` 的一个切片。
+- 若 `kernel` 有返回值（单个，或用 `tuple[...]` 注解的多返回值）且给出 `reduce_op`，则把各次迭代的返回值归约，
+  并把结果**作为 `parallel_loop` 的返回值**（多返回值以多返回形式交付）。
+- `reduce_op` 以 `reduce_op(acc, v)` 调用：两个操作数各是「kernel 的返回值」本身——单返回值即该值，多返回值即整个返回值元组（**不会**掉平成每元素一个实参）。
+- 每个线程先用自己的切片折叠出一个 partial，再在临界区（`__kmpc_critical`）内并入共享累加器；合并顺序不确定，
+  因此 `reduce_op` 需满足结合律（最好还有交换律）。
+- `length == 0` 时没有迭代可归约，返回累加器的初始（`undefined`）值。
+- `kernel` 返回 void 时不做归约，`reduce_op` 被忽略（只执行循环体）。
+
+```python,norun
+@func()
+def parallel_sum(n: i32) -> i64:
+    def kernel(i: i32) -> i64:
+        return coerce(i, i64)          # 显式转换（typing.cast 在 spy 里只是空操作）
+
+    def add(a: i64, b: i64) -> i64:
+        return a + b
+
+    return parallel_loop(n, kernel, add)   # sum(0..n-1)
+
+@func()
+def parallel_sum_count(n: i32) -> i64:
+    def kernel(i: i32):
+        return coerce(i, i64), coerce(1, i64)   # 多返回值
+
+    def add(a, b):
+        return a[0] + b[0], a[1] + b[1]
+
+    total, count = parallel_loop(n, kernel, add)
+    return total * 1000 + count
+```
 
 ---
 
@@ -1613,7 +1646,7 @@ assert id64(spy_as(2 ** 40, u64)) == 2 ** 40   # spy.as_ picks an explicit type
 **已实现（要点）**：见上文各节——标量/指针/数组/切片/Option/tagged union/union/complex/枚举/结构体；
 多返回值；泛型（函数与结构体）；闭包（即匿名 struct）；`Comptime`/`ConstComptime`/`InferComptime`；
 编译期指针（含 const 跨非内联边界）；编译期聚合/循环/反射；`defer`；异常与 `noreturn`；
-panic/`catch_unwind`；原子操作；OpenMP；Python 侧互操作（结构体/枚举/option/union/异常/多返回值）。
+panic/`catch_unwind`；原子操作；OpenMP（含归约）；Python 侧互操作（结构体/枚举/option/union/异常/多返回值）。
 
 **未实现 / 已知限制**：
 

@@ -20,7 +20,7 @@ Conventions:
 Usage::
 
     python3 tools/run_doc_examples.py [doc/features.md ...]
-"""
+"""  # noqa: EXE001
 
 import re
 import sys

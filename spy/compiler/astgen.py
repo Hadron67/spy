@@ -2138,6 +2138,7 @@ def parse_function(
     exceptions: tuple[Any, ...] | Literal["infer"] | None = None,
     callconv: str = 'default',
     may_panic: bool = True,
+    ignore_signature: bool = False,
 ) -> FunctionIR:
     """Parse ``fn`` (a plain Python function) into a :class:`FunctionIR`.
 
@@ -2162,6 +2163,14 @@ def parse_function(
     ``'default'`` is the spy one; any other value names a C one, in which
     every argument is passed by value, the result is returned by value, and
     the function may not raise.  ``may_panic`` is carried through only.
+
+    ``ignore_signature`` (the ``@func(ignore_signature=True)`` declaration)
+    drops the parameter and return type annotations, which then serve the
+    Python type checker only: every parameter's type is inferred from the
+    call's argument and the return type from the body.  The type parameters
+    the function declares are dropped with them (they are annotation-only
+    names).  A ``Comptime``/``Comptime[T]`` parameter annotation is *not* a
+    type and is kept (the parameter stays a compile-time one).
 
     ``resolver`` is the host the annotations (and the declared exceptions) are
     resolved in: a struct class or function handle the annotation names is
@@ -2211,14 +2220,20 @@ def parse_function(
         )
     generic_args: list[SpyTypeVar] = []
     type_vars: dict[TypeVar, Value] = dict(context_type_vars) if context_type_vars is not None else {}
-    for type_param in declared_type_params:
-        if not isinstance(type_param, TypeVar):
-            raise CompileError(
-                f"unsupported type parameter {type_param!r} in function {node.name}"
-            )
-        spy = SpyTypeVar(type_param.__name__)
-        generic_args.append(spy)
-        type_vars[type_param] = spy
+    # ``ignore_signature`` drops the whole signature, and with it the type
+    # parameters the function declares: one is an annotation-only name (nothing
+    # in the ignored signature constrains it and the body reads no solved value
+    # for it), so leaving it in would make every call fail to solve it (see
+    # ``Signature.solve_param_types``)
+    if not ignore_signature:
+        for type_param in declared_type_params:
+            if not isinstance(type_param, TypeVar):
+                raise CompileError(
+                    f"unsupported type parameter {type_param!r} in function {node.name}"
+                )
+            spy = SpyTypeVar(type_param.__name__)
+            generic_args.append(spy)
+            type_vars[type_param] = spy
 
     # Read the signature metadata off the function object instead of
     # re-evaluating the source: Python already evaluated the annotations
@@ -2247,6 +2262,10 @@ def parse_function(
         ret_annotation = VoidType()
     else:
         ret_annotation = annotations['return']
+    if ignore_signature:
+        # the return annotation is for the Python type checker only: spy infers
+        # the return type from the body
+        ret_annotation = None
 
     def convert(annotation: Any, what: str) -> AnyValue | None:
         """The spy-domain value of one evaluated annotation or default
@@ -2316,6 +2335,11 @@ def parse_function(
         # ``SignatureFormalArg``): the marker is split off the annotation and
         # the type it wraps is the parameter's declared type
         is_comptime, annotated = unwrap_comptime(annotations.get(arg.arg))
+        if ignore_signature:
+            # the annotation is for the Python type checker only: the parameter
+            # is unannotated to spy (its type is inferred from the call's
+            # argument), but a ``Comptime`` marker is kept
+            annotated = None
         # ``type[X]`` annotates a *type-valued* parameter: the argument is the
         # spy type the call passes and ``X`` (usually a type parameter of this
         # signature) is what it solves to (see ``SignatureFormalArg``)
@@ -2360,6 +2384,8 @@ def parse_function(
                 f"InferComptime: only a local declaration may infer its storage"
             )
         is_comptime, annotated = unwrap_comptime(annotations.get(arg.arg))
+        if ignore_signature:
+            annotated = None
         if get_origin(annotated) is type:
             raise CompileError(
                 f"*args/**kwargs of function {node.name} cannot be a type[...] parameter"

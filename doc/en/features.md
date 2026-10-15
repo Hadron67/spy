@@ -846,8 +846,9 @@ Case guards and subpatterns are not supported (`case A(x):` is an error). (For a
 ### 6.1 Definition and specialization
 
 - Register with `@spy.func()`; the first call compiles a **specialization** for the argument types, and a function may have multiple specializations.
-- An ordinary (unregistered) Python function called inside a function body is **inlined**; the same holds for undecorated struct methods.
+- An ordinary (unregistered) Python function called inside a function body is **inlined**; the same holds for undecorated struct methods.  `@func(inline=True)` marks a registered function as inlined too.
 - A parameter's type is determined by: the annotation (after substituting solved generic parameters) > the type inferred from the argument > the type of the default value.
+- `@func(ignore_signature=True)` ignores the parameter and return **type** annotations (they are read by the Python type checker only): every parameter's type is inferred from the argument and the return type from the body.  `Comptime`/`Comptime[T]` is not a type, so its marker is kept (the parameter stays a compile-time one).
 
 ```python
 @func()
@@ -1568,8 +1569,41 @@ assert use_bump(5) == 56
 
 ### 9.2 OpenMP
 
-`std.openmp.parallel_loop(length, kernel)` implements `#pragma omp parallel for` (static schedule).
+`std.openmp.parallel_loop(length, kernel, reduce_op=None)` implements `#pragma omp parallel for` (static schedule).
 Before use, `load_openmp_runtime()` is required (idempotent, loads `libomp`).
+
+- `kernel` is a closure taking the index `i` (typed `typeof(length)`, one of `i32`/`u32`/`i64`/`u64`); every thread gets a slice of `[0, length)`.
+- When `kernel` returns a value (a single one, or several for a `tuple[...]` annotation) and `reduce_op` is given, the per-iteration
+  results are reduced and the reduced value **is returned by `parallel_loop`** (several values are delivered as a multi-value result).
+- `reduce_op` is called `reduce_op(acc, v)`; each operand is a kernel result - a single value, or the whole tuple of them for a
+  several-valued kernel (it is **not** spread into one argument per element).
+- Each thread first folds its own slice into a partial, then combines the partials under a critical section (`__kmpc_critical`); the order
+  partials are combined in is unspecified, so `reduce_op` must be associative (and ideally commutative).
+- With `length == 0` no iteration runs, so nothing is reduced and the accumulator keeps its initial (`undefined`) value.
+- When `kernel` returns void there is no reduction and `reduce_op` is ignored (the loop just runs its body).
+
+```python,norun
+@func()
+def parallel_sum(n: i32) -> i64:
+    def kernel(i: i32) -> i64:
+        return coerce(i, i64)          # an explicit conversion (typing.cast is a no-op in spy)
+
+    def add(a: i64, b: i64) -> i64:
+        return a + b
+
+    return parallel_loop(n, kernel, add)   # sum(0..n-1)
+
+@func()
+def parallel_sum_count(n: i32) -> i64:
+    def kernel(i: i32):
+        return coerce(i, i64), coerce(1, i64)   # several return values
+
+    def add(a, b):
+        return a[0] + b[0], a[1] + b[1]
+
+    total, count = parallel_loop(n, kernel, add)
+    return total * 1000 + count
+```
 
 ---
 
@@ -1613,7 +1647,7 @@ assert id64(spy_as(2 ** 40, u64)) == 2 ** 40   # spy.as_ picks an explicit type
 **Implemented (highlights)**: see the sections above — scalars/pointers/arrays/slices/Option/tagged unions/union/complex/enums/structs;
 multiple return values; generics (functions and structs); closures (i.e. anonymous structs); `Comptime`/`ConstComptime`/`InferComptime`;
 compile-time pointers (including const across a non-inline boundary); compile-time aggregates/loops/reflection; `defer`; exceptions and `noreturn`;
-panic/`catch_unwind`; atomic operations; OpenMP; Python-side interoperability (structs/enums/option/union/exceptions/multiple return values).
+panic/`catch_unwind`; atomic operations; OpenMP (with reduction); Python-side interoperability (structs/enums/option/union/exceptions/multiple return values).
 
 **Not implemented / known limitations**:
 
