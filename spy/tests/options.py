@@ -373,6 +373,175 @@ def maybe_void_ptr(b: spy_bool) -> Option[Ptr[void]]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# an option of a zero-sized child: its representation is the tag alone (a
+# ``bool``), so a delivery marks it present without a payload place to write
+# through (see ``_option_payload_ptr``).  The value paths already did; every
+# construction path is covered here.
+# ---------------------------------------------------------------------------
+
+
+@struct()
+class ZstPayload:
+    """A zero-sized struct."""
+
+
+@struct()
+class ZstWithField:
+    """A zero-sized struct with a zero-sized field of its own: the field has no
+    address either, so a construction of one has nothing to write."""
+
+    e: ZstPayload
+
+
+@struct()
+class ZstOptHolder:
+    o: Option[ZstPayload]
+    n: i32
+
+
+@func()
+def opt_zst_constructed(c: spy_bool) -> i32:
+    # a construction (rather than a value) reaching the option: the tag is all
+    # that says the option is present
+    s: Option[ZstPayload] = ZstPayload() if c else None
+    if s is None:
+        return -1
+    return 1
+
+
+@func()
+def opt_zst_single() -> i32:
+    s: Option[ZstPayload] = ZstPayload()
+    if s is None:
+        return -1
+    return 1
+
+
+@func()
+def opt_zst_reassigned(c: spy_bool) -> i32:
+    # the option already holds a place when the construction reaches it
+    s: Option[ZstPayload] = None
+    if c:
+        s = ZstPayload()
+    if s is None:
+        return -1
+    return 1
+
+
+@func()
+def opt_zst_comptime() -> i32:
+    # a compile-time option place: a box whose only cell is the tag
+    s: Comptime[Option[ZstPayload]] = ZstPayload()
+    if s is None:
+        return -1
+    return 1
+
+
+@func()
+def opt_zst_field(c: spy_bool) -> i32:
+    h = ZstOptHolder(ZstPayload() if c else None, 2)
+    if h.o is None:
+        return -1
+    return h.n
+
+
+@func()
+def opt_zst_with_field(c: spy_bool) -> i32:
+    # the child has a field, but the field is zero-sized too: the construction
+    # has no place to take an address of
+    s: Option[ZstWithField] = ZstWithField(ZstPayload()) if c else None
+    if s is None:
+        return -1
+    return 1
+
+
+@func()
+def make_opt_zst(c: spy_bool) -> Option[ZstPayload]:
+    if c:
+        return ZstPayload()
+    return None
+
+
+@func()
+def opt_zst_returned(c: spy_bool) -> i32:
+    # the callee's result location is materialized before its body runs
+    s = make_opt_zst(c)
+    if s is None:
+        return -1
+    return 1
+
+
+@func()
+def nothing_void() -> void:
+    return
+
+
+@func()
+def opt_void_single() -> i32:
+    s: Option[void] = nothing_void()
+    if s is None:
+        return -1
+    return 1
+
+
+@func()
+def opt_void_value(b: spy_bool) -> i32:
+    s: Option[void] = nothing_void() if b else None
+    if s is None:
+        return -1
+    return 1
+
+
+@func()
+def opt_void_reassigned(b: spy_bool) -> i32:
+    s: Option[void] = None
+    if b:
+        s = nothing_void()
+    if s is None:
+        return -1
+    return 1
+
+
+class SpyZeroSizedOptionTest(TestCase):
+    """An ``Option`` of a zero-sized child is the tag alone: a delivery marks it
+    present (see ``_option_payload_ptr``), whether the value is constructed in
+    place or arrives as a value."""
+
+    def test_a_constructed_value(self) -> None:
+        self.assertEqual(opt_zst_constructed(True), 1)
+        self.assertEqual(opt_zst_constructed(False), -1)
+
+    def test_a_single_construction(self) -> None:
+        self.assertEqual(opt_zst_single(), 1)
+
+    def test_an_already_materialized_option(self) -> None:
+        self.assertEqual(opt_zst_reassigned(True), 1)
+        self.assertEqual(opt_zst_reassigned(False), -1)
+
+    def test_compile_time_storage(self) -> None:
+        self.assertEqual(opt_zst_comptime(), 1)
+
+    def test_a_field_of_a_construction(self) -> None:
+        self.assertEqual(opt_zst_field(True), 2)
+        self.assertEqual(opt_zst_field(False), -1)
+
+    def test_a_zero_sized_child_with_a_zero_sized_field(self) -> None:
+        self.assertEqual(opt_zst_with_field(True), 1)
+        self.assertEqual(opt_zst_with_field(False), -1)
+
+    def test_a_returned_option(self) -> None:
+        self.assertEqual(opt_zst_returned(True), 1)
+        self.assertEqual(opt_zst_returned(False), -1)
+
+    def test_the_void_child(self) -> None:
+        self.assertEqual(opt_void_single(), 1)
+        self.assertEqual(opt_void_value(True), 1)
+        self.assertEqual(opt_void_value(False), -1)
+        self.assertEqual(opt_void_reassigned(True), 1)
+        self.assertEqual(opt_void_reassigned(False), -1)
+
+
 class SpyOptionNestingTest(TestCase):
     """The tag of a nested option: an ``Option`` uses one pointer of its child
     as its tag, so it has one fewer than the child and ``Option[Option[T]]``
@@ -1039,6 +1208,7 @@ class SpyPythonSideOptionTest(TestCase):
 all_tests = [
     SpyOptionTest,
     SpyOptionNestingTest,
+    SpyZeroSizedOptionTest,
     SpyBoolOpTest,
     SpyOptionUnwrapTest,
     SpyPythonSideOptionTest,

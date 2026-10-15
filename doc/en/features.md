@@ -942,6 +942,7 @@ assert sum_nested((1, (2, 3))) == 6        # a Python tuple is flattened too
 - Return annotation `tuple[T1, T2, ...]` = returning multiple values.
 - Call side: `a, b = f()` destructures; `return f()` forwards.
 - **Packing**: an all-runtime result can be packed into a **plain tuple variable** `packed = f()` (afterwards it can be destructured again with `x, y = packed`, and `len`, `packed[i]` work);
+  the packed tuple keeps the result grouping — one element per result *element*, a nested result being a tuple of its own (so `packed[i][j]` works and `len` is the top-level arity);
   when it contains compile-time leaves (type values/const pointers/byte strings/function values), the packed tuple has no runtime representation and the target must be a `Comptime` variable.
 - **Compile-time return values**: a return value fully known at compile time occupies no runtime result.
   A non-inline call takes the value of the callee's **last analyzed `return`** (it does not check whether the return paths agree).
@@ -965,9 +966,19 @@ def packed(a: i32, b: i32) -> i32:
     lo, hi = p
     return lo + hi
 
+@func()
+def nested() -> tuple[i32, tuple[i32, i32]]:
+    return 1, (2, 3)
+
+@func()
+def use_packed_nested() -> i32:
+    p = nested()               # the packed tuple keeps the nesting
+    return p[1][0] + p[1][1]   # 5
+
 assert min_max(3, 1) == (1, 3)   # the Python side gets a tuple
 assert use_min_max(3, 1) == 13
 assert packed(3, 1) == 4
+assert use_packed_nested() == 5
 ```
 
 ### 6.6 Generics

@@ -306,7 +306,13 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - `_PendingAction` variants: `_PendingStore`, `_PendingPtrConvertion`, `_PendingTuple`, `_PendingAggregate`, `_PendingErrorCodeWrite`.
 - Bookkeeping: `_record_pending_store` (rejects a runtime value into an `is_comptime=True` slot; `is_inline = does not cross a runtime block and is a compile-time value`), `_record_pending_action`.
 - commit: `_commit_pending_slot` -> compile-time (or ZST still needing a place) goes through `_commit_box_slot`, DST errors out, otherwise it emits `mir.Alloca` and goes through `_bind_slot`;
-  `_exec_pending_action` delivers by variant (`_store_into_element` handles option layers / in-place writes).
+  `_exec_pending_action` delivers by variant (`_store_into_element` handles option layers / in-place writes); `_PendingAggregate` first peels the option layers with
+  `_peel_option_layers` (a construction into an `Option[U]`, shared with the `is_aggregate_init` path of `field_index_addr`), and when the storage lands on a
+  tagged union it sets the tag and writes the variant.  An option of a *zero-sized* child is its tag alone and is marked present the same way (`_option_payload_ptr`
+  writes the tag, and the materialized paths of `finish_struct`/`finish_array` peel a zero-sized aggregate's option layers).
+- **`_is_union_delivery`**: in a tagged union held in *runtime* storage every construction records a `_PendingAggregate` of its own (the places a previous one recorded
+  are not reused), so both branches of an `if` expression deliver their own variant at their own position; a compile-time `Box` holds one variant only, which stays the
+  `incompatible types` error.
 - `Box` storage: `_flatten_value` (including padding; `undefined` -> `UndefinedScalar` per leaf), `_unflatten_cells`,
   `_fill_comptime_defaults` (fills `is_comptime` fields with defaults, iterative), `_load_box_cells` (`bytes` box special case).
 - **`mir.Insertion`** is the mechanism for "emit an instruction at a place I have already passed": `PendingSlot.insertion` reserves the position of the alloca,
@@ -314,8 +320,9 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 
 ### 6.3 place and field addressing
 
-- `field_index_addr(ptr, index, is_aggregate_init, at=None)`: no automatic dereference; `is_aggregate_init` + uncommitted -> reuses the recorded `_PendingAggregate` place or a new alloca;
-  passes through an outer option construction (sets the tag); ZST field -> no storage address; compile-time box -> `sval.ComptimePtr(box, offset+field_scalar_offset)` (an `is_ref` field returns the cell);
+- `field_index_addr(ptr, index, is_aggregate_init, at=None)`: no automatic dereference; `is_aggregate_init` + uncommitted -> reuses the recorded `_PendingAggregate` place or a new alloca
+  (a tagged union in runtime storage reuses nothing, see `_is_union_delivery`);
+  passes through an outer option construction (sets the tag; a zero-sized child only has the tag); ZST field -> no storage address; compile-time box -> `sval.ComptimePtr(box, offset+field_scalar_offset)` (an `is_ref` field returns the cell);
   runtime -> `mir.Gep` (or the value itself when `mirror_is_a_field`).
 - `exec_field_name_addr`: resolves a field by name (**automatic dereference**); `ComplexType`'s `real`/`imag` are also treated as fields.
 - `_comptime_field_place`/`_const_box_place`: the read/write place of an `is_comptime` field (a compile-time struct is a box cell; a runtime struct is a read-only constant).
@@ -333,7 +340,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
   builds an `InlineFrame` whose `ComptimeResultPtr` **shares the function's own** error position — an error in the body leaves along the function's own path.
 - `_make_runtime_call`: pairs the `ArgNode` tree with the arguments; compile-time leaves are not passed; `is_ref` arguments are passed by pointer; landing pads are decided by `may_panic`;
   on error a code position is allocated (`_check_call_error` -> `mir.Switch`).
-- `_deliver_result`: pairs the `RetSpec` with the caller's place tree (`_pair_places`); a single place receiving multiple values is **packed** (`_fresh_places`/`_PendingTuple`);
+- `_deliver_result`: pairs the `RetSpec` with the caller's place tree (`_pair_places`); a single place receiving multiple values is **packed** - one fresh place per result element, a nested group being a slot that records its own element places (`_fresh_places`/`_PendingTuple`), so the packed tuple keeps the nesting (`_deliver_packed_tuple`);
   leaf-by-leaf delivery (`RetComptime` takes the value recorded by the callee, `via_result_ptr` appends an out-pointer, ZST stores the unit value, otherwise it stores by value).
 - `Analyser`: holds an explicit runner stack (`_analyse_stack`, non-recursive). `_request_function` has four cases:
   already in `specs` with a `native_fn` (an earlier module) -> `ExternAnonSymbol`; in `specs` with `mir.is_complete` (this round) -> an in-module `mir.Function`;
@@ -353,7 +360,8 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 ### 6.6 Aggregates
 
 - `finish_struct`: resolves the struct type (template specialization or `_infer_struct_generic_args` inferred from the target/fields), binds positional/keyword arguments in declaration order,
-  taking defaults where omitted; an uncommitted target records a `_PendingAggregate` (a second construction into the same slot only fills defaults; a different type is an error).
+  taking defaults where omitted; an uncommitted target records a `_PendingAggregate` (a second construction into the same slot only fills defaults; a different type is an error - except for a
+  tagged union in runtime storage, where every construction records an action of its own, see `_is_union_delivery`); a materialized target peels a zero-sized aggregate's option layers.
 - `finish_array`: the length is the element count, and the element type comes from storage or the common type.
 - `init_tuple`/`tuple_ptr_element`: an uncommitted target records a `_PendingTuple` (the elements are new slots); a committed target addresses the elements directly; nesting becomes a `_PlaceTreeVal`.
 - Option/tagged union/complex each have their own `_option_*`/`_tagged_union_*`/`_complex_*` helpers.

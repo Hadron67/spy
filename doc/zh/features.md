@@ -942,6 +942,7 @@ assert sum_nested((1, (2, 3))) == 6        # a Python tuple is flattened too
 - 返回注解 `tuple[T1, T2, ...]` = 返回多个值。
 - 调用侧：`a, b = f()` 解构；`return f()` 转发。
 - **打包**：全运行时结果可打包进**普通元组变量** `packed = f()`（之后可 `x, y = packed` 再解构、`len`、`packed[i]`）；
+  打包保留结果的分组——每个「结果元素」一个元素，嵌套结果是它自己的元组（故 `packed[i][j]` 可用，`len` 为顶层 arity）；
   含编译期叶（类型值/const 指针/字节串/函数值）时打包出的元组无运行时表示，目标必须是 `Comptime` 变量。
 - **编译时返回值**：完全编译时已知的返回值不占运行时结果。
   非 inline 调用取 callee **最后一条被分析的 `return`** 的值（不检查各 return 路径是否一致）。
@@ -965,9 +966,19 @@ def packed(a: i32, b: i32) -> i32:
     lo, hi = p
     return lo + hi
 
+@func()
+def nested() -> tuple[i32, tuple[i32, i32]]:
+    return 1, (2, 3)
+
+@func()
+def use_packed_nested() -> i32:
+    p = nested()               # 打包出的元组保留嵌套
+    return p[1][0] + p[1][1]   # 5
+
 assert min_max(3, 1) == (1, 3)   # the Python side gets a tuple
 assert use_min_max(3, 1) == 13
 assert packed(3, 1) == 4
+assert use_packed_nested() == 5
 ```
 
 ### 6.6 泛型

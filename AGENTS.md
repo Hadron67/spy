@@ -7,7 +7,8 @@
 * A method **must** use `self`, otherwise, define it as a function.
 * When using `@dataclass` annotation, always pass `slots=True`
 * When using object identity dicts, use `map: dict[util.IdentityKey[K], V]` and `map[util.IdentityKey(key)] = val` instead of `map: dict[int, V]` and `map[id(key)] = val`. If `util.IdentityKey` is not defined, define it first.
-* Do not read archived docs in `doc-ai/archive/` unless explicitly requested.
+* Do not read or touch archived docs in `doc-ai/archive/` unless explicitly requested.
+* Feature docs are located in `doc/zh/`
 * Local variables should be assigned first, i.e., write
 * When a feature changes, update `doc/` accordingly.
 ```python

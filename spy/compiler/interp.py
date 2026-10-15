@@ -4352,9 +4352,12 @@ class HirRunner:
             # the aggregate's storage has no address yet: the field gets a
             # pending place of its own - the one a previous construction of the
             # same storage recorded, when there is one (the branches of an
-            # ``if`` expression build into one storage), see ``finish_struct``
+            # ``if`` expression build into one storage), see ``finish_struct``.
+            # A storage that is a tagged union takes a fresh place instead: every
+            # construction is a delivery of a variant of its own, with fields the
+            # previous construction recorded no place for
             recorded = self._pending_aggregate(ptr)
-            if recorded is not None:
+            if recorded is not None and not self._is_union_delivery(ptr):
                 index_int = _comptime_index(index)
                 if index_int is not None and 0 <= index_int < len(recorded.places):
                     return recorded.places[index_int]
@@ -4368,13 +4371,11 @@ class HirRunner:
             # the construction may build the child of nested options: the field
             # or element address is taken in the payload of each of them, which
             # marks the option present when its tag is a ``bool``
-            while self._is_option_construction(container_type):
-                assert isinstance(container_type, sval.OptionType)
-                ptr = self._option_payload_ptr(ptr)
-                type = _type_of(ptr)
-                assert isinstance(type, sval.PointerType)
-                container_type = type.elem
-                is_const = type.is_const
+            ptr = self._peel_option_layers(ptr)
+            type = _type_of(ptr)
+            assert isinstance(type, sval.PointerType)
+            container_type = type.elem
+            is_const = type.is_const
 
         if is_aggregate_init and isinstance(container_type, sval.TaggedUnionType):
             # a construction into a tagged union: which variant the storage holds
@@ -7400,7 +7401,12 @@ class HirRunner:
             case _PendingAggregate():
                 # an aggregate construction: every field/element is written
                 # through its address in the aggregate's own storage (a box cell
-                # for a compile-time one, ``mir.Gep`` for memory)
+                # for a compile-time one, ``mir.Gep`` for memory).  The storage
+                # may be the payload of a (nested) ``Option`` - a construction
+                # delivering a ``T`` into an ``Option[U]`` whose ``U`` is the
+                # aggregate's own type or one of the variants of its tagged
+                # union - so the option layers are stepped through first
+                ptr = self._peel_option_layers(ptr)
                 ptr_type = _type_of(ptr)
                 if isinstance(ptr_type, sval.PointerType) and isinstance(ptr_type.elem, sval.TaggedUnionType):
                     # the storage is a tagged union: the struct is one of its
@@ -7425,15 +7431,9 @@ class HirRunner:
         storage is memory, and materialized and stored when it is a box.  A
         construction that was written into an ``Option[T]``'s payload (see
         ``field_index_addr`` with ``is_aggregate_init``) writes its fields there
-        again, so the option layer is stepped through first."""
-        ptr = _shallow_normalize(ptr)
-        ptr_type = _type_of(ptr)
-        while (
-            isinstance(ptr_type, sval.PointerType)
-            and self._is_option_construction(ptr_type.elem)
-        ):
-            ptr = self._option_payload_ptr(ptr)
-            ptr_type = _type_of(ptr)
+        again, so the option layer is stepped through first (see
+        ``_peel_option_layers``)."""
+        ptr = self._peel_option_layers(ptr)
         addr = self.field_index_addr(ptr, _index_value(index))
         if isinstance(addr, RuntimeVal) and isinstance(place, PendingSlot) and place.committed is None:
             self._bind_slot(place, addr.value, type)
@@ -7524,13 +7524,52 @@ class HirRunner:
         )
 
     def _is_option_construction(self, container_type: sval.Type) -> bool:
-        """Whether ``container_type`` is an option whose child a construction
-        builds in place (the child has storage to address: it is not
-        zero-sized)."""
-        return (
-            isinstance(container_type, sval.OptionType)
-            and not container_type.child.is_zst()
-        )
+        """Whether ``container_type`` is an option a construction is delivered
+        into: the option layer is stepped through into its payload place, which
+        marks the option present (see ``_peel_option_layers``).  A zero-sized
+        child has no payload to step into, so only its tag is written."""
+        return isinstance(container_type, sval.OptionType)
+
+    def _is_union_delivery(self, ptr: InterpVal, variant: sval.Type | None = None) -> bool:
+        """Whether a construction into ``ptr`` is a union *delivery* of its own -
+        one that writes the union's tag and the constructed variant's fields at
+        its own position.  It is: the storage is a tagged union (of the
+        ``variant``, when one is named - the declared type is all a still
+        uncommitted slot knows about its storage), with any ``Option`` layer
+        wrapping it stepped through (a construction delivers into such a payload,
+        see ``_peel_option_layers``), held in *runtime* storage.  A compile-time
+        ``Box`` holds a single value, so a second variant built into one is not a
+        delivery of its own but the ``incompatible types`` error (see
+        ``finish_struct``)."""
+        type = _type_of(ptr)
+        if not isinstance(type, sval.PointerType):
+            return False
+        elem: sval.Type = type.elem
+        while isinstance(elem, sval.OptionType):
+            elem = elem.child
+        if not isinstance(elem, sval.TaggedUnionType):
+            return False
+        if variant is not None and elem.variant_index(variant) is None:
+            return False
+        return not (isinstance(ptr, PendingSlot) and ptr.use_comptime_storage())
+
+    def _peel_option_layers(self, ptr: InterpVal) -> InterpVal:
+        """The place a construction writes through when ``ptr`` is the storage of
+        a (possibly nested) ``Option[T]``: every option layer is stepped through
+        into the payload place below it, which marks the option present (see
+        ``_is_option_construction``/``_option_payload_ptr``).  A layer of a
+        zero-sized child has no payload place to step into - only its tag is
+        written - and the place is returned unchanged when the storage is no
+        option at all."""
+        ptr = _shallow_normalize(ptr)
+        ptr_type = _type_of(ptr)
+        while (
+            isinstance(ptr_type, sval.PointerType)
+            and self._is_option_construction(ptr_type.elem)
+        ):
+            ptr = self._option_payload_ptr(ptr)
+            ptr_type = _type_of(ptr)
+        return ptr
 
     def _option_payload_ptr(self, ptr: InterpVal, write_tag: bool = True) -> InterpVal:
         """The place the value of a present ``Option[T]`` lives in - what a
@@ -7543,13 +7582,15 @@ class HirRunner:
         ``write_tag`` says whether taking the address also marks the option
         present: a construction delivering a ``T`` does, while the ``:=``
         unwrap does not - the option may still be absent when the address is
-        taken, and its tag must not be overwritten before it is tested."""
+        taken, and its tag must not be overwritten before it is tested.  A
+        zero-sized child has no value to write at all: its delivery is the
+        tag alone (there is no payload to address)."""
         type = _type_of(ptr)
         assert isinstance(type, sval.PointerType)
         option = type.elem
         assert isinstance(option, sval.OptionType)
         child = option.child
-        if child.is_zst():
+        if child.is_zst() and not write_tag:
             # a zero-sized child has no storage to address: its value is the
             # type's unit value, which the place of an undefined pointer names
             # (a store into it is a no-op, see ``store``)
@@ -7562,10 +7603,21 @@ class HirRunner:
             cptr = ptr.obj
             if isinstance(cptr.box, sval.Box) and write_tag:
                 cptr.box.cells[cptr.offset] = True
+            if child.is_zst():
+                # ... and a zero-sized child has no payload cell to name (the tag
+                # is the option's only cell)
+                return ComptimeVal(sval.UndefinedScalar(sval.PointerType(child, type.is_const)))
             return ComptimeVal(sval.ComptimePtr(
                 cptr.box, cptr.offset + 1, sval.PointerType(child, cptr.type.is_const),
             ))
         src = self._to_runtime(ptr)
+        if child.is_zst():
+            # the option *is* whether a value is there (its mirror is a ``bool``):
+            # a zero-sized child has no payload to write, so the tag alone is what
+            # the delivery sets
+            if write_tag:
+                self._emit(mir.Store(src, mir.BoolValue(True)))
+            return ComptimeVal(sval.UndefinedScalar(sval.PointerType(child, type.is_const)))
         if sval.find_first_pointer_type_pos(child) is not None:
             return RuntimeVal(src, sval.PointerType(child, type.is_const))
         tag = self._emit(mir.Gep(src, 0))
@@ -8284,8 +8336,12 @@ class HirRunner:
         if isinstance(dest, PendingSlot) and dest.committed is None:
             # the fields are their own places (``field_index_addr`` with
             # ``is_aggregate_init`` gave each a fresh slot), which the construction
-            # records on the slot for its commit to materialize into the aggregate
-            if self._pending_aggregate(dest) is None:
+            # records on the slot for its commit to materialize into the aggregate.
+            # A storage that is a tagged union records one action per
+            # construction: each construction delivers a variant of its own, at
+            # its own position (see ``field_index_addr`` and
+            # ``_exec_pending_action``)
+            if self._pending_aggregate(dest) is None or self._is_union_delivery(dest, struct_type):
                 places = tuple(
                     provided[index] if index in provided
                     else self._default_field_place(dest, index, fields.get_by_id(index))
@@ -8311,8 +8367,13 @@ class HirRunner:
             return
 
         # an already materialized storage: its fields already are places, which
-        # the provided arguments wrote through (see ``field_index_addr``)
+        # the provided arguments wrote through (see ``field_index_addr``).  A
+        # zero-sized construction may have no field place at all (an empty
+        # struct); every other construction marks an enclosing ``Option`` present
+        # through a field address it took, so the empty one is marked here
         dest_ptr = _shallow_normalize(dest)
+        if struct_type.is_zst():
+            self._peel_option_layers(dest_ptr)
         for index, field0 in enumerate(fields.values()):
             if index not in provided:
                 self._default_field_place(dest_ptr, index, field0)
@@ -8390,11 +8451,18 @@ class HirRunner:
         slot for its commit to materialize into the array."""
         array_type = _array_construction_type(array, elements)
         if isinstance(array, PendingSlot) and array.committed is None:
-            if self._pending_aggregate(array) is None:
+            # the elements are their own places, recorded on the slot for its
+            # commit to materialize into the array; a storage that is a tagged
+            # union records one action per construction, exactly like a struct's
+            # (see ``finish_struct``)
+            if self._pending_aggregate(array) is None or self._is_union_delivery(array, array_type):
                 self._record_pending_action(array, _PendingAggregate(array_type, elements))
             return
         # an already materialized storage: the elements already wrote through
-        # their places (see ``field_index_addr``)
+        # their places (see ``field_index_addr``).  A zero-sized array has no
+        # element place at all, so an enclosing ``Option`` is marked here
+        if array_type.is_zst():
+            self._peel_option_layers(_shallow_normalize(array))
 
     def _build_tuple_value(self, elems: tuple[ArgEntry[InterpVal], ...]) -> InterpVal:
         """The *value* of a ``tuple`` expression (see ``hir.Tuple``): a tuple is a

@@ -2,7 +2,7 @@
 
 这里记录在实现各项特性时发现、但**本任务不处理**的顺带问题（多为既有实现里已存在的问题）。每节给出原状、最小复现/后果与（若有）规避办法。
 
-> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除），已从本文件移除。
+> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、往 `Option[零尺寸类型]` 的构造不置 present、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除），已从本文件移除。
 
 ---
 
@@ -118,4 +118,32 @@ def f() -> bytes:
 - 待做：让 `_commit_ret_places` 的 `RetComptime` 分支直接把它提交成编译期 box（该 place 按构造就是编译期存储）——例如带上声明类型，或走专门的分支。
 - 波及：`-> bytes` 目前无用例（`grep` 不到），修好前不要依赖它。要返回类型值可以绕开：`t: Comptime = i32; return t`（不写返回注解）能编译并交给 Python。
 
+---
+
+## 8. 嵌套字段位置的 union 两变体构造仍不被支持
+
+**已修**：`u: U = A(1) if c else B(2)`（以及 `Option[U]` 存储）现在可以了——`interp` 的 `_is_union_delivery` 让**运行时存储**里的
+tagged union 每次构造记自己的 `_PendingAggregate`（`field_index_addr` 不复用已记录的 place），各按自己的变体在各自位置交付。
+
+**仍未修**：把一个 union 字段**在构造实参里**用 `if` 表达式填两个不同变体时，字段 place 由 `field_index_addr` 的 `self.alloca()`
+建出、**不带声明类型**（尽管 `_type_of(h_slot) = ptr(Holder)` 已经知道字段类型是 `U`），于是构造收尾（`finish_struct`）看不到“存储是 union”：
+
+```python
+@struct()
+class Holder:
+    u: TV_A | TV_B
+
+@func()
+def f(c: bool) -> i32:
+    h = Holder(TV_A(1) if c else TV_B(2))   # CompileError: a slot is stored with
+    ...                                     # incompatible types TV_A and TV_B
+```
+
+- 待做：构造的字段 place 应带上基类型声明的字段类型（`field_index_addr` 未提交分支的 `self.alloca()` → `alloca(declared=...)`）。
+  这会让**所有**聚合构造的字段 place 提前定型（`committed_type`、编译期存储推断、ZST/DST 处理都受影响），需要单独一轮验证。
+- 规避：先构造进一个显式声明类型的变量再传入（`u: TV_A | TV_B = TV_A(1) if c else TV_B(2)`；`h = Holder(u)`）。
+- 相关（有意为之）：**编译期存储**的 union 装不下两个变体——一个 `Box` 只有一个值，所以
+  `u: Comptime[TV_A | TV_B] = TV_A(1) if c else TV_B(2)`（运行时条件）仍报 `incompatible types`，与 struct 的
+  `s: Comptime[S] = S(1) if c else S(2)` 报 `cannot store a runtime value into a compile-time variable` 一致；
+  编译期条件会折叠成单次构造，正常。
 

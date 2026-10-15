@@ -6,10 +6,12 @@ from ..compiler import (
     i32,
     i64,
 )
+from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
 from ..compiler.syntax import (
     Comptime,
+    Option,
     Ptr,
     ref,
 )
@@ -381,6 +383,86 @@ def tu_capture_pattern() -> i32:
             return 0
 
 
+# ---------------------------------------------------------------------------
+# a construction delivered into the payload of an ``Option`` that holds a
+# tagged union (or a variant's own type): the option layers are stepped through
+# before the union is tagged (see ``HirRunner._peel_option_layers``)
+# ---------------------------------------------------------------------------
+
+
+@struct()
+class TU_OptHolder:
+    u: Option[TU_A | TU_B]
+
+
+@func()
+def tu_opt_union_declared(c: spy_bool) -> i32:
+    # a declared ``Option`` storage: the construction is deferred, and delivered
+    # into the option's payload once the slot is committed
+    u: Option[TU_A | TU_B] = TU_A(2) if c else None
+    if (v := u) is not None and isinstance(a := v, TU_A):
+        return a.x
+    return -1
+
+
+@func()
+def tu_opt_union_comptime() -> i32:
+    # a compile-time ``Option`` storage (a box): the same delivery into cells
+    u: Comptime[Option[TU_A | TU_B]] = TU_A(3)
+    if (v := u) is not None and isinstance(a := v, TU_A):
+        return a.x
+    return -1
+
+
+@func()
+def tu_opt_union_field() -> i32:
+    # an ``Option`` union field of a struct being constructed
+    h = TU_OptHolder(TU_A(6))
+    if (v := h.u) is not None and isinstance(a := v, TU_A):
+        return a.x
+    return -1
+
+
+# ---------------------------------------------------------------------------
+# a union slot both branches of an ``if`` expression construct: every
+# construction delivers the variant it is, at its own position (see
+# ``HirRunner._is_union_delivery``)
+# ---------------------------------------------------------------------------
+
+
+@func()
+def tu_pair(c: spy_bool) -> i32:
+    u: TU_A | TU_B = TU_A(4) if c else TU_B(5)
+    if isinstance(a := u, TU_A):
+        return a.x
+    if isinstance(b := u, TU_B):
+        return b.y
+    return -1
+
+
+@func()
+def tu_pair_option(c: spy_bool) -> i32:
+    # the same, delivered into the payload of an ``Option`` storage
+    u: Option[TU_A | TU_B] = TU_A(6) if c else TU_B(7)
+    if (v := u) is not None:
+        if isinstance(a := v, TU_A):
+            return a.x
+        if isinstance(b := v, TU_B):
+            return b.y
+    return -1
+
+
+@func()
+def tu_pair_comptime(c: spy_bool) -> i32:
+    # a compile-time ``Box`` holds one value only, so two variants under a
+    # *runtime* condition are still rejected: only a compile-time condition
+    # folds the expression to a single construction (see ``tu_comptime``)
+    u: Comptime[TU_A | TU_B] = TU_A(8) if c else TU_B(9)
+    if isinstance(a := u, TU_A):
+        return a.x
+    return -1
+
+
 class SpyTaggedUnionTest(TestCase):
     def test_tag_test_without_unwrap(self) -> None:
         self.assertEqual(tu_tag_of_make(0), 1)
@@ -465,6 +547,27 @@ class SpyTaggedUnionTest(TestCase):
     def test_writing_a_tagged_union_field(self) -> None:
         self.assertEqual(tu_field_write(0), 8)
         self.assertEqual(tu_field_write(1), -1)
+
+    def test_an_option_of_a_tagged_union(self) -> None:
+        # the construction of a variant into an ``Option`` storage is delivered
+        # into the option's payload: the option layer is stepped through before
+        # the union is tagged
+        self.assertEqual(tu_opt_union_declared(True), 2)
+        self.assertEqual(tu_opt_union_declared(False), -1)
+        self.assertEqual(tu_opt_union_comptime(), 3)
+        self.assertEqual(tu_opt_union_field(), 6)
+
+    def test_both_branches_construct_a_variant(self) -> None:
+        self.assertEqual(tu_pair(True), 4)
+        self.assertEqual(tu_pair(False), 5)
+        self.assertEqual(tu_pair_option(True), 6)
+        self.assertEqual(tu_pair_option(False), 7)
+
+    def test_a_compile_time_union_holds_one_variant(self) -> None:
+        # a box holds a single value: two variants under a runtime condition are
+        # still the ``incompatible types`` error rather than a delivery of its own
+        with self.assertRaises(CompileError):
+            tu_pair_comptime(True)
 
     def test_a_type_that_is_not_a_variant_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:

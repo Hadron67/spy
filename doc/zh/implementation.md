@@ -306,7 +306,11 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 - `_PendingAction` 变体：`_PendingStore`、`_PendingPtrConvertion`、`_PendingTuple`、`_PendingAggregate`、`_PendingErrorCodeWrite`。
 - 记账：`_record_pending_store`（拒绝运行时值进 `is_comptime=True` 槽；`is_inline = 未跨运行期块 且 是编译期值`）、`_record_pending_action`。
 - commit：`_commit_pending_slot` → 编译期（或 ZST 仍需 place）走 `_commit_box_slot`，DST 报错，否则发 `mir.Alloca` 走 `_bind_slot`；
-  `_exec_pending_action` 按变体交付（`_store_into_element` 应对 option 层/就地写）。
+  `_exec_pending_action` 按变体交付（`_store_into_element` 应对 option 层/就地写）；`_PendingAggregate` 投递前先 `_peel_option_layers`
+  剥掉 option 层（`Option[U]` 里的构造，`field_index_addr` 的 `is_aggregate_init` 路径共用），落点是 tagged union 时再设 tag + 写变体；
+  零尺寸 child 的 option（表示就是一个 tag）也照样置 present——`_option_payload_ptr` 写 tag，`finish_struct`/`finish_array` 的已物化路径对零尺寸聚合补一次剥层。
+- **`_is_union_delivery`**：运行时存储里的 tagged union，每次构造记自己的 `_PendingAggregate`（`field_index_addr` 不复用已记录的 place），
+  故 `if` 表达式两分支构造不同变体也各按自己的变体在各自位置交付；编译期 `Box` 只装得下一个变体，那种情形仍是 `incompatible types` 错误。
 - `Box` 存储：`_flatten_value`（含 padding；`undefined` → 每叶 `UndefinedScalar`）、`_unflatten_cells`、
   `_fill_comptime_defaults`（把 `is_comptime` 字段填默认，迭代）、`_load_box_cells`（`bytes` box 特判）。
 - **`mir.Insertion`** 是「在我已经走过的地方发射指令」的机制：`PendingSlot.insertion` 预留 alloca 的位置，
@@ -314,8 +318,9 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 
 ### 6.3 place 与字段寻址
 
-- `field_index_addr(ptr, index, is_aggregate_init, at=None)`：无自动解引用；`is_aggregate_init` + 未 commit → 复用记录的 `_PendingAggregate` place 或新 alloca；
-  穿过外层 option 构造（设 tag）；ZST 字段 → 无存储地址；编译期 box → `sval.ComptimePtr(box, offset+field_scalar_offset)`（`is_ref` 字段返回 cell）；
+- `field_index_addr(ptr, index, is_aggregate_init, at=None)`：无自动解引用；`is_aggregate_init` + 未 commit → 复用记录的 `_PendingAggregate` place 或新 alloca
+  （运行时存储的 tagged union 不复用，见 `_is_union_delivery`）；
+  穿过外层 option 构造（设 tag；零尺寸 child 只写 tag）；ZST 字段 → 无存储地址；编译期 box → `sval.ComptimePtr(box, offset+field_scalar_offset)`（`is_ref` 字段返回 cell）；
   运行时 → `mir.Gep`（或 `mirror_is_a_field` 时该值本身）。
 - `exec_field_name_addr`：按名解析字段（**自动解引用**）；`ComplexType` 的 `real`/`imag` 也当字段。
 - `_comptime_field_place`/`_const_box_place`：`is_comptime` 字段的读写 place（编译期 struct 是 box cell；运行时 struct 是只读常量）。
@@ -333,7 +338,8 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
   建 `InlineFrame`，其 `ComptimeResultPtr` **共享函数本身**的 error 位置——体内错误沿函数自身的路径离开。
 - `_make_runtime_call`：按 `ArgNode` 树与实参配对；编译期叶不传；`is_ref` 实参按指针传；按 `may_panic` 决定 landing pad；
   有错时分配 code 位置（`_check_call_error` → `mir.Switch`）。
-- `_deliver_result`：把 `RetSpec` 与调用方的 place 树配对（`_pair_places`）；单 place 接多值则**打包**（`_fresh_places`/`_PendingTuple`）；
+- `_deliver_result`：把 `RetSpec` 与调用方的 place 树配对（`_pair_places`）；单 place 接多值则**打包**——每个结果元素一个 fresh place，
+  嵌套分组是一个记录了自身元素 place 的 slot（`_fresh_places`/`_PendingTuple`），故打包出的元组保留嵌套（`_deliver_packed_tuple`）；
   逐叶交付（`RetComptime` 取 callee 记录的值、`via_result_ptr` 追加出指针、ZST 存单位值、否则按值存）。
 - `Analyser`：持有显式 runner 栈（`_analyse_stack`，非递归）。`_request_function` 分四种情形：
   已在 `specs` 且有 `native_fn`（早先模块）→ `ExternAnonSymbol`；在 `specs` 且 `mir.is_complete`（本轮）→ 模块内 `mir.Function`；
@@ -353,7 +359,8 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 ### 6.6 聚合
 
 - `finish_struct`：解析 struct 类型（模板特化或从目标/字段推断 `_infer_struct_generic_args`）、按声明序绑定位置/关键字实参、
-  缺省取默认值；未 commit 的目标记录 `_PendingAggregate`（同一 slot 第二次构造只补默认；不同类型报错）。
+  缺省取默认值；未 commit 的目标记录 `_PendingAggregate`（同一 slot 第二次构造只补默认；不同类型报错——运行时存储的 tagged union 例外，
+  每次构造记自己的 action，见 `_is_union_delivery`）；已物化的目标对零尺寸聚合补一次 `_peel_option_layers`。
 - `finish_array`：长度取元素个数，元素类型取存储或共同类型。
 - `init_tuple`/`tuple_ptr_element`：未 commit 目标记录 `_PendingTuple`（元素是新 slot）；已 commit 目标直接寻址元素；嵌套作为 `_PlaceTreeVal`。
 - Option/tagged union/complex 各有 `_option_*`/`_tagged_union_*`/`_complex_*` 辅助。
