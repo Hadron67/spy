@@ -128,7 +128,7 @@ assert in_range(5) is True and in_range(20) is False
 `syntax.Ptr[T]` (mutable single pointer), `ConstPtr[T]` (read-only single pointer), `MultiPtr[T]` / `ConstMultiPtr[T]`
 (multi pointer, subscriptable like an array).
 
-- A single pointer is written `p[...]` (dereference, C's `*p`), a multi pointer is written `p[i]` (the pointer to the i-th element).
+- A single pointer is written `p[...]` (dereference, C's `*p`), a multi pointer is written `p[i]` (the address of the i-th element - a single pointer itself, so the element's value is `p[i][...]`).
 - Pointers are **non-null**; `Option[Ptr[T]]` is what gives a nullable pointer.
 - A mutable pointer implicitly converts to const (`Ptr[T]` → `ConstPtr[T]`); the reverse does not hold.
 - A pointer to an array (`*[N]T`) can be treated as a multi pointer to its elements.

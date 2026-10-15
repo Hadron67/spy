@@ -186,6 +186,7 @@ flowchart TD
 - `PointerType(elem, is_const, variant)`：元素相同才可转换；`_points_at_elements_of`（`*[N]T` → `T` 的多指针）；
   只能**加** const；peer 的 const 性用 `_peer_const`。`to_mir_type`：ZST/Opaque pointee → `void*`；无长度数组 pointee → 元素指针。
 - `ComptimePtr(box: Box | bytes, offset: int, type: PointerType)`：结构化 eq/hash → **自身即特化键**（同一 box + offset + 视图类型）。
+- `pointer_object_type(ptr)`：指针**所指的对象**——pointee 本身；若它指向的是 `box` 那个数组的元素（`offset` 处、元素类型相同），则是该数组**从该元素起的尾部**（元素下标 = `offset // scalar_count(elem)`，长度 = `length - 下标`）。物化时按它生成存储，才留得住「后面还有多少个元素」（见 §6.5）。
   `is_writable()` 要求视图非 const、box 非 `bytes`、`Box.is_const` 为假。
 - `CastedPtr(ptr, type)`：`ptr_cast` 重解释后的编译期指针；不能读写透。
 
@@ -335,6 +336,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 - `_comptime_field_place`/`_const_box_place`：`is_comptime` 字段的读写指针（编译期 struct 是 box cell；运行时 struct 是只读常量）。
 - `operand`：解析 `Const`（类型参数值 / 全局 / `as_value`）、`Arg(index)`、`Inst`（寄存器表）。
 - `subscript`（大分派）：数组/元组/字典/`$args`/`$kwargs`/字节串/指针/切片/结构体 `__spy_getitemptr__`/结构体模板特化。
+- `_subscript_pointer`：切片 → `SlicePtr`；多指针 → 元素的 place——**单**指针（地址 `p + i`），编译期则取 `box` 中该元素的 cell。
 - `exec_ptr_cast`：运行时指针 → `mir.BitCast`；编译期 `ComptimePtr` 是其子类型 → 重定型；否则 `sval.CastedPtr`；字节串指针 → 指向字节 store。
 
 ### 6.4 调用
@@ -364,6 +366,8 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 - 自动 lower：`_to_runtime` → `_comptime_value_to_runtime`/`_comptime_pointer_value`/`_function_value_to_mir`；
   `_const_to_mir` 家族（`_const_pointer_to_mir`/`_const_struct_to_mir`/`_const_tuple_to_mir`/`_const_option_to_mir`/`_const_array_to_mir`/`_const_tagged_union_to_mir` 等）
   产生可用于全局初始化器的静态常量。
+- 编译期指针物化时按**指针所指的对象**（`sval.pointer_object_type`，见 §4.5）生成存储：非 const 视图 `alloca` 整块后拷入、再按视图重定型（`mir.BitCast`），
+  const 视图的全局常量同理；视图比该对象窄时结果就是该对象的地址（`p` 指向的数组元素、`p[1]` 起仍在其内）。
 
 ### 6.6 聚合
 

@@ -186,6 +186,7 @@ Key types: `IntType` (subtyped by range), `FloatType` (narrow -> wide subtyping)
 - `PointerType(elem, is_const, variant)`: convertible only when the elements are identical; `_points_at_elements_of` (`*[N]T` -> `T` multi-pointer);
   const can only be **added**; a peer's constness uses `_peer_const`. `to_mir_type`: ZST/Opaque pointee -> `void*`; unsized array pointee -> element pointer.
 - `ComptimePtr(box: Box | bytes, offset: int, type: PointerType)`: structural eq/hash -> **is itself a specialization key** (same box + offset + view type).
+- `pointer_object_type(ptr)`: the object the pointer names - its pointee; when it names an element of the array the `box` holds (at `offset`, same element type), the array's **tail** from that element on (the element's index is `offset // scalar_count(elem)`, the length `length - index`). Materializing that object is what keeps the elements after the first one (see §6.5).
   `is_writable()` requires the view to be non-const, the box to not be `bytes`, and `Box.is_const` to be false.
 - `CastedPtr(ptr, type)`: the compile-time pointer after a `ptr_cast` reinterpretation; reads/writes cannot see through it.
 
@@ -338,6 +339,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - `_comptime_field_place`/`_const_box_place`: the read/write pointer of an `is_comptime` field (a compile-time struct is a box cell; a runtime struct is a read-only constant).
 - `operand`: resolves `Const` (type parameter value / global / `as_value`), `Arg(index)`, `Inst` (the register table).
 - `subscript` (big dispatch): array/tuple/dict/`$args`/`$kwargs`/byte string/pointer/slice/struct `__spy_getitemptr__`/struct template specialization.
+- `_subscript_pointer`: a slice -> `SlicePtr`; a multi pointer -> the element's place, a **single** pointer (the address `p + i`); a compile-time one picks the element's cell in the `box`.
 - `exec_ptr_cast`: runtime pointer -> `mir.BitCast`; a compile-time `ComptimePtr` that is a subtype of it -> retype; otherwise `sval.CastedPtr`; byte string pointer -> points at the byte store.
 
 ### 6.4 Calls
@@ -366,6 +368,8 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - Automatic lower: `_to_runtime` -> `_comptime_value_to_runtime`/`_comptime_pointer_value`/`_function_value_to_mir`;
   the `_const_to_mir` family (`_const_pointer_to_mir`/`_const_struct_to_mir`/`_const_tuple_to_mir`/`_const_option_to_mir`/`_const_array_to_mir`/`_const_tagged_union_to_mir`, etc.)
   produces static constants usable in global initializers.
+- Materializing a compile-time pointer builds the storage of the **object the pointer names** (`sval.pointer_object_type`, see §4.5): a non-const view allocates the whole object, copies it in and retypes it to the view (`mir.BitCast`); a const view's global holds the same,
+  and a view narrower than the object is that object's address (`p[1]` still reads inside the array `p` points into).
 
 ### 6.6 Aggregates
 

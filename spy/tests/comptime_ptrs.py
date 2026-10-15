@@ -1,7 +1,7 @@
 from typing import Protocol
 from unittest import TestCase
 
-from ..compiler import i32, syntax
+from ..compiler import i32, sval, syntax
 from ..compiler.dsl import func, func_type, struct
 from ..compiler.syntax import Comptime, ConstComptime, Option, Ptr, as_func_ptr, ref
 from ..std.core import coerce
@@ -370,6 +370,58 @@ class SpyComptimePtrTest(TestCase):
         self.assertEqual(comptime_capture_as_func_ptr(), 6)
 
 
+_I32 = sval.IntType(32, True)
+_I8 = sval.IntType(8, True)
+
+
+class SpyPointerObjectTypeTest(TestCase):
+    """``sval.pointer_object_type``: the object a compile-time pointer names when
+    it is materialized into runtime storage - its pointee, or the array's tail
+    from the element it names on."""
+
+    def test_a_scalar_pointee(self) -> None:
+        box = sval.Box('x', _I32)
+        ptr = sval.ComptimePtr(box, 0, sval.PointerType(_I32))
+        self.assertEqual(sval.pointer_object_type(ptr), _I32)
+
+    def test_a_pointer_into_an_unknown_box(self) -> None:
+        # the box holds no type yet: there is nothing wider to name
+        box = sval.Box('x')
+        ptr = sval.ComptimePtr(box, 0, sval.PointerType(_I32))
+        self.assertEqual(sval.pointer_object_type(ptr), _I32)
+
+    def test_the_first_element_of_an_array_is_the_whole_array(self) -> None:
+        array = sval.ArrayType(_I32, 3)
+        box = sval.Box('a', array)
+        ptr = sval.ComptimePtr(
+            box, 0, sval.PointerType(_I32, variant=sval.PointerVariant.MULTI),
+        )
+        self.assertEqual(sval.pointer_object_type(ptr), array)
+
+    def test_a_later_element_is_the_array_tail(self) -> None:
+        array = sval.ArrayType(_I32, 3)
+        box = sval.Box('a', array)
+        ptr = sval.ComptimePtr(box, 2, sval.PointerType(_I32))
+        self.assertEqual(sval.pointer_object_type(ptr), sval.ArrayType(_I32, 1))
+
+    def test_the_tail_counts_cells_not_elements(self) -> None:
+        # a two-cell element at index 1 sits at cell offset 2, and the tail holds
+        # the remaining two elements (``length - offset`` would say one)
+        pair = sval.TupleType((_I32, _I32), False)
+        array = sval.ArrayType(pair, 3)
+        box = sval.Box('p', array)
+        ptr = sval.ComptimePtr(box, 2, sval.PointerType(pair))
+        self.assertEqual(sval.pointer_object_type(ptr), sval.ArrayType(pair, 2))
+
+    def test_a_pointer_of_another_pointee_is_not_an_element(self) -> None:
+        # a pointee that is not the array's element type (a field of the box's
+        # object, say) names only itself
+        box = sval.Box('a', sval.ArrayType(_I32, 3))
+        ptr = sval.ComptimePtr(box, 0, sval.PointerType(_I8))
+        self.assertEqual(sval.pointer_object_type(ptr), _I8)
+
+
 all_tests = [
     SpyComptimePtrTest,
+    SpyPointerObjectTypeTest,
 ]

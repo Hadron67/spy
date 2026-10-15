@@ -114,6 +114,7 @@ from .fn import (
 )
 from .sval import (
     CompileContext,
+    PointerVariant,
     RetComptime,
     RetSpec,
     RetTuple,
@@ -4008,21 +4009,16 @@ class HirRunner:
 
     def _auto_deref(self, ev: InterpVal) -> InterpVal:
         t = _type_of(ev)
-        if isinstance(t, sval.PointerType) and isinstance(t.elem, sval.PointerType):
-            return self.load(ev)
-        place = _shallow_normalize(ev)
-        # a compile-time place declared to hold no fixed type (an ``Any`` variable)
-        # may yet hold a pointer - a function pointer, say (``comptime(); fn: Any =
-        # foo``).  What it holds is what a callee/field access needs, so it is
-        # dereferenced like a pointer that points at a pointer
-        if (
-            isinstance(t, sval.PointerType)
-            and isinstance(place, ComptimeVal)
-            and isinstance(place.obj, sval.ComptimePtr)
-        ):
-            loaded = self.load(place)
-            if isinstance(_type_of(loaded), sval.PointerType):
-                return loaded
+        if isinstance(t, sval.PointerType):
+            if t.variant == PointerVariant.MULTI:
+                return ev
+            if isinstance(t.elem, sval.PointerType):
+                return self.load(ev)
+            ev = _shallow_normalize(ev)
+            if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.ComptimePtr):
+                loaded = self.load(ev)
+                if isinstance(_type_of(loaded), sval.PointerType):
+                    return loaded
         return ev
 
     # -- struct and array values ---------------------------------------------
@@ -4499,20 +4495,35 @@ class HirRunner:
           box first, so the lowered global is a constant;
         * a **mutable (non-const) view** materializes a *copy* of the box's
           contents into fresh memory, whose address is the result - a write
-          through it is lost (the compile-time variable itself is not aliased)."""
+          through it is lost (the compile-time variable itself is not aliased).
+
+        The object copied/lowered is the one the pointer names
+        (``sval.pointer_object_type``): the pointee, or the array's tail a pointer
+        into the array names - the same address, and the tail is what the storage
+        behind it holds.  A narrower view of a wider object is that object's
+        address, so the result keeps its address."""
         if cptr.type.is_const or isinstance(cptr.box, bytes):
             if isinstance(cptr.box, sval.Box) and not cptr.box.is_const:
                 snapshot = sval.Box(cptr.box.name_base, cptr.box.type, is_const=True)
                 snapshot.cells = list(cptr.box.cells)
                 cptr = sval.ComptimePtr(snapshot, cptr.offset, cptr.type)
             return self._const_pointer_to_mir(ComptimeVal(cptr), cptr.type)
-        mir_type = cptr.type.to_mir_type(self._mir_cache)
-        assert isinstance(mir_type, mir.PointerType)
-        elem_mir = mir_type.elem
-        assert isinstance(elem_mir, mir.Type)
-        ptr = self._emit(mir.Alloca(elem_mir))
-        self.store(RuntimeVal(ptr, cptr.type), self.load(ComptimeVal(cptr)))
-        return ptr
+        view_mir = cptr.type.to_mir_type(self._mir_cache)
+        assert isinstance(view_mir, mir.PointerType)
+        object_type = sval.pointer_object_type(cptr)
+        object_mir = object_type.to_mir_type(self._mir_cache)
+        if object_mir is None:
+            raise _no_runtime_type(object_type)
+        ptr = self._emit(mir.Alloca(object_mir))
+        self.store(
+            RuntimeVal(ptr, sval.PointerType(object_type, is_const=False)),
+            ComptimeVal(sval.load_box_cells(cptr.box, cptr.offset, object_type)),
+        )
+        if object_type == cptr.type.elem:
+            return ptr
+        # the pointer views an element of the object that was copied: the address
+        # is the object's, the view is the element's
+        return self._emit(mir.BitCast(ptr, view_mir))
 
     def _function_value_to_mir(self, fn: FunctionValue) -> mir.Value:
         """The runtime ``mir`` value of the function value ``fn``: the in-module
@@ -6321,18 +6332,24 @@ class HirRunner:
             return mir.UndefValue(mir_type)
         if isinstance(ev, ComptimeVal) and isinstance(ev.obj, sval.ComptimePtr):
             # the pointer names compile-time storage: the content becomes a global
-            # of its own, and the pointer is a reference to it
+            # of its own, and the pointer is a reference to it.  The content is
+            # the object the pointer names (``sval.pointer_object_type``) - the
+            # array's tail it points into, not the single element, so that the
+            # global keeps the remaining length
             cptr = ev.obj
-            elem = type.elem
             if isinstance(cptr.box, bytes):
                 # a byte-string store: the pointer is a global string constant
                 # (the content plus a trailing NUL, see ``_string_global``)
                 return self._string_global(cptr.box)
-            elem_mir = elem.to_mir_type(self._mir_cache)
-            if elem_mir is None or elem.classify() == sval.SpecialTypeKind.DST:
-                raise CompileError(f'cannot make a static pointer to a pointer to {elem}')
-            content = self._const_to_mir(self.load(ev), elem)
-            return mir.GlobalConstant(content, mir.PointerType(elem_mir, mir_type.is_const))
+            object_type = sval.pointer_object_type(cptr)
+            object_mir = object_type.to_mir_type(self._mir_cache)
+            if object_mir is None or object_type.classify() == sval.SpecialTypeKind.DST:
+                raise CompileError(f'cannot make a static pointer to a pointer to {object_type}')
+            content = self._const_to_mir(
+                ComptimeVal(sval.load_box_cells(cptr.box, cptr.offset, object_type)),
+                object_type,
+            )
+            return mir.GlobalConstant(content, mir_type)
         raise CompileError(f'cannot make a static pointer to the pointer constant {ev!r}')
 
     def _const_struct_to_mir(self, ev: InterpVal, type: sval.StructType) -> mir.Value | mir.AggregateConstant | mir.UnionConstant:
@@ -7778,8 +7795,11 @@ class HirRunner:
         if not isinstance(pointer, RuntimeVal):
             raise CompileError('cannot index a compile-time pointer')
         offset = self._to_runtime(self._coerce(index_ev, self._isize_type()))
+        # the place of the element, an address ``p + i`` away - a *single* pointer
+        # to it, like the compile-time branch above labels its place
         self._frames[-1].regs[ret] = RuntimeVal(
-            self._emit(mir.Gep(pointer.value, offset)), ptr_type,
+            self._emit(mir.Gep(pointer.value, offset)),
+            sval.PointerType(ptr_type.elem, ptr_type.is_const),
         )
         return PollResult.AGAIN
 

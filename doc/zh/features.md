@@ -128,7 +128,7 @@ assert in_range(5) is True and in_range(20) is False
 `syntax.Ptr[T]`（可变单指针）、`ConstPtr[T]`（只读单指针）、`MultiPtr[T]` / `ConstMultiPtr[T]`
 （多指针，可像数组一样下标）。
 
-- 单指针写 `p[...]`（解引用，C 的 `*p`），多指针写 `p[i]`（第 i 个元素的指针）。
+- 单指针写 `p[...]`（解引用，C 的 `*p`），多指针写 `p[i]`（第 i 个元素的地址——本身就是单指针，元素的值再 `p[i][...]`）。
 - 指针是**非空**的；`Option[Ptr[T]]` 才是可空指针。
 - 可变指针可隐式转 const（`Ptr[T]` → `ConstPtr[T]`）；反之不行。
 - 指向数组的指针（`*[N]T`）可当成元素的多指针。

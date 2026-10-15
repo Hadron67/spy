@@ -2135,6 +2135,29 @@ def _points_at_elements_of(ptr: PointerType, other: PointerType) -> bool:
     )
 
 
+def pointer_object_type(ptr: ComptimePtr) -> Type:
+    """The object a compile-time pointer names, for materializing it into runtime
+    storage: its pointee, or - when it names an element of an array it is the
+    multi pointer of (see :func:`_points_at_elements_of`) - the array's *tail*
+    from that element on, the whole array for its first element.  The tail is what
+    the storage behind the address actually holds, and naming it keeps the
+    remaining length: materializing only the element would leave a global (or a
+    slot) holding a single element, so indexing past it would read out of
+    bounds.
+
+    The tail starts at the pointed element, so its length is the array's minus
+    the element's index - the cell offset over the element's cell width (a value
+    of an element is :func:`scalar_count` cells of the box)."""
+    if isinstance(ptr.box, Box):
+        box_type = ptr.box.type
+        if isinstance(box_type, ArrayType) and box_type.elem == ptr.type.elem:
+            length = box_type.length_int
+            if length is not None:
+                index = ptr.offset // scalar_count(box_type.elem)
+                return ArrayType(box_type.elem, length - index)
+    return ptr.type.elem
+
+
 @dataclass(frozen=True)
 class PointerType(ScalarType):
     elem: Type

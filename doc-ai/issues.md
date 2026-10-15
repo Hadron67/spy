@@ -2,7 +2,7 @@
 
 这里记录在实现各项特性时发现、但**本任务不处理**的顺带问题（多为既有实现里已存在的问题）。每节给出原状、最小复现/后果与（若有）规避办法。
 
-> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、往 `Option[零尺寸类型]` 的构造不置 present、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除），已从本文件移除。
+> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、往 `Option[零尺寸类型]` 的构造不置 present、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽、编译期「元素视图」指针物化只按视图生成存储）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除，末者随 `sval.pointer_object_type` 的修复移除），已从本文件移除。
 
 ---
 
@@ -171,24 +171,4 @@ def f() -> i32:
   但把 const 指针交给一个声明为可写的 `*T` 位置，读起来像可以写。
 - **更合理的规则**：pointee 相同的前提下只允许「加 const」（即运行时路径的 `is_subtype_of`）；那样上述 12 处用例需要改写
   （把 `Ptr[T]` 形参改成 `ConstPtr[T]` 等）。因为 `ref(ConstComptime)` 传给 `Ptr[T]` 形参是惯用写法，改动会波及用户代码，本轮不动。
-
----
-
-## 10. 编译期「元素视图」指针物化成运行期指针时全局只按视图生成
-
-把一个**编译期数组**的元素指针（类型是 `MultiPtr[T]`，但指向的是 `Box` 里的整个 `Array[T, N]`）放进**运行期**位置时，自动物化（`interp._comptime_pointer_value`
-→ `_const_pointer_to_mir`）只按**视图**的 pointee（`T`）生成全局（或只 alloca 一个元素），数组长度丢失，于是 `m[1]` 起读到越界内存：
-
-```python
-@func()
-def f() -> i32:
-    a: ConstComptime[Array[i32, 3]] = const_array(7, 3)
-    m = coerce(ref(a), MultiPtr[i32])   # 或 ptr_cast(ref(a), MultiPtr[i32])（a: Comptime 数组）
-    return m[0] * 100 + m[1] * 10 + m[2]   # 实测得到无关内存（如 1104357117），不是 777
-```
-
-- **非本轮引入**：`ptr_cast(ref(a), MultiPtr[i32])`（`a` 是 `Comptime` 数组、视图非 const → 重定型）单独就能复现（实测与上面同值）；本轮的 `*[N]T -> MultiPtr[T]` 自动转换只是多了一条到达它的路径。
-- **正确的物化**：全局应按 **`Box` 的类型**（`Array[T, N]`）生成，指针再「数组转元素」得到 `*T`（地址相同）；这样步长与全局大小都正确。
-- **规避**：让指针留在编译期（如 `m: Comptime = coerce(ref(a), MultiPtr[i32])` 后 `m[i]`，此时索引全在 `Box` 里，正确），或干脆用 `std.arr_slice`/`std.core.const_arr_ptr` 的切片形式。
-- 与 #9 相关：都是编译期指针在 const/视图上的语义边界。
 

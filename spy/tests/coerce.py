@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 from unittest import TestCase
 
 from ..compiler import (
@@ -17,10 +17,12 @@ from ..compiler.syntax import (
     Array,
     Comptime,
     ConstComptime,
+    ConstMultiPtr,
     MultiPtr,
     Opaque,
     Option,
     Ptr,
+    array,
     comptime,
     ref,
 )
@@ -146,7 +148,7 @@ def coerce_comptime_pointer_of_another_pointee() -> u8:
 def coerce_array_pointer_to_multi_pointer() -> i32:
     # a pointer to an array converts to the multi pointer of its elements: the
     # same address, now viewed one element at a time
-    a: ConstComptime[Array[i32, 3]] = const_array(7, 3)
+    a: ConstComptime[Array[i32, Literal[3]]] = const_array(7, 3)
     m: Comptime = coerce(ref(a), MultiPtr[i32])
     return m[0] * 100 + m[1] * 10 + m[2]
 
@@ -154,7 +156,7 @@ def coerce_array_pointer_to_multi_pointer() -> i32:
 @func()
 def coerce_multi_pointer_to_pointer() -> i32:
     # and a multi pointer converts on to the single pointer of its element
-    a: ConstComptime[Array[i32, 3]] = const_array(4, 3)
+    a: ConstComptime[Array[i32, Literal[3]]] = const_array(4, 3)
     m: Comptime = coerce(ref(a), MultiPtr[i32])
     p: Comptime = coerce(m, Ptr[i32])
     return p[...]
@@ -166,6 +168,34 @@ def coerce_array_pointer_of_a_runtime_array(x: i32) -> i32:
     a = const_array(x, 3)
     m = coerce(ref(a), MultiPtr[i32])
     return m[2]
+
+
+@func()
+def coerce_materialized_pointer_to_an_array() -> i32:
+    # here the multi pointer is *materialized* (it has no ``Comptime``
+    # annotation): the storage behind it holds the whole array, not just the
+    # element the view names, so indexing past the first element stays in bounds
+    a: ConstComptime[Array[i32, Literal[3]]] = const_array(7, 3)
+    m = coerce(ref(a), MultiPtr[i32])
+    return m[0] * 100 + m[1] * 10 + m[2]
+
+
+@func()
+def coerce_materialized_const_pointer_to_an_array() -> i32:
+    # likewise for a const view: the global constant it lowers to holds the array
+    a: ConstComptime[Array[i32, Literal[3]]] = const_array(7, 3)
+    m: ConstMultiPtr[i32] = coerce(ref(a), ConstMultiPtr[i32])
+    return m[0] * 100 + m[1] * 10 + m[2]
+
+
+@func()
+def coerce_materialized_element_at_an_offset() -> i32:
+    # the storage starts at the element the pointer names - the array's tail from
+    # there on, so a later element reads its own value
+    a: ConstComptime[Array[i32, Literal[3]]] = array(7, 8, 9, length=3)
+    m: Comptime = coerce(ref(a), MultiPtr[i32])
+    r = ref(m[1])
+    return r[...]
 
 
 @func()
@@ -254,6 +284,15 @@ class SpyCoerceTest(TestCase):
 
     def test_a_pointer_to_a_runtime_array(self) -> None:
         self.assertEqual(coerce_array_pointer_of_a_runtime_array(9), 9)
+
+    def test_a_materialized_pointer_to_an_array(self) -> None:
+        self.assertEqual(coerce_materialized_pointer_to_an_array(), 100 * 7 + 10 * 7 + 7)
+
+    def test_a_materialized_const_pointer_to_an_array(self) -> None:
+        self.assertEqual(coerce_materialized_const_pointer_to_an_array(), 100 * 7 + 10 * 7 + 7)
+
+    def test_a_materialized_element_at_an_offset(self) -> None:
+        self.assertEqual(coerce_materialized_element_at_an_offset(), 8)
 
     def test_any_takes_a_pointer(self) -> None:
         self.assertEqual(coerce_any_takes_a_pointer(), 7)

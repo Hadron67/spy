@@ -15,9 +15,13 @@ from ..compiler import as_ as spy_as
 from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type, struct
 from ..compiler.syntax import (
     ConstPtr,
+    MultiPtr,
+    array,
+    ref,
 )
 from ..compiler.util import FrozenArraySet
 from ..std import compile as spy_compile
+from ..std.core import coerce
 from .structs import MIR_CACHE, Handle, struct_type
 
 # ---------------------------------------------------------------------------
@@ -236,6 +240,17 @@ def call_spy_func_ptr_typed(n: i32) -> i32:
     return apply_int_unary(p, n)
 
 
+@func()
+def call_an_array_element_function_pointer(n: i32) -> i32:
+    # the place ``m[i]`` names is the *single* pointer of the element, so the
+    # function pointer it holds is called through it like any other (an element
+    # place is not a multi pointer - see ``interp._subscript_pointer``)
+    p = spy_compile(ptr_target_incr)
+    a = array(p, p)
+    m = coerce(ref(a), MultiPtr[ConstPtr[IntUnary]])
+    return m[0](n)  # pyright: ignore[reportCallIssue]
+
+
 class SpyFuncTypeTest(TestCase):
     """``@func_type``: the annotations of a Protocol's ``__call__`` (its
     receiver dropped) become a ``sval.FunctionType``, resolved in the context
@@ -289,6 +304,11 @@ class SpyFuncTypeTest(TestCase):
 class SpyFnPtrCallTest(TestCase):
     """A runtime function pointer is called through the address its value
     carries; the call is emitted like a call of a compiled function."""
+
+    def test_the_element_of_a_multi_pointer_is_a_single_pointer(self) -> None:
+        # ``m[i]`` names the element's place - a single pointer to it - so the
+        # function pointer it holds is called through it like any other
+        self.assertEqual(call_an_array_element_function_pointer(5), 6)
 
     def test_calling_a_c_function_pointer(self) -> None:
         ptr_type = sval.as_value(ConstPtr[CBinary], _GLOBAL_CONTEXT)
