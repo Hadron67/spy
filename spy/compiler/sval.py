@@ -4287,6 +4287,11 @@ def _coerce_const_complex(value: AnyValue, type: ComplexType) -> AnyValue:
         )
     if isinstance(value, complex):
         re, im = value.real, value.imag
+    elif isinstance(value, (Int, Float)):
+        # an already-typed spy numeric constant (the ``f64`` a compile-time
+        # ``coerce`` folded to, say): its real part is the value, its imaginary
+        # one zero
+        re, im = value.value, 0.0
     elif isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CoerceError(f"cannot use {value!r} as a complex constant")
     else:

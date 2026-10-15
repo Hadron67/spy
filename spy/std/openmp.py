@@ -141,34 +141,73 @@ class _MicrotaskReduce(Protocol):
     # reduction's reducer (a ``reduce_op`` closure), its shared accumulator, the
     # flag that says the accumulator has a value and the critical-section name;
     # the names must match ``parallel_loop.outlined_reduce`` exactly
-    def __call__(self, gtid: Ptr[i32], bound_tid: Ptr[i32], n: i64, kernel: Ptr[Opaque],
-                 reduce_op: Ptr[Opaque], acc: Ptr[Opaque], has: Ptr[Opaque],
-                 crit: Ptr[Opaque]) -> None: ...
+    def __call__(
+        self,
+        gtid: Ptr[i32],
+        bound_tid: Ptr[i32],
+        n: i64,
+        kernel: Ptr[Opaque],
+        reduce_op: Ptr[Opaque],
+        acc: Ptr[Opaque],
+        has: Ptr[Opaque],
+        crit: Ptr[Opaque],
+    ) -> None: ...
 
 
 @decl_func()
-def __kmpc_fork_call(loc: ConstPtr[_Ident], argc: i32,
-                     microtask: ConstPtr[_Microtask], *args) -> None: ...
+def __kmpc_fork_call(loc: ConstPtr[_Ident], argc: i32, microtask: ConstPtr[_Microtask], *args) -> None: ...
 
 @decl_func()
-def __kmpc_for_static_init_4(loc: ConstPtr[_Ident], gtid: i32, schedtype: i32,
-                             plastiter: Ptr[i32], plower: Ptr[i32], pupper: Ptr[i32],
-                             pstride: Ptr[i32], incr: i32, chunk: i32) -> None: ...
+def __kmpc_for_static_init_4(
+    loc: ConstPtr[_Ident],
+    gtid: i32,
+    schedtype: i32,
+    plastiter: Ptr[i32],
+    plower: Ptr[i32],
+    pupper: Ptr[i32],
+    pstride: Ptr[i32],
+    incr: i32,
+    chunk: i32,
+) -> None: ...
 
 @decl_func()
-def __kmpc_for_static_init_4u(loc: ConstPtr[_Ident], gtid: i32, schedtype: i32,
-                              plastiter: Ptr[i32], plower: Ptr[u32], pupper: Ptr[u32],
-                              pstride: Ptr[i32], incr: i32, chunk: i32) -> None: ...
+def __kmpc_for_static_init_4u(
+    loc: ConstPtr[_Ident],
+    gtid: i32,
+    schedtype: i32,
+    plastiter: Ptr[i32],
+    plower: Ptr[u32],
+    pupper: Ptr[u32],
+    pstride: Ptr[i32],
+    incr: i32,
+    chunk: i32,
+) -> None: ...
 
 @decl_func()
-def __kmpc_for_static_init_8(loc: ConstPtr[_Ident], gtid: i32, schedtype: i32,
-                             plastiter: Ptr[i32], plower: Ptr[i64], pupper: Ptr[i64],
-                             pstride: Ptr[i64], incr: i64, chunk: i64) -> None: ...
+def __kmpc_for_static_init_8(
+    loc: ConstPtr[_Ident],
+    gtid: i32,
+    schedtype: i32,
+    plastiter: Ptr[i32],
+    plower: Ptr[i64],
+    pupper: Ptr[i64],
+    pstride: Ptr[i64],
+    incr: i64,
+    chunk: i64,
+) -> None: ...
 
 @decl_func()
-def __kmpc_for_static_init_8u(loc: ConstPtr[_Ident], gtid: i32, schedtype: i32,
-                              plastiter: Ptr[i32], plower: Ptr[u64], pupper: Ptr[u64],
-                              pstride: Ptr[i64], incr: i64, chunk: i64) -> None: ...
+def __kmpc_for_static_init_8u(
+    loc: ConstPtr[_Ident],
+    gtid: i32,
+    schedtype: i32,
+    plastiter: Ptr[i32],
+    plower: Ptr[u64],
+    pupper: Ptr[u64],
+    pstride: Ptr[i64],
+    incr: i64,
+    chunk: i64,
+) -> None: ...
 
 @decl_func()
 def __kmpc_for_static_fini(loc: ConstPtr[_Ident], gtid: i32) -> None: ...
@@ -291,9 +330,16 @@ def parallel_loop[R](length: int, kernel: Callable[[int], R], reduce_op: Callabl
     crit: u64 = 0
 
     @closure(inline=False, callconv='c')
-    def outlined_reduce(gtid: Ptr[i32], bound_tid: Ptr[i32], n: i64, kernel: Ptr[Opaque],
-                        reduce_op: Ptr[Opaque], acc: Ptr[Opaque], has: Ptr[Opaque],
-                        crit: Ptr[Opaque]) -> None:
+    def outlined_reduce(
+        gtid: Ptr[i32],
+        bound_tid: Ptr[i32],
+        n: i64,
+        kernel: Ptr[Opaque],
+        reduce_op: Ptr[Opaque],
+        acc: Ptr[Opaque],
+        has: Ptr[Opaque],
+        crit: Ptr[Opaque],
+    ) -> None:
         if n > 0:
             lastiter: i32 = 0
             lower = coerce(0, LT)

@@ -12,7 +12,7 @@ cannot be found the tests are skipped, since the JIT would not resolve the
 from typing import Literal, cast
 from unittest import TestCase
 
-from ...compiler import CompileError, func, i32, i64, u8
+from ...compiler import CompileError, c64, c128, f32, f64, func, i32, i64, u8
 from ...compiler.syntax import Array, ref
 from ...std.core import arr_slice, coerce, undefined
 from ...std.openmp import load_openmp_runtime, parallel_loop
@@ -76,7 +76,7 @@ def parallel_sum(n: i32) -> i64:
     # a single-valued reduction: each thread folds its slice of ``i``, the
     # partials are combined, and the sum comes back as the loop's result
     def kernel(i: i32) -> i64:
-        return cast(i64, i)
+        return coerce(i, i64)
 
     def add(a: i64, b: i64) -> i64:
         return a + b
@@ -88,8 +88,8 @@ def parallel_sum(n: i32) -> i64:
 def parallel_sum_count(n: i32) -> i64:
     # a multi-valued reduction: the kernel returns a (sum, count) pair which is
     # reduced element-wise, and ``parallel_loop`` delivers the pair as a
-    # multi-value result (the reducer's spread operands are unannotated, so they
-    # take the shape the call gives them)
+    # multi-value result (the reducer receives the two tuples, one per operand -
+    # an unannotated parameter takes the shape the call gives it)
     def kernel(i: i32):
         return coerce(i, i64), coerce(1, i64)
 
@@ -106,7 +106,7 @@ def parallel_reduce_zero(n: i32) -> i32:
     # accumulator keeps its initial (undefined) value.  A successful compile and
     # run is the assertion.
     def kernel(i: i32) -> i64:
-        return cast(i64, i)
+        return coerce(i, i64)
 
     def add(a: i64, b: i64) -> i64:
         return a + b
@@ -121,7 +121,7 @@ def parallel_missing_reducer(n: i32) -> i64:
     # a value-returning kernel with no ``reduce_op`` has nothing to combine the
     # results with: resolving this is a compile error
     def kernel(i: i32) -> i64:
-        return cast(i64, i)
+        return coerce(i, i64)
 
     return parallel_loop(n, kernel)
 
@@ -138,6 +138,104 @@ def parallel_void_with_reducer(n: i32) -> i32:
 
     parallel_loop(n, kernel, add) # pyright: ignore
     return n
+
+
+@func()
+def parallel_sum_f64(n: i32) -> f64:
+    # a floating-point reduction: the values and the accumulator are ``f64``
+    def kernel(i: i32) -> f64:
+        return coerce(i, f64)
+
+    def add(a: f64, b: f64) -> f64:
+        return a + b
+
+    return parallel_loop(n, kernel, add)
+
+
+@func()
+def parallel_sum_f32(n: i32) -> f32:
+    # a 32-bit float reduction (every partial sum is an integer below 2**24, so
+    # the result is exact whatever the schedule)
+    def kernel(i: i32) -> f32:
+        return coerce(i, f32)
+
+    def add(a: f32, b: f32) -> f32:
+        return a + b
+
+    return parallel_loop(n, kernel, add)
+
+
+@func()
+def parallel_sum_c128(n: i32) -> c128:
+    # a complex128 reduction: each kernel result is ``i + 1j``
+    def kernel(i: i32) -> c128:
+        z: c128 = coerce(i, f64)
+        return z + 1j
+
+    def add(a: c128, b: c128) -> c128:
+        return a + b
+
+    return parallel_loop(n, kernel, add)
+
+
+@func()
+def parallel_sum_c64(n: i32) -> c64:
+    # a complex64 reduction: each kernel result is the real value ``i``
+    def kernel(i: i32) -> c64:
+        z: c64 = coerce(i, f32)
+        return z
+
+    def add(a: c64, b: c64) -> c64:
+        return a + b
+
+    return parallel_loop(n, kernel, add)
+
+
+@func()
+def parallel_write_and_reduce(n: i32) -> i64:
+    # a kernel with both a side effect (it writes its index into the buffer) and
+    # a return value (which is reduced): both must happen for every index
+    buf: Array[i32, Literal[2048]] = undefined()
+    out = arr_slice(ref(buf))
+
+    def kernel(i: i32) -> i64:
+        out[i] = i
+        return coerce(i, i64)
+
+    def add(a: i64, b: i64) -> i64:
+        return a + b
+
+    total = parallel_loop(n, kernel, add)
+
+    written: i64 = 0
+    j: i32 = 0
+    while j < n:
+        written = written + cast(i64, out[j])
+        j = j + 1
+    return total * 1000000 + written
+
+
+@func()
+def parallel_write_and_pair(n: i32) -> i64:
+    # a kernel with a side effect and a *multi-valued* result, reduced as a pair
+    buf: Array[i32, Literal[2048]] = undefined()
+    out = arr_slice(ref(buf))
+
+    def kernel(i: i32):
+        out[i] = i
+        return coerce(i, i64), coerce(1, i64)
+
+    def add(a, b):
+        return a[0] + b[0], a[1] + b[1]
+
+    total, count = parallel_loop(n, kernel, add)
+
+    written: i64 = 0
+    j: i32 = 0
+    while j < n:
+        written = written + cast(i64, out[j])
+        j = j + 1
+    return total * 1000000 + count * 1000 + written
 
 
 class SpyOpenMPTest(TestCase):
@@ -184,6 +282,28 @@ class SpyOpenMPTest(TestCase):
 
     def test_a_reducer_on_a_void_kernel_is_ignored(self) -> None:
         self.assertEqual(parallel_void_with_reducer(3), 3)
+
+    def test_a_64_bit_float_reduction(self) -> None:
+        self.assertEqual(parallel_sum_f64(1000), 499500.0)
+
+    def test_a_32_bit_float_reduction(self) -> None:
+        self.assertEqual(parallel_sum_f32(1000), 499500.0)
+
+    def test_a_complex128_reduction(self) -> None:
+        # sum(0..999) as the real part, 1000 as the imaginary one
+        self.assertEqual(parallel_sum_c128(1000), 499500 + 1000j)
+
+    def test_a_complex64_reduction(self) -> None:
+        self.assertEqual(parallel_sum_c64(1000), 499500 + 0j)
+
+    def test_a_kernel_that_writes_and_returns(self) -> None:
+        # both the writes and the reduced result cover every index
+        self.assertEqual(parallel_write_and_reduce(1000), 499500 * 1000000 + 499500)
+
+    def test_a_kernel_that_writes_and_returns_a_pair(self) -> None:
+        self.assertEqual(
+            parallel_write_and_pair(1000), 499500 * 1000000 + 1000 * 1000 + 499500,
+        )
 
 
 all_tests = [
