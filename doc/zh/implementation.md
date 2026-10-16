@@ -333,7 +333,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 
 - `field_index_addr(ptr, index, is_aggregate_init, at=None)`：不额外解引用（基类型就是指向容器的指针）；`is_aggregate_init` + 未 commit → 复用记录的元素指针或新 alloca
   （运行时存储的 tagged union 不复用，见 `_is_union_delivery`）；
-  穿过外层 option 构造（设 tag；零尺寸 child 只写 tag）；ZST 字段 → 无存储地址；编译期 box → `sval.ComptimePtr(box, offset+field_scalar_offset)`（`is_ref` 字段返回 cell）；
+  穿过外层 option 构造（设 tag；零尺寸 child 只写 tag）；ZST 字段 → 无存储地址；编译期 box → `sval.ComptimePtr(box, offset+field_scalar_offset)`（`is_ref` 字段返回 cell）；只读编译期 box 的运行期数组下标 → 先用 `_comptime_pointer_value` 物化成全局常量再 `mir.Gep`（可变编译期 box 则报错）；
   运行时 → `mir.Gep`（或 `mirror_is_a_field` 时该值本身）。
 - `exec_field_name_addr`：按名解析字段（**自动解引用**）；`ComplexType` 的 `real`/`imag` 也当字段。
 - `_comptime_field_place`/`_const_box_place`：`is_comptime` 字段的读写指针（编译期 struct 是 box cell；运行时 struct 是只读常量）。

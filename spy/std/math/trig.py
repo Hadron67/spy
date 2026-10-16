@@ -16,7 +16,7 @@ from typing import Literal
 
 from ...compiler import bool, f32, f64, i32, typeof, u32, u64
 from ...compiler.dsl import func
-from ...compiler.syntax import Array, Comptime, array, comptime, const_comptime, ref
+from ...compiler.syntax import Array, Comptime, array, comptime, const_comptime
 from ..core import (
     bitcast,
     coerce,
@@ -187,8 +187,6 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
     )
     # the tables are compile-time constants: taking their address lowers each to
     # a private constant global, built once instead of on every call
-    ipio2p = ref(ipio2)
-    pio2p = ref(pio2)
 
     jk: i32 = 3
     if prec == 1 or prec == 2:
@@ -221,7 +219,7 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
         if jf < 0:
             f[i] = 0.0
         else:
-            f[i] = int_to_float_unchecked(ipio2p[...][jf], f64)
+            f[i] = int_to_float_unchecked(ipio2[jf], f64)
         jf = jf + 1
         i = i + 1
 
@@ -307,7 +305,7 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
                     k = k + 1
                 i = jz + 1
                 while i <= jz + k:
-                    f[jx + i] = int_to_float_unchecked(ipio2p[...][jv + i], f64)
+                    f[jx + i] = int_to_float_unchecked(ipio2[jv + i], f64)
                     fw = 0.0
                     j = 0
                     while j <= jx:
@@ -353,7 +351,7 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
         fw = 0.0
         k = 0
         while k <= jp and k <= jz - i:
-            fw = fw + pio2p[...][k] * q[i + k]
+            fw = fw + pio2[k] * q[i + k]
             k = k + 1
         fq[jz - i] = fw
         i = i - 1

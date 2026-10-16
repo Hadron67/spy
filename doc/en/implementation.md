@@ -336,7 +336,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 
 - `field_index_addr(ptr, index, is_aggregate_init, at=None)`: dereferences nothing further (the base type is a pointer to the container); `is_aggregate_init` + uncommitted -> reuses the recorded element pointer or a new alloca
   (a tagged union in runtime storage reuses nothing, see `_is_union_delivery`);
-  passes through an outer option construction (sets the tag; a zero-sized child only has the tag); ZST field -> no storage address; compile-time box -> `sval.ComptimePtr(box, offset+field_scalar_offset)` (an `is_ref` field returns the cell);
+  passes through an outer option construction (sets the tag; a zero-sized child only has the tag); ZST field -> no storage address; compile-time box -> `sval.ComptimePtr(box, offset+field_scalar_offset)` (an `is_ref` field returns the cell); a runtime array index into a read-only compile-time box -> materialize it into a global constant with `_comptime_pointer_value` first, then `mir.Gep` (a mutable compile-time box is rejected);
   runtime -> `mir.Gep` (or the value itself when `mirror_is_a_field`).
 - `exec_field_name_addr`: resolves a field by name (**automatic dereference**); `ComplexType`'s `real`/`imag` are also treated as fields.
 - `_comptime_field_place`/`_const_box_place`: the read/write pointer of an `is_comptime` field (a compile-time struct is a box cell; a runtime struct is a read-only constant).

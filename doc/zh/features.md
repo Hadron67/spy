@@ -579,7 +579,7 @@ assert comptime_marker_typed() == 1
 
 - `x: ConstComptime = e` / `x: ConstComptime[T] = e`（必须带初值），或标记 `syntax.const_comptime()` + 一条新声明。
 - 初始化后即只读；之后写它是编译错误。
-- 它是「编译期全局常量」的来源：初始化后 `ref(x)` 得到一个指向全局常量的指针。
+- 它是「编译期全局常量」的来源：初始化后 `ref(x)` 得到一个指向全局常量的指针；**只读常量数组**（或其它只读常量聚合体）也可以直接用运行期下标读取——该访问会把它物化成一个全局常量。可变编译期变量没有运行期身份，仍需编译期下标。
 
 ```python
 @func()
@@ -588,7 +588,13 @@ def static_read() -> i32:
     p = ref(const_x)             # automatically becomes a global constant
     return p[...]
 
+@func()
+def const_array_read(i: i32) -> i32:
+    arr: ConstComptime[Array[i32, Literal[3]]] = array(10, 20, 30)
+    return arr[i]                # a runtime index materializes it into a global constant
+
 assert static_read() == 42
+assert const_array_read(1) == 20
 ```
 
 ### 3.5 `InferComptime`（推断存储）

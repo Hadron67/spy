@@ -4246,9 +4246,24 @@ class HirRunner:
                     if isinstance(box, bytes):
                         raise CompileError('cannot take a field address of a byte string')
                     if index_int is None:
-                        raise CompileError(
-                            'cannot index compile-time storage with a runtime index: '
-                            'it has to be a compile-time integer'
+                        # a runtime index into compile-time storage: a read-only
+                        # compile-time constant (a ``ConstComptime``, or any const
+                        # compile-time place) is materialized into runtime storage -
+                        # the global constant ``_comptime_pointer_value`` builds -
+                        # and the element is addressed there with the runtime index;
+                        # a mutable compile-time variable has no runtime identity of
+                        # its own, so it stays compile-time-only
+                        if not ptr.type.is_const:
+                            raise CompileError(
+                                'cannot index compile-time storage with a runtime index: '
+                                'it has to be a compile-time integer'
+                            )
+                        return RuntimeVal(
+                            self._emit(
+                                mir.Gep(self._comptime_pointer_value(ptr), _mir_index(index)),
+                                at,
+                            ),
+                            field_ptr_type,
                         )
                     field_offset = offset + sval.field_scalar_offset(container_type, index_int)
                     if field_is_ref:
@@ -6542,7 +6557,10 @@ class HirRunner:
         pointer to compile-time storage - a reference to a fresh global holding
         the content it points at."""
         mir_type = type.to_mir_type(self._mir_cache)
-        assert isinstance(mir_type, mir.PointerType)
+        if not isinstance(mir_type, mir.PointerType):
+            # the pointee has no runtime representation (a compile-time-only
+            # element type, say): the constant cannot be lowered
+            raise _no_runtime_type(type)
         obj = _to_comptime(ev)
         if isinstance(obj, (sval.Null, sval.TypedNull)):
             return mir.NullValue(mir_type)

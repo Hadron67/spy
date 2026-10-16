@@ -1,9 +1,18 @@
-from typing import Protocol
+from typing import Literal, Protocol
 from unittest import TestCase
 
-from ..compiler import i32, sval, syntax
+from ..compiler import CompileError, i32, sval, syntax
 from ..compiler.dsl import func, func_type, struct
-from ..compiler.syntax import Comptime, ConstComptime, Option, Ptr, ref
+from ..compiler.syntax import (
+    Array,
+    Comptime,
+    ConstComptime,
+    Option,
+    Ptr,
+    array,
+    const_comptime,
+    ref,
+)
 from ..std.core import as_func_ptr, coerce
 
 # ---------------------------------------------------------------------------
@@ -170,6 +179,38 @@ def comptime_ptr_union_other_variant() -> i32:
     u: Comptime[V_A | V_B] = v
     const_u: ConstComptime[V_A | V_B] = u
     return take_union_ptr(ref(const_u))
+
+
+# -- a runtime index into a compile-time array ------------------------------
+# a read-only compile-time constant (a ``ConstComptime``) is materialized into a
+# global constant when a runtime index reads it (its variable stays compile-time);
+# a mutable ``Comptime`` variable has no runtime identity, so a runtime index is
+# still rejected
+
+
+@func()
+def const_comptime_array_read_with_a_runtime_index(i: i32) -> i32:
+    arr: ConstComptime[Array[i32, Literal[3]]] = array(
+        coerce(10, i32), coerce(20, i32), coerce(30, i32), length=3,
+    )
+    return arr[i]
+
+
+@func()
+def const_comptime_untyped_array_read_with_a_runtime_index(i: i32) -> i32:
+    # an untyped element has no runtime representation, so the constant cannot
+    # be materialized: a clean error, not a crash
+    const_comptime()
+    arr = array(10, 20, 30)
+    return arr[i]
+
+
+@func()
+def comptime_array_read_with_a_runtime_index(i: i32) -> i32:
+    arr: Comptime[Array[i32, Literal[3]]] = array(
+        coerce(10, i32), coerce(20, i32), coerce(30, i32), length=3,
+    )
+    return arr[i]
 
 
 # -- an option/union field whose tag is only known at runtime ---------------
@@ -368,6 +409,24 @@ class SpyComptimePtrTest(TestCase):
 
     def test_a_comptime_capture_baked_into_a_function_pointer(self) -> None:
         self.assertEqual(comptime_capture_as_func_ptr(), 6)
+
+    def test_a_const_comptime_array_read_with_a_runtime_index(self) -> None:
+        # a read-only compile-time constant crosses into runtime storage so that
+        # a runtime index reads it
+        self.assertEqual(const_comptime_array_read_with_a_runtime_index(0), 10)
+        self.assertEqual(const_comptime_array_read_with_a_runtime_index(2), 30)
+
+    def test_a_mutable_comptime_array_with_a_runtime_index_is_rejected(self) -> None:
+        # a mutable compile-time variable has no runtime identity of its own
+        with self.assertRaises(CompileError) as ctx:
+            comptime_array_read_with_a_runtime_index(0)
+        self.assertIn('runtime index', str(ctx.exception))
+
+    def test_a_const_comptime_array_of_untyped_elements_is_rejected(self) -> None:
+        # the untyped element has no runtime representation: a clean compiler
+        # error rather than a crash
+        with self.assertRaises(CompileError):
+            const_comptime_untyped_array_read_with_a_runtime_index(0)
 
 
 _I32 = sval.IntType(32, True)

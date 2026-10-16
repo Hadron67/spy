@@ -579,7 +579,7 @@ assert comptime_marker_typed() == 1
 
 - `x: ConstComptime = e` / `x: ConstComptime[T] = e` (an initial value is required), or the marker `syntax.const_comptime()` + a new declaration.
 - After initialization it is read-only; writing it afterwards is a compile error.
-- It is the source of "compile-time global constants": after initialization, `ref(x)` yields a pointer to a global constant.
+- It is the source of "compile-time global constants": after initialization, `ref(x)` yields a pointer to a global constant. A **read-only constant array** (or any other read-only constant aggregate) can also be read with a runtime index directly - that access materializes it into a global constant. A mutable compile-time variable has no runtime identity and still needs a compile-time index.
 
 ```python
 @func()
@@ -588,7 +588,13 @@ def static_read() -> i32:
     p = ref(const_x)             # automatically becomes a global constant
     return p[...]
 
+@func()
+def const_array_read(i: i32) -> i32:
+    arr: ConstComptime[Array[i32, Literal[3]]] = array(10, 20, 30)
+    return arr[i]                # a runtime index materializes it into a global constant
+
 assert static_read() == 42
+assert const_array_read(1) == 20
 ```
 
 ### 3.5 `InferComptime` (inferred storage)
