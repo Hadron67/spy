@@ -1609,9 +1609,22 @@ class _Builder:
             case ast.BoolOp():
                 self._gen_boolop(node, result_loc)
             case ast.Tuple():
-                self.add(hir.InitTuple(result_loc, len(node.elts)))
-                for i, elt in enumerate(node.elts):
-                    self._gen_result_loc(elt, self.add(hir.TuplePtrElement(result_loc, i)))
+                if isinstance(result_loc, tuple):
+                    # a destructuring target (``a, b = c, d``): each element goes
+                    # straight into its own target place, so no tuple value is
+                    # built - which is what keeps ``InitTuple``'s location from
+                    # ever being a *tree* (see ``hir.InitTuple``)
+                    if len(node.elts) != len(result_loc):
+                        raise CompileError(
+                            f'cannot initialize a tuple of {len(node.elts)} '
+                            f'element(s) in a location of {len(result_loc)} place(s)'
+                        )
+                    for elt, leaf in zip(node.elts, result_loc):
+                        self._gen_result_loc(elt, leaf)
+                else:
+                    self.add(hir.InitTuple(result_loc, len(node.elts)))
+                    for i, elt in enumerate(node.elts):
+                        self._gen_result_loc(elt, self.add(hir.TuplePtrElement(result_loc, i)))
             case ast.IfExp():
                 # each arm opens a scope of its own: a ``:=`` in an arm is not
                 # visible outside it (the other arm may have run instead)

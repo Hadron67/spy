@@ -101,6 +101,8 @@ flowchart TD
 
 - **结果位置语义（RLS）**：`_gen_result_loc(node, result_loc, allow_fall_back=True)` 把结果写进调用方给的**结果位置指针**，不产生寄存器。
   `hir.ReturnLoc()` 表示整棵函数结果位置树（多返回值是一棵指针树）。`_gen_expr` 的 fallback 为需要「值」的表达式分配临时 `Alloca`、RLS 写入、返回该指针。
+- **解构赋值**：`_gen_lhs` 对元组目标给出**位置树**（`_gen_target_tuple`）；当 RHS 是元组表达式且目标是位置树时，`_gen_result_loc` 把它**逐元素拆开**（`a, b = c, d` → `a = c; b = d`，长度不符在 astgen 报错），
+  因此 `hir.InitTuple`/`hir.TuplePtrElement` 的位置**从不**是树（见 §3；树只可能由 `ReturnLoc` 在解释器中解析出来）。
 - **标记识别**（按对象身份）：`_SYNTAX_CALLS = (ref, unroll, comptime, typeof)` → `_gen_syntax_call`；
   语句级标记（`unroll`/`comptime`/`const_comptime`/`infer_comptime`）由 `_as_marker` 缓冲为 pragma，由下一条语句消费（悬空 pragma 报错）。
 - 下标 `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` 分派见 `astgen._gen_expr`、`_gen_type_ctor`、`_gen_literal`。
@@ -126,7 +128,7 @@ flowchart TD
 - `Value` 基类；`Const(value)`（字面量/不可变全局值）；`Arg(index)`（第 index 个参数的**地址**）。
 - `ReturnLoc`（**不是** `Value`）；`type ResultLocTree = hir.Value | tuple[ResultLocTree, ...]`；`type FullResultLoc = ResultLocTree | ReturnLoc`。
 - 指令：`Alloca(is_comptime, is_const, type)`、`Load`、`Store(ptr, value)`、`StoreVoidRetloc`、`CommitSlot(slot)`；
-  `FieldAddr`/`FieldIndexAddr`（`is_aggregate_init`）、`FinishStruct`/`FinishArray`、`InitTuple`/`TuplePtrElement`、`Tuple`/`Dict`；
+  `FieldAddr`/`FieldIndexAddr`（`is_aggregate_init`）、`FinishStruct`/`FinishArray`、`InitTuple`/`TuplePtrElement`（位置是 `Value | ReturnLoc`，从不是树，见 §2.3）、`Tuple`/`Dict`；
   `CallInplace`/`CallMethodInplace`（带 `ret`）、`CallArgs`/`Spread`；
   `Subscript`/`Slice`/`PtrCast`/`AsFuncPtr`/`TypeOfBegin`/`TypeOfEnd`；
   `Binary`/`BinaryAssign`/`Compare`/`Not`/`Unary`/`Ord`/`AsBool`/`Len`/`IsNull`/`OptionPayloadPtr`/`IsInstance`/`TaggedUnionPayloadPtr`；
@@ -298,15 +300,15 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 
 ### 6.1 一切皆值
 
-- `InterpVal = ComptimeVal | RuntimeVal | PendingSlot | _PlaceTreeVal`；`PlaceTree = InterpVal | tuple[PlaceTree, ...]`。
+- `InterpVal = sval.AnyValue | RuntimeVal | PendingSlot`；`FullInterpVal = InterpVal | tuple[FullInterpVal, ...]`（*位置树*，多值 `ResultLocTree` 解析得到的形态）。
 - HIR 之后只有值：一个名字/字段/下标的求值结果就是一个**指针值**（类型 `PointerType`），`astgen` 在需要「值」的地方插入 `hir.Load`（`_as_value`）、
   在需要指针的地方物化一个（`_as_ref`），所以解释器里没有「place / 值」之分。
-- `ComptimeVal(obj)`: 完全 Python 化的编译期值（「无值」用 `Void()`、源码 `None` 用 `Null()`）。
+- 编译期值**就是**直接持有的 `sval.AnyValue`（判定用 `sval.is_sval`；「无值」用 `Void()`、源码 `None` 用 `Null()`）。
 - `RuntimeVal(value: mir.Value, type: sval.Type)`：只保留 spy 类型；MIR 类型按需由 `to_mir_type` 产生。
 - `PendingSlot`：已执行但未 commit 的 `hir.Alloca`（见 §6.2）。
 - `ComptimeResultPtr(value, code, payload)`：函数结果位置的指针形态（value/code/payload 三个位置），**不是** `InterpVal`。
 - 判定：`_is_comptime_val`（`RuntimeVal` 一律不是；旧的「不引用寄存器」放宽已删除）、`_place_is_comptime`、`_references_register`。
-- `_coerce(ev, target)`：**编译期量一律交给 `sval.coerce_const`**（`ComptimeVal`，含 `ComptimePtr` 这种指针值），运行期量走 `_convert_inst`（拓宽/收窄）；
+- `_coerce(ev, target)`：**编译期量一律交给 `sval.coerce_const`**（一个 `sval` 编译期值，含 `ComptimePtr` 这种指针值），运行期量走 `_convert_inst`（拓宽/收窄）；
   失败抛 `CoerceError`（`_try_coerce` 吞掉它）。`Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` 的目标分支只处理运行期值。
 
 ### 6.2 Compile-time 存储与 pending slot
@@ -342,7 +344,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 ### 6.4 调用
 
 - `call(callee, args, ret, on_return)`：`FunctionValue`/`BoundMethod` → `_call_function_entry`；`BuiltinFn` → `_call_builtin`；
-  `PyFunction` → `_call_py_function`（实参必须是能降为普通 Python 对象的编译期量，`str` 编码成字节串，返回值包成 `ComptimeVal` 写进结果位置）；
+  `PyFunction` → `_call_py_function`（实参必须是能降为普通 Python 对象的编译期量，`str` 编码成字节串，返回值就是该编译期值本身、写进结果位置）；
   指向含 `__call__` 结构体的指针 → `call_method('__call__')`（闭包）；指向 `FunctionType` → `_call_fn_ptr`。
 - `_call_function_entry`：`substitute_type_vars` + `bind_arg_pos` + `_check_comptime_args`；`force_inline` → `_start_inline`，
   否则 `specialize` 后 `_request_function`（返回 `SUSPEND`，由 `Analyser` 排程）。
@@ -376,7 +378,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
   缺省取默认值；未 commit 的目标记录 `_PendingAggregate`（同一 slot 第二次构造只补默认；不同类型报错——运行时存储的 tagged union 例外，
   每次构造记自己的 action，见 `_is_union_delivery`）；已物化的目标对零尺寸聚合补一次 `_peel_option_layers`。
 - `finish_array`：长度取元素个数，元素类型取存储或共同类型。
-- `init_tuple`/`tuple_ptr_element`：未 commit 目标记录 `_PendingTuple`（元素是新 slot）；已 commit 目标直接寻址元素；嵌套作为 `_PlaceTreeVal`。
+- `init_tuple`/`tuple_ptr_element`：未 commit 目标记录 `_PendingTuple`（元素是新 slot）；已 commit 目标直接寻址元素；嵌套作为**位置树**（`FullInterpVal`），由 `TuplePtrElement` 寄存器承载。位置树只可能来自 `ReturnLoc` 解析出的多值返回位置（见 §2.3）。
 - Option/tagged union/complex 各有 `_option_*`/`_tagged_union_*`/`_complex_*` 辅助。
 
 ### 6.7 控制流与错误
@@ -389,7 +391,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
   `_add_function_exception`（声明集外拒绝、推断集增长）；错误码写入推迟（`_defer_error_code_write`，`_finish_function` 填上）。
 - `_cut`：路径结束时的展开器（循环 `block_stack`）：空栈 → 函数 proper `DONE`（park `pc`）/`_pop_frame`；defer body 未完成报错；typeof 未产值报错；
   try → 下一个活子句或继续；loop → inline 下一轮或出口块；plain block → 出口块；if → 选中的 pop 或类型化 else 再汇合。
-- `typeof` 探针：`_exec_typeof_begin` 切到**分离的** MIR 块（不接入 CFG）；`_exec_typeof_end` 读取被探测值的 spy 类型、丢弃该块、存为 `ComptimeVal`。
+- `typeof` 探针：`_exec_typeof_begin` 切到**分离的** MIR 块（不接入 CFG）；`_exec_typeof_end` 读取被探测值的 spy 类型、丢弃该块、存为该编译期类型值。
 
 ### 6.8 内建与运算符
 
@@ -520,7 +522,7 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
 2. **comptime/runtime 硬划分**：`RuntimeVal` 一律非编译期；运行时值永不进编译期存储（`store` 拒绝）。
 3. **一切皆值**：HIR/解释器里没有「place」这种第二类东西——一个名字/字段/下标的求值结果就是一个**指针值**（类型 `PointerType`）；
    需要「值」的地方由 `astgen` **自动插入解引用**（`hir.Load`，见 `_as_value`），需要指针的地方由 `_as_ref` 物化。
-4. **结果位置是一个指针**：RLS 把结果写进调用方给的**结果位置指针**（多返回值是一棵指针树，`PlaceTree`）；
+4. **结果位置是一个指针**：RLS 把结果写进调用方给的**结果位置指针**（多返回值是一棵位置树 `FullInterpVal`）；
    `ComptimeResultPtr` 是编译期结果位置的指针形态，刻意不是 `InterpVal`。
 5. **无 Python 递归**：`_run_machine`/`_step` 迭代；`_cut` 是块栈循环；`Analyser._run` 是显式 runner 栈；
    铺平/展平/可达性/常量收集/`TypeVarSolver` 等均用显式栈/工作表。例外：`mir._clone_template` 随 defer 源嵌套递归（浅）。

@@ -51,6 +51,14 @@ class Value:
 
 type AnyValue = Value | int | float | complex | bytes | bool
 
+def is_sval(val: Any) -> TypeGuard[AnyValue]:
+    """Whether ``val`` is a compile-time spy value - one of the forms of
+    ``AnyValue`` (an ``sval.Value`` such as a scalar snapshot, a type
+    descriptor or an ``sval.ComptimePtr``, or a plain Python scalar).  The
+    interpreter holds such values directly; its own runtime-side values
+    (``RuntimeVal``, ``PendingSlot``) are not ``sval`` values."""
+    return isinstance(val, (Value, int, float, complex, bytes, bool))
+
 type ScalarValue = (
     Type | Void | Null | Int | Float | IntEnumValue | UndefinedScalar
     | UntypedUndefined | DeclareFunction | BoundMethod | BuiltinFn | PyFunction

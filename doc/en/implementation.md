@@ -101,6 +101,8 @@ Expression highlights:
 
 - **Result location semantics (RLS)**: `_gen_result_loc(node, result_loc, allow_fall_back=True)` writes the result through the caller-provided **result location pointer** and produces no register.
   `hir.ReturnLoc()` denotes the entire function result location tree (a tree of pointers for a multiple-value result). The fallback of `_gen_expr` allocates a temporary `Alloca` for expressions that need a "value", writes via RLS, and returns that pointer.
+- **Destructuring assignment**: `_gen_lhs` yields a **place tree** for a tuple target (`_gen_target_tuple`); when the RHS is a tuple expression and the target is a place tree, `_gen_result_loc` splits it **element by element** (`a, b = c, d` -> `a = c; b = d`, a length mismatch being an error in astgen),
+  so the location of `hir.InitTuple`/`hir.TuplePtrElement` is **never** a tree (see §3; a tree can only come from a `ReturnLoc` the interpreter resolves).
 - **Marker recognition** (by object identity): `_SYNTAX_CALLS = (ref, unroll, comptime, typeof)` -> `_gen_syntax_call`;
   statement-level markers (`unroll`/`comptime`/`const_comptime`/`infer_comptime`) are buffered as a pragma by `_as_marker` and consumed by the next statement (a dangling pragma is an error).
 - Subscript dispatch for `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` is in `astgen._gen_expr`, `_gen_type_ctor`, `_gen_literal`.
@@ -126,7 +128,7 @@ A linear, untyped instruction stream; each `Inst` object **is itself a result re
 - `Value` base class; `Const(value)` (literal / immutable global value); `Arg(index)` (the **address** of the index-th parameter).
 - `ReturnLoc` (**not** a `Value`); `type ResultLocTree = hir.Value | tuple[ResultLocTree, ...]`; `type FullResultLoc = ResultLocTree | ReturnLoc`.
 - Instructions: `Alloca(is_comptime, is_const, type)`, `Load`, `Store(ptr, value)`, `StoreVoidRetloc`, `CommitSlot(slot)`;
-  `FieldAddr`/`FieldIndexAddr` (`is_aggregate_init`), `FinishStruct`/`FinishArray`, `InitTuple`/`TuplePtrElement`, `Tuple`/`Dict`;
+  `FieldAddr`/`FieldIndexAddr` (`is_aggregate_init`), `FinishStruct`/`FinishArray`, `InitTuple`/`TuplePtrElement` (location is `Value | ReturnLoc`, never a tree, see §2.3), `Tuple`/`Dict`;
   `CallInplace`/`CallMethodInplace` (with `ret`), `CallArgs`/`Spread`;
   `Subscript`/`Slice`/`PtrCast`/`AsFuncPtr`/`TypeOfBegin`/`TypeOfEnd`;
   `Binary`/`BinaryAssign`/`Compare`/`Not`/`Unary`/`Ord`/`AsBool`/`Len`/`IsNull`/`OptionPayloadPtr`/`IsInstance`/`TaggedUnionPayloadPtr`;
@@ -299,15 +301,15 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 
 ### 6.1 Everything is a value
 
-- `InterpVal = ComptimeVal | RuntimeVal | PendingSlot | _PlaceTreeVal`; `PlaceTree = InterpVal | tuple[PlaceTree, ...]`.
+- `InterpVal = sval.AnyValue | RuntimeVal | PendingSlot`; `FullInterpVal = InterpVal | tuple[FullInterpVal, ...]` (a *place tree*, what a multi-value `ResultLocTree` resolves to).
 - Past HIR there are only values: evaluating a name/field/subscript yields a **pointer value** (`PointerType`), and `astgen` inserts the `hir.Load` where a "value" is needed (`_as_value`)
   and materializes a pointer where one is needed (`_as_ref`), so the interpreter knows no "place vs value" distinction.
-- `ComptimeVal(obj)`: a fully Python-ized compile-time value ("no value" uses `Void()`, source `None` uses `Null()`).
+- A compile-time value **is** an `sval.AnyValue` held directly (see `sval.is_sval`; "no value" uses `Void()`, source `None` uses `Null()`).
 - `RuntimeVal(value: mir.Value, type: sval.Type)`: keeps only the spy type; the MIR type is produced on demand by `to_mir_type`.
 - `PendingSlot`: an executed but uncommitted `hir.Alloca` (see §6.2).
 - `ComptimeResultPtr(value, code, payload)`: the pointer form of a function result location (the three positions value/code/payload), **not** an `InterpVal`.
 - Predicates: `_is_comptime_val` (`RuntimeVal` is never one; the old "does not reference a register" relaxation has been removed), `_place_is_comptime`, `_references_register`.
-- `_coerce(ev, target)`: **every compile-time value goes to `sval.coerce_const`** (a `ComptimeVal`, the `ComptimePtr` pointer value included), while a runtime value goes through `_convert_inst`
+- `_coerce(ev, target)`: **every compile-time value goes to `sval.coerce_const`** (an `sval` compile-time value, the `ComptimePtr` pointer value included), while a runtime value goes through `_convert_inst`
   (widening/narrowing); a failure raises `CoerceError` (which `_try_coerce` swallows). The `Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` target branches handle runtime values only.
 
 ### 6.2 Compile-time storage and pending slot
@@ -345,7 +347,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 ### 6.4 Calls
 
 - `call(callee, args, ret, on_return)`: `FunctionValue`/`BoundMethod` -> `_call_function_entry`; `BuiltinFn` -> `_call_builtin`;
-  `PyFunction` -> `_call_py_function` (every argument must be a compile-time value that lowers to a plain Python object, a `str` is encoded to its byte string, and the result is written into the result location as a `ComptimeVal`);
+  `PyFunction` -> `_call_py_function` (every argument must be a compile-time value that lowers to a plain Python object, a `str` is encoded to its byte string, and the result is written into the result location as the compile-time value itself);
   a pointer to a struct containing `__call__` -> `call_method('__call__')` (closure); a pointer to `FunctionType` -> `_call_fn_ptr`.
 - `_call_function_entry`: `substitute_type_vars` + `bind_arg_pos` + `_check_comptime_args`; `force_inline` -> `_start_inline`,
   otherwise `_request_function` after `specialize` (returns `SUSPEND`, scheduled by `Analyser`).
@@ -378,7 +380,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
   taking defaults where omitted; an uncommitted target records a `_PendingAggregate` (a second construction into the same slot only fills defaults; a different type is an error - except for a
   tagged union in runtime storage, where every construction records an action of its own, see `_is_union_delivery`); a materialized target peels a zero-sized aggregate's option layers.
 - `finish_array`: the length is the element count, and the element type comes from storage or the common type.
-- `init_tuple`/`tuple_ptr_element`: an uncommitted target records a `_PendingTuple` (the elements are new slots); a committed target addresses the elements directly; nesting becomes a `_PlaceTreeVal`.
+- `init_tuple`/`tuple_ptr_element`: an uncommitted target records a `_PendingTuple` (the elements are new slots); a committed target addresses the elements directly; nesting becomes a **place tree** (`FullInterpVal`), which a `TuplePtrElement` register carries. A location tree can only come from a multiple-value return location a `ReturnLoc` resolves (see §2.3).
 - Option/tagged union/complex each have their own `_option_*`/`_tagged_union_*`/`_complex_*` helpers.
 
 ### 6.7 Control flow and errors
@@ -391,7 +393,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
   `_add_function_exception` (rejects outside the declared set, grows the inferred set); the error code write is deferred (`_defer_error_code_write`, filled in by `_finish_function`).
 - `_cut`: the unwinder at the end of a path (iterating `block_stack`): empty stack -> the function proper's `DONE` (park `pc`) / `_pop_frame`; a defer body that is not finished is an error; typeof with no produced value is an error;
   try -> the next live clause or continue; loop -> the next inline round or the exit block; plain block -> the exit block; if -> the selected pop, or a typed else and then merge.
-- `typeof` probe: `_exec_typeof_begin` switches to a **separate** MIR block (not wired into the CFG); `_exec_typeof_end` reads the spy type of the probed value, discards the block, and stores it as a `ComptimeVal`.
+- `typeof` probe: `_exec_typeof_begin` switches to a **separate** MIR block (not wired into the CFG); `_exec_typeof_end` reads the spy type of the probed value, discards the block, and stores it as the compile-time type value.
 
 ### 6.8 Builtins and operators
 
@@ -523,7 +525,7 @@ The only place that turns Python values into spy values (and back); it does **no
 2. **Hard comptime/runtime split**: `RuntimeVal` is never compile-time; a runtime value never enters compile-time storage (`store` rejects it).
 3. **Everything is a value**: HIR/the interpreter has no second kind of thing called a "place" - evaluating a name/field/subscript yields a **pointer value** (`PointerType`);
    where a "value" is needed `astgen` **inserts the dereference** (`hir.Load`, see `_as_value`), and where a pointer is needed `_as_ref` materializes one.
-4. **The result location is a pointer**: RLS writes the result through the caller-provided **result location pointer** (a tree of pointers, `PlaceTree`, for a multiple-value result);
+4. **The result location is a pointer**: RLS writes the result through the caller-provided **result location pointer** (a place tree, `FullInterpVal`, for a multiple-value result);
    `ComptimeResultPtr` is the pointer form of a compile-time result location and is deliberately not an `InterpVal`.
 5. **No Python recursion**: `_run_machine`/`_step` are iterative; `_cut` is a block-stack loop; `Analyser._run` is an explicit runner stack;
    flatten/flatten out/reachability/constant collection/`TypeVarSolver` all use explicit stacks/worklists. Exception: `mir._clone_template` recurses with the nesting of the defer source (shallow).

@@ -422,13 +422,23 @@ class MakeClosure(Inst):
 
 @dataclass(eq=False)
 class InitTuple(Inst):
-    result_loc: FullResultLoc
+    """Start initializing a tuple into the place ``result_loc``, which holds
+    ``length`` elements.  The location is never a *tree*: a destructuring target
+    (``a, b = c, d``) is lowered element by element instead (see
+    ``astgen._gen_result_loc``), so a tree only reaches here resolved - through
+    the function's whole result location (a ``ReturnLoc``) whose declared return
+    type is a tuple, or a ``TuplePtrElement`` of one."""
+
+    result_loc: Value | ReturnLoc
     length: int
 
 
 @dataclass(eq=False)
 class TuplePtrElement(Inst):
-    tuple_ptr: FullResultLoc
+    """The address of the ``index``-th element of the tuple being initialized
+    in ``tuple_ptr`` (see ``InitTuple``, whose location rule this shares)."""
+
+    tuple_ptr: Value | ReturnLoc
     index: int
 
 
