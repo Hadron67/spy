@@ -45,15 +45,19 @@ from spy.std import (
 from spy.std.core import (
     panic, catch_unwind, UnwindException, coerce, typed_undefined, bitcast,
     ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error,
+    int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
 from spy.std.mem import Layout, layout_of, size_of, align_of
-from spy.std.int import IntCastError, int_cast, try_int_cast, truncate, valid_range
+from spy.std.int import (
+    IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
+    int_to_float, try_int_to_float, float_to_int, try_float_to_int,
+)
 from spy.std.atomic import (
     MemoryOrder, RmwOp,
     atomic_load, atomic_store, atomic_rmw, atomic_cmpxchg, atomic_fence, atomic_fetch_add,
 )
-from spy.std.reflect import TypeInfo, IntType, type_info, reify
+from spy.std.reflect import TypeInfo, IntType, FloatType, type_info, reify
 from typing import TYPE_CHECKING, Literal, Never, NoReturn
 ```
 
@@ -1464,6 +1468,7 @@ assert unrolled_sum() == 6
 - `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`）；未设置时是缺失值（`None`）。
 - `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)`：标量的同位宽重解释 / 整数收窄。
+- `std.core.int_to_float_unchecked(value, T)` / `std.core.float_to_int_unchecked(value, T)`：整数↔浮点转换（`sitofp`/`uitofp` 与 `fptosi`/`fptoui`，后者向零取整），**不做任何检查**；编译期值装不进目标类型时得到 `undefined`。
 
 ```python
 @func()
@@ -1495,17 +1500,27 @@ def same_bits(x: f32) -> u32:
 def truncated(x: u32) -> u8:
     return truncate(x, u8)
 
+@func()
+def to_f64(x: u64) -> f64:
+    return int_to_float(x, f64)          # exact, else panics
+
+@func()
+def to_i32(x: f64) -> i32:
+    return float_to_int(x, i32)          # in range, else panics
+
 assert dead_branch() == 1
 assert pick(True, 1, 2) == 1 and pick(False, 1, 2) == 2
 assert narrowed(128) == -128
 assert same_bits(1.0) == 0x3F800000
 assert truncated(300) == 44
+assert to_f64(9007199254740992) == 9007199254740992.0
+assert to_i32(3.9) == 3
 ```
 
 ### 8.8 反射
 
 - `std.reflect.type_info(type) -> TypeInfo` / `reify(info) -> type`；
-  变体 `IntType`/`PointerType`/`ArrayType`/`StructType`/`TaggedUnionType`/`OptionType`/`TupleType`/`StrDictType`/`ComplexType`/`UnionType`。
+  变体 `IntType`/`FloatType`/`PointerType`/`ArrayType`/`StructType`/`TaggedUnionType`/`OptionType`/`TupleType`/`StrDictType`/`ComplexType`/`UnionType`。
 - `reflect.StructField` 含 `is_comptime` / `is_ref` 标记；`reflect.StructType.head`（非泛型为 `None`）。
 - `reify` 一个 struct 会**重新构建**（与原始 struct 不 identity 相等，但字段/字段类型相同）。
 - `std.mem.layout_of`/`size_of`/`align_of`：也接受元组/字典类型。
@@ -1516,6 +1531,14 @@ def int_bits(t: type[i32]) -> i32:
     comptime()
     info = type_info(t)
     if isinstance(i := info, IntType):
+        return i.bits
+    return 0
+
+@func()
+def float_bits(t: type[f32]) -> i32:
+    comptime()
+    info = type_info(t)
+    if isinstance(i := info, FloatType):
         return i.bits
     return 0
 
@@ -1532,6 +1555,7 @@ def int_size() -> i32:
     return coerce(size_of(i32), i32)
 
 assert int_bits(i32) == 32
+assert float_bits(f32) == 32
 assert reified() == 1
 assert int_size() == 4
 ```
@@ -1571,9 +1595,9 @@ assert str_len() == 5
 
 | 模块 | 内容 |
 |---|---|
-| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option` |
+| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`int_to_float_unchecked`/`float_to_int_unchecked`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option` |
 | `std.reflect` | `TypeInfo` 及变体、`StructField`、`type_info`、`reify` |
-| `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast` |
+| `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast`、`FloatCastError`、`try_int_to_float`/`int_to_float`、`try_float_to_int`/`float_to_int` |
 | `std.mem` | `Layout`、`layout_of`/`size_of`/`align_of`、`AllocError`、`Allocator`（协议）、`AllocatorVtable`、`DynamicAllocator`、`CAllocator` |
 | `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf`（extern 声明）、`CError`、`FILE`、`fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`、`Writable`/`Readable`（协议） |

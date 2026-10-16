@@ -3,12 +3,17 @@ from typing import Any
 from ..compiler import Option, builtin_func, struct
 from .core import ConstSlicePtr
 
-type TypeInfo = IntType | PointerType | ArrayType | StructType | UnionType | TaggedUnionType | OptionType | ComplexType | TupleType | StrDictType
+type TypeInfo = IntType | FloatType | PointerType | ArrayType | StructType | UnionType | TaggedUnionType | OptionType | ComplexType | TupleType | StrDictType
 
 @struct()
 class IntType:
     bits: int
     signed: bool
+
+
+@struct()
+class FloatType:
+    bits: int
 
 
 @struct()

@@ -1,15 +1,23 @@
 """Integer casts (``std.int``).
 
-``truncate`` is a builtin (implemented by ``interp._builtin_truncate``); the
-``(try_)int_cast`` functions are ordinary spy functions built on top of
-compile-time reflection (``std.reflect``) plus ``bitcast``/``coerce``.  They
-live here rather than in ``std.core`` so that they can import ``std.reflect``
-(``reflect`` imports ``core``, so a ``core``-side import would be circular).
+``truncate``, ``int_to_float_unchecked`` and ``float_to_int_unchecked`` are
+builtins; the ``(try_)int_cast`` and ``(try_)int_to_float``/``(try_)float_to_int``
+functions are ordinary spy functions built on top of compile-time reflection
+(``std.reflect``) plus those builtins.  They live here rather than in
+``std.core`` so that they can import ``std.reflect`` (``reflect`` imports
+``core``, so a ``core``-side import would be circular).
 """
 
-from ..compiler import builtin_func, func, struct, typeof
+from ..compiler import builtin_func, f32, f64, func, struct, typeof
 from ..compiler.syntax import Comptime, comptime
-from .core import bitcast, coerce, panic, sstr
+from .core import (
+    bitcast,
+    coerce,
+    float_to_int_unchecked,
+    int_to_float_unchecked,
+    panic,
+    sstr,
+)
 from .reflect import IntType, reify, type_info
 
 
@@ -104,3 +112,128 @@ def int_cast[T](value, typ: type[T]) -> T:
         return try_int_cast(value, typ)
     except IntCastError:
         panic(sstr(b'integer cast out of range'))
+
+
+@struct()
+class FloatCastError(Exception):
+    """``try_int_to_float``/``try_float_to_int`` raise this when the value
+    cannot be converted without loss (see ``int_to_float``/``float_to_int``)."""
+
+
+@func(exceptions=FloatCastError)
+def try_int_to_float[T: float](value, typ: type[T]) -> T:
+    """Cast the integer ``value`` to the float type ``typ`` exactly.
+
+    A conversion that cannot lose precision - the whole source range stays
+    within the integers a float of ``typ`` represents exactly, ``[-2**p, 2**p]``
+    for the precision ``p`` (24 for ``f32``, 53 for ``f64``) - needs no check.
+    Otherwise the value is checked against that range clamped to the source
+    range (so that both bounds are representable in the source type) and the
+    conversion is done by ``int_to_float_unchecked``; an integer that cannot be
+    represented exactly raises ``FloatCastError``.  A value whose type is not an
+    integer, or a target that is not ``f32``/``f64``, is handed to the unchecked
+    conversion, which reports the mismatch.
+    """
+    comptime()
+    src = type_info(typeof(value))
+    if isinstance(s := src, IntType):
+        comptime()
+        sb = s.bits
+        comptime()
+        rs = s.signed
+        # the precision of the target float type; a target that is neither
+        # ``f32`` nor ``f64`` is not a float type, and the unchecked conversion
+        # below reports it
+        comptime()
+        p = 0
+        if typ == f32:
+            p = 24
+        elif typ == f64:
+            p = 53
+        else:
+            return int_to_float_unchecked(value, typ)
+
+        # the exact-integer range of the float, clamped to the source range:
+        # every integer in ``[lo, hi]`` converts without loss
+        comptime()
+        src_min, src_max = valid_range(sb, rs)
+        comptime()
+        exact_min = -(1 << p)
+        comptime()
+        exact_max = 1 << p
+        contained: Comptime = src_min >= exact_min and src_max <= exact_max
+        if contained:
+            return int_to_float_unchecked(value, typ)
+        comptime()
+        lo = exact_min
+        if src_min > exact_min:
+            lo = src_min
+        comptime()
+        hi = exact_max
+        if src_max < exact_max:
+            hi = src_max
+        if value >= lo and value <= hi:
+            return int_to_float_unchecked(value, typ)
+        raise FloatCastError()
+    return int_to_float_unchecked(value, typ)
+
+
+@func(inline=True)
+def int_to_float[T: float](value, typ: type[T]) -> T:
+    """``try_int_to_float`` that panics instead of raising ``FloatCastError``."""
+    try:
+        return try_int_to_float(value, typ)
+    except FloatCastError:
+        panic(sstr(b'integer is not exactly representable as a float'))
+
+
+@func(exceptions=FloatCastError)
+def try_float_to_int[T: int](value, typ: type[T]) -> T:
+    """Cast the float ``value`` to the integer type ``typ``, truncating towards
+    zero.
+
+    The truncated value has to fit ``typ``: a signed target holds
+    ``[-2**(b-1), 2**(b-1) - 1]`` and an unsigned one ``[0, 2**b - 1]``, so the
+    check is ``-2**(b-1) <= value < 2**(b-1)`` or ``0 <= value < 2**b``.  Both
+    bounds are powers of two, exactly representable in any float, so the
+    comparison is exact - and false for a NaN or an infinity.  A value that does
+    not fit raises ``FloatCastError``; the conversion itself is
+    ``float_to_int_unchecked``.
+    """
+    comptime()
+    dst = type_info(typ)
+    if isinstance(d := dst, IntType):
+        comptime()
+        db = d.bits
+        comptime()
+        rd = d.signed
+        comptime()
+        lo = 0
+        if rd:
+            lo = -(1 << (db - 1))
+        comptime()
+        hi = 1 << db
+        if rd:
+            hi = 1 << (db - 1)
+        # the bounds are powers of two, exactly representable in ``value``'s
+        # float type: materialize them as floats so the comparison needs no
+        # int/float peer
+        comptime()
+        ftype = typeof(value)
+        comptime()
+        flo = coerce(lo, ftype)
+        comptime()
+        fhi = coerce(hi, ftype)
+        if value >= flo and value < fhi:
+            return float_to_int_unchecked(value, typ)
+        raise FloatCastError()
+    return float_to_int_unchecked(value, typ)
+
+
+@func(inline=True)
+def float_to_int[T: int](value, typ: type[T]) -> T:
+    """``try_float_to_int`` that panics instead of raising ``FloatCastError``."""
+    try:
+        return try_float_to_int(value, typ)
+    except FloatCastError:
+        panic(sstr(b'float is out of range for the integer type'))

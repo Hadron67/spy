@@ -399,7 +399,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 ### 6.8 Builtins and operators
 
 - `_call_builtin` dispatches by `fn.name`: `compile_log`, `type_info`, `reify`, `undefined`, `layout_of`, `panic`, `catch_unwind`,
-  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `coerce`, `compile_error`, `compile_option`, `atomic_load/store/rmw/cmpxchg/fence`;
+  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `int_to_float_unchecked`, `float_to_int_unchecked`, `coerce`, `compile_error`, `compile_option`, `atomic_load/store/rmw/cmpxchg/fence`;
   an unknown name raises `cannot call the spy builtin ...`.
 - Operators: `_eval_binary` decides in order the union meaning of `|` -> struct overload -> complex -> `/` -> `//` -> `**` -> bitwise -> fold both constants -> pointer arithmetic -> emit `mir.Arith` for numeric peer types;
   `_eval_cmp` (struct overload / enum member / both constants / numeric `mir.Cmp`), `_eval_not`, `_eval_unary`, `_eval_ord`, `binary_assign`.

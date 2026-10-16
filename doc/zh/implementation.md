@@ -397,7 +397,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 ### 6.8 内建与运算符
 
 - `_call_builtin` 按 `fn.name` 分派：`compile_log`、`type_info`、`reify`、`undefined`、`layout_of`、`panic`、`catch_unwind`、
-  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`coerce`、`compile_error`、`compile_option`、`atomic_load/store/rmw/cmpxchg/fence`；
+  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`int_to_float_unchecked`、`float_to_int_unchecked`、`coerce`、`compile_error`、`compile_option`、`atomic_load/store/rmw/cmpxchg/fence`；
   未知名字报 `cannot call the spy builtin ...`。
 - 运算符：`_eval_binary` 依序判定 `|` 的 union 含义 → struct 重载 → complex → `/` → `//` → `**` → 位运算 → 双常量折叠 → 指针算术 → 数值 peer 类型发 `mir.Arith`；
   `_eval_cmp`（struct 重载/枚举成员/双常量/数值 `mir.Cmp`）、`_eval_not`、`_eval_unary`、`_eval_ord`、`binary_assign`。

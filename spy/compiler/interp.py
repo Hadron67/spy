@@ -1481,6 +1481,13 @@ def _convert_inst(
 
 _FLOAT_STRUCT_FMT = {32: '=f', 64: '=d'}
 
+#: the largest finite value of a float of the given width (see
+#: ``_builtin_int_to_float_unchecked``)
+_FLOAT_MAX = {
+    32: float.fromhex('0x1.fffffep+127'),
+    64: sys.float_info.max,
+}
+
 def _scalar_bit_width(t: sval.Type) -> int | None:
     """The storage width in bits of a scalar type ``std.core.bitcast`` accepts
     (a boolean is a one-bit integer), or None for every other type."""
@@ -5903,6 +5910,10 @@ class HirRunner:
             return self._builtin_as_func_ptr(binded, ret)
         if fn.name == 'truncate':
             return self._builtin_truncate(binded, ret)
+        if fn.name == 'int_to_float_unchecked':
+            return self._builtin_int_to_float_unchecked(binded, ret)
+        if fn.name == 'float_to_int_unchecked':
+            return self._builtin_float_to_int_unchecked(binded, ret)
         if fn.name == 'coerce':
             return self._builtin_coerce(binded, ret)
         if fn.name == 'compile_error':
@@ -6081,6 +6092,100 @@ class HirRunner:
         assert target_mir is not None
         self.store(ret, RuntimeVal(
             self._emit(mir.Convert('trunc', self._to_runtime(ev), target_mir)), target
+        ))
+        return PollResult.AGAIN
+
+    # -- ``std.core.int_to_float_unchecked`` ---------------------------------
+
+    def _builtin_int_to_float_unchecked(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.int_to_float_unchecked(value, T)``: convert the integer
+        ``value`` to the float type ``T``, without any check.  A compile-time
+        value is converted in Python and stays compile-time - an integer the
+        float cannot hold at all (beyond its largest finite value) becomes
+        ``undefined`` - while a runtime value is
+        ``mir.Convert('sitofp'/'uitofp')`` (the signedness of the source picks
+        the instruction)."""
+        target = self._type_value_arg(
+            args.positional[1], 'the type argument of std.core.int_to_float_unchecked'
+        )
+        if not isinstance(target, sval.FloatType):
+            raise CompileError(
+                f'std.core.int_to_float_unchecked expects a float type, got {target}'
+            )
+        ev = self._arg_value(args.positional[0])
+        obj = ev if sval.is_sval(ev) else None
+        if isinstance(obj, sval.Int) or (
+            isinstance(obj, int) and not isinstance(obj, bool)
+        ):
+            value = obj.value if isinstance(obj, sval.Int) else obj
+            if -_FLOAT_MAX[target.bits] <= value <= _FLOAT_MAX[target.bits]:
+                self.store(ret, sval.Float(float(value), target))
+            else:
+                self.store(ret, sval.UntypedUndefined())
+            return PollResult.AGAIN
+        source = _type_of(ev)
+        if not isinstance(source, sval.IntType):
+            raise CompileError(
+                f'std.core.int_to_float_unchecked expects an integer, got {source}'
+            )
+        target_mir = target.to_mir_type(self._mir_cache)
+        assert target_mir is not None
+        kind = 'sitofp' if source.signed else 'uitofp'
+        self.store(ret, RuntimeVal(
+            self._emit(mir.Convert(kind, self._to_runtime(ev), target_mir)), target
+        ))
+        return PollResult.AGAIN
+
+    # -- ``std.core.float_to_int_unchecked`` ---------------------------------
+
+    def _builtin_float_to_int_unchecked(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.float_to_int_unchecked(value, T)``: convert the float
+        ``value`` to the integer type ``T``, truncating towards zero, without any
+        check.  A compile-time value is converted in Python and stays
+        compile-time - a value the integer cannot hold (a non-finite one, or one
+        whose truncation is out of range) becomes ``undefined`` - while a runtime
+        value is ``mir.Convert('fptosi'/'fptoui')`` (the signedness of the target
+        picks the instruction)."""
+        target = self._type_value_arg(
+            args.positional[1], 'the type argument of std.core.float_to_int_unchecked'
+        )
+        if not isinstance(target, sval.IntType):
+            raise CompileError(
+                f'std.core.float_to_int_unchecked expects an integer type, got {target}'
+            )
+        ev = self._arg_value(args.positional[0])
+        obj = ev if sval.is_sval(ev) else None
+        if isinstance(obj, sval.Float) or (
+            isinstance(obj, float) and not isinstance(obj, bool)
+        ):
+            value = obj.value if isinstance(obj, sval.Float) else obj
+            # the bounds of the truncation-towards-zero result: signed values fit
+            # ``[-2**(bits-1), 2**(bits-1) - 1]``, unsigned ones
+            # ``[0, 2**bits - 1]``.  The exclusive upper bound ``2**(bits-1)`` /
+            # ``2**bits`` and the inclusive lower one are powers of two, exactly
+            # representable in any float, so the comparison is exact (and false
+            # for a NaN)
+            lo = -(1 << (target.bits - 1)) if target.signed else 0
+            hi = (1 << (target.bits - 1)) if target.signed else (1 << target.bits)
+            if lo <= value < hi:
+                self.store(ret, sval.Int(int(value), target))
+            else:
+                self.store(ret, sval.UntypedUndefined())
+            return PollResult.AGAIN
+        source = _type_of(ev)
+        if not isinstance(source, sval.FloatType):
+            raise CompileError(
+                f'std.core.float_to_int_unchecked expects a float, got {source}'
+            )
+        target_mir = target.to_mir_type(self._mir_cache)
+        assert target_mir is not None
+        kind = 'fptosi' if target.signed else 'fptoui'
+        self.store(ret, RuntimeVal(
+            self._emit(mir.Convert(kind, self._to_runtime(ev), target_mir)), target
         ))
         return PollResult.AGAIN
 
@@ -6753,6 +6858,9 @@ class HirRunner:
         if isinstance(ty, sval.IntType):
             variant = 'IntType'
             fields = (ty.bits, ty.signed)
+        elif isinstance(ty, sval.FloatType):
+            variant = 'FloatType'
+            fields = (ty.bits,)
         elif isinstance(ty, sval.PointerType):
             variant = 'PointerType'
             fields = (ty.elem, ty.is_const)
@@ -6906,6 +7014,11 @@ class HirRunner:
         resolve = self._analyser._resolver.resolve_global
         if variant is resolve(reflect.IntType):
             return sval.IntType(self._reify_int(fields[0]), self._reify_bool(fields[1]))
+        if variant is resolve(reflect.FloatType):
+            bits = self._reify_int(fields[0])
+            if bits not in (32, 64):
+                raise CompileError(f'the width of a float type is 32 or 64, got {bits}')
+            return sval.FloatType(bits)
         if variant is resolve(reflect.PointerType):
             # the pointer variant (single/multi) is not reflected, so the
             # reified pointer is always a single one

@@ -2,6 +2,8 @@ from unittest import TestCase
 
 from ..compiler import bool as spy_bool
 from ..compiler import (
+    f32,
+    f64,
     i32,
     i64,
     u32,
@@ -18,6 +20,7 @@ from ..compiler.syntax import (
 from ..std.core import coerce
 from ..std.reflect import (
     ArrayType,
+    FloatType,
     IntType,
     OptionType,
     PointerType,
@@ -69,6 +72,14 @@ def reflect_int_signed() -> spy_bool:
     if isinstance(v := info, IntType):
         return v.signed
     return False
+
+
+@func()
+def reflect_float_bits() -> i32:
+    info: Comptime = type_info(f32)
+    if isinstance(v := info, FloatType):
+        return v.bits
+    return -1
 
 
 @func()
@@ -176,6 +187,11 @@ def reify_int() -> spy_bool:
 
 
 @func()
+def reify_float() -> spy_bool:
+    return reify(type_info(f64)) == f64
+
+
+@func()
 def reify_ptr() -> spy_bool:
     return reify(type_info(Ptr[i32])) == Ptr[i32]
 
@@ -259,6 +275,9 @@ class SpyReflectTest(TestCase):
         self.assertEqual(reflect_int_bits(), 32)
         self.assertTrue(reflect_int_signed())
 
+    def test_a_float_type_reflects_its_width(self) -> None:
+        self.assertEqual(reflect_float_bits(), 32)
+
     def test_the_type_of_a_value_reflects_like_the_type(self) -> None:
         self.assertEqual(reflect_typeof_bits(0), 64)
 
@@ -295,6 +314,7 @@ class SpyReifyTest(TestCase):
 
     def test_scalar_like_types_reify_to_themselves(self) -> None:
         self.assertTrue(reify_int())
+        self.assertTrue(reify_float())
         self.assertTrue(reify_ptr())
         self.assertTrue(reify_option())
         self.assertTrue(reify_tagged_union())

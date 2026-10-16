@@ -246,6 +246,12 @@ def coerce[T](value: Any, typ: type[T]) -> T: ...
 def typed_undefined[T](typ: type[T]) -> T:
     return coerce(undefined(), typ)
 
+@builtin_func
+def int_to_float_unchecked[T: float](value: int, typ: type[T]) -> T: ...
+
+@builtin_func
+def float_to_int_unchecked[T: int](value: float, typ: type[T]) -> T: ...
+
 # ``const_array(elem, length)``: an array of ``length`` (a compile-time integer)
 # elements, every element equal to ``elem`` (evaluated once, may be a runtime
 # value).  ``elem`` is written into each element place, so a compile-time one
