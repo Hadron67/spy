@@ -18,7 +18,7 @@ time.
 
 from ...compiler import f32, f64, typeof
 from ...compiler.dsl import func
-from ...compiler.syntax import Comptime, comptime
+from ...compiler.syntax import comptime
 from ..c import cos as c_cos
 from ..c import cosf as c_cosf
 from ..c import sin as c_sin
@@ -27,7 +27,7 @@ from ..c import sqrt as c_sqrt
 from ..c import sqrtf as c_sqrtf
 from ..c import tan as c_tan
 from ..c import tanf as c_tanf
-from ..core import coerce, compile_error, compile_option
+from ..core import compile_error, compile_option
 from ..llvm import cos_f32 as llvm_cos_f32
 from ..llvm import cos_f64 as llvm_cos_f64
 from ..llvm import sin_f32 as llvm_sin_f32
@@ -45,122 +45,60 @@ _MODE_LLVM = b'llvm'
 _MODE_LIBC = b'libc'
 _MODE_SOFTWARE = b'software'
 
+@func(inline=True)
+def _dispatch_float(x, f32_fn, f64_fn):
+    comptime()
+    typ = typeof(x)
+    if typ == f32:
+        return f32_fn(x)
+    elif typ == f64:
+        return f64_fn(x)
+    else:
+        compile_error("must use f32 or f64")
 
-@func()
+@func(inline=True)
+def _dispatch(x, opt_name, llvm_f32_fn, llvm_f64_fn, libc_f32_fn, libc_f64_fn, spy_fn):
+    comptime()
+    mode = compile_option(opt_name)
+    if mode == b'llvm':
+        return _dispatch_float(x, llvm_f32_fn, llvm_f64_fn)
+    elif mode == b'libc':
+        return _dispatch_float(x, libc_f32_fn, libc_f64_fn)
+    elif mode == b'software' or mode is None:
+        return spy_fn(x)
+    else:
+        compile_error('mode must be "llvm", "libc" or "software"')
+
+@func(inline=True)
 def sin[T](x: T) -> T:
     """The sine of ``x`` (``f32`` or ``f64``): ``llvm.sin.*``, the libc
     ``sinf``/``sin``, or the pure spy implementation, as the compile-time option
     ``sin_mode`` (``llvm``/``libc``/``software``) selects.  An unknown mode is a
     compile error."""
-    comptime()
-    typ = typeof(x)
-    mode: Comptime = compile_option('sin_mode')
-    use_llvm: Comptime = mode == _MODE_LLVM
-    use_libc: Comptime = mode == _MODE_LIBC
-    use_software: Comptime = mode is None or mode == _MODE_SOFTWARE
-    if not use_llvm and not use_libc and not use_software:
-        compile_error('sin_mode must be "llvm", "libc" or "software"')
-    is_32: Comptime = typ == f32
-    if is_32:
-        x32: f32 = coerce(x, f32)
-        if use_libc:
-            return coerce(c_sinf(x32), typ)
-        if use_software:
-            return coerce(software_sin(x32), typ)
-        return coerce(llvm_sin_f32(x32), typ)
-    x64: f64 = coerce(x, f64)
-    if use_libc:
-        return coerce(c_sin(x64), typ)
-    if use_software:
-        return coerce(software_sin(x64), typ)
-    return coerce(llvm_sin_f64(x64), typ)
+    return _dispatch(x, "sin_mode", llvm_sin_f32, llvm_sin_f64, c_sinf, c_sin, software_sin)
 
 
-@func()
+@func(inline=True)
 def cos[T](x: T) -> T:
     """The cosine of ``x`` (``f32`` or ``f64``): ``llvm.cos.*``, the libc
     ``cosf``/``cos``, or the pure spy implementation, as the compile-time option
     ``cos_mode`` (``llvm``/``libc``/``software``) selects.  An unknown mode is a
     compile error."""
-    comptime()
-    typ = typeof(x)
-    mode: Comptime = compile_option('cos_mode')
-    use_llvm: Comptime = mode == _MODE_LLVM
-    use_libc: Comptime = mode == _MODE_LIBC
-    use_software: Comptime = mode is None or mode == _MODE_SOFTWARE
-    if not use_llvm and not use_libc and not use_software:
-        compile_error('cos_mode must be "llvm", "libc" or "software"')
-    is_32: Comptime = typ == f32
-    if is_32:
-        x32: f32 = coerce(x, f32)
-        if use_libc:
-            return coerce(c_cosf(x32), typ)
-        if use_software:
-            return coerce(software_cos(x32), typ)
-        return coerce(llvm_cos_f32(x32), typ)
-    x64: f64 = coerce(x, f64)
-    if use_libc:
-        return coerce(c_cos(x64), typ)
-    if use_software:
-        return coerce(software_cos(x64), typ)
-    return coerce(llvm_cos_f64(x64), typ)
+    return _dispatch(x, "cos_mode", llvm_cos_f32, llvm_cos_f64, c_cosf, c_cos, software_cos)
 
 
-@func()
+@func(inline=True)
 def tan[T](x: T) -> T:
     """The tangent of ``x`` (``f32`` or ``f64``): ``llvm.tan.*``, the libc
     ``tanf``/``tan``, or the pure spy implementation (``sin(x) / cos(x)``), as the
     compile-time option ``tan_mode`` (``llvm``/``libc``/``software``) selects.  An
     unknown mode is a compile error."""
-    comptime()
-    typ = typeof(x)
-    mode: Comptime = compile_option('tan_mode')
-    use_llvm: Comptime = mode == _MODE_LLVM
-    use_libc: Comptime = mode == _MODE_LIBC
-    use_software: Comptime = mode is None or mode == _MODE_SOFTWARE
-    if not use_llvm and not use_libc and not use_software:
-        compile_error('tan_mode must be "llvm", "libc" or "software"')
-    is_32: Comptime = typ == f32
-    if is_32:
-        x32 = coerce(x, f32)
-        if use_libc:
-            return coerce(c_tanf(x32), typ)
-        if use_software:
-            return coerce(software_tan(x32), typ)
-        return coerce(llvm_tan_f32(x32), typ)
-    x64: f64 = coerce(x, f64)
-    if use_libc:
-        return coerce(c_tan(x64), typ)
-    if use_software:
-        return coerce(software_tan(x64), typ)
-    return coerce(llvm_tan_f64(x64), typ)
+    return _dispatch(x, "tan_mode", llvm_tan_f32, llvm_tan_f64, c_tanf, c_tan, software_tan)
 
-
-@func()
+@func(inline=True)
 def sqrt[T](x: T) -> T:
     """The square root of ``x`` (``f32`` or ``f64``): ``llvm.sqrt.*``, the libc
     ``sqrtf``/``sqrt``, or the pure spy implementation, as the compile-time option
     ``sqrt_mode`` (``llvm``/``libc``/``software``) selects.  An unknown mode is a
     compile error."""
-    comptime()
-    typ = typeof(x)
-    mode: Comptime = compile_option('sqrt_mode')
-    use_llvm: Comptime = mode == _MODE_LLVM
-    use_libc: Comptime = mode == _MODE_LIBC
-    use_software: Comptime = mode is None or mode == _MODE_SOFTWARE
-    if not use_llvm and not use_libc and not use_software:
-        compile_error('sqrt_mode must be "llvm", "libc" or "software"')
-    is_32: Comptime = typ == f32
-    if is_32:
-        x32 = coerce(x, f32)
-        if use_libc:
-            return coerce(c_sqrtf(x32), typ)
-        if use_software:
-            return coerce(software_sqrt(x32), typ)
-        return coerce(llvm_sqrt_f32(x32), typ)
-    x64 = coerce(x, f64)
-    if use_libc:
-        return coerce(c_sqrt(x64), typ)
-    if use_software:
-        return coerce(software_sqrt(x64), typ)
-    return coerce(llvm_sqrt_f64(x64), typ)
+    return _dispatch(x, "sqrt_mode", llvm_sqrt_f32, llvm_sqrt_f64, c_sqrtf, c_sqrt, software_sqrt)

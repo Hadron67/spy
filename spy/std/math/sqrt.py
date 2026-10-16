@@ -25,7 +25,7 @@ from ...compiler.syntax import Comptime, array, comptime, const_comptime
 from ..core import bitcast, coerce
 
 
-@func()
+@func(inline=True)
 def _mul32(a: u32, b: u32) -> u32:
     """``a * b * 2**-32``, the 32-bit fixed point product of musl's ``mul32``."""
     return coerce(coerce(a, u64) * coerce(b, u64) >> 32, u32)
