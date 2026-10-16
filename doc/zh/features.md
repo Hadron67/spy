@@ -48,7 +48,7 @@ from spy.std.core import (
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
-from spy.std.math import sin, cos, tan, sqrt
+from spy.std.math import sin, cos, tan, sqrt, cbrt
 from spy.std.mem import Layout, layout_of, size_of, align_of
 from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
@@ -1606,9 +1606,9 @@ assert str_len() == 5
 | `std.reflect` | `TypeInfo` 及变体、`StructField`、`type_info`、`reify` |
 | `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast`、`FloatCastError`、`try_int_to_float`/`int_to_float`、`try_float_to_int`/`float_to_int` |
 | `std.mem` | `Layout`、`layout_of`/`size_of`/`align_of`、`AllocError`、`Allocator`（协议）、`AllocatorVtable`、`DynamicAllocator`、`CAllocator` |
-| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf`（extern 声明）、`sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`sqrt`/`sqrtf`（libm）、`CError`、`FILE`、`fopen`/`fclose`/`fread`/`fwrite` |
+| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf`（extern 声明）、`sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`（libm）、`CError`、`FILE`、`fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`、`Writable`/`Readable`（协议） |
-| `std.math` | `sin`/`cos`/`tan`/`sqrt`（实现由编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`sqrt_mode` 在编译期选定：`llvm`/`libc`/`software`） |
+| `std.math` | `sin`/`cos`/`tan`/`sqrt`/`cbrt`（实现由编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`sqrt_mode`/`cbrt_mode` 在编译期选定：`llvm`/`libc`/`software`） |
 | `std.vec` | `Vec[T, A]` 动态数组 |
 | `std.atomic` | `MemoryOrder`/`RmwOp`、`atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`、便捷包装 |
 | `std.openmp` | `load_openmp_runtime`、`parallel_loop` |
@@ -1649,7 +1649,7 @@ assert use_bump(5) == 56
 - `length == 0` 时没有迭代可归约，返回累加器的初始（`undefined`）值。
 - `kernel` 返回 void 时不做归约，`reduce_op` 被忽略（只执行循环体）。
 
-```python,norun
+```python
 @func()
 def parallel_sum(n: i32) -> i64:
     def kernel(i: i32) -> i64:
@@ -1674,14 +1674,14 @@ def parallel_sum_count(n: i32) -> i64:
 
 ### 9.3 数学
 
-`std.math.sin(x)` / `std.math.cos(x)` / `std.math.tan(x)` 返回 `f32` 或 `f64` 的 `x` 的正弦/余弦/正切（结果类型与 `x` 相同），`std.math.sqrt(x)` 返回其平方根（非负 `x`）。具体用哪个实现在**编译期**由宿主的编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`sqrt_mode` 选定：
+`std.math.sin(x)` / `std.math.cos(x)` / `std.math.tan(x)` 返回 `f32` 或 `f64` 的 `x` 的正弦/余弦/正切（结果类型与 `x` 相同），`std.math.sqrt(x)` 返回其平方根（非负 `x`），`std.math.cbrt(x)` 返回其立方根（可为负 `x`）。具体用哪个实现在**编译期**由宿主的编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`sqrt_mode`/`cbrt_mode` 选定：
 
-- `llvm`：LLVM 内建（`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.sqrt.*`）；
-- `libc`：C 标准库的 `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`sqrtf`/`sqrt`（即 `std.c` 中的 extern 声明）；
-- `software`（默认值，选项未设置时也是它）：musl 的 `sin`/`sinf`/`cos`/`cosf` 的纯 spy 移植（`std.math.trig`，两者共用内核与参数规约），`tan` 定义为 `sin(x) / cos(x)`；musl 的 `sqrt`/`sqrtf` 的纯 spy 移植在 `std.math.sqrt`。
+- `llvm`：LLVM 内建（`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.sqrt.*`/`llvm.cbrt.*`；其中 `llvm.cbrt.*` 是 LLVM 21 才引入的内建，更早的 LLVM 上不可用）；
+- `libc`：C 标准库的 `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`sqrtf`/`sqrt`/`cbrtf`/`cbrt`（即 `std.c` 中的 extern 声明）；
+- `software`（默认值，选项未设置时也是它）：musl 的 `sin`/`sinf`/`cos`/`cosf` 的纯 spy 移植（`std.math.trig`，两者共用内核与参数规约），`tan` 定义为 `sin(x) / cos(x)`；musl 的 `sqrt`/`sqrtf` 的纯 spy 移植在 `std.math.sqrt`，`cbrt`/`cbrtf` 的在 `std.math.cbrt`。
 
 只有被选中的实现会被类型推导并 lowering，因此选择在运行时没有开销；非法取值是编译错误。`sin`/`cos` 与 `sqrt` 的软件实现对 `f32` 与 `f64`
-都是正确舍入的。`sqrt` 的负参数（以及 NaN）得到 NaN，`sqrt(-0.0)` 是 `-0.0`。
+都是正确舍入的，`cbrt` 的软件实现误差小于 0.667 ULP。`sqrt` 的负参数（以及 NaN）得到 NaN，`sqrt(-0.0)` 是 `-0.0`；`cbrt` 是奇函数（`cbrt(-x) == -cbrt(x)`），负参数正常计算，`cbrt(±0)` 是 `±0`。
 
 ```python
 @func()
@@ -1700,6 +1700,10 @@ def my_tan(x: f64) -> f64:
 def my_sqrt(x: f64) -> f64:
     return sqrt(x)
 
+@func()
+def my_cbrt(x: f64) -> f64:
+    return cbrt(x)
+
 assert abs(my_sin(0.5) - 0.479425538604203) < 1e-15
 assert abs(my_sin(1.0) - 0.8414709848078965) < 1e-15
 assert abs(my_cos(0.5) - 0.8775825618903728) < 1e-15
@@ -1707,6 +1711,9 @@ assert abs(my_tan(0.5) - 0.5463024898437905) < 1e-15
 assert abs(my_sqrt(2.0) - 1.4142135623730951) < 1e-15
 assert my_sqrt(4.0) == 2.0
 assert my_sqrt(0.25) == 0.5
+assert my_cbrt(8.0) == 2.0
+assert my_cbrt(-8.0) == -2.0
+assert abs(my_cbrt(2.0) - 1.2599210498948732) < 1e-15
 ```
 
 ---

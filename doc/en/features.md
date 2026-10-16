@@ -48,7 +48,7 @@ from spy.std.core import (
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
-from spy.std.math import sin, cos, tan, sqrt
+from spy.std.math import sin, cos, tan, sqrt, cbrt
 from spy.std.mem import Layout, layout_of, size_of, align_of
 from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
@@ -1603,9 +1603,9 @@ assert str_len() == 5
 | `std.reflect` | `TypeInfo` and its variants, `StructField`, `type_info`, `reify` |
 | `std.int` | `truncate` (builtin), `IntCastError`, `valid_range`, `try_int_cast`/`int_cast`, `FloatCastError`, `try_int_to_float`/`int_to_float`, `try_float_to_int`/`float_to_int` |
 | `std.mem` | `Layout`, `layout_of`/`size_of`/`align_of`, `AllocError`, `Allocator` (protocol), `AllocatorVtable`, `DynamicAllocator`, `CAllocator` |
-| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf` (extern declarations), `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`sqrt`/`sqrtf` (libm), `CError`, `FILE`, `fopen`/`fclose`/`fread`/`fwrite` |
+| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf` (extern declarations), `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf` (libm), `CError`, `FILE`, `fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`, `Writable`/`Readable` (protocols) |
-| `std.math` | `sin`/`cos`/`tan`/`sqrt` (the implementation is chosen at compile time by the option `sin_mode`/`cos_mode`/`tan_mode`/`sqrt_mode`: `llvm`/`libc`/`software`) |
+| `std.math` | `sin`/`cos`/`tan`/`sqrt`/`cbrt` (the implementation is chosen at compile time by the option `sin_mode`/`cos_mode`/`tan_mode`/`sqrt_mode`/`cbrt_mode`: `llvm`/`libc`/`software`) |
 | `std.vec` | `Vec[T, A]` dynamic array |
 | `std.atomic` | `MemoryOrder`/`RmwOp`, `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`, convenience wrappers |
 | `std.openmp` | `load_openmp_runtime`, `parallel_loop` |
@@ -1673,18 +1673,21 @@ def parallel_sum_count(n: i32) -> i64:
 ### 9.3 Math
 
 `std.math.sin(x)` / `std.math.cos(x)` / `std.math.tan(x)` return the sine/cosine/tangent of an `f32` or `f64` `x` (the result
-has the same type), and `std.math.sqrt(x)` returns its square root (a non-negative `x`). Which implementation runs is picked
-**at compile time** by the host's compile-time option `sin_mode`/`cos_mode`/`tan_mode`/`sqrt_mode`:
+has the same type), `std.math.sqrt(x)` returns its square root (a non-negative `x`), and `std.math.cbrt(x)` its cube root (a
+negative `x` is fine). Which implementation runs is picked **at compile time** by the host's compile-time option
+`sin_mode`/`cos_mode`/`tan_mode`/`sqrt_mode`/`cbrt_mode`:
 
-- `llvm` - the LLVM intrinsic (`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.sqrt.*`);
-- `libc` - the C library `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`sqrtf`/`sqrt` (the extern declarations in `std.c`);
+- `llvm` - the LLVM intrinsic (`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.sqrt.*`/`llvm.cbrt.*`; `llvm.cbrt.*` is an
+  intrinsic only from LLVM 21 on, so it is unavailable on an older LLVM);
+- `libc` - the C library `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`sqrtf`/`sqrt`/`cbrtf`/`cbrt` (the extern declarations in `std.c`);
 - `software` (the default, also when the option is unset) - a pure spy port of musl's `sin`/`sinf`/`cos`/`cosf` in
-  `std.math.trig` (where the two share the kernels and the argument reduction), with `tan` defined as `sin(x) / cos(x)`, and
-  of musl's `sqrt`/`sqrtf` in `std.math.sqrt`.
+  `std.math.trig` (where the two share the kernels and the argument reduction), with `tan` defined as `sin(x) / cos(x)`;
+  musl's `sqrt`/`sqrtf` in `std.math.sqrt`; and musl's `cbrt`/`cbrtf` in `std.math.cbrt`.
 
 Only the selected implementation is typed and lowered, so the choice costs nothing at run time; an unknown mode is a compile
-error. The software port of `sin`/`cos` and `sqrt` is correctly rounded for both `f32` and `f64`. A negative (`sqrt`) argument
-(and a NaN) yields a NaN, and `sqrt(-0.0)` is `-0.0`.
+error. The software port of `sin`/`cos` and `sqrt` is correctly rounded for both `f32` and `f64`, and `cbrt`'s error is below
+0.667 ULP. A negative `sqrt` argument (and a NaN) yields a NaN, and `sqrt(-0.0)` is `-0.0`; `cbrt` is odd
+(`cbrt(-x) == -cbrt(x)`), so a negative argument is computed, and `cbrt(+-0)` is `+-0`.
 
 ```python
 @func()
@@ -1703,6 +1706,10 @@ def my_tan(x: f64) -> f64:
 def my_sqrt(x: f64) -> f64:
     return sqrt(x)
 
+@func()
+def my_cbrt(x: f64) -> f64:
+    return cbrt(x)
+
 assert abs(my_sin(0.5) - 0.479425538604203) < 1e-15
 assert abs(my_sin(1.0) - 0.8414709848078965) < 1e-15
 assert abs(my_cos(0.5) - 0.8775825618903728) < 1e-15
@@ -1710,6 +1717,9 @@ assert abs(my_tan(0.5) - 0.5463024898437905) < 1e-15
 assert abs(my_sqrt(2.0) - 1.4142135623730951) < 1e-15
 assert my_sqrt(4.0) == 2.0
 assert my_sqrt(0.25) == 0.5
+assert my_cbrt(8.0) == 2.0
+assert my_cbrt(-8.0) == -2.0
+assert abs(my_cbrt(2.0) - 1.2599210498948732) < 1e-15
 ```
 
 ---

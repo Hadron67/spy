@@ -22,7 +22,7 @@ changes the returned number.
 from ...compiler import f32, f64, typeof, u16, u32, u64, usize
 from ...compiler.dsl import func
 from ...compiler.syntax import Comptime, array, comptime, const_comptime
-from ..core import bitcast, coerce
+from ..core import Numeric, bitcast, coerce
 
 
 @func(inline=True)
@@ -98,7 +98,7 @@ def _invalid_f64(x: f64) -> f64:
 
 
 @func()
-def sqrt[T](x: T) -> T:
+def sqrt[T: Numeric](x: T) -> T:
     """The square root of ``x`` (``f32`` or ``f64``), the pure spy
     implementation: a port of musl's ``sqrtf``/``sqrt``."""
     comptime()

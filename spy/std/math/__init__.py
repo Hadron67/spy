@@ -1,15 +1,16 @@
 """Math functions (``std.math``).
 
-:func:`sin`, :func:`cos`, :func:`tan` and :func:`sqrt` each dispatch to one of
-three implementations at compile time, chosen by the host's compile-time option
-``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode``:
+:func:`sin`, :func:`cos`, :func:`tan`, :func:`sqrt` and :func:`cbrt` each
+dispatch to one of three implementations at compile time, chosen by the host's
+compile-time option
+``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode``/``cbrt_mode``:
 
 * ``llvm`` - the LLVM intrinsic (``llvm.sin.*``/``llvm.cos.*``/``llvm.tan.*``/
-  ``llvm.sqrt.*``),
+  ``llvm.sqrt.*``/``llvm.cbrt.*``),
 * ``libc`` - the C library ``sinf``/``sin``/``cosf``/``cos``/``tanf``/``tan``/
-  ``sqrtf``/``sqrt`` (see ``std.c``),
+  ``sqrtf``/``sqrt``/``cbrtf``/``cbrt`` (see ``std.c``),
 * ``software`` (the default, also when the option is unset) - the pure spy port
-  in ``std.math.trig``/``std.math.sqrt``.
+  in ``std.math.trig``/``std.math.sqrt``/``std.math.cbrt``.
 
 The mode is read while the function is compiled (``compile_option``) and only the
 selected implementation is typed and lowered, so the choice costs nothing at run
@@ -19,6 +20,8 @@ time.
 from ...compiler import f32, f64, typeof
 from ...compiler.dsl import func
 from ...compiler.syntax import comptime
+from ..c import cbrt as c_cbrt
+from ..c import cbrtf as c_cbrtf
 from ..c import cos as c_cos
 from ..c import cosf as c_cosf
 from ..c import sin as c_sin
@@ -28,6 +31,8 @@ from ..c import sqrtf as c_sqrtf
 from ..c import tan as c_tan
 from ..c import tanf as c_tanf
 from ..core import compile_error, compile_option
+from ..llvm import cbrt_f32 as llvm_cbrt_f32
+from ..llvm import cbrt_f64 as llvm_cbrt_f64
 from ..llvm import cos_f32 as llvm_cos_f32
 from ..llvm import cos_f64 as llvm_cos_f64
 from ..llvm import sin_f32 as llvm_sin_f32
@@ -36,6 +41,7 @@ from ..llvm import sqrt_f32 as llvm_sqrt_f32
 from ..llvm import sqrt_f64 as llvm_sqrt_f64
 from ..llvm import tan_f32 as llvm_tan_f32
 from ..llvm import tan_f64 as llvm_tan_f64
+from .cbrt import cbrt as software_cbrt
 from .sqrt import sqrt as software_sqrt
 from .trig import cos as software_cos
 from .trig import sin as software_sin
@@ -102,3 +108,11 @@ def sqrt[T](x: T) -> T:
     ``sqrt_mode`` (``llvm``/``libc``/``software``) selects.  An unknown mode is a
     compile error."""
     return _dispatch(x, "sqrt_mode", llvm_sqrt_f32, llvm_sqrt_f64, c_sqrtf, c_sqrt, software_sqrt)
+
+@func(inline=True)
+def cbrt[T](x: T) -> T:
+    """The cube root of ``x`` (``f32`` or ``f64``): ``llvm.cbrt.*``, the libc
+    ``cbrtf``/``cbrt``, or the pure spy implementation, as the compile-time
+    option ``cbrt_mode`` (``llvm``/``libc``/``software``) selects.  An unknown
+    mode is a compile error."""
+    return _dispatch(x, "cbrt_mode", llvm_cbrt_f32, llvm_cbrt_f64, c_cbrtf, c_cbrt, software_cbrt)
