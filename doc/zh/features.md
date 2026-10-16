@@ -220,8 +220,8 @@ assert repeat(2) == 4
 
 - 值要么是一个 `T`，要么是 `None`。
 - `T` 与 `None` 都能自动转成 `Option[T]`；同一个位置同时收到 `T` 与 `None` 时类型即 `Option[T]`。
-- 判断与解包：`expr is None` / `expr is not None`；海牙语法 `(name := expr) is not None` 把 `name`
-  绑定到内层值的可写位置；一般 `(name := expr)` 把 `name` 绑定到 option 本身。
+- 判断与解包：`expr is None` / `expr is not None`（对任意类型可用：非 option 值永不缺失，判断恒为 `False`）；海牙语法 `(name := expr) is not None` 把 `name`
+  绑定到内层值的可写位置（该形式要求 option）；一般 `(name := expr)` 把 `name` 绑定到 option 本身。
 - **尚未实现**：模式匹配 option；借用式表示下还存在误判缺失的边界情况（见 `doc/implementation.md`）。
 
 ```python
@@ -1461,7 +1461,7 @@ assert unrolled_sum() == 6
 - `std.core.undefined()`：任意类型的 undefined，写进目标时按其类型定型；undefined 作条件报错。
 - `std.core.compile_error(msg)`：以编译期字节串为消息中止编译；非字节串/运行时消息报错；死分支不触发。
 - `std.core.coerce(value, T)`：把 value 具体化成类型 `T`（同 store 的转换）。
-- `std.core.compile_option(name)`：**已声明但未实现**（调用报错）。
+- `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`）；未设置时是缺失值（`None`）。
 - `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)`：标量的同位宽重解释 / 整数收窄。
 
@@ -1571,7 +1571,7 @@ assert str_len() == 5
 
 | 模块 | 内容 |
 |---|---|
-| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option`（未实现） |
+| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option` |
 | `std.reflect` | `TypeInfo` 及变体、`StructField`、`type_info`、`reify` |
 | `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast` |
 | `std.mem` | `Layout`、`layout_of`/`size_of`/`align_of`、`AllocError`、`Allocator`（协议）、`AllocatorVtable`、`DynamicAllocator`、`CAllocator` |
@@ -1695,7 +1695,6 @@ panic/`catch_unwind`；原子操作；OpenMP（含归约）；Python 侧互操�
 - 数组：运行时长度的数组、数组之间的转换、数组跨 Python 边界。
 - `dict[str, T]` 注解解析；option 的模式匹配；闭包 `nonlocal`；互递归闭包；闭包引用外层类型参数。
 - 声明的「编译期专属」返回类型（`-> bytes` / `-> type` 等，见 `doc/issues.md` #7）。
-- `std.core.compile_option`：声明了但未实现。
 - 破坏性 move 语义（`copyable=False` 只表示不可拷贝，不做 move 检查）。
 
 > 逐条实现缺陷与最小复现见 `doc/issues.md`。

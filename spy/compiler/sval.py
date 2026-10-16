@@ -4572,3 +4572,15 @@ class CompileContext:
 
     def special_types(self) -> SpecialTypes:
         ...
+
+    @abstractmethod
+    def get_compile_option(self, name: bytes) -> AnyValue | None:
+        """The value the host stored for the compile-time option ``name``, or
+        ``None`` when it is not set (the absent value of a spy value read by
+        ``std.core.compile_option``)."""
+        ...
+
+    @abstractmethod
+    def set_compile_option(self, name: bytes, value: AnyValue) -> None:
+        """Store ``value`` as the compile-time option ``name`` of this host."""
+        ...

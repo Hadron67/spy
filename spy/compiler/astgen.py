@@ -1348,12 +1348,13 @@ class _Builder:
 
     def _gen_is_none(self, node: ast.Compare, negated: bool) -> tuple[ArgEntry[hir.Value], bool]:
         """``expr is None`` / ``expr is not None``: whether the option ``expr`` is
-        absent (the ``is not None`` negates the test).  The operand has to be an
-        ``Option[T]`` - ``hir.IsNull`` rejects anything else.
+        absent (the ``is not None`` negates the test).  The operand may be of any
+        type - a non-option value is never the absent one, so the test reads
+        ``False`` there (see ``hir.IsNull``).
 
         ``(name := expr) is not None`` is the *unwrap* form: it is handled as a
         whole (see ``_gen_unwrap``), binding ``name`` to the option's *payload*
-        pointer rather than to the option pointer."""
+        pointer rather than to the option pointer, and requires an option."""
         left, right = node.left, node.comparators[0]
         if not _is_none_literal(left) and not _is_none_literal(right):
             raise CompileError(

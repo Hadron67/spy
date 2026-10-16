@@ -290,7 +290,8 @@ each storage leaf is delivered through a trailing `$result` out-pointer; the thu
 - `_RegisteredClass`: `get_entry` builds the `StructTypeHead` (binds the head before reading the body, supporting self-reference), the fields, and the methods (walking `reversed(MRO)`, subclass overrides first);
   `__getitem__` -> `glue.specialized_struct`; `__call__` -> `glue.construct`.
 - `_Context` (a subclass of `sval.CompileContext`): `resolve_global` (resolves registered objects / enum members into spy values or `FunctionValue`s of this context, and wraps a plain Python function that is not decorated with `@func` into a `sval.PyFunction`),
-  `special_types`, `mir_lower_cache`, `target_info`, `_resolve_call`, enum support (`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`).
+  `special_types`, `mir_lower_cache`, `target_info`, `_resolve_call`, enum support (`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`),
+  compile options (`get_compile_option`/`set_compile_option`, stored in `_compile_options`).
   `_GLOBAL_CONTEXT = _Context(LLVMBackend())` is the top-level default context.
 
 ---
@@ -398,8 +399,8 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 ### 6.8 Builtins and operators
 
 - `_call_builtin` dispatches by `fn.name`: `compile_log`, `type_info`, `reify`, `undefined`, `layout_of`, `panic`, `catch_unwind`,
-  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `coerce`, `compile_error`, `atomic_load/store/rmw/cmpxchg/fence`;
-  an unknown name (such as `compile_option`) raises `cannot call the spy builtin ...`.
+  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `coerce`, `compile_error`, `compile_option`, `atomic_load/store/rmw/cmpxchg/fence`;
+  an unknown name raises `cannot call the spy builtin ...`.
 - Operators: `_eval_binary` decides in order the union meaning of `|` -> struct overload -> complex -> `/` -> `//` -> `**` -> bitwise -> fold both constants -> pointer arithmetic -> emit `mir.Arith` for numeric peer types;
   `_eval_cmp` (struct overload / enum member / both constants / numeric `mir.Cmp`), `_eval_not`, `_eval_unary`, `_eval_ord`, `binary_assign`.
 

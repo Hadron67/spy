@@ -658,6 +658,10 @@ class _Context(CompileContext):
         # the ``std`` types the type rules need, resolved lazily on the first
         # request (see ``sval.SpecialTypes``)
         self._special_types: sval.SpecialTypes | None = None
+        # the compile-time options (``std.core.compile_option``), by name: the
+        # host sets them (see ``set_compile_option``) and a spy body reads them
+        # back while it is compiled
+        self._compile_options: dict[bytes, sval.AnyValue] = {}
 
     def _local_fn(self, handle: _RegisteredFn) -> _RegisteredFn:
         # this context's handle of the Python function ``handle`` names: a
@@ -811,6 +815,14 @@ class _Context(CompileContext):
     @override
     def mir_cache(self) -> MirLowerCache:
         return self.mir_lower_cache
+
+    @override
+    def get_compile_option(self, name: bytes) -> sval.AnyValue | None:
+        return self._compile_options.get(name)
+
+    @override
+    def set_compile_option(self, name: bytes, value: sval.AnyValue) -> None:
+        self._compile_options[name] = value
 
     def _resolve_call(
         self, fn: FunctionValue, call_sig: CallSignature, ret_sig: PartialReturnSignature

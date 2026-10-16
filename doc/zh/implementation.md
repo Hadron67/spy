@@ -289,7 +289,8 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 - `_RegisteredClass`：`get_entry` 建 `StructTypeHead`（先绑 head 再读 body，支持自引用）、字段、方法（走 `reversed(MRO)`，子类覆盖优先）；
   `__getitem__` → `glue.specialized_struct`；`__call__` → `glue.construct`。
 - `_Context`（`sval.CompileContext` 子类）：`resolve_global`（把注册对象/enum 成员解析成本上下文的 spy 值或 `FunctionValue`，把不用 `@func` 装饰的普通 Python 函数包成 `sval.PyFunction`）、
-  `special_types`、`mir_lower_cache`、`target_info`、`_resolve_call`、enum 支持（`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`）。
+  `special_types`、`mir_lower_cache`、`target_info`、`_resolve_call`、enum 支持（`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`）、
+  编译选项（`get_compile_option`/`set_compile_option`，由 `_compile_options` 存）。
   `_GLOBAL_CONTEXT = _Context(LLVMBackend())` 是顶层默认上下文。
 
 ---
@@ -396,8 +397,8 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 ### 6.8 内建与运算符
 
 - `_call_builtin` 按 `fn.name` 分派：`compile_log`、`type_info`、`reify`、`undefined`、`layout_of`、`panic`、`catch_unwind`、
-  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`coerce`、`compile_error`、`atomic_load/store/rmw/cmpxchg/fence`；
-  未知名字（如 `compile_option`）报 `cannot call the spy builtin ...`。
+  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`coerce`、`compile_error`、`compile_option`、`atomic_load/store/rmw/cmpxchg/fence`；
+  未知名字报 `cannot call the spy builtin ...`。
 - 运算符：`_eval_binary` 依序判定 `|` 的 union 含义 → struct 重载 → complex → `/` → `//` → `**` → 位运算 → 双常量折叠 → 指针算术 → 数值 peer 类型发 `mir.Arith`；
   `_eval_cmp`（struct 重载/枚举成员/双常量/数值 `mir.Cmp`）、`_eval_not`、`_eval_unary`、`_eval_ord`、`binary_assign`。
 

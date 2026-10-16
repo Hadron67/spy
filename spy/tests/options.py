@@ -916,9 +916,15 @@ def unwrap_declared() -> i32:
 
 
 @func()
-def bad_is_none(x: i32) -> spy_bool:
-    # ``is None`` needs an option
+def non_option_is_none(x: i32) -> spy_bool:
+    # ``is None`` works on any type: a non-option value is never the absent one
     return x is None  # pyright: ignore[reportUnnecessaryComparison]
+
+
+@func()
+def non_option_is_not_none(x: i32) -> spy_bool:
+    # ... and ``is not None`` is its negation, so it is always true there
+    return x is not None  # pyright: ignore[reportUnnecessaryComparison]
 
 
 @func()
@@ -1160,9 +1166,10 @@ class SpyOptionUnwrapTest(TestCase):
         with self.assertRaises(CompileError):
             unwrap_opt_else_scope(1, True)
 
-    def test_is_none_needs_an_option(self) -> None:
-        with self.assertRaises(CompileError):
-            bad_is_none(1)
+    def test_is_none_on_a_non_option(self) -> None:
+        # ``is None`` works on any type: a non-option value is never absent
+        self.assertFalse(non_option_is_none(1))
+        self.assertTrue(non_option_is_not_none(1))
 
     def test_an_unwrap_target_is_scoped_to_the_branch(self) -> None:
         with self.assertRaises(CompileError):

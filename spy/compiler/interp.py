@@ -2701,9 +2701,6 @@ class HirRunner:
                 return self.exec_len(inst)
             case hir.IsNull():
                 value = self._arg_value(self.operand_arg(inst.opt))
-                value_type = _type_of(value)
-                if not isinstance(value_type, (sval.OptionType, sval.NullType)):
-                    raise CompileError(f'``is None`` needs an option, got {value_type}')
                 regs[inst] = self._is_null(value)
             case hir.OptionPayloadPtr():
                 place = self.operand(inst.ptr)
@@ -5910,6 +5907,8 @@ class HirRunner:
             return self._builtin_coerce(binded, ret)
         if fn.name == 'compile_error':
             return self._builtin_compile_error(binded)
+        if fn.name == 'compile_option':
+            return self._builtin_compile_option(binded, ret)
         if fn.name == 'atomic_load':
             return self._builtin_atomic_load(binded, ret)
         if fn.name == 'atomic_store':
@@ -5978,6 +5977,21 @@ class HirRunner:
         time, see ``astgen``) - as the error message."""
         data = self._bytes_builtin_arg(args, 'std.core.compile_error')
         raise CompileError(data.decode(errors='replace'))
+
+    # -- ``std.core.compile_option`` -----------------------------------------
+
+    def _builtin_compile_option(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.compile_option(name)``: the value the host stored for the
+        compile-time option ``name`` (see ``CompileContext.set_compile_option``),
+        or the absent value (``sval.Null``) when it is not set.  The name is a
+        compile-time byte string (a string literal is encoded to bytes at parse
+        time, see ``astgen``)."""
+        name = self._bytes_builtin_arg(args, 'std.core.compile_option')
+        value = self._analyser._resolver.get_compile_option(name)
+        self.store(ret, sval.Null() if value is None else value)
+        return PollResult.AGAIN
 
     # -- ``std.core.bitcast`` ------------------------------------------------
 

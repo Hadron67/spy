@@ -562,9 +562,10 @@ class Len(Inst):
 class IsNull(Inst):
     """Whether the option value ``opt`` denotes is *absent*: the boolean the
     source ``expr is None`` tests (``expr is not None`` negates it with
-    :class:`Not`).  The operand has to be an ``Option[T]`` (a bare ``null``
-    counts as the absent one); any other type is rejected.  The result is a
-    ``bool`` register."""
+    :class:`Not`).  The operand may be of any type: an ``Option[T]`` (a bare
+    ``null`` counts as the absent one) reports whether it is absent, and any
+    other type is never the absent value (the test is ``False``).  The result is
+    a ``bool`` register."""
 
     opt: ArgEntry[Value]
 

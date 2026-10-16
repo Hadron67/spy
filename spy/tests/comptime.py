@@ -8,14 +8,14 @@ from ..compiler import (
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
+from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
 from ..compiler.syntax import (
     Comptime,
     InferComptime,
     Ptr,
     ref,
 )
-from ..std.core import compile_error
+from ..std.core import compile_error, compile_option
 from .basics import inc
 from .errors import ErrorA
 
@@ -703,10 +703,46 @@ class SpyCompileErrorTest(TestCase):
         self.assertEqual(compile_error_in_a_dead_branch(), 1)
 
 
+# ---------------------------------------------------------------------------
+# ``std.core.compile_option``: the value the host stored for a compile-time
+# option, read back while a body is being compiled; an option that is not set
+# reads as the absent value (``None``)
+# ---------------------------------------------------------------------------
+
+
+@func()
+def compile_option_is_absent() -> spy_bool:
+    return compile_option('test.absent') is None
+
+
+@func()
+def compile_option_value() -> i32:
+    v: Comptime = compile_option('test.answer')
+    if v is None:
+        return -1
+    return v
+
+
+class SpyCompileOptionTest(TestCase):
+    """``std.core.compile_option`` reads a compile-time option the host stored on
+    its context; one that is not set is the absent value."""
+
+    def test_an_unset_option_is_the_absent_value(self) -> None:
+        self.assertTrue(compile_option_is_absent())
+
+    def test_a_set_option_is_read_back(self) -> None:
+        _GLOBAL_CONTEXT.set_compile_option(b'test.answer', 42)
+        try:
+            self.assertEqual(compile_option_value(), 42)
+        finally:
+            _GLOBAL_CONTEXT._compile_options.pop(b'test.answer', None)
+
+
 all_tests = [
     SpyComptimeMarkerTest,
     SpyInferComptimeTest,
     SpyTupleTest,
     SpyTypeOfTest,
     SpyCompileErrorTest,
+    SpyCompileOptionTest,
 ]

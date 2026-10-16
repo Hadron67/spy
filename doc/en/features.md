@@ -220,8 +220,8 @@ assert repeat(2) == 4
 
 - A value is either a `T` or `None`.
 - Both `T` and `None` implicitly convert to `Option[T]`; when a single location receives both `T` and `None`, the type becomes `Option[T]`.
-- Testing and unwrapping: `expr is None` / `expr is not None`; the walrus syntax `(name := expr) is not None` binds `name`
-  to the writable location of the inner value; plain `(name := expr)` binds `name` to the option itself.
+- Testing and unwrapping: `expr is None` / `expr is not None` (usable on any type: a non-option value is never absent, so the test is always `False`); the walrus syntax `(name := expr) is not None` binds `name`
+  to the writable location of the inner value (this form requires an option); plain `(name := expr)` binds `name` to the option itself.
 - **Not yet implemented**: pattern matching an option; under the borrow-style representation there are still edge cases where absence is misjudged (see `doc/implementation.md`).
 
 ```python
@@ -1458,7 +1458,7 @@ assert unrolled_sum() == 6
 - `std.core.undefined()`: undefined of any type, typed according to its type when written into a target; undefined as a condition is an error.
 - `std.core.compile_error(msg)`: aborts compilation with a compile-time byte string message; a non-byte-string/runtime message is an error; a dead branch does not trigger.
 - `std.core.coerce(value, T)`: concretizes value into type `T` (the same conversion as store).
-- `std.core.compile_option(name)`: **declared but not implemented** (calling it is an error).
+- `std.core.compile_option(name)`: reads a compile-time option the host context stores (`CompileContext.get_compile_option`); an option that is not set is the absent value (`None`).
 - `std.core.compile(fn)`: manually compiles a **non-generic** function value (precompiles its default specialization).
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)`: same-bit-width reinterpretation of a scalar / integer narrowing.
 
@@ -1568,7 +1568,7 @@ assert str_len() == 5
 
 | Module | Contents |
 |---|---|
-| `std.core` | `Numeric`, `StopIteration`, `slice`, `range`, `SlicePtr`/`ConstSlicePtr`, `arr_slice`/`const_arr_slice`/`const_arr_ptr`, `NullException`, `unwrap`/`unwrap_or`, `undefined`, `coerce`/`typed_undefined`, `const_array`, `compile_error`, `sstr`, `compile`, `bitcast`, `DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`, `panic`, `catch_unwind`, `compile_option` (not implemented) |
+| `std.core` | `Numeric`, `StopIteration`, `slice`, `range`, `SlicePtr`/`ConstSlicePtr`, `arr_slice`/`const_arr_slice`/`const_arr_ptr`, `NullException`, `unwrap`/`unwrap_or`, `undefined`, `coerce`/`typed_undefined`, `const_array`, `compile_error`, `sstr`, `compile`, `bitcast`, `DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`, `panic`, `catch_unwind`, `compile_option` |
 | `std.reflect` | `TypeInfo` and its variants, `StructField`, `type_info`, `reify` |
 | `std.int` | `truncate` (builtin), `IntCastError`, `valid_range`, `try_int_cast`/`int_cast` |
 | `std.mem` | `Layout`, `layout_of`/`size_of`/`align_of`, `AllocError`, `Allocator` (protocol), `AllocatorVtable`, `DynamicAllocator`, `CAllocator` |
@@ -1693,7 +1693,6 @@ panic/`catch_unwind`; atomic operations; OpenMP (with reduction); Python-side in
 - Arrays: arrays with a runtime length, conversions between arrays, arrays crossing the Python boundary.
 - `dict[str, T]` annotation parsing; pattern matching an option; closure `nonlocal`; mutually recursive closures; a closure referencing the outer type parameters.
 - Declared "compile-time-only" return types (`-> bytes` / `-> type` etc., see `doc/issues.md` #7).
-- `std.core.compile_option`: declared but not implemented.
 - Destructive move semantics (`copyable=False` only means non-copyable; no move checking is done).
 
 > For individual implementation defects and minimal reproductions see `doc/issues.md`.
