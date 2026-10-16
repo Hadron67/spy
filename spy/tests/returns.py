@@ -3,12 +3,14 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    c128,
     i32,
     i64,
     mir,
     void,
 )
 from ..compiler.dsl import func
+from ..compiler.syntax import Comptime, Option
 from .structs import Large, Small, struct_mirror
 
 # ---------------------------------------------------------------------------
@@ -732,7 +734,102 @@ class SpyInferredMultiReturnTest(TestCase):
             bad_infer_falloff(3)
 
 
+# ---------------------------------------------------------------------------
+# a function with no return annotation whose body returns a *compile-time*
+# value of a type that has a runtime representation (a complex, a struct, an
+# option): the result location keeps the value in compile-time storage (a
+# ``Box``), yet the inferred convention delivers it by value or through a
+# result pointer - so the value is materialized at the return site (see
+# ``interp.HirRunner._finish_function``).  A scalar is unaffected (its lowering
+# is a constant); an aggregate needs the ``InsertValue`` chain building it.
+# ---------------------------------------------------------------------------
+
+
+@func()
+def infer_comptime_complex():
+    z: Comptime = 1 + 2j
+    return z
+
+
+@func()
+def annotate_comptime_complex() -> c128:
+    z: Comptime = 1 + 2j
+    return z
+
+
+@func()
+def use_infer_comptime_complex() -> c128:
+    # the compile-time aggregate crosses an internal call site too
+    return infer_comptime_complex()
+
+
+@func()
+def infer_comptime_small():
+    s: Comptime = Small(1, 2)
+    return s
+
+
+@func()
+def use_infer_comptime_small() -> i32:
+    s = infer_comptime_small()
+    return s.a * 10 + s.b
+
+
+@func()
+def infer_comptime_large():
+    # outgrows the by-value limit: delivered through a hidden result pointer
+    l: Comptime = Large(1, 2, 3, 4)
+    return l
+
+
+@func()
+def use_infer_comptime_large() -> i64:
+    l = infer_comptime_large()
+    return l.a * 1000 + l.d
+
+
+@func()
+def infer_comptime_option():
+    o: Comptime[Option[i32]] = 7
+    return o
+
+
+class SpyInferredComptimeReturnTest(TestCase):
+    """A function with no return annotation whose body returns a compile-time
+    value whose type has a runtime representation: the inferred convention
+    delivers it as a runtime value (materialized from its compile-time storage).
+    """
+
+    def test_a_complex_value(self) -> None:
+        self.assertEqual(infer_comptime_complex(), 1 + 2j)
+        self.assertEqual(use_infer_comptime_complex(), 1 + 2j)
+
+    def test_the_lowered_signature_matches_the_annotated_one(self) -> None:
+        # an inferred compile-time aggregate return lowers exactly like the
+        # declared one (the complex is returned by value)
+        infer_comptime_complex()
+        annotate_comptime_complex()
+        self.assertEqual(
+            mir_signature(infer_comptime_complex),
+            mir_signature(annotate_comptime_complex),
+        )
+
+    def test_a_struct_value(self) -> None:
+        self.assertEqual(use_infer_comptime_small(), 12)
+        s = infer_comptime_small()
+        self.assertEqual((s.a, s.b), (1, 2))
+
+    def test_a_large_struct_value(self) -> None:
+        self.assertEqual(use_infer_comptime_large(), 1004)
+        l = infer_comptime_large()
+        self.assertEqual((l.a, l.b, l.c, l.d), (1, 2, 3, 4))
+
+    def test_a_present_option_value(self) -> None:
+        self.assertEqual(infer_comptime_option(), 7)
+
+
 all_tests = [
     SpyMultiReturnTest,
     SpyInferredMultiReturnTest,
+    SpyInferredComptimeReturnTest,
 ]

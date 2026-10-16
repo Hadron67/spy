@@ -9537,9 +9537,17 @@ class HirRunner:
                     block.insts.append(load)
                     block.insts.append(mir.Ret(load, defer_blocks))
                 elif isinstance(slot, ComptimeVal) and isinstance(slot.obj, sval.ComptimePtr):
-                    # a compile-time result place (a box): its value is lowered into
-                    # a constant the deferred return delivers
-                    block.insts.append(mir.Ret(self._to_runtime(self.load(slot)), defer_blocks))
+                    # a compile-time result place (a box): its value is lowered at
+                    # this return site - a scalar into a constant, an aggregate
+                    # into the ``InsertValue`` chain building it.  The
+                    # instructions belong to this return's own block, whose
+                    # insertion is the placeholder the finished block left for
+                    # them (see ``_defer_return``)
+                    saved = self._insertion
+                    self._insertion = block
+                    value = self._to_runtime(self.load(slot))
+                    self._insertion = saved
+                    block.insts.append(mir.Ret(value, defer_blocks))
                 else:
                     raise CompileError('cannot deliver the return value')
 

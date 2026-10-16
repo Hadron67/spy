@@ -2,7 +2,7 @@
 
 这里记录在实现各项特性时发现、但**本任务不处理**的顺带问题（多为既有实现里已存在的问题）。每节给出原状、最小复现/后果与（若有）规避办法。
 
-> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、往 `Option[零尺寸类型]` 的构造不置 present、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽、编译期「元素视图」指针物化只按视图生成存储）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除，末者随 `sval.pointer_object_type` 的修复移除），已从本文件移除。
+> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、往 `Option[零尺寸类型]` 的构造不置 present、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽、编译期「元素视图」指针物化只按视图生成存储、无返回注解的函数返回编译期聚合值（`complex`/struct/option 等）时把物化指令发到已收尾区块而崩溃）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除，末者随 `sval.pointer_object_type` 的修复移除），已从本文件移除。
 
 ---
 
@@ -171,25 +171,4 @@ def f() -> i32:
   但把 const 指针交给一个声明为可写的 `*T` 位置，读起来像可以写。
 - **更合理的规则**：pointee 相同的前提下只允许「加 const」（即运行时路径的 `is_subtype_of`）；那样上述 12 处用例需要改写
   （把 `Ptr[T]` 形参改成 `ConstPtr[T]` 等）。因为 `ref(ConstComptime)` 传给 `Ptr[T]` 形参是惯用写法，改动会波及用户代码，本轮不动。
-
----
-
-## 10. 无返回注解的函数返回编译期 `complex` 会崩
-
-```python
-@func()
-def f():
-    z: Comptime = 1 + 2j
-    return z
-```
-
-报 `AssertionError: cannot emit into a finished basic block`（`mir.BasicBlock.emit`）。
-
-- **触发链**：`ComplexType.classify()` 是 `NONE`（复数有运行时表示——两个 float 的 struct），所以 `sval.make_ret_spec` 把这个无注解返回值定成
-  **`RetValue`** 而非 `RetComptime`；于是 `interp._finish_function` 要把结果位置的编译期值 lower 成运行时值
-  （`_to_runtime` → `_comptime_value_to_runtime` → `_aggregate_to_runtime`），却在函数区块已经收尾之后才发射 `mir.InsertValue`。
-- **与原状**：与「未装饰函数 = `sval.PyFunction`」无关——上面那个体写在普通 `@func()` 里同样崩，本改动之前就如此。
-- **规避**：写返回值注解（`-> c128`）：那时结果按声明的运行时类型交付，正常。
-- **波及**：`PyFunction` 返回 `complex` 时、调用处不写返回注解也会踩到（`spy/tests/py_functions.py` 用 `-> c128` 绕开）。
-- **待做**：`_finish_function` 对「编译期值但类型有运行时表示」的返回值，应在区块收尾前把它物化（或让 `make_ret_spec` 在这种情形下也走 `RetComptime`，交付时再 lower）。
 
