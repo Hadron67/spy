@@ -52,9 +52,9 @@ def args_and_kwargs(*args: i32, **kwargs: i32) -> i32:
     return args[0] + kwargs['x']
 
 
+@func(inline=True)
 def sum_inline(*args: i32) -> i32:
-    # an undecorated function is inlined at its call site; it declares
-    # ``*args`` like any other
+    # an inlined spy function: it declares ``*args`` like any other
     i: Comptime = 0
     total: i32 = 0
     syntax.unroll()

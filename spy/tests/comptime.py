@@ -170,8 +170,9 @@ def comptime_declared_after_runtime_control_flow(n: i32) -> i32:
     return c + x
 
 
+@func(inline=True)
 def pair(a: i32) -> tuple[i32, i32]:
-    # a plain (inline) function returning two values
+    # an inlined spy function returning two values
     return a, a + 1
 
 

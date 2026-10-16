@@ -40,9 +40,11 @@ Python-side construction is not supported yet.
 A decorated function used from inside another spy function body is
 resolved to its function entry when the reference runs (see ``interp``);
 calling it is compiled to a native ``call``.  An *undecorated* plain
-Python function reached the same way is inlined instead.  The ``spy.*``
-builtins (``spy.compile_log``) are evaluated at compile time; ``spy.typeof``
-is a ``syntax`` marker, lowered by the parser to a type probe.
+Python function reached the same way becomes a ``sval.PyFunction``: a
+compile-time helper that is only ever called while the HIR runs, on plain
+Python scalars (see ``interp``).  The ``spy.*`` builtins
+(``spy.compile_log``) are evaluated at compile time; ``spy.typeof`` is a
+``syntax`` marker, lowered by the parser to a type probe.
 """
 
 import functools
@@ -137,8 +139,8 @@ class FnMetadata:
     self_arg: Literal["const ptr", "ptr", "value"] | None
     extern: bool
     linkname: str | None
-    # an undecorated struct method: it is inlined at its call sites like a
-    # plain Python function instead of being compiled into a native call
+    # a method inlined at its call sites instead of being compiled into a
+    # native call: ``@func(inline=True)``, and every undecorated struct method
     inline: bool = False
     # the exceptions the function may raise: ``None`` (the default) means it
     # raises nothing, ``"infer"`` that they are inferred from the body, and a
@@ -386,11 +388,10 @@ class _RegisteredClass(StructDecl):
                         value.context_type_vars = self.class_type_vars
                         head.methods[name] = value
                     elif isinstance(value, pytypes.FunctionType):
-                        # an undecorated method: inlined at its call sites like
-                        # a plain function.  It is wrapped like a registered one
-                        # so that it is parsed lazily with the struct as its
-                        # ``self`` type and the struct's type parameters in
-                        # scope (a static one takes no ``self``)
+                        # an undecorated method: inlined at its call sites.  It is
+                        # wrapped like a registered one so that it is parsed lazily
+                        # with the struct as its ``self`` type and the struct's
+                        # type parameters in scope (a static one takes no ``self``)
                         method = _RegisteredFn(
                             value, None if is_static else template, _INLINE_META, self.context,
                         )
@@ -644,9 +645,6 @@ class _Context(CompileContext):
         self._func_type_cache: dict[type, _FuncTypeDecl] = {}
         # the ``@decl_func()`` declarations, by the function that carries them
         self._decl_func_cache: dict[Any, _DeclFuncDecl] = {}
-        # the inline entries of the undecorated Python functions reached
-        # from a spy body, by function object
-        self._inline_cache: dict[Any, FunctionValue] = {}
         self._symbol_table = SymbolTable()
         # the MIR-mirror interning table of this context, shared by every
         # analysis it runs and bound to the target it compiles for (see
@@ -720,14 +718,11 @@ class _Context(CompileContext):
                 builtin = _BUILTINS.get(value)
                 if builtin is not None:
                     return builtin
-                # an undecorated plain Python function: it is inlined where
-                # it is called (it contributes no native specialization)
-                entry = self._inline_cache.get(value)
-                if entry is None:
-                    hir = astgen.parse_function(value, self)
-                    entry = FunctionValue(value.__qualname__, hir, force_inline=True)
-                    self._inline_cache[value] = entry
-                return entry
+                # a plain Python function - one *not* decorated with ``@func``:
+                # a compile-time helper (``sval.PyFunction``) that is only ever
+                # called while the HIR runs.  The function object is wrapped as it
+                # is; nothing about its signature is read (see ``interp``)
+                return sval.PyFunction(value)
             case _:
                 if sval.is_int_enum_member(value):
                     # a member of a Python enum class: the typed member value of this
@@ -777,8 +772,8 @@ class _Context(CompileContext):
                 if isinstance(value, _RegisteredFn):
                     method = value if value.context is self else value.with_context(self)
                 elif isinstance(value, pytypes.FunctionType):
-                    # an undecorated method: inlined at its call sites like a
-                    # plain Python function (see ``_INLINE_META``)
+                    # an undecorated method: inlined at its call sites (see
+                    # ``_INLINE_META``)
                     method = _RegisteredFn(value, None, _INLINE_META, self)
                 else:
                     continue

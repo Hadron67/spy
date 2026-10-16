@@ -271,18 +271,20 @@ def raise_undeclared(n: i32) -> i32:
     return n + 1
 
 
-# inlined plain Python functions: their bodies are emitted into their call
+# inlined spy functions: their bodies are emitted into their call
 # sites, so an error they raise or let through belongs to the error space - and
 # to the try blocks - enclosing the *caller*, exactly like an error raised at
 # the call site itself (see ``HirRunner._active_try``)
 
 
+@func(inline=True)
 def inline_raise(n: i32) -> i32:
     if n < 0:
         raise ErrorA(7)
     return n + 1
 
 
+@func(inline=True)
 def inline_catch(n: i32) -> i32:
     # the inline body has a try of its own: a raise crosses two frames before
     # reaching the try (the body of the raise is inlined into this one)
@@ -292,6 +294,7 @@ def inline_catch(n: i32) -> i32:
         return e.code + 100
 
 
+@func(inline=True)
 def inline_reraise(n: i32) -> i32:
     # the clause matches nothing the callee raises, so the error is re-raised
     # out of the body's own try - into the caller's, not out of the function
@@ -301,12 +304,14 @@ def inline_reraise(n: i32) -> i32:
         return 1
 
 
+@func(inline=True)
 def inline_forward(n: i32) -> i32:
     # a native call inside an inlined body: the error it carries is delivered
     # into the caller's space too
     return raise_a(n) + 10
 
 
+@func(inline=True)
 def inline_no_return(n: i32) -> i32:
     # an inlined body whose every path raises: it never falls through to its
     # caller, so the caller's code after the call is dead (see
@@ -314,6 +319,7 @@ def inline_no_return(n: i32) -> i32:
     raise ErrorA(7)
 
 
+@func(inline=True)
 def inline_raise_either(n: i32) -> i32:
     # both paths of the body raise, so it does not fall through either
     if n < 0:
@@ -321,11 +327,13 @@ def inline_raise_either(n: i32) -> i32:
     raise ErrorB(9)
 
 
+@func(inline=True)
 def inline_forward_no_return(n: i32) -> i32:
     # an inlined body whose only path raises through another inlined body
     return inline_no_return(n) + 3
 
 
+@func(inline=True)
 def inline_raise_two(n: i32) -> i32:
     # an inlined body that may raise either of two exceptions
     if n > 10:
@@ -916,6 +924,7 @@ def falls_through_never(n: i32) -> Never:  # pyright: ignore
     n = n + 1
 
 
+@func(inline=True)
 def inline_never(n: i32) -> Never:
     # an inlined body that always raises: its declaration holds, and the caller's
     # code after the call is dead (the body reaches no continuation)
@@ -931,6 +940,7 @@ def catch_inline_never(n: i32) -> i32:
         return e.code + 300
 
 
+@func(inline=True)
 def inline_returns_from_never(n: i32) -> Never:
     # an inlined body has no convention of its own, so its declaration is what
     # rejects the return
@@ -942,6 +952,7 @@ def call_inline_returns_from_never(n: i32) -> i32:
     return inline_returns_from_never(n) + 1
 
 
+@func(inline=True)
 def inline_falls_through_never(n: i32) -> Never:  # pyright: ignore
     n = n + 1
 

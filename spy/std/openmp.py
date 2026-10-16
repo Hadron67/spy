@@ -117,6 +117,7 @@ class _Ident:
     psource: ConstMultiPtr[u8]
 
 
+@func(inline=True)
 def _ident() -> ConstPtr[_Ident]:
     # the ``comptime()`` marker keeps the construction compile-time, so a
     # read-only compile-time variable holds it and its pointer lowers into a
@@ -285,6 +286,8 @@ def parallel_loop[R](length: int, kernel: Callable[[int], R], reduce_op: Callabl
         ST = i64
     else:
         compile_error('parallel_loop: the index type must be i32/u32/i64/u64')
+
+    load_openmp_runtime()
 
     # a kernel that returns nothing just runs its body; a kernel that returns a
     # value is reduced (the two paths differ in their result, their microtask

@@ -72,9 +72,10 @@ def choose_comptime_else(a: i32, b: i32, c: spy_bool) -> i32:
     return a if spy_typeof(a) == i64 else (b if c else a)
 
 
+@func(inline=True)
 def pick_inline(c: bool, a: i32, b: i32) -> i32:
-    # an undecorated plain function: its body (with the if-expression) is
-    # inlined at its call sites
+    # an inlined spy function: its body (with the if-expression) is emitted
+    # at its call sites
     return a if c else b
 
 

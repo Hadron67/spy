@@ -232,9 +232,10 @@ def bounded_loop(n: i32) -> i32:
     return i + 100
 
 
+@func(inline=True)
 def sum_inline(n: i32) -> i32:
-    # an undecorated plain function: its body - loop included - is inlined at
-    # the call site, in a frame of its own
+    # an inlined spy function: its body - loop included - is emitted at the
+    # call site, in a frame of its own
     i: i32 = 0
     total: i32 = 0
     while i < n:

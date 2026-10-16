@@ -14,8 +14,8 @@ Example::
 Pipeline: the Python source of a function is lowered by ``astgen`` into
 an untyped HIR, which is *run* at compile time by ``interp`` with the
 concrete argument types (comptime semantics: ``spy.typeof``, compile-time
-``if``, inlining of plain Python functions) into a typed MIR, which
-``lower`` turns into native code via LLVM.
+``if``, calls to plain Python functions evaluated at compile time) into a
+typed MIR, which ``lower`` turns into native code via LLVM.
 """
 
 import builtins as pybuiltins

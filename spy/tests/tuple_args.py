@@ -12,7 +12,6 @@ from ..std import Numeric
 from ..std.core import coerce
 from ..std.reflect import (
     StructType,
-    TupleType,
     type_info,
 )
 
@@ -68,8 +67,9 @@ def call_with_a_literal_element(a: i32) -> i32:
     return sum_pair((a, 5))
 
 
+@func(inline=True)
 def sum_pair_inline(x: tuple[i32, i32]) -> i32:
-    # an undecorated (inlined) function may take a tuple parameter too
+    # an inlined spy function may take a tuple parameter too
     return x[0] + x[1]
 
 
@@ -156,6 +156,7 @@ def call_big_with_a_literal_element(a: i64, b: i64, c: i64) -> i64:
 # ---------------------------------------------------------------------------
 
 
+@func(inline=True)
 def is_tuple_shape(v: StructType) -> spy_bool:
     # a ``tuple[...]``/``*args`` parameter binds a synthesized struct whose
     # positional fields are named ``_0, _1, ...``; a ``dict[str, T]``/``**kwargs``
@@ -188,8 +189,7 @@ def reflect_sum(x) -> i64:
                 # the second element is a tuple itself: read its elements too
                 syntax.comptime()
                 second = type_info(v.fields.ptr[1].type)
-                if isinstance(s := second, StructType):
-                    if is_tuple_shape(s):
+                if isinstance(s := second, StructType) and is_tuple_shape(s):
                         return 20 + x[0] + x[1][0] + x[1][1]
             # a flat tuple: walk it by the length the reflection gives
             total: i64 = 0
@@ -250,8 +250,7 @@ def dict_value_is_tuple(x) -> spy_bool:
         entry = v.fields.ptr[0]
         syntax.comptime()
         child = type_info(entry.type)
-        if isinstance(c := child, StructType):
-            if is_tuple_shape(c):
+        if isinstance(c := child, StructType) and is_tuple_shape(c):
                 # the entry's value is read out of the runtime ``$args`` struct:
                 # it is a runtime tuple, so the local is a plain variable
                 value = x[entry.name]

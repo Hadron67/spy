@@ -189,6 +189,7 @@ def bad_option_argument(x: i32) -> i32:
     return opt_width(Small(x, 1))  # pyright: ignore[reportArgumentType]
 
 
+@func(inline=True)
 def opt_inline(x: i32, c: spy_bool):
     # an inlined body: its result location takes the option type from the
     # peer type of its two returns

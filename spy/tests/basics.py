@@ -76,11 +76,13 @@ def add_default[T: Numeric](a: T, b: T = 0) -> T:
     return a + b
 
 
+@func(inline=True)
 def add_inline[T: Numeric](a: T, b: T) -> T:
     compile_log("add_inline was compiled")
     return a + b
 
 
+@func(inline=True)
 def abs_inline(n: i32) -> i32:
     if n < 0:
         return -n
@@ -88,6 +90,7 @@ def abs_inline(n: i32) -> i32:
         return n
 
 
+@func(inline=True)
 def clamp_inline(n: i32) -> i32:
     if n > 100:
         return 100
@@ -310,7 +313,7 @@ def call_untyped_param() -> i32:
 
 class SpyFunctionCallTest(TestCase):
     """Basic function calls: arithmetic, generics, calls between spy
-    functions, inlining of plain functions, compile-time dispatch and
+    functions, inlining of spy functions, compile-time dispatch and
     recursion."""
 
     def test_smoke(self) -> None:
@@ -353,7 +356,7 @@ class SpyFunctionCallTest(TestCase):
     def test_call_spy_function(self) -> None:
         self.assertEqual(call_add(20, 22), 42)
 
-    def test_inline_plain_function(self) -> None:
+    def test_inlined_function(self) -> None:
         out = io.StringIO()
         with redirect_stdout(out):
             self.assertEqual(call_inline(20, 22), 42)

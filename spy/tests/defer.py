@@ -179,9 +179,9 @@ def call_defer_nested(x: i32) -> i32:
     return v * 100 + r
 
 
+@func(inline=True)
 def inline_defer(p: Ptr[i32]) -> i32:
-    # a plain (unregistered) function inlined at its call site: its defer runs
-    # when the inlined body is left
+    # an inlined spy function: its defer runs when the inlined body is left
     with defer():
         p[...] = p[...] + 1
     return 3

@@ -23,6 +23,7 @@ from .reflect import ReflectA, ReflectB
 # ---------------------------------------------------------------------------
 
 
+@func(inline=True)
 def identity_i32(x: i32) -> i32:
     return x
 

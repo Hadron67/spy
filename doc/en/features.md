@@ -459,7 +459,8 @@ assert maybe_spin(False) is False
 A value is either a **runtime value** (it has a runtime representation) or a **compile-time value** (it exists only at compile time):
 
 - Compile-time values cover: scalar constants, type values, compile-time aggregate values, compile-time Option/tagged unions, `Null`/`Void`/undefined,
-  compile-time pointers, and ordinary Python `int/float/complex/bytes/bool`; in addition there are compile-time objects such as function values.
+  compile-time pointers, and ordinary Python `int/float/complex/bytes/bool`; in addition there are compile-time objects such as function values and a Python
+  function that is not decorated with `@func` (a `PyFunction`, see §6.10).
 
 **Key point**: there is no such thing as "a compile-time value in the form of a runtime value". An aggregate any of whose components is a runtime value
 **is a runtime value as a whole** and cannot be stored in a `Comptime` variable/parameter (to hold it, use an ordinary variable).
@@ -846,7 +847,8 @@ Case guards and subpatterns are not supported (`case A(x):` is an error). (For a
 ### 6.1 Definition and specialization
 
 - Register with `@spy.func()`; the first call compiles a **specialization** for the argument types, and a function may have multiple specializations.
-- An ordinary (unregistered) Python function called inside a function body is **inlined**; the same holds for undecorated struct methods.  `@func(inline=True)` marks a registered function as inlined too.
+- **A function that is not decorated with `@func` is a compile-time Python helper** (a `PyFunction`, see §6.10): it can only be called at compile time, and its body is executed by Python as it is.
+- `@func(inline=True)` marks a registered function as **inlined**: its body is expanded into the call site, and it may take runtime arguments. An undecorated struct method is inlined too.
 - A parameter's type is determined by: the annotation (after substituting solved generic parameters) > the type inferred from the argument > the type of the default value.
 - `@func(ignore_signature=True)` ignores the parameter and return **type** annotations (they are read by the Python type checker only): every parameter's type is inferred from the argument and the return type from the body.  `Comptime`/`Comptime[T]` is not a type, so its marker is kept (the parameter stays a compile-time one).
 
@@ -855,7 +857,8 @@ Case guards and subpatterns are not supported (`case A(x):` is an error). (For a
 def add_generic[T: Numeric](a: T, b: T) -> T:
     return a + b
 
-def add_plain(a: i32, b: i32) -> i32:      # an ordinary Python function: inlined
+@func(inline=True)
+def add_plain(a: i32, b: i32) -> i32:      # an inlined spy function
     return a + b
 
 @func()
@@ -1015,7 +1018,8 @@ assert fact(5) == 120
 - **Restrictions**: no `nonlocal`; **mutually recursive closures are not supported** (see `doc/issues.md` #6); a closure body referencing the outer function's type parameters is not supported.
 
 ```python
-def apply_inline(f, x: i32) -> i32:        # an inlined plain Python function
+@func(inline=True)
+def apply_inline(f, x: i32) -> i32:        # an inlined spy function
     return f(x)
 
 @func()
@@ -1065,6 +1069,35 @@ assert use_func_ptr(2, 3) == 5
 ### 6.9 Recursion
 
 - Direct recursion, mutual recursion, and generic multi-type recursion are all supported; a recursive function's return type must be determinable from its annotation (see §6.6).
+
+### 6.10 Compile-time Python functions (`PyFunction`)
+
+- A Python function that is **not decorated with `@func`** is a **compile-time value** (`sval.PyFunction`, with no runtime representation): it can **only be called at compile time**, and its body is **executed by Python as it is** (not compiled into spy code). `@func(inline=True)` is what an "inlined spy function" is spelled as.
+- Its arguments and its result must be **compile-time values**, and only plain Python objects: `int` (including `bool`), `float`, `complex`, `bytes`, `None`.
+  A Python `str` is encoded to the spy byte string at the boundary, the way a string literal in the source is. Like the Python call boundary, `Null`/`TypedNull`/`Void` all cross as `None`, an `Option` is auto-unwrapped to its payload and a tagged union to its variant (an aggregate payload/variant is then rejected, not being a plain object);
+  a `None` result becomes `Null`, the absent value of an option. Any other argument (a runtime value, a spy type, an ordinary aggregate, a pointer, ...) or result is a compile error.
+- The result is written into the call's result location, so it takes that location's type (an inferred location keeps the value's own type). Python does the argument binding (default values and `*args`/`**kwargs` work as usual).
+- A `PyFunction` is an ordinary compile-time value: it can be stored in a `Comptime` variable/parameter and passed as a comptime argument to another spy function.
+
+```python
+def double(n: int) -> int:                 # not registered: runs at compile time
+    return n * 2
+
+def shout(s: bytes) -> str:
+    return s.decode("utf-8").upper()
+
+@func()
+def use_py_function() -> i32:
+    f: Comptime = double                   # stored in a compile-time variable
+    return f(21)
+
+@func()
+def use_py_function_str():
+    return shout(b"hey")                   # b'HEY': a str crosses as its UTF-8 bytes
+
+assert use_py_function() == 42
+assert use_py_function_str() == b"HEY"
+```
 
 ---
 
@@ -1645,7 +1678,8 @@ assert id64(spy_as(2 ** 40, u64)) == 2 ** 40   # spy.as_ picks an explicit type
 ## 11. Implemented / unimplemented boundary
 
 **Implemented (highlights)**: see the sections above — scalars/pointers/arrays/slices/Option/tagged unions/union/complex/enums/structs;
-multiple return values; generics (functions and structs); closures (i.e. anonymous structs); `Comptime`/`ConstComptime`/`InferComptime`;
+multiple return values; generics (functions and structs); inlined functions (`@func(inline=True)`) and compile-time Python functions (`PyFunction`);
+closures (i.e. anonymous structs); `Comptime`/`ConstComptime`/`InferComptime`;
 compile-time pointers (including const across a non-inline boundary); compile-time aggregates/loops/reflection; `defer`; exceptions and `noreturn`;
 panic/`catch_unwind`; atomic operations; OpenMP (with reduction); Python-side interoperability (structs/enums/option/union/exceptions/multiple return values).
 

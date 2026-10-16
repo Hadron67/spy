@@ -1728,7 +1728,7 @@ class _Builder:
         """One call whose result is written into ``result_loc``: a
         construction ``Foo(...)`` or ``array(...)``, a method call ``x.h(...)``
         on a runtime struct value, or an ordinary call (a spy function, an
-        inlined plain function or a spy builtin)."""
+        inlined function or a spy builtin)."""
         fn_global = self._try_resolve_object(node.func)
         if fn_global is not None:
             if fn_global is cast:

@@ -105,7 +105,7 @@ Expression highlights:
   statement-level markers (`unroll`/`comptime`/`const_comptime`/`infer_comptime`) are buffered as a pragma by `_as_marker` and consumed by the next statement (a dangling pragma is an error).
 - Subscript dispatch for `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` is in `astgen._gen_expr`, `_gen_type_ctor`, `_gen_literal`.
 - `is None`/`is not None` (`_gen_is_none`), walrus `_gen_walrus`/`_gen_unwrap`, `isinstance` (`_gen_isinstance`).
-- Call `_gen_call`: `cast` (no-op) -> `array` -> `isinstance` -> `ord` -> `len` -> if the attribute is an ordinary Python function, inline `CallInplace` ->
+- Call `_gen_call`: `cast` (no-op) -> `array` -> `isinstance` -> `ord` -> `len` -> if the attribute is an ordinary Python function, `CallInplace` (its callee resolves to a `sval.PyFunction`, evaluated by Python at compile time) ->
   if the attribute is a method, `CallMethodInplace` -> struct construction `FinishStruct` -> ordinary `CallInplace`.
   `_gen_arglist` currently **silently ignores `**kw` and errors on `*x`** (`hir.Spread` exists but astgen does not emit it, see `doc/issues.md` #1).
 
@@ -287,7 +287,7 @@ each storage leaf is delivered through a trailing `$result` out-pointer; the thu
   `get_entry` resolves lazily: `self_arg` defaults to a decision by type (enum -> `"value"`, struct -> `"ptr"`).
 - `_RegisteredClass`: `get_entry` builds the `StructTypeHead` (binds the head before reading the body, supporting self-reference), the fields, and the methods (walking `reversed(MRO)`, subclass overrides first);
   `__getitem__` -> `glue.specialized_struct`; `__call__` -> `glue.construct`.
-- `_Context` (a subclass of `sval.CompileContext`): `resolve_global` (resolves registered objects / ordinary Python functions / enum members into spy values or `FunctionValue`s of this context),
+- `_Context` (a subclass of `sval.CompileContext`): `resolve_global` (resolves registered objects / enum members into spy values or `FunctionValue`s of this context, and wraps a plain Python function that is not decorated with `@func` into a `sval.PyFunction`),
   `special_types`, `mir_lower_cache`, `target_info`, `_resolve_call`, enum support (`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`).
   `_GLOBAL_CONTEXT = _Context(LLVMBackend())` is the top-level default context.
 
@@ -345,6 +345,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 ### 6.4 Calls
 
 - `call(callee, args, ret, on_return)`: `FunctionValue`/`BoundMethod` -> `_call_function_entry`; `BuiltinFn` -> `_call_builtin`;
+  `PyFunction` -> `_call_py_function` (every argument must be a compile-time value that lowers to a plain Python object, a `str` is encoded to its byte string, and the result is written into the result location as a `ComptimeVal`);
   a pointer to a struct containing `__call__` -> `call_method('__call__')` (closure); a pointer to `FunctionType` -> `_call_fn_ptr`.
 - `_call_function_entry`: `substitute_type_vars` + `bind_arg_pos` + `_check_comptime_args`; `force_inline` -> `_start_inline`,
   otherwise `_request_function` after `specialize` (returns `SUSPEND`, scheduled by `Analyser`).

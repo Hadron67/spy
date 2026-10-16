@@ -3,9 +3,10 @@
 The functions under test are defined at module level and registered with
 the ordinary ``@spy.func()`` decorator; a function body may call the
 other registered functions by name (they are module globals, resolved by
-the compile-time interpreter) exactly like a user would.  The
-undecorated ``add_inline`` is deliberately left unregistered: it stays a
-plain Python function and is inlined at its call sites.
+the compile-time interpreter) exactly like a user would.  A function that
+is *not* decorated is a plain Python function: it only ever runs at
+compile time (a ``sval.PyFunction``, see ``py_functions``); an inlined
+spy function is spelled ``@func(inline=True)``.
 
 The tests are grouped by feature into the submodules of this package; each
 submodule defines an ``all_tests`` list of its test cases, and this module
@@ -41,6 +42,7 @@ from .operators import all_tests as operators_tests
 from .options import all_tests as options_tests
 from .panic import all_tests as panic_tests
 from .pointers import all_tests as pointers_tests
+from .py_functions import all_tests as py_functions_tests
 from .reflect import all_tests as reflect_tests
 from .returns import all_tests as returns_tests
 from .slices import all_tests as slices_tests
@@ -69,6 +71,7 @@ all_tests: list[type[TestCase]] = [
     *pointers_tests,
     *slices_tests,
     *arrays_tests,
+    *py_functions_tests,
     *ifexpr_tests,
     *comptime_structs_tests,
     *options_tests,

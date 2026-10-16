@@ -459,7 +459,8 @@ assert maybe_spin(False) is False
 一个值要么是**运行时值**（有运行时表示），要么是**编译期值**（只在编译期存在）：
 
 - 编译期值涵盖：标量常量、类型值、编译期聚合值、编译期 Option/tagged union、`Null`/`Void`/undefined、
-  编译期指针，以及普通 Python `int/float/complex/bytes/bool`；此外还有函数值等编译期对象。
+  编译期指针，以及普通 Python `int/float/complex/bytes/bool`；此外还有函数值、不用 `@func` 装饰的
+  Python 函数（`PyFunction`，见 §6.10）等编译期对象。
 
 **关键点**：不存在「以运行时值形式存在的编译期值」。任何一个组成部分是运行时值的聚合，
 **整体就是运行时值**，不能存进 `Comptime` 变量/参数（要持有它就用普通变量）。
@@ -846,7 +847,8 @@ assert caught() == 42
 ### 6.1 定义与特化
 
 - `@spy.func()` 注册；首次调用按实参类型编译出一个**特化**，同函数可有多个特化。
-- 普通（未注册的）Python 函数在函数体内被调用时会被**内联**；未装饰的结构体方法同理。`@func(inline=True)` 可把注册的函数也标成内联。
+- **不用 `@func` 装饰的函数是编译期 Python 辅助函数**（`PyFunction`，见 §6.10）：只能在编译期调用，函数体由 Python 原样执行。
+- `@func(inline=True)` 把注册的函数标成**内联**：函数体展开到调用处，可以接收运行期实参。未装饰的结构体方法也是内联的。
 - 形参类型由：注解（替换已求解的泛型参数后）> 实参推断出的类型 > 默认值的类型决定。
 - `@func(ignore_signature=True)` 忽略形参与返回**类型**注解（它们只供 Python 类型检查器阅读）：形参类型一律由实参推断、返回类型由函数体推断。`Comptime`/`Comptime[T]` 不是类型，其标记仍保留（参数仍是编译期参数）。
 
@@ -855,7 +857,8 @@ assert caught() == 42
 def add_generic[T: Numeric](a: T, b: T) -> T:
     return a + b
 
-def add_plain(a: i32, b: i32) -> i32:      # an ordinary Python function: inlined
+@func(inline=True)
+def add_plain(a: i32, b: i32) -> i32:      # an inlined spy function
     return a + b
 
 @func()
@@ -1015,7 +1018,8 @@ assert fact(5) == 120
 - **限制**：无 `nonlocal`；**互递归闭包不支持**（见 `doc/issues.md` #6）；闭包体引用外层函数的类型参数不支持。
 
 ```python
-def apply_inline(f, x: i32) -> i32:        # an inlined plain Python function
+@func(inline=True)
+def apply_inline(f, x: i32) -> i32:        # an inlined spy function
     return f(x)
 
 @func()
@@ -1065,6 +1069,38 @@ assert use_func_ptr(2, 3) == 5
 ### 6.9 递归
 
 - 直接递归、互递归、泛型多类型递归都支持；递归函数必须能由注解确定返回类型（见 §6.6）。
+
+### 6.10 编译期 Python 函数（`PyFunction`）
+
+- **不用 `@func` 装饰**的普通 Python 函数是一个**编译期值**（`sval.PyFunction`，没有运行时表示）：它**只能在编译期被调用**，
+  函数体由 Python **原样执行**（不是编译成 spy 代码）；`@func(inline=True)` 才是「内联 spy 函数」。
+- 实参与返回值都必须是**编译期量**，且只能是普通 Python 对象：`int`（含 `bool`）、`float`、`complex`、`bytes`、`None`；
+  Python `str` 在边界处按 UTF-8 编码成 spy 的字节串（与源码里的字符串字面量一致）。
+  和 Python 调用边界一样，`Null`/`TypedNull`/`Void` 都传成 `None`，`Option` 自动解包成载荷值、tagged union 解包成变体值（载荷/变体是聚合时会因不是普通对象而被拒）；
+  返回 `None` 则变成 `Null`（option 的缺失值）。
+  其它实参（运行期值、spy 类型值、普通聚合、指针等）或其它返回值一律编译报错。
+- 返回值写进调用处的结果位置，因此取该位置的类型（推断出的位置保留值自身的类型）。绑参由 Python 完成（默认值、`*args`/`**kwargs` 都照常）。
+- `PyFunction` 是普通编译期值，可存进 `Comptime` 变量/参数，也可作为 comptime 实参传给别的 spy 函数。
+
+```python
+def double(n: int) -> int:                 # not registered: runs at compile time
+    return n * 2
+
+def shout(s: bytes) -> str:
+    return s.decode("utf-8").upper()
+
+@func()
+def use_py_function() -> i32:
+    f: Comptime = double                   # stored in a compile-time variable
+    return f(21)
+
+@func()
+def use_py_function_str():
+    return shout(b"hey")                   # b'HEY': a str crosses as its UTF-8 bytes
+
+assert use_py_function() == 42
+assert use_py_function_str() == b"HEY"
+```
 
 ---
 
@@ -1644,7 +1680,8 @@ assert id64(spy_as(2 ** 40, u64)) == 2 ** 40   # spy.as_ picks an explicit type
 ## 11. 已实现 / 未实现边界
 
 **已实现（要点）**：见上文各节——标量/指针/数组/切片/Option/tagged union/union/complex/枚举/结构体；
-多返回值；泛型（函数与结构体）；闭包（即匿名 struct）；`Comptime`/`ConstComptime`/`InferComptime`；
+多返回值；泛型（函数与结构体）；内联函数（`@func(inline=True)`）与编译期 Python 函数（`PyFunction`）；
+闭包（即匿名 struct）；`Comptime`/`ConstComptime`/`InferComptime`；
 编译期指针（含 const 跨非内联边界）；编译期聚合/循环/反射；`defer`；异常与 `noreturn`；
 panic/`catch_unwind`；原子操作；OpenMP（含归约）；Python 侧互操作（结构体/枚举/option/union/异常/多返回值）。
 

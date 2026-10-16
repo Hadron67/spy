@@ -199,16 +199,19 @@ class _SliceRefIterator[T]:
         self.cursor += 1
         return result
 
+@func(inline=True)
 def arr_slice[T, N: int](arr: Ptr[Array[T, N]]) -> SlicePtr[T]:
     """The slice of the whole array the pointer ``arr`` names: the
     ``*[N]T -> SlicePtr[T]`` conversion, written out with ``ptr_cast`` (a
     pointer to an array already carries the address of its first element)."""
     return cast(SlicePtr[T], SlicePtr(ptr_cast(arr, MultiPtr[T]), cast(int, N)))
 
+@func(inline=True)
 def const_arr_slice[T, N: int](arr: ConstPtr[Array[T, N]]) -> ConstSlicePtr[T]:
     """Likewise for a const pointer: the slice of it is a ``ConstSlicePtr``."""
     return cast(ConstSlicePtr[T], ConstSlicePtr(ptr_cast(arr, ConstMultiPtr[T]), cast(int, N)))
 
+@func(inline=True)
 def const_arr_ptr[T, N: int](arr: Ptr[Array[T, N]]) -> MultiPtr[T]:
     return cast(MultiPtr[T], arr)
 
@@ -217,11 +220,13 @@ def const_arr_ptr[T, N: int](arr: Ptr[Array[T, N]]) -> MultiPtr[T]:
 class NullException(Exception):
     pass
 
+@func(inline=True)
 def unwrap[T](val: Option[T]) -> T:
     if (ret := val) is not None:
         return ret
     raise NullException()
 
+@func(inline=True)
 def unwrap_or[T](val: Option[T], default: T) -> T:
     if (ret := val) is not None:
         return ret
@@ -237,6 +242,7 @@ def undefined() -> Any: ...
 @builtin_func
 def coerce[T](value: Any, typ: type[T]) -> T: ...
 
+@func(inline=True)
 def typed_undefined[T](typ: type[T]) -> T:
     return coerce(undefined(), typ)
 
@@ -254,6 +260,7 @@ def compile_error(msg: str | bytes) -> Never: ...
 # ``sstr(s)``: the compile-time byte string ``s`` as a ``ConstSlicePtr[u8]`` -
 # a pointer to its bytes (lowered into a global constant automatically, see the
 # behaviour doc §4.3) and the number of bytes (no trailing NUL is counted).
+@func(inline=True)
 def sstr(s: bytes) -> ConstSlicePtr[u8]:
     return ConstSlicePtr(ptr_cast(s, ConstMultiPtr[u8]), len(s))
 
@@ -295,6 +302,7 @@ class OpaqueWithDestructor:
 
 type PanicData = i32 | u32 | i64 | u64 | ConstSlicePtr[u8] | Ptr[Opaque] | OpaqueWithDestructor
 
+@func(inline=True)
 def deinit_panic_data(data: PanicData) -> None:
     if isinstance(v := data, OpaqueWithDestructor):
         v.deinit()

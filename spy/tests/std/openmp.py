@@ -15,13 +15,7 @@ from unittest import TestCase
 from ...compiler import CompileError, c64, c128, f32, f64, func, i32, i64, u8
 from ...compiler.syntax import Array, ref
 from ...std.core import arr_slice, coerce, undefined
-from ...std.openmp import load_openmp_runtime, parallel_loop
-
-_LOAD_ERROR: str | None = None
-try:
-    load_openmp_runtime()
-except RuntimeError as error:
-    _LOAD_ERROR = str(error)
+from ...std.openmp import parallel_loop
 
 
 @func()
@@ -240,10 +234,6 @@ def parallel_write_and_pair(n: i32) -> i64:
 
 class SpyOpenMPTest(TestCase):
     """``std.openmp.parallel_loop``: the static-schedule parallel loop."""
-
-    def setUp(self) -> None:
-        if _LOAD_ERROR is not None:
-            self.skipTest(_LOAD_ERROR)
 
     def test_a_loop_body_runs_over_every_index_once(self) -> None:
         # sum(0..999)

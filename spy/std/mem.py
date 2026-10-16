@@ -40,9 +40,11 @@ class Layout:
 @builtin_func
 def layout_of(type: Any) -> Layout: ...
 
+@func(inline=True)
 def size_of(type: Any) -> usize:
     return layout_of(type).size
 
+@func(inline=True)
 def align_of(type: Any) -> usize:
     return layout_of(type).align
 

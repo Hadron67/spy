@@ -82,8 +82,10 @@ def class_name_plain() -> i32:
 
 
 @func()
-def class_name_plain_method(a: i32) -> i32:
-    return _ClassNamePlain.baz(a)  # pyright: ignore
+def class_name_plain_method() -> i32:
+    # the functions of a plain class are plain Python functions, so they are
+    # called at compile time (with compile-time arguments)
+    return _ClassNamePlain.baz(41)  # pyright: ignore
 
 
 @func()
@@ -128,7 +130,7 @@ class SpyClassNameCallTest(TestCase):
 
     def test_a_plain_class_is_a_namespace(self) -> None:
         self.assertEqual(class_name_plain(), 7)
-        self.assertEqual(class_name_plain_method(41), 42)
+        self.assertEqual(class_name_plain_method(), 42)
 
     def test_a_struct_inherits_a_base_method_through_the_class_name(self) -> None:
         self.assertEqual(class_name_inherited_class_name(100), 105)

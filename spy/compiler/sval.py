@@ -53,7 +53,7 @@ type AnyValue = Value | int | float | complex | bytes | bool
 
 type ScalarValue = (
     Type | Void | Null | Int | Float | IntEnumValue | UndefinedScalar
-    | UntypedUndefined | DeclareFunction | BoundMethod | BuiltinFn
+    | UntypedUndefined | DeclareFunction | BoundMethod | BuiltinFn | PyFunction
     | ComptimePtr | CastedPtr | FunctionValue
     | int | float | complex | bytes | bool
 )
@@ -3298,6 +3298,44 @@ class BoundMethod(Value):
         return f'bound_method({self.fn})'
 
 
+class PyFunction(Value):
+    """A plain Python function - one *not* decorated with ``@func`` - used as a
+    compile-time helper.  It is only ever called while the HIR runs (see
+    ``interp``), so it has no runtime representation at all: its arguments and
+    result are plain Python scalars (an ``int``/``bool``/``float``/``complex``/
+    ``bytes``, and a ``str`` which crosses as its UTF-8 byte string).
+
+    Its value is a *const function pointer* (see ``get_type``), like a
+    registered function's (``fn.FunctionValue``), so a call reaches it through a
+    pointer/place like any other callee.  The wrapped object is kept as it is:
+    nothing about it (its signature, its annotations, ...) is read here - the
+    interpreter binds the call's arguments by Python's own rules (see
+    ``interp.HirRunner._call_py_function``).
+
+    The value is not interned: two ``PyFunction`` values are equal only when they
+    wrap the very same object (identity), so that reconstructing one is harmless."""
+
+    fn: Callable[..., Any]
+
+    def __init__(self, fn: Callable[..., Any]) -> None:
+        self.fn = fn
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, PyFunction) and self.fn is other.fn
+
+    def __hash__(self) -> int:
+        return object.__hash__(self.fn)
+
+    @override
+    def get_type(self) -> Type:
+        # a const function pointer, like a registered function's value; its
+        # signature is not a spy one, so the pointee is the untyped AnyFunction
+        return PointerType(AnyFunction(), is_const=True)
+
+    def __str__(self) -> str:
+        return f'pyfn({getattr(self.fn, "__qualname__", self.fn)})'
+
+
 def int_range(type: IntType) -> tuple[int, int]:
     if type.signed:
         return (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
@@ -4393,10 +4431,11 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
         # a pointer reinterpreted by ``ptr_cast``: reading or writing through it
         # is not supported yet (see ``CastedPtr``)
         raise CoerceError(f"cannot use {value!r} as a constant of {type}")
-    if isinstance(value, DeclareFunction) or _is_function_value(value):
-        # a registered function value or an external declaration *is* a const
-        # function pointer (see ``FunctionValue.get_type``): its concrete type is
-        # checked where it is lowered (see ``interp``)
+    if isinstance(value, (DeclareFunction, PyFunction)) or _is_function_value(value):
+        # a registered function value, a Python function used at compile time or
+        # an external declaration *is* a const function pointer (see
+        # ``FunctionValue.get_type``/``PyFunction.get_type``): its concrete type
+        # is checked where it is lowered (see ``interp``)
         if isinstance(type, PointerType):
             return value
         raise CoerceError(f"cannot use {value!r} as a constant of {type}")

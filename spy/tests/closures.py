@@ -28,9 +28,9 @@ def closure_capture_param(n: i32) -> i32:
     return add(3)
 
 
+@func(inline=True)
 def apply_inline(f, x: i32) -> i32:
-    # a plain Python function: inlined at its call site, so it may take a
-    # closure as a parameter
+    # an inlined spy function, so it may take a closure as a parameter
     return f(x)
 
 

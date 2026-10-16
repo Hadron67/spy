@@ -23,6 +23,7 @@ class IntCastError(Exception):
     integer type (see ``int_cast``)."""
 
 
+@func(inline=True)
 def valid_range(bits: int, signed: bool) -> tuple[int, int]:
     """The inclusive range ``(min, max)`` of the ``bits``-wide integer type of
     the given signedness: ``[0, 2**bits - 1]`` when unsigned, or
@@ -96,6 +97,7 @@ def try_int_cast[T](value, typ: type[T]) -> T:
     return value
 
 
+@func(inline=True)
 def int_cast[T](value, typ: type[T]) -> T:
     """``try_int_cast`` that panics instead of raising ``IntCastError``."""
     try:

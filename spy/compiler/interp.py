@@ -48,8 +48,8 @@ Calls are dispatched at compile time:
 * calls to the ``spy`` builtins (``spy.compile_log``) are evaluated eagerly,
 * calls to other spy functions (jit or aot) become native ``call``
   instructions to the specialization selected by the argument types,
-* calls to plain Python functions inline the callee body into the
-  current stream.
+* calls to a plain Python function (a ``sval.PyFunction``) are evaluated at
+  compile time, on plain Python scalars (see ``_call_py_function``).
 
 ``spy.typeof`` is not a call at all: it is a ``syntax`` marker the parser
 lowers to a *type probe* (see ``hir.TypeOfBegin``), which types its argument
@@ -70,8 +70,8 @@ before its ``End``; a single-path body's store/load round trip is
 cleaned up afterwards by ``opt``.
 
 Both kinds of function calls push a *frame* holding the by-value
-arguments (resolved by ``hir.Arg`` leaves): an inlined plain-Python
-callee pushes it on the current runner, and a called spy function gets a
+arguments (resolved by ``hir.Arg`` leaves): an inlined callee pushes it on
+the current runner, and a called spy function gets a
 runner of its own instead (the caller suspends until that runner has
 typed it, see ``Analyser._request_function``).  The interpreter types an
 ``Alloca`` when its first store executes, so the untyped HIR needs no
@@ -816,11 +816,11 @@ class InlineFrame:
         # inherited from the caller (a fresh default for the function proper)
         self.compile_vars_stack: list[CompileVars] = [CompileVars() if compile_vars is None else compile_vars]
         # the frame's result location: the place its result is delivered into and
-        # the function proper's error places (an inlined plain body raises into
+        # the function proper's error places (an inlined body raises into
         # the enclosing function's error location, so it shares them)
         self.ret_loc: ComptimeResultPtr = ret_loc
         # whether the body of this frame has no value to return (the *declared*
-        # one of an inlined plain-Python body; the function proper's own type is
+        # one of an inlined body; the function proper's own type is
         # asked for when it runs, see ``HirRunner._current_value_is_empty``)
         self.value_is_empty = value_is_empty
         # what the call the body was inlined into has to do once the body
@@ -833,7 +833,7 @@ class InlineFrame:
         self.block_stack: list[BlockFrame] = []
         self.regs: dict[hir.Inst, InterpVal] = {}
         # the deferred bodies declared directly in the body's top-level region
-        # (the function body, or the body an inlined plain function; see
+        # (the function body, or the body of an inlined function; see
         # ``hir.Defer`` and ``HirRunner._region_defers``)
         self.body_defers: list[_DeferEntry] = []
         # the block the caller of the inlined body continues in: created by
@@ -918,6 +918,71 @@ def _to_comptime(value: InterpVal) -> sval.AnyValue | None:
             return value.obj
         case _:
             return None
+
+
+def _py_function_arg(ev: InterpVal, fn: sval.PyFunction) -> Any:
+    """The plain Python object one argument of a ``PyFunction`` call denotes.
+    Like the Python boundary, an option and a tagged union hand their payload /
+    variant over (an option's absent value included) and the null, typed-null and
+    void values are the Python ``None``; anything else has to be a plain Python
+    scalar, a typed ``sval.Int``/``sval.Float`` unwrapped to the Python scalar it
+    holds and a compile-time complex number rebuilt from its two parts.  A runtime
+    value, or a compile-time value that is none of these (a spy type, an
+    aggregate, a pointer, ...), is rejected."""
+    obj = _to_comptime(_shallow_normalize(ev))
+    if obj is None:
+        raise CompileError(
+            f'the argument of the Python function {fn} has to be a compile-time value'
+        )
+    # an option and a tagged union are unwrapped, the way the Python boundary hands
+    # one over (an aggregate payload/variant is then rejected by the scalar check
+    # below, since only plain Python objects may cross)
+    while isinstance(obj, (sval.OptionValue, sval.TaggedUnionValue)):
+        obj = obj.value
+    if isinstance(obj, (sval.Null, sval.TypedNull, sval.Void)):
+        return None
+    if isinstance(obj, (sval.Int, sval.Float)):
+        # a typed scalar constant: the Python scalar it holds
+        return obj.value
+    if isinstance(obj, sval.AggregateValue) and isinstance(obj.type, sval.ComplexType):
+        # a compile-time complex number is an aggregate of its two parts
+        re, im = obj.values[0], obj.values[1]
+        if isinstance(re, (sval.Int, sval.Float)) and isinstance(im, (sval.Int, sval.Float)):
+            return complex(re.value, im.value)
+    if isinstance(obj, (bool, int, float, complex, bytes)):
+        return obj
+    raise CompileError(
+        f'the argument of the Python function {fn} has to be a plain Python value '
+        f'(an int, float, complex, str, bytes or None), got {obj!r}'
+    )
+
+
+def _py_function_result(result: Any, fn: sval.PyFunction) -> sval.AnyValue:
+    """The compile-time value a ``PyFunction``'s result becomes: one of the plain
+    Python scalars a Python function may return, or ``None`` - spy's ``Null``, the
+    absent value of an option.  A ``str`` is encoded to its UTF-8 byte string, the
+    way a string literal in the source is (spy has no ``str`` type), and a
+    ``complex`` becomes the aggregate of its two parts; nothing else has a spy
+    value."""
+    if result is None:
+        return sval.Null()
+    if isinstance(result, str):
+        return result.encode('utf-8')
+    if isinstance(result, complex):
+        complex_type = sval.type_of(result)
+        assert isinstance(complex_type, sval.ComplexType)
+        elem = complex_type.elem
+        return sval.AggregateValue(
+            (sval.Float(float(result.real), elem), sval.Float(float(result.imag), elem)),
+            complex_type,
+        )
+    if isinstance(result, (bool, int, float, bytes)):
+        return result
+    raise CompileError(
+        f'the Python function {fn} returned {result!r}: a Python function used at '
+        f'compile time has to return a plain Python value (an int, float, complex, '
+        f'str, bytes or None)'
+    )
 
 
 def _shallow_normalize(ev: InterpVal) -> InterpVal:
@@ -1533,7 +1598,7 @@ class HirRunner:
         # which every mirror a type is lowered to is made
         self._mir_cache = analyser.mir_lower_cache
         # the frames of the function bodies under execution: the function
-        # proper at the bottom, one frame per inlined plain function
+        # proper at the bottom, one frame per inlined body
         # above it (see ``_in_function_proper``; each frame carries the
         # HIR of its body, see ``InlineFrame``)
         self._frames: list[InlineFrame] = []
@@ -2063,7 +2128,7 @@ class HirRunner:
         path of it may deliver a result (see ``hir.Ret`` and
         ``store_void_retloc``): the function proper's settled value type (the
         empty type for a ``-> Never`` annotation, or a type parameter that solved
-        to it), or the declared one of an inlined plain-Python body - an inlined
+        to it), or the declared one of an inlined body - an inlined
         body has no convention of its own, so only a declaration can say it."""
         if not self._in_function_proper():
             return self._frames[-1].value_is_empty
@@ -2335,7 +2400,7 @@ class HirRunner:
     def _in_function_proper(self) -> bool:
         """Whether the instructions currently being executed are those
         of the function proper (whose ``return`` emits a typed return)
-        rather than of an inlined plain function (whose ``return`` just
+        rather than of an inlined body (whose ``return`` just
         yields a value to the caller): the frames stack holds the
         function proper at its bottom and one frame per inlined body
         above it, so the innermost body is the function proper exactly
@@ -4525,11 +4590,11 @@ class HirRunner:
         """The runtime ``mir`` value of the function value ``fn``: the in-module
         ``mir.Function`` of its default specialization, or an external symbol when
         it was compiled in an earlier module (see §4.3).  A generic function has no
-        default specialization and an inlined Python one is no runtime function at
+        default specialization and an inlined one is no runtime function at
         all, so both are rejected."""
         if fn.force_inline:
             raise CompileError(
-                f'cannot lower {fn.hir.name}: an inlined Python function is not a runtime function'
+                f'cannot lower {fn.hir.name}: an inlined function is not a runtime function'
             )
         sig = fn.hir.signature
         if sig.is_generic():
@@ -4560,7 +4625,7 @@ class HirRunner:
         if not isinstance(obj, FunctionValue):
             raise CompileError('std.core.compile expects a spy function')
         if obj.force_inline:
-            raise CompileError('std.core.compile cannot compile an inlined Python function')
+            raise CompileError('std.core.compile cannot compile an inlined function')
         sig = obj.hir.signature
         if sig.is_generic():
             raise CompileError('std.core.compile does not accept a generic function')
@@ -5688,10 +5753,11 @@ class HirRunner:
     def call(self, callee: InterpVal, args: RawArgList[ArgEntry[InterpVal]], ret: PlaceTree, on_return: Callable[[], None] | None = None) -> PollResult:
         """Resolve one call by its callee value and run it.  Spy
         functions compile to a native ``call`` producing a typed
-        register, plain Python functions are inlined, and the spy
-        builtins are evaluated at compile time.  The callee constant of a
-        registered spy function already resolved to its entry when the
-        callee operand was evaluated (see ``operand``).
+        register, plain Python functions are evaluated at compile time,
+        and the spy builtins are evaluated at compile time too.  The
+        callee constant of a registered spy function already resolved to
+        its entry when the callee operand was evaluated (see
+        ``operand``).
 
         ``on_return`` is invoked once the callee delivered its result
         (see ``_call_function_entry``); None when the caller wants nothing
@@ -5720,6 +5786,13 @@ class HirRunner:
                 if res == PollResult.AGAIN and on_return is not None:
                     on_return()
                 return res
+            if isinstance(target, sval.PyFunction):
+                # a plain Python function used at compile time (see ``dsl``):
+                # evaluated here, on the plain Python objects its arguments denote
+                self._call_py_function(target, args, ret)
+                if on_return is not None:
+                    on_return()
+                return PollResult.AGAIN
         callee_type = _type_of(callee)
         # a call of a *struct value* through its ``__call__`` method (a closure is
         # such a struct, see §9): the callee is a place, so its type is a pointer
@@ -5736,9 +5809,34 @@ class HirRunner:
         if isinstance(callee_type, sval.PointerType) and isinstance(callee_type.elem, sval.FunctionType):
             return self._call_fn_ptr(callee, callee_type.elem, args, ret, on_return)
         raise CompileError(
-            f"cannot compile a call to {callee!r}; only spy functions, plain Python "
-            "functions and the spy builtins can be called"
+            f"cannot compile a call to {callee!r}; only spy functions, compile-time "
+            "Python functions and the spy builtins can be called"
         )
+
+    def _call_py_function(
+        self, fn: sval.PyFunction, args: RawArgList[ArgEntry[InterpVal]], ret: PlaceTree
+    ) -> None:
+        """Evaluate one call of a plain Python function (a ``sval.PyFunction``,
+        see ``dsl``) while the HIR runs.  Every argument has to be a
+        compile-time value that denotes a plain Python scalar (an
+        ``int``/``bool``/``float``/``complex``/``bytes``), the function is called
+        with them, and the plain Python value it returns is written into the
+        call's result location, where it takes that location's type (an inferred
+        location keeps the value's own).  The function's signature is never read:
+        Python binds the arguments itself (default values, ``*args``/``**kwargs``,
+        and a binding error is reported as a compile error)."""
+        py_args = [_py_function_arg(self._arg_value(arg), fn) for arg in args.positional]
+        py_kwargs = {
+            name: _py_function_arg(self._arg_value(arg), fn)
+            for name, arg in args.kwargs.items()
+        }
+        try:
+            result = fn.fn(*py_args, **py_kwargs)
+        except CompileError:
+            raise
+        except Exception as e:
+            raise CompileError(f'calling the Python function {fn} failed: {e}') from e
+        self.store(_single_place(ret), ComptimeVal(_py_function_result(result, fn)))
 
     def _call_builtin(
         self, fn: sval.BuiltinFn, args: RawArgList[ArgEntry[InterpVal]], ret: PlaceTree
@@ -8748,7 +8846,7 @@ class HirRunner:
         function call and of a method call (whose ``self`` the caller
         prepended to the arguments).  The call is specialized
         from the marshaled argument types (an annotated parameter fixes its
-        type, an unannotated one is typed by its argument); a plain Python
+        type, an unannotated one is typed by its argument); a forced-inline
         callee (``force_inline``) is inlined into the current stream
         instead of being compiled into a native specialization.
 
@@ -8772,7 +8870,8 @@ class HirRunner:
         binded_args = sig.bind_arg_pos(args, lambda e: ArgEntry(ComptimeVal(e), False))
         _check_comptime_args(sig, binded_args)
         if fn.force_inline:
-            # an undecorated plain Python function or a forced-inline closure:
+            # a forced-inline function (``@func(inline=True)``), a
+            # ``@syntax.closure(inline=True)`` or a lambda:
             # its body is inlined into the current stream (it has no native
             # specialization of its own).  Its declared return type still says
             # when it can never return a value, which its body must respect (see

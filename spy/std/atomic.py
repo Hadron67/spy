@@ -20,7 +20,7 @@ two updates are not one atomic operation as a whole.
 
 from enum import Enum
 
-from ..compiler import ConstPtr, Ptr, builtin_func
+from ..compiler import ConstPtr, Ptr, builtin_func, func
 
 
 class MemoryOrder(Enum):
@@ -81,32 +81,38 @@ def atomic_cmpxchg[T](ptr: Ptr[T], expected: T, desired: T,
 def atomic_fence(ordering: MemoryOrder = MemoryOrder.SEQ_CST): ...
 
 
+@func(inline=True)
 def atomic_fetch_add[T](ptr: Ptr[T], value: T, ordering: MemoryOrder = MemoryOrder.SEQ_CST) -> T:
     """``atomic_rmw(ptr, RmwOp.ADD, value, ordering)``: add ``value`` to the
     pointee of ``ptr`` and return the value it held before."""
     return atomic_rmw(ptr, RmwOp.ADD, value, ordering)
 
 
+@func(inline=True)
 def atomic_fetch_sub[T](ptr: Ptr[T], value: T, ordering: MemoryOrder = MemoryOrder.SEQ_CST) -> T:
     """``atomic_rmw(ptr, RmwOp.SUB, value, ordering)``."""
     return atomic_rmw(ptr, RmwOp.SUB, value, ordering)
 
 
+@func(inline=True)
 def atomic_fetch_and[T](ptr: Ptr[T], value: T, ordering: MemoryOrder = MemoryOrder.SEQ_CST) -> T:
     """``atomic_rmw(ptr, RmwOp.AND, value, ordering)``."""
     return atomic_rmw(ptr, RmwOp.AND, value, ordering)
 
 
+@func(inline=True)
 def atomic_fetch_or[T](ptr: Ptr[T], value: T, ordering: MemoryOrder = MemoryOrder.SEQ_CST) -> T:
     """``atomic_rmw(ptr, RmwOp.OR, value, ordering)``."""
     return atomic_rmw(ptr, RmwOp.OR, value, ordering)
 
 
+@func(inline=True)
 def atomic_fetch_xor[T](ptr: Ptr[T], value: T, ordering: MemoryOrder = MemoryOrder.SEQ_CST) -> T:
     """``atomic_rmw(ptr, RmwOp.XOR, value, ordering)``."""
     return atomic_rmw(ptr, RmwOp.XOR, value, ordering)
 
 
+@func(inline=True)
 def atomic_swap[T](ptr: Ptr[T], value: T, ordering: MemoryOrder = MemoryOrder.SEQ_CST) -> T:
     """``atomic_rmw(ptr, RmwOp.XCHG, value, ordering)``: store ``value`` and
     return the pointee's old value."""
