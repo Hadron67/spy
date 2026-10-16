@@ -1,19 +1,23 @@
 import math
 import struct
+from collections.abc import Callable
 from unittest import TestCase
 
 from ...compiler import CompileError, f32, f64
 from ...compiler import as_ as spy_as
 from ...compiler.dsl import _Context, func
 from ...compiler.lower import LLVMBackend
-from ...std.math import sin
-from ...std.math.sin import sin as software_sin
+from ...std.math import cos, sin, tan
+from ...std.math.trig import cos as software_cos
+from ...std.math.trig import sin as software_sin
+from ...std.math.trig import tan as software_tan
 
 # ---------------------------------------------------------------------------
-# ``std.math.sin``: the sine of an ``f32``/``f64``, dispatched at compile time
-# by the host's compile-time option ``sin_mode`` - ``llvm`` (the LLVM
-# intrinsic), ``libc`` (the C ``sinf``/``sin``) or ``software`` (the pure spy
-# port of musl, also the default when the option is unset).
+# ``std.math.sin``/``cos``/``tan``: the trigonometric functions of an
+# ``f32``/``f64``, each dispatched at compile time by the host's compile-time
+# option ``sin_mode``/``cos_mode``/``tan_mode`` - ``llvm`` (the LLVM intrinsic),
+# ``libc`` (the C ``sinf``/``sin``/...) or ``software`` (the pure spy port of
+# musl in ``std.math.trig``, also the default when the option is unset).
 #
 # The mode is read while the function is compiled and the specialization is
 # cached per host context, so each mode is exercised in a context of its own.
@@ -44,6 +48,7 @@ def _to_f32(x: float) -> float:
 _F64_VALUES = [
     0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 0.1, 3.141592653589793,
     1.5707963267948966, 0.7853981633974483, 2.0 * 3.141592653589793,
+    -2.0, -2.5, -3.0, -4.0, -5.0, 2.0, 3.0, 4.0, 5.0, -0.7853981633974483,
     1e-30, 1e-8, 1e-300, 1e16, 1e17, 1e20, 1e100, 1e300, -1e300,
     100.0, 999999.0, 123456789.123, 2.0**20, 2.0**30,
 ]
@@ -52,6 +57,20 @@ _F32_VALUES = [
     0.0, 1.0, -1.0, 0.5, -0.5, 0.1, 0.7853982, 2.0, 3.0, 3.1415927,
     6.0, 100.0, 1234.5678, 1e-4, 1e-30, 1e7, 1e8, -1e8,
     1e9, -1e9, 1e10, 1e20, 1e30, 3.4e38,
+    -2.0, -2.5, -3.0, -4.0, -5.0, -7.0,
+]
+
+# ``tan`` is a ratio, so its error is measured relatively (an absolute/ULP
+# distance is meaningless next to its poles); its values stay away from an odd
+# multiple of pi/2.
+_TAN_F64_VALUES = [
+    0.0, -0.0, 0.1, -0.1, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0,
+    0.7853981633974483, 1e-8, 100.0, -100.0, 1e8, 1e16, 1e100, 1e300,
+]
+
+_TAN_F32_VALUES = [
+    0.0, 0.1, -0.1, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0,
+    0.7853982, 1e-4, 100.0, -100.0, 1e8,
 ]
 
 
@@ -59,22 +78,44 @@ _F32_VALUES = [
 
 
 @func()
-def sw_f64(x: f64) -> f64:
+def sw_sin_f64(x: f64) -> f64:
     return software_sin(x)
 
 
 @func()
-def sw_f32(x: f32) -> f32:
+def sw_sin_f32(x: f32) -> f32:
     return software_sin(x)
 
 
-# -- one host context per mode ----------------------------------------------
+@func()
+def sw_cos_f64(x: f64) -> f64:
+    return software_cos(x)
+
+
+@func()
+def sw_cos_f32(x: f32) -> f32:
+    return software_cos(x)
+
+
+@func()
+def sw_tan_f64(x: f64) -> f64:
+    return software_tan(x)
+
+
+@func()
+def sw_tan_f32(x: f32) -> f32:
+    return software_tan(x)
+
+
+# -- one host context per mode (the option names cover every function) -------
 
 
 def _context_with_mode(mode: bytes | None) -> _Context:
     ctx = _Context(LLVMBackend())
     if mode is not None:
         ctx.set_compile_option(b'sin_mode', mode)
+        ctx.set_compile_option(b'cos_mode', mode)
+        ctx.set_compile_option(b'tan_mode', mode)
     return ctx
 
 
@@ -86,86 +127,195 @@ _CTX_BOGUS = _context_with_mode(b'bogus')
 
 
 @_CTX_LLVM.func()
-def mode_llvm[T](x: T) -> T:
+def libm_sin_llvm[T](x: T) -> T:
+    return sin(x)
+
+
+@_CTX_LLVM.func()
+def libm_cos_llvm[T](x: T) -> T:
+    return cos(x)
+
+
+@_CTX_LLVM.func()
+def libm_tan_llvm[T](x: T) -> T:
+    return tan(x)
+
+
+@_CTX_LIBC.func()
+def libm_sin_libc[T](x: T) -> T:
     return sin(x)
 
 
 @_CTX_LIBC.func()
-def mode_libc[T](x: T) -> T:
+def libm_cos_libc[T](x: T) -> T:
+    return cos(x)
+
+
+@_CTX_LIBC.func()
+def libm_tan_libc[T](x: T) -> T:
+    return tan(x)
+
+
+@_CTX_SOFTWARE.func()
+def libm_sin_software[T](x: T) -> T:
     return sin(x)
 
 
 @_CTX_SOFTWARE.func()
-def mode_software[T](x: T) -> T:
+def libm_cos_software[T](x: T) -> T:
+    return cos(x)
+
+
+@_CTX_SOFTWARE.func()
+def libm_tan_software[T](x: T) -> T:
+    return tan(x)
+
+
+@_CTX_DEFAULT.func()
+def libm_sin_default[T](x: T) -> T:
     return sin(x)
 
 
 @_CTX_DEFAULT.func()
-def mode_default[T](x: T) -> T:
+def libm_cos_default[T](x: T) -> T:
+    return cos(x)
+
+
+@_CTX_DEFAULT.func()
+def libm_tan_default[T](x: T) -> T:
+    return tan(x)
+
+
+@_CTX_BOGUS.func()
+def libm_sin_bogus(x: f64) -> f64:
     return sin(x)
 
 
 @_CTX_BOGUS.func()
-def mode_bogus(x: f64) -> f64:
-    return sin(x)
+def libm_cos_bogus(x: f64) -> f64:
+    return cos(x)
 
 
-class SpySoftwareSinTest(TestCase):
-    """The pure spy ``sin`` (the musl port): both ``f32`` and ``f64`` are
-    correctly rounded (well within 1 ULP of the C library)."""
+@_CTX_BOGUS.func()
+def libm_tan_bogus(x: f64) -> f64:
+    return tan(x)
 
-    def test_f64(self) -> None:
+
+class _TrigUlpTest(TestCase):
+    """Shared comparison helpers (no tests of its own)."""
+
+    def check_f64(self, fn: Callable[[float], float], expect: Callable[[float], float], tol: int) -> None:
         for v in _F64_VALUES:
-            self.assertLessEqual(_f64_ulp(sw_f64(v), math.sin(v)), 1, msg=repr(v))
+            self.assertLessEqual(_f64_ulp(fn(v), expect(v)), tol, msg=repr(v))
 
-    def test_f32(self) -> None:
+    def check_f32(self, fn: Callable[[f32], f32], expect: Callable[[float], float], tol: int) -> None:
         for v in _F32_VALUES:
-            want = _to_f32(math.sin(_to_f32(v)))
-            self.assertLessEqual(_f32_ulp(float(sw_f32(spy_as(v, f32))), want), 1, msg=repr(v))
+            want = _to_f32(expect(_to_f32(v)))
+            self.assertLessEqual(_f32_ulp(float(fn(spy_as(v, f32))), want), tol, msg=repr(v))
 
-    def test_negative_zero(self) -> None:
-        # sin(-0) is -0
-        self.assertEqual(math.copysign(1.0, sw_f64(-0.0)), -1.0)
+    def assert_rel_close(self, got: float, want: float, tol: float, msg: str) -> None:
+        if got == want or (math.isnan(got) and math.isnan(want)):
+            return
+        denom = abs(want) if want != 0.0 else 1.0
+        self.assertLessEqual(abs(got - want), tol * denom, msg=msg)
+
+    def check_tan_f64(self, fn: Callable[[float], float], tol: float) -> None:
+        for v in _TAN_F64_VALUES:
+            self.assert_rel_close(fn(v), math.tan(v), tol, repr(v))
+
+    def check_tan_f32(self, fn: Callable[[f32], f32], tol: float) -> None:
+        for v in _TAN_F32_VALUES:
+            got = float(fn(spy_as(v, f32)))
+            self.assert_rel_close(got, math.tan(_to_f32(v)), tol, repr(v))
 
 
-class SpySinModeTest(TestCase):
-    """``sin_mode`` selects the ``llvm``/``libc``/``software`` implementation at
-    compile time; an unset option defaults to ``software``."""
+class SpySoftwareTrigTest(_TrigUlpTest):
+    """The pure spy ``sin``/``cos``/``tan`` (the musl port): both ``f32`` and
+    ``f64`` are correctly rounded (well within 1 ULP of the C library); ``tan``
+    is ``sin / cos`` of the same kernels."""
+
+    def test_sin_f64(self) -> None:
+        self.check_f64(sw_sin_f64, math.sin, 1)
+
+    def test_sin_f32(self) -> None:
+        self.check_f32(sw_sin_f32, math.sin, 1)
+
+    def test_cos_f64(self) -> None:
+        self.check_f64(sw_cos_f64, math.cos, 1)
+
+    def test_cos_f32(self) -> None:
+        self.check_f32(sw_cos_f32, math.cos, 1)
+
+    def test_tan_f64(self) -> None:
+        self.check_tan_f64(sw_tan_f64, 1e-14)
+
+    def test_tan_f32(self) -> None:
+        self.check_tan_f32(sw_tan_f32, 1e-5)
+
+    def test_tan_is_sin_over_cos(self) -> None:
+        for v in _TAN_F64_VALUES:
+            self.assertEqual(sw_tan_f64(v), sw_sin_f64(v) / sw_cos_f64(v), msg=repr(v))
+
+    def test_sin_of_negative_zero(self) -> None:
+        self.assertEqual(math.copysign(1.0, sw_sin_f64(-0.0)), -1.0)
+
+    def test_cos_of_zero(self) -> None:
+        self.assertEqual(sw_cos_f64(0.0), 1.0)
+        self.assertEqual(sw_cos_f64(-0.0), 1.0)
+
+    def test_tan_of_zero(self) -> None:
+        self.assertEqual(sw_tan_f64(0.0), 0.0)
+        self.assertEqual(math.copysign(1.0, sw_tan_f64(-0.0)), -1.0)
+
+
+class SpyTrigModeTest(_TrigUlpTest):
+    """``sin_mode``/``cos_mode``/``tan_mode`` select the
+    ``llvm``/``libc``/``software`` implementation at compile time; an unset
+    option defaults to ``software``."""
 
     def test_llvm(self) -> None:
-        for v in _F64_VALUES:
-            self.assertLessEqual(_f64_ulp(mode_llvm(v), math.sin(v)), 2, msg=repr(v))
-        self.assertLessEqual(
-            _f32_ulp(float(mode_llvm(spy_as(0.5, f32))), _to_f32(math.sin(0.5))), 2
-        )
+        self.check_f64(libm_sin_llvm, math.sin, 2)
+        self.check_f32(libm_sin_llvm, math.sin, 2)
+        self.check_f64(libm_cos_llvm, math.cos, 2)
+        self.check_f32(libm_cos_llvm, math.cos, 2)
+        self.check_tan_f64(libm_tan_llvm, 1e-13)
+        self.check_tan_f32(libm_tan_llvm, 1e-5)
 
     def test_libc(self) -> None:
-        for v in _F64_VALUES:
-            self.assertLessEqual(_f64_ulp(mode_libc(v), math.sin(v)), 2, msg=repr(v))
-        self.assertLessEqual(
-            _f32_ulp(float(mode_libc(spy_as(0.5, f32))), _to_f32(math.sin(0.5))), 2
-        )
+        self.check_f64(libm_sin_libc, math.sin, 2)
+        self.check_f32(libm_sin_libc, math.sin, 2)
+        self.check_f64(libm_cos_libc, math.cos, 2)
+        self.check_f32(libm_cos_libc, math.cos, 2)
+        self.check_tan_f64(libm_tan_libc, 1e-13)
+        self.check_tan_f32(libm_tan_libc, 1e-5)
 
     def test_software(self) -> None:
-        for v in _F64_VALUES:
-            self.assertLessEqual(_f64_ulp(mode_software(v), math.sin(v)), 1, msg=repr(v))
-        self.assertLessEqual(
-            _f32_ulp(float(mode_software(spy_as(0.5, f32))), _to_f32(math.sin(0.5))), 1
-        )
+        self.check_f64(libm_sin_software, math.sin, 1)
+        self.check_f32(libm_sin_software, math.sin, 1)
+        self.check_f64(libm_cos_software, math.cos, 1)
+        self.check_f32(libm_cos_software, math.cos, 1)
+        self.check_tan_f64(libm_tan_software, 1e-14)
+        self.check_tan_f32(libm_tan_software, 1e-5)
 
     def test_default_is_software(self) -> None:
         # the software implementation is exact, so the default (an unset option)
         # has to match it bit for bit
         for v in _F64_VALUES:
-            self.assertEqual(mode_default(v), sw_f64(v), msg=repr(v))
-        self.assertEqual(mode_default(0.5), mode_software(0.5))
+            self.assertEqual(libm_sin_default(v), sw_sin_f64(v), msg=repr(v))
+            self.assertEqual(libm_cos_default(v), sw_cos_f64(v), msg=repr(v))
+        for v in _TAN_F64_VALUES:
+            self.assertEqual(libm_tan_default(v), sw_tan_f64(v), msg=repr(v))
 
     def test_an_unknown_mode_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
-            mode_bogus(0.5)
+            libm_sin_bogus(0.5)
+        with self.assertRaises(CompileError):
+            libm_cos_bogus(0.5)
+        with self.assertRaises(CompileError):
+            libm_tan_bogus(0.5)
 
 
 all_tests = [
-    SpySoftwareSinTest,
-    SpySinModeTest,
+    SpySoftwareTrigTest,
+    SpyTrigModeTest,
 ]

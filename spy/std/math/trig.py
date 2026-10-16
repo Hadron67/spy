@@ -1,14 +1,15 @@
-"""The software (pure spy) sine (``std.math.sin``).
+"""The software (pure spy) trigonometric functions (``std.math``).
 
-A port of musl's ``sin.c``/``sinf.c`` and the kernels they build on
-(``__sin``/``__cos``/``__sindf``/``__cosdf``, ``__rem_pio2``/``__rem_pio2f`` and
-``__rem_pio2_large``).  Where C needs a separate ``float`` and ``double`` copy, a
-single function with a compile-time ``is_32`` flag serves both: only the branch of
-the requested float type is ever typed and lowered.
+A port of musl's ``sin.c``/``sinf.c``/``cos.c``/``cosf.c`` and the kernels they
+build on (``__sin``/``__cos``/``__sindf``/``__cosdf``, ``__rem_pio2``/
+``__rem_pio2f`` and ``__rem_pio2_large``).  Where C needs a separate ``float`` and
+``double`` copy, a single function with a compile-time ``is_32`` flag serves both:
+only the branch of the requested float type is ever typed and lowered.  ``sin``
+and ``cos`` share the kernels and the argument reduction, so both live here.
 
-The public entry point is :func:`sin`, generic over ``f32``/``f64``.  It is what
-``std.math.sin`` calls when the compile-time option ``sin_mode`` is ``software``
-(the default).
+The public entry points are :func:`sin` and :func:`cos`, generic over
+``f32``/``f64``.  They are what ``std.math`` calls when the compile-time option
+``sin_mode``/``cos_mode`` is ``software`` (the default).
 """
 
 from typing import Literal
@@ -76,11 +77,12 @@ _PIO4F = 0.7853981852531433  # 0x1.921fb6p-1
 _PIO2_1F = 1.57079631090164184570e00
 _PIO2_1TF = 1.58932547735281966916e-08
 
-# smaller multiples of pi/2 for sinf (f64)
-_S1PIO2 = 1.5707963267948966
-_S2PIO2 = 3.141592653589793
-_S3PIO2 = 4.71238898038469
-_S4PIO2 = 6.283185307179586
+# smaller multiples of pi/2 for sinf/cosf (f64; the `s1pio2..` of musl's sinf
+# and the `c1pio2..` of cosf are the same values)
+_PIO2 = 1.5707963267948966
+_PI = 3.141592653589793
+_THREE_PIO2 = 4.71238898038469
+_TWO_PI = 6.283185307179586
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +532,7 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
 
 
 @func()
-def _sin_cos_switch(is_32: Comptime[bool], n: i32, y0: f64, y1: f64) -> f64:
+def _sin_switch(is_32: Comptime[bool], n: i32, y0: f64, y1: f64) -> f64:
     """``sin``'s ``switch (n & 3)``: the reduced argument ``y0 (+ y1)`` picks
     between the sine and cosine kernel and their signs (the table in musl)."""
     m: i32 = n & 3
@@ -541,6 +543,20 @@ def _sin_cos_switch(is_32: Comptime[bool], n: i32, y0: f64, y1: f64) -> f64:
     if m == 2:
         return -_sin_kernel(is_32, y0, y1, 1)
     return -_cos_kernel(is_32, y0, y1)
+
+
+@func()
+def _cos_switch(is_32: Comptime[bool], n: i32, y0: f64, y1: f64) -> f64:
+    """``cos``'s ``switch (n & 3)``: the same reduced argument, the other
+    diagonal of musl's table (cosine/kernel with the opposite signs)."""
+    m: i32 = n & 3
+    if m == 0:
+        return _cos_kernel(is_32, y0, y1)
+    if m == 1:
+        return -_sin_kernel(is_32, y0, y1, 1)
+    if m == 2:
+        return -_cos_kernel(is_32, y0, y1)
+    return _sin_kernel(is_32, y0, y1, 1)
 
 
 @func()
@@ -561,24 +577,24 @@ def sin[T](x: T) -> T:
         if ix <= 0x407B53D1:
             if ix <= 0x4016CBE3:
                 if neg:
-                    return coerce(-_cos_kernel(is_32, coerce(x, f64) + _S1PIO2, 0.0), typ)
-                return coerce(_cos_kernel(is_32, coerce(x, f64) - _S1PIO2, 0.0), typ)
+                    return coerce(-_cos_kernel(is_32, coerce(x, f64) + _PIO2, 0.0), typ)
+                return coerce(_cos_kernel(is_32, coerce(x, f64) - _PIO2, 0.0), typ)
             if neg:
-                return coerce(_sin_kernel(is_32, -(coerce(x, f64) + _S2PIO2), 0.0, 0), typ)
-            return coerce(_sin_kernel(is_32, -(coerce(x, f64) - _S2PIO2), 0.0, 0), typ)
+                return coerce(_sin_kernel(is_32, -(coerce(x, f64) + _PI), 0.0, 0), typ)
+            return coerce(_sin_kernel(is_32, -(coerce(x, f64) - _PI), 0.0, 0), typ)
         if ix <= 0x40E231D5:
             if ix <= 0x40AFEDDF:
                 if neg:
-                    return coerce(_cos_kernel(is_32, coerce(x, f64) + _S3PIO2, 0.0), typ)
-                return coerce(-_cos_kernel(is_32, coerce(x, f64) - _S3PIO2, 0.0), typ)
+                    return coerce(_cos_kernel(is_32, coerce(x, f64) + _THREE_PIO2, 0.0), typ)
+                return coerce(-_cos_kernel(is_32, coerce(x, f64) - _THREE_PIO2, 0.0), typ)
             if neg:
-                return coerce(_sin_kernel(is_32, coerce(x, f64) + _S4PIO2, 0.0, 0), typ)
-            return coerce(_sin_kernel(is_32, coerce(x, f64) - _S4PIO2, 0.0, 0), typ)
+                return coerce(_sin_kernel(is_32, coerce(x, f64) + _TWO_PI, 0.0, 0), typ)
+            return coerce(_sin_kernel(is_32, coerce(x, f64) - _TWO_PI, 0.0, 0), typ)
         if ix >= 0x7F800000:
             xf32: f64 = coerce(x, f64)
             return coerce(xf32 - xf32, typ)
         n, y0, y1 = _rem_pio2(is_32, coerce(bits, u64), coerce(x, f64))
-        return coerce(_sin_cos_switch(is_32, n, y0, y1), typ)
+        return coerce(_sin_switch(is_32, n, y0, y1), typ)
 
     bits64: u64 = bitcast(x, u64)
     ix64: u64 = (bits64 >> 32) & 0x7FFFFFFF
@@ -590,4 +606,61 @@ def sin[T](x: T) -> T:
         xf64: f64 = coerce(x, f64)
         return coerce(xf64 - xf64, typ)
     n, y0, y1 = _rem_pio2(is_32, bits64, coerce(x, f64))
-    return coerce(_sin_cos_switch(is_32, n, y0, y1), typ)
+    return coerce(_sin_switch(is_32, n, y0, y1), typ)
+
+
+@func()
+def cos[T](x: T) -> T:
+    """The cosine of ``x`` (``f32`` or ``f64``), the pure spy implementation: a
+    port of musl's ``cosf``/``cos``."""
+    comptime()
+    typ = typeof(x)
+    is_32: Comptime = typ == f32
+    if is_32:
+        bits: u32 = bitcast(x, u32)
+        ix: u32 = bits & 0x7FFFFFFF
+        if ix <= 0x3F490FDA:
+            if ix < 0x39800000:
+                return coerce(1.0, typ)
+            return coerce(_cos_kernel(is_32, coerce(x, f64), 0.0), typ)
+        neg: bool = (bits >> 31) != 0
+        if ix <= 0x407B53D1:
+            if ix > 0x4016CBE3:
+                if neg:
+                    return coerce(-_cos_kernel(is_32, coerce(x, f64) + _PI, 0.0), typ)
+                return coerce(-_cos_kernel(is_32, coerce(x, f64) - _PI, 0.0), typ)
+            if neg:
+                return coerce(_sin_kernel(is_32, coerce(x, f64) + _PIO2, 0.0, 0), typ)
+            return coerce(_sin_kernel(is_32, _PIO2 - coerce(x, f64), 0.0, 0), typ)
+        if ix <= 0x40E231D5:
+            if ix > 0x40AFEDDF:
+                if neg:
+                    return coerce(_cos_kernel(is_32, coerce(x, f64) + _TWO_PI, 0.0), typ)
+                return coerce(_cos_kernel(is_32, coerce(x, f64) - _TWO_PI, 0.0), typ)
+            if neg:
+                return coerce(_sin_kernel(is_32, -coerce(x, f64) - _THREE_PIO2, 0.0, 0), typ)
+            return coerce(_sin_kernel(is_32, coerce(x, f64) - _THREE_PIO2, 0.0, 0), typ)
+        if ix >= 0x7F800000:
+            xfc32: f64 = coerce(x, f64)
+            return coerce(xfc32 - xfc32, typ)
+        n, y0, y1 = _rem_pio2(is_32, coerce(bits, u64), coerce(x, f64))
+        return coerce(_cos_switch(is_32, n, y0, y1), typ)
+
+    bits64: u64 = bitcast(x, u64)
+    ix64: u64 = (bits64 >> 32) & 0x7FFFFFFF
+    if ix64 <= 0x3FE921FB:
+        if ix64 < 0x3E46A09E:
+            return coerce(1.0, typ)
+        return coerce(_cos_kernel(is_32, coerce(x, f64), 0.0), typ)
+    if ix64 >= 0x7FF00000:
+        xfc64: f64 = coerce(x, f64)
+        return coerce(xfc64 - xfc64, typ)
+    n, y0, y1 = _rem_pio2(is_32, bits64, coerce(x, f64))
+    return coerce(_cos_switch(is_32, n, y0, y1), typ)
+
+
+@func()
+def tan[T](x: T) -> T:
+    """The tangent of ``x`` (``f32`` or ``f64``), the pure spy implementation:
+    ``sin(x) / cos(x)`` of the same (software) kernels."""
+    return sin(x) / cos(x)  # pyright: ignore[reportOperatorIssue]
