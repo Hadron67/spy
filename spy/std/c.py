@@ -8,6 +8,8 @@ from ..compiler import (
     Option,
     Ptr,
     decl_func,
+    f32,
+    f64,
     i32,
     struct,
     u8,
@@ -31,6 +33,12 @@ def puts(ptr: MultiPtr[u8]) -> None: ...
 
 @decl_func()
 def snprintf(buf: MultiPtr[u8], size: usize, fmt: ConstMultiPtr[u8], *args) -> i32: ...
+
+@decl_func()
+def sin(x: f64) -> f64: ...
+
+@decl_func()
+def sinf(x: f32) -> f32: ...
 
 @struct()
 class CError(Exception):

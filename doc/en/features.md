@@ -48,6 +48,7 @@ from spy.std.core import (
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
+from spy.std.math import sin
 from spy.std.mem import Layout, layout_of, size_of, align_of
 from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
@@ -1596,8 +1597,9 @@ assert str_len() == 5
 | `std.reflect` | `TypeInfo` and its variants, `StructField`, `type_info`, `reify` |
 | `std.int` | `truncate` (builtin), `IntCastError`, `valid_range`, `try_int_cast`/`int_cast`, `FloatCastError`, `try_int_to_float`/`int_to_float`, `try_float_to_int`/`float_to_int` |
 | `std.mem` | `Layout`, `layout_of`/`size_of`/`align_of`, `AllocError`, `Allocator` (protocol), `AllocatorVtable`, `DynamicAllocator`, `CAllocator` |
-| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf` (extern declarations), `CError`, `FILE`, `fopen`/`fclose`/`fread`/`fwrite` |
+| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf` (extern declarations), `sin`/`sinf` (libm), `CError`, `FILE`, `fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`, `Writable`/`Readable` (protocols) |
+| `std.math` | `sin` (the mode is chosen at compile time by the option `sin_mode`: `llvm`/`libc`/`software`) |
 | `std.vec` | `Vec[T, A]` dynamic array |
 | `std.atomic` | `MemoryOrder`/`RmwOp`, `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`, convenience wrappers |
 | `std.openmp` | `load_openmp_runtime`, `parallel_loop` |
@@ -1660,6 +1662,27 @@ def parallel_sum_count(n: i32) -> i64:
 
     total, count = parallel_loop(n, kernel, add)
     return total * 1000 + count
+```
+
+### 9.3 Math
+
+`std.math.sin(x)` returns the sine of an `f32` or `f64` `x` (the result has the same type). Which implementation runs is
+picked **at compile time** by the host's compile-time option `sin_mode`:
+
+- `llvm` - the LLVM intrinsic (`llvm.sin.f32`/`llvm.sin.f64`);
+- `libc` - the C library `sinf`/`sin` (the extern declarations in `std.c`);
+- `software` (the default, also when the option is unset) - a pure spy port of musl's `sin`/`sinf` (`std.math.sin`).
+
+Only the selected implementation is typed and lowered, so the choice costs nothing at run time; an unknown mode is a compile
+error. The software port is correctly rounded for both `f32` and `f64`.
+
+```python
+@func()
+def my_sin(x: f64) -> f64:
+    return sin(x)
+
+assert abs(my_sin(0.5) - 0.479425538604203) < 1e-15
+assert abs(my_sin(1.0) - 0.8414709848078965) < 1e-15
 ```
 
 ---
