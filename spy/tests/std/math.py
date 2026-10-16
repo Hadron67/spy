@@ -7,17 +7,19 @@ from ...compiler import CompileError, f32, f64
 from ...compiler import as_ as spy_as
 from ...compiler.dsl import _Context, func
 from ...compiler.lower import LLVMBackend
-from ...std.math import cos, sin, tan
+from ...std.math import cos, sin, sqrt, tan
+from ...std.math.sqrt import sqrt as software_sqrt
 from ...std.math.trig import cos as software_cos
 from ...std.math.trig import sin as software_sin
 from ...std.math.trig import tan as software_tan
 
 # ---------------------------------------------------------------------------
-# ``std.math.sin``/``cos``/``tan``: the trigonometric functions of an
+# ``std.math.sin``/``cos``/``tan``/``sqrt``: the mathematical functions of an
 # ``f32``/``f64``, each dispatched at compile time by the host's compile-time
-# option ``sin_mode``/``cos_mode``/``tan_mode`` - ``llvm`` (the LLVM intrinsic),
-# ``libc`` (the C ``sinf``/``sin``/...) or ``software`` (the pure spy port of
-# musl in ``std.math.trig``, also the default when the option is unset).
+# option ``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode`` - ``llvm`` (the
+# LLVM intrinsic), ``libc`` (the C ``sinf``/``sin``/...) or ``software`` (the
+# pure spy port of musl in ``std.math.trig``/``std.math.sqrt``, also the default
+# when the option is unset).
 #
 # The mode is read while the function is compiled and the specialization is
 # cached per host context, so each mode is exercised in a context of its own.
@@ -73,6 +75,22 @@ _TAN_F32_VALUES = [
     0.7853982, 1e-4, 100.0, -100.0, 1e8,
 ]
 
+# ``sqrt`` only takes non-negative arguments (a negative one is a NaN), and it
+# is correctly rounded, so the values cover the whole range: the two zeros, a
+# subnormal, the smallest normal, several magnitudes, and the powers of two on
+# either side of the ``f64``/``f32`` significand width.
+_SQRT_F64_VALUES = [
+    0.0, -0.0, 1.0, 0.5, 0.1, 2.0, 3.0, 4.0, 5.0, 0.7853981633974483,
+    1.5707963267948966, 3.141592653589793, 1e-8, 1e-30, 1e-300, 5e-324,
+    2.2250738585072014e-308, 2.0**20, 2.0**30, 2.0**52, 2.0**53, 1e16, 1e20,
+    1e100, 1e300, 100.0, 999999.0, 123456789.123,
+]
+
+_SQRT_F32_VALUES = [
+    0.0, 1.0, 0.5, 0.1, 2.0, 3.0, 0.7853982, 1e-4, 1e-30, 1.4e-45,
+    1.1754944e-38, 2.0**12, 2.0**23, 2.0**24, 1e7, 1e8, 1e30, 3.4e38,
+]
+
 
 # -- software implementation: the port itself, tested directly ---------------
 
@@ -107,6 +125,16 @@ def sw_tan_f32(x: f32) -> f32:
     return software_tan(x)
 
 
+@func()
+def sw_sqrt_f64(x: f64) -> f64:
+    return software_sqrt(x)
+
+
+@func()
+def sw_sqrt_f32(x: f32) -> f32:
+    return software_sqrt(x)
+
+
 # -- one host context per mode (the option names cover every function) -------
 
 
@@ -116,6 +144,7 @@ def _context_with_mode(mode: bytes | None) -> _Context:
         ctx.set_compile_option(b'sin_mode', mode)
         ctx.set_compile_option(b'cos_mode', mode)
         ctx.set_compile_option(b'tan_mode', mode)
+        ctx.set_compile_option(b'sqrt_mode', mode)
     return ctx
 
 
@@ -141,6 +170,11 @@ def libm_tan_llvm[T](x: T) -> T:
     return tan(x)
 
 
+@_CTX_LLVM.func()
+def libm_sqrt_llvm[T](x: T) -> T:
+    return sqrt(x)
+
+
 @_CTX_LIBC.func()
 def libm_sin_libc[T](x: T) -> T:
     return sin(x)
@@ -154,6 +188,11 @@ def libm_cos_libc[T](x: T) -> T:
 @_CTX_LIBC.func()
 def libm_tan_libc[T](x: T) -> T:
     return tan(x)
+
+
+@_CTX_LIBC.func()
+def libm_sqrt_libc[T](x: T) -> T:
+    return sqrt(x)
 
 
 @_CTX_SOFTWARE.func()
@@ -171,6 +210,11 @@ def libm_tan_software[T](x: T) -> T:
     return tan(x)
 
 
+@_CTX_SOFTWARE.func()
+def libm_sqrt_software[T](x: T) -> T:
+    return sqrt(x)
+
+
 @_CTX_DEFAULT.func()
 def libm_sin_default[T](x: T) -> T:
     return sin(x)
@@ -184,6 +228,11 @@ def libm_cos_default[T](x: T) -> T:
 @_CTX_DEFAULT.func()
 def libm_tan_default[T](x: T) -> T:
     return tan(x)
+
+
+@_CTX_DEFAULT.func()
+def libm_sqrt_default[T](x: T) -> T:
+    return sqrt(x)
 
 
 @_CTX_BOGUS.func()
@@ -201,15 +250,32 @@ def libm_tan_bogus(x: f64) -> f64:
     return tan(x)
 
 
+@_CTX_BOGUS.func()
+def libm_sqrt_bogus(x: f64) -> f64:
+    return sqrt(x)
+
+
 class _TrigUlpTest(TestCase):
     """Shared comparison helpers (no tests of its own)."""
 
-    def check_f64(self, fn: Callable[[float], float], expect: Callable[[float], float], tol: int) -> None:
-        for v in _F64_VALUES:
+    def check_f64(
+        self,
+        fn: Callable[[float], float],
+        expect: Callable[[float], float],
+        tol: int,
+        values: list[float] = _F64_VALUES,
+    ) -> None:
+        for v in values:
             self.assertLessEqual(_f64_ulp(fn(v), expect(v)), tol, msg=repr(v))
 
-    def check_f32(self, fn: Callable[[f32], f32], expect: Callable[[float], float], tol: int) -> None:
-        for v in _F32_VALUES:
+    def check_f32(
+        self,
+        fn: Callable[[f32], f32],
+        expect: Callable[[float], float],
+        tol: int,
+        values: list[float] = _F32_VALUES,
+    ) -> None:
+        for v in values:
             want = _to_f32(expect(_to_f32(v)))
             self.assertLessEqual(_f32_ulp(float(fn(spy_as(v, f32))), want), tol, msg=repr(v))
 
@@ -313,9 +379,68 @@ class SpyTrigModeTest(_TrigUlpTest):
             libm_cos_bogus(0.5)
         with self.assertRaises(CompileError):
             libm_tan_bogus(0.5)
+        with self.assertRaises(CompileError):
+            libm_sqrt_bogus(0.5)
+
+
+class SpySoftwareSqrtTest(_TrigUlpTest):
+    """The pure spy ``sqrt`` (the musl port): both ``f32`` and ``f64`` are
+    correctly rounded, and the special values (the two zeros, ``inf``, a NaN
+    and a negative argument) come out as C's do."""
+
+    def test_sqrt_f64(self) -> None:
+        self.check_f64(sw_sqrt_f64, math.sqrt, 0, _SQRT_F64_VALUES)
+
+    def test_sqrt_f32(self) -> None:
+        self.check_f32(sw_sqrt_f32, math.sqrt, 1, _SQRT_F32_VALUES)
+
+    def test_sqrt_of_zero(self) -> None:
+        self.assertEqual(sw_sqrt_f64(0.0), 0.0)
+        self.assertEqual(math.copysign(1.0, sw_sqrt_f64(-0.0)), -1.0)
+
+    def test_sqrt_of_inf(self) -> None:
+        self.assertEqual(sw_sqrt_f64(math.inf), math.inf)
+
+    def test_sqrt_of_nan(self) -> None:
+        self.assertTrue(math.isnan(sw_sqrt_f64(math.nan)))
+
+    def test_sqrt_of_negative_is_nan(self) -> None:
+        for v in (-1.0, -0.5, -5e-324, -1e300):
+            self.assertTrue(math.isnan(sw_sqrt_f64(v)), msg=repr(v))
+        for v in (-1.0, -0.5, -1e30):
+            self.assertTrue(math.isnan(float(sw_sqrt_f32(spy_as(v, f32)))), msg=repr(v))
+
+
+class SpySqrtModeTest(_TrigUlpTest):
+    """``sqrt_mode`` selects the ``llvm``/``libc``/``software`` implementation at
+    compile time; an unset option defaults to ``software``."""
+
+    def test_llvm(self) -> None:
+        self.check_f64(libm_sqrt_llvm, math.sqrt, 1, _SQRT_F64_VALUES)
+        self.check_f32(libm_sqrt_llvm, math.sqrt, 1, _SQRT_F32_VALUES)
+
+    def test_libc(self) -> None:
+        self.check_f64(libm_sqrt_libc, math.sqrt, 1, _SQRT_F64_VALUES)
+        self.check_f32(libm_sqrt_libc, math.sqrt, 1, _SQRT_F32_VALUES)
+
+    def test_software(self) -> None:
+        self.check_f64(libm_sqrt_software, math.sqrt, 0, _SQRT_F64_VALUES)
+        self.check_f32(libm_sqrt_software, math.sqrt, 1, _SQRT_F32_VALUES)
+
+    def test_default_is_software(self) -> None:
+        # the software implementation is exact, so the default (an unset option)
+        # has to match it bit for bit
+        for v in _SQRT_F64_VALUES:
+            self.assertEqual(libm_sqrt_default(v), sw_sqrt_f64(v), msg=repr(v))
+
+    def test_negative_is_nan_in_every_mode(self) -> None:
+        for fn in (libm_sqrt_llvm, libm_sqrt_libc, libm_sqrt_software, libm_sqrt_default):
+            self.assertTrue(math.isnan(fn(-1.0)))
 
 
 all_tests = [
     SpySoftwareTrigTest,
     SpyTrigModeTest,
+    SpySoftwareSqrtTest,
+    SpySqrtModeTest,
 ]

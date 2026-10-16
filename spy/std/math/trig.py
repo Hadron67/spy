@@ -94,8 +94,8 @@ _TWO_PI = 6.283185307179586
 def _scalbn(x: f64, n: i32) -> f64:
     """``x * 2**n``, computed by repeated (exact) scaling by two.  ``n`` stays
     small in every use here, so the linear loop is cheap."""
-    r: f64 = x
-    k: i32 = n
+    r = x
+    k = n
     if k < 0:
         k = -k
         for _ in range(k):
@@ -111,15 +111,15 @@ def _sin_kernel(is_32: Comptime[bool], x: f64, y: f64, iy: i32) -> f64:
     """The sine kernel on ``[-pi/4, pi/4]``: ``__sin`` for ``f64`` (with the
     tail ``y``) and ``__sindf`` for ``f32`` (which ignores ``y``/``iy``)."""
     if is_32:
-        z32: f64 = x * x
-        w32: f64 = z32 * z32
-        r32: f64 = _FS3 + z32 * _FS4
-        s32: f64 = z32 * x
+        z32 = x * x
+        w32 = z32 * z32
+        r32 = _FS3 + z32 * _FS4
+        s32 = z32 * x
         return (x + s32 * (_FS1 + z32 * _FS2)) + s32 * w32 * r32
-    z: f64 = x * x
-    w: f64 = z * z
-    r: f64 = _DS2 + z * (_DS3 + z * _DS4) + z * w * (_DS5 + z * _DS6)
-    v: f64 = z * x
+    z = x * x
+    w = z * z
+    r = _DS2 + z * (_DS3 + z * _DS4) + z * w * (_DS5 + z * _DS6)
+    v = z * x
     if iy == 0:
         return x + v * (_DS1 + z * r)
     return x - ((z * (0.5 * y - v * r) - y) - v * _DS1)
@@ -130,15 +130,15 @@ def _cos_kernel(is_32: Comptime[bool], x: f64, y: f64) -> f64:
     """The cosine kernel on ``[-pi/4, pi/4]``: ``__cos`` for ``f64`` and
     ``__cosdf`` for ``f32``."""
     if is_32:
-        z32: f64 = x * x
-        w32: f64 = z32 * z32
-        r32: f64 = _FC2 + z32 * _FC3
+        z32 = x * x
+        w32 = z32 * z32
+        r32 = _FC2 + z32 * _FC3
         return ((1.0 + z32 * _FC0) + w32 * _FC1) + (w32 * z32) * r32
-    z: f64 = x * x
-    w: f64 = z * z
-    r: f64 = z * (_DC1 + z * (_DC2 + z * _DC3)) + w * w * (_DC4 + z * (_DC5 + z * _DC6))
-    hz: f64 = 0.5 * z
-    w2: f64 = 1.0 - hz
+    z = x * x
+    w = z * z
+    r = z * (_DC1 + z * (_DC2 + z * _DC3)) + w * w * (_DC4 + z * (_DC5 + z * _DC6))
+    hz = 0.5 * z
+    w2 = 1.0 - hz
     return w2 + (((1.0 - w2) - hz) + (z * r - x * y))
 
 
@@ -198,7 +198,7 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
     jv: i32 = 0
     if e0 - 3 > 0:
         jv = (e0 - 3) // 24
-    q0: i32 = e0 - 24 * (jv + 1)
+    q0 = e0 - 24 * (jv + 1)
 
     f: Array[f64, Literal[20]] = undefined()
     fq: Array[f64, Literal[20]] = undefined()
@@ -212,8 +212,8 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
     fw: f64 = 0.0
 
     # f[0 .. jx+jk] = ipio2[jv-jx .. jv+jk] (padding the negative indices with 0)
-    jf: i32 = jv - jx
-    m: i32 = jx + jk
+    jf = jv - jx
+    m = jx + jk
     i = 0
     while i <= m:
         if jf < 0:
@@ -234,7 +234,7 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
         q[i] = fw
         i = i + 1
 
-    jz: i32 = jk
+    jz = jk
     n: i32 = 0
     ih: i32 = 0
     z: f64 = 0.0
@@ -397,10 +397,10 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
     32-bit one zero-extended for ``f32``) and ``xf`` its value as a double.
     Returns ``(n, y0, y1)``."""
     if is_32:
-        ix: u64 = bits & 0x7FFFFFFF
+        ix = bits & 0x7FFFFFFF
         if ix < 0x4DC90FDB:
-            fn32: f64 = xf * _INVPIO2 + _TOINT - _TOINT
-            n32: i32 = float_to_int_unchecked(fn32, i32)
+            fn32 = xf * _INVPIO2 + _TOINT - _TOINT
+            n32 = float_to_int_unchecked(fn32, i32)
             yv: f64 = xf - fn32 * _PIO2_1F - fn32 * _PIO2_1TF
             if yv < -_PIO4F:
                 n32 = n32 - 1
@@ -413,9 +413,9 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
             return n32, yv, 0.0
         if ix >= 0x7F800000:
             return 0, xf - xf, 0.0
-        sgn: u64 = bits >> 31
-        e032: i32 = coerce(ix >> 23, i32) - (0x7F + 23)
-        u2: u32 = coerce(ix, u32) - bitcast(e032 << 23, u32)
+        sgn = bits >> 31
+        e032 = coerce(ix >> 23, i32) - (0x7F + 23)
+        u2 = coerce(ix, u32) - bitcast(e032 << 23, u32)
         tx32: Array[f64, Literal[3]] = undefined()
         tx32[0] = coerce(bitcast(u2, f32), f64)
         tx32[1] = 0.0
@@ -425,10 +425,10 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
             return -n2, -ty0, 0.0
         return n2, ty0, 0.0
 
-    sign: u64 = bits >> 63
-    ix64: u64 = (bits >> 32) & 0x7FFFFFFF
+    sign = bits >> 63
+    ix64 = (bits >> 32) & 0x7FFFFFFF
 
-    medium: bool = False
+    medium = False
     if ix64 <= 0x400F6A7A:
         if (ix64 & 0xFFFFF) == 0x921FB:
             medium = True
@@ -473,10 +473,10 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
 
     if medium or ix64 < 0x413921FB:
         # medium size: rint(x/(pi/2)) through the 1.5/eps trick
-        fn: f64 = xf * _INVPIO2 + _TOINT - _TOINT
-        n: i32 = float_to_int_unchecked(fn, i32)
-        r: f64 = xf - fn * _PIO2_1
-        w: f64 = fn * _PIO2_1T
+        fn = xf * _INVPIO2 + _TOINT - _TOINT
+        n = float_to_int_unchecked(fn, i32)
+        r = xf - fn * _PIO2_1
+        w = fn * _PIO2_1T
         if r - w < -_PIO4:
             n = n - 1
             fn = fn - 1.0
@@ -487,12 +487,12 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
             fn = fn + 1.0
             r = xf - fn * _PIO2_1
             w = fn * _PIO2_1T
-        y0b: f64 = r - w
-        ey: i32 = coerce((bitcast(y0b, u64) >> 52) & 0x7FF, i32)
-        ex: i32 = coerce(ix64 >> 20, i32)
+        y0b = r - w
+        ey = coerce((bitcast(y0b, u64) >> 52) & 0x7FF, i32)
+        ex = coerce(ix64 >> 20, i32)
         if ex - ey > 16:
             # second round
-            t: f64 = r
+            t = r
             w = fn * _PIO2_2
             r = t - w
             w = fn * _PIO2_2T - ((t - r) - w)
@@ -511,7 +511,7 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
     if ix64 >= 0x7FF00000:
         return 0, xf - xf, xf - xf
     # z = scalbn(|x|, -ilogb(x) + 23): scale into [2**23, 2**24)
-    u64v: u64 = (bits & 0xFFFFFFFFFFFFF) | 0x4160000000000000
+    u64v = (bits & 0xFFFFFFFFFFFFF) | 0x4160000000000000
     z = bitcast(u64v, f64)
     tx: Array[f64, Literal[3]] = undefined()
     tx[0] = int_to_float_unchecked(float_to_int_unchecked(z, i32), f64)
@@ -522,7 +522,7 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
     i: i32 = 2
     while tx[i] == 0.0:
         i = i - 1
-    e0: i32 = coerce(ix64 >> 20, i32) - (0x3FF + 23)
+    e0 = coerce(ix64 >> 20, i32) - (0x3FF + 23)
     n, ty0, ty1 = _rem_pio2_large(tx, e0, i + 1, 1)
     if sign != 0:
         return -n, -ty0, -ty1
@@ -533,7 +533,7 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
 def _sin_switch(is_32: Comptime[bool], n: i32, y0: f64, y1: f64) -> f64:
     """``sin``'s ``switch (n & 3)``: the reduced argument ``y0 (+ y1)`` picks
     between the sine and cosine kernel and their signs (the table in musl)."""
-    m: i32 = n & 3
+    m = n & 3
     if m == 0:
         return _sin_kernel(is_32, y0, y1, 1)
     if m == 1:
@@ -547,7 +547,7 @@ def _sin_switch(is_32: Comptime[bool], n: i32, y0: f64, y1: f64) -> f64:
 def _cos_switch(is_32: Comptime[bool], n: i32, y0: f64, y1: f64) -> f64:
     """``cos``'s ``switch (n & 3)``: the same reduced argument, the other
     diagonal of musl's table (cosine/kernel with the opposite signs)."""
-    m: i32 = n & 3
+    m = n & 3
     if m == 0:
         return _cos_kernel(is_32, y0, y1)
     if m == 1:
@@ -594,14 +594,14 @@ def sin[T](x: T) -> T:
         n, y0, y1 = _rem_pio2(is_32, coerce(bits, u64), coerce(x, f64))
         return coerce(_sin_switch(is_32, n, y0, y1), typ)
 
-    bits64: u64 = bitcast(x, u64)
-    ix64: u64 = (bits64 >> 32) & 0x7FFFFFFF
+    bits64 = bitcast(x, u64)
+    ix64 = (bits64 >> 32) & 0x7FFFFFFF
     if ix64 <= 0x3FE921FB:
         if ix64 < 0x3E500000:
             return x
         return coerce(_sin_kernel(is_32, coerce(x, f64), 0.0, 0), typ)
     if ix64 >= 0x7FF00000:
-        xf64: f64 = coerce(x, f64)
+        xf64 = coerce(x, f64)
         return coerce(xf64 - xf64, typ)
     n, y0, y1 = _rem_pio2(is_32, bits64, coerce(x, f64))
     return coerce(_sin_switch(is_32, n, y0, y1), typ)
@@ -615,13 +615,13 @@ def cos[T](x: T) -> T:
     typ = typeof(x)
     is_32: Comptime = typ == f32
     if is_32:
-        bits: u32 = bitcast(x, u32)
-        ix: u32 = bits & 0x7FFFFFFF
+        bits = bitcast(x, u32)
+        ix = bits & 0x7FFFFFFF
         if ix <= 0x3F490FDA:
             if ix < 0x39800000:
                 return coerce(1.0, typ)
             return coerce(_cos_kernel(is_32, coerce(x, f64), 0.0), typ)
-        neg: bool = (bits >> 31) != 0
+        neg = (bits >> 31) != 0
         if ix <= 0x407B53D1:
             if ix > 0x4016CBE3:
                 if neg:
@@ -644,14 +644,14 @@ def cos[T](x: T) -> T:
         n, y0, y1 = _rem_pio2(is_32, coerce(bits, u64), coerce(x, f64))
         return coerce(_cos_switch(is_32, n, y0, y1), typ)
 
-    bits64: u64 = bitcast(x, u64)
-    ix64: u64 = (bits64 >> 32) & 0x7FFFFFFF
+    bits64 = bitcast(x, u64)
+    ix64 = (bits64 >> 32) & 0x7FFFFFFF
     if ix64 <= 0x3FE921FB:
         if ix64 < 0x3E46A09E:
             return coerce(1.0, typ)
         return coerce(_cos_kernel(is_32, coerce(x, f64), 0.0), typ)
     if ix64 >= 0x7FF00000:
-        xfc64: f64 = coerce(x, f64)
+        xfc64 = coerce(x, f64)
         return coerce(xfc64 - xfc64, typ)
     n, y0, y1 = _rem_pio2(is_32, bits64, coerce(x, f64))
     return coerce(_cos_switch(is_32, n, y0, y1), typ)
