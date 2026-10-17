@@ -23,12 +23,13 @@ from ...compiler import f32, f64, typeof, u16, u32, u64, usize
 from ...compiler.dsl import func
 from ...compiler.syntax import array, comptime, const_comptime
 from ..core import Numeric, bitcast, coerce, compile_error
+from ..int import truncate
 
 
 @func(inline=True)
 def _mul32(a: u32, b: u32) -> u32:
     """``a * b * 2**-32``, the 32-bit fixed point product of musl's ``mul32``."""
-    return coerce(coerce(a, u64) * coerce(b, u64) >> 32, u32)
+    return truncate(coerce(a, u64) * coerce(b, u64) >> 32, u32)
 
 
 @func()
@@ -150,14 +151,14 @@ def sqrt[T: Numeric](x: T) -> T:
             m = m >> 1
         top = (top + 0x3FF) >> 1
         r = coerce(_rsqrt_tab(coerce((ix >> 46) % 128, usize)) << 16, u64)
-        s = coerce(_mul32(coerce(m >> 32, u32), coerce(r, u32)), u64)
-        d = coerce(_mul32(coerce(s, u32), coerce(r, u32)), u64)
+        s = coerce(_mul32(truncate(m >> 32, u32), truncate(r, u32)), u64)
+        d = coerce(_mul32(truncate(s, u32), truncate(r, u32)), u64)
         u = 0xC0000000 - d
-        r = coerce(_mul32(coerce(r, u32), coerce(u, u32)) << 1, u64)
-        s = coerce(_mul32(coerce(s, u32), coerce(u, u32)) << 1, u64)
-        d = coerce(_mul32(coerce(s, u32), coerce(r, u32)), u64)
+        r = coerce(_mul32(truncate(r, u32), truncate(u, u32)) << 1, u64)
+        s = coerce(_mul32(truncate(s, u32), truncate(u, u32)) << 1, u64)
+        d = coerce(_mul32(truncate(s, u32), truncate(r, u32)), u64)
         u = 0xC0000000 - d
-        r = coerce(_mul32(coerce(r, u32), coerce(u, u32)) << 1, u64)
+        r = coerce(_mul32(truncate(r, u32), truncate(u, u32)) << 1, u64)
         r = r << 32
         s = _mul64(m, r)
         d = _mul64(s, r)

@@ -8,6 +8,7 @@ from ..compiler import (
     syntax,
     u8,
     u64,
+    usize,
 )
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
@@ -424,7 +425,7 @@ class Indexable:
 
     ptr: MultiPtr[i32]
 
-    def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
+    def __spy_getitemptr__(self, index: usize) -> MultiPtr[i32]:
         return self.ptr + index
 
     if TYPE_CHECKING:
@@ -443,7 +444,7 @@ class RegisteredIndexable:
     ptr: MultiPtr[i32]
 
     @func()
-    def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
+    def __spy_getitemptr__(self, index: usize) -> MultiPtr[i32]:
         return self.ptr + index
 
     if TYPE_CHECKING:
@@ -457,7 +458,7 @@ class BadIndexable:
 
     ptr: MultiPtr[i32]
 
-    def __spy_getitemptr__(self, index: i64) -> i32:
+    def __spy_getitemptr__(self, index: usize) -> i32:
         return self.ptr[index]
 
     if TYPE_CHECKING:
@@ -569,7 +570,7 @@ def comptime_slice_length() -> u64:
 
 
 @func()
-def runtime_index_into_comptime_storage(x: i32) -> i32:
+def runtime_index_into_comptime_storage(x: usize) -> i32:
     # a runtime index cannot pick a compile-time place
     syntax.comptime()
     v = array(Small(1, 2), Small(3, 4))

@@ -13,6 +13,7 @@ from ..compiler import (
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func
 from ..compiler.syntax import Comptime
+from ..std.int import int_to_float
 from ..std.reflect import ComplexType, type_info
 
 # ---------------------------------------------------------------------------
@@ -54,7 +55,9 @@ def complex_mul_real(z: c128, r: f64) -> c128:
 
 @func()
 def complex_add_int(z: c128, r: i32) -> c128:
-    return z + r
+    # an integer no longer converts to a complex implicitly: convert it to a
+    # real explicitly, and the real takes the ``T -> Complex[T]`` conversion
+    return z + int_to_float(r, f64)
 
 
 @func()
@@ -108,7 +111,7 @@ def complex_from_real_local(r: f64) -> c128:
 
 @func()
 def complex_from_int_local(i: i32) -> c128:
-    z: c128 = i
+    z: c128 = int_to_float(i, f64)
     return z
 
 

@@ -1,7 +1,7 @@
 from typing import Literal, Protocol
 from unittest import TestCase
 
-from ..compiler import CompileError, i32, sval, syntax
+from ..compiler import CompileError, i32, sval, syntax, usize
 from ..compiler.dsl import func, func_type, struct
 from ..compiler.syntax import (
     Array,
@@ -189,7 +189,7 @@ def comptime_ptr_union_other_variant() -> i32:
 
 
 @func()
-def const_comptime_array_read_with_a_runtime_index(i: i32) -> i32:
+def const_comptime_array_read_with_a_runtime_index(i: usize) -> i32:
     arr: ConstComptime[Array[i32, Literal[3]]] = array(
         coerce(10, i32), coerce(20, i32), coerce(30, i32), length=3,
     )
@@ -197,7 +197,7 @@ def const_comptime_array_read_with_a_runtime_index(i: i32) -> i32:
 
 
 @func()
-def const_comptime_untyped_array_read_with_a_runtime_index(i: i32) -> i32:
+def const_comptime_untyped_array_read_with_a_runtime_index(i: usize) -> i32:
     # an untyped element has no runtime representation, so the constant cannot
     # be materialized: a clean error, not a crash
     const_comptime()
@@ -206,7 +206,7 @@ def const_comptime_untyped_array_read_with_a_runtime_index(i: i32) -> i32:
 
 
 @func()
-def comptime_array_read_with_a_runtime_index(i: i32) -> i32:
+def comptime_array_read_with_a_runtime_index(i: usize) -> i32:
     arr: Comptime[Array[i32, Literal[3]]] = array(
         coerce(10, i32), coerce(20, i32), coerce(30, i32), length=3,
     )

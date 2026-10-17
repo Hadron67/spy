@@ -30,6 +30,8 @@ from ...compiler import f32, f64, typeof, u32, u64
 from ...compiler.dsl import func
 from ...compiler.syntax import comptime
 from ..core import Numeric, bitcast, coerce, compile_error
+from ..float import float_truncate
+from ..int import truncate
 
 # ``cbrt.c`` (f64): the exponent bias folded into the bits for the rough
 # estimate, and the polynomial approximating ``1/cbrt(r)`` with error < 2**-23.5.
@@ -81,18 +83,18 @@ def cbrt[T: Numeric](x: T) -> T:
         t = t * (xd + xd + r) / (xd + r + r)
 
         # rounding to 24 bits is perfect in round-to-nearest mode
-        return coerce(t, typ)
+        return float_truncate(t, typ)
     elif typ == f64:
         xd = coerce(x, f64)
         ix = bitcast(x, u64)
-        hx = coerce(ix >> 32, u32) & 0x7FFFFFFF
+        hx = truncate(ix >> 32, u32) & 0x7FFFFFFF
         if hx >= 0x7FF00000:
             # cbrt(NaN, +-inf) is itself
             return x + x
         if hx < 0x00100000:
             # zero or subnormal?
             scaled = xd * coerce(_SCALE_F64, f64)
-            hx = coerce(bitcast(scaled, u64) >> 32, u32) & 0x7FFFFFFF
+            hx = truncate(bitcast(scaled, u64) >> 32, u32) & 0x7FFFFFFF
             if hx == 0:
                 return x  # cbrt(+-0) is itself
             hx = (hx // 3) + _B2_F64

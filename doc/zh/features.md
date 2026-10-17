@@ -54,6 +54,7 @@ from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
     int_to_float, try_int_to_float, float_to_int, try_float_to_int,
 )
+from spy.std.float import float_truncate
 from spy.std.atomic import (
     MemoryOrder, RmwOp,
     atomic_load, atomic_store, atomic_rmw, atomic_cmpxchg, atomic_fence, atomic_fetch_add,
@@ -87,7 +88,8 @@ def arith(a: i32, b: i32) -> i32:
 
 @func()
 def to_float(a: i32, b: i32) -> f64:
-    return a / b                 # integer / is true division -> f64
+    # 运行期整数不能直接做真除法（见 §4）：先显式转成浮点
+    return int_to_float(a, f64) / int_to_float(b, f64)
 
 @func()
 def width_and_literals() -> i32:
@@ -270,9 +272,15 @@ assert is_absent(None) is True and is_absent(5) is False
 def tuple_use(a: i32, b: i32) -> i32:
     t = (a, b)                   # a runtime tuple value
     t[1] = t[1] + 1
-    return t[0] + t[1] + len(t)
+    return t[0] + t[1]
 
-assert tuple_use(3, 4) == 3 + 5 + 2
+@func()
+def tuple_len(a: i32, b: i32, c: i32) -> usize:
+    t = (a, b, c)                # a runtime tuple value
+    return len(t)                # a compile-time integer
+
+assert tuple_use(3, 4) == 3 + 5
+assert tuple_len(1, 2, 3) == 3
 ```
 
 ### 1.7 无标签 union（`UnionType`）
@@ -331,7 +339,7 @@ assert tu_match(A(9)) == 9
 
 复数类型 `spy.c64` / `spy.c128`：实部与虚部各是一个浮点元素。
 
-- Python `complex` 映射到 `c128`；实数/整数有一条隐式 `T → Complex[T]` 转换（虚部 0），`Complex[f32]` 可扩宽到 `Complex[f64]`。
+- Python `complex` 映射到 `c128`；**浮点**实数有一条隐式 `T → Complex[T]` 转换（虚部 0），`Complex[f32]` 可扩宽到 `Complex[f64]`。整数要先显式转成浮点（编译期整数常量按值检查，`z: c128 = 3` 仍可直接写）。
 - 支持 `+ - * /`（逐分量）与字段 `z.real` / `z.imag`。
 - `std.reflect.type_info` 给出 `ComplexType` 反射变体。
 
@@ -348,9 +356,15 @@ def cparts(z: c128) -> f64:
 def widen(x: f64) -> c128:
     return x                     # implicit T -> Complex[T]
 
+@func()
+def widen_int_literal() -> c128:
+    z: c128 = 3                  # 编译期整数常量按值检查，仍可转
+    return z
+
 assert cmul(1 + 2j, 3 + 4j) == (1 + 2j) * (3 + 4j)
 assert cparts(3 + 4j) == 7.0
 assert widen(2.5) == complex(2.5, 0.0)
+assert widen_int_literal() == complex(3, 0.0)
 ```
 
 ### 1.10 整数枚举
@@ -589,7 +603,7 @@ def static_read() -> i32:
     return p[...]
 
 @func()
-def const_array_read(i: i32) -> i32:
+def const_array_read(i: usize) -> i32:
     arr: ConstComptime[Array[i32, Literal[3]]] = array(10, 20, 30)
     return arr[i]                # a runtime index materializes it into a global constant
 
@@ -627,7 +641,7 @@ assert infer_runtime(1) == 2
 - 算术 `+ - * / // % **`（整数与浮点）、位运算 `| & ^ << >> ~`、一元负号、`not`（仅 `spy.bool`）、
   比较 `== != < <= > >=`（**不支持链式比较**）。
 - 两侧都是编译期常量时在编译期折叠；含运行时值时在运行时计算。
-- 整数 `/` 是真除法（结果默认为 `f64`）；整数 `//` 默认向下取整；浮点 `//` 是 `floor(a/b)`。
+- 整数 `/` 是真除法（结果默认为 `f64`）：整数操作数只能是**编译期常量**（如 `1 / 3`、`float_var / 10`），或至少一侧是浮点；**运行期整数**不能直接参与，要么显式转成浮点（`int_to_float`），要么用 `//`。整数 `//` 默认向下取整；浮点 `//` 是 `floor(a/b)`。
 - `**`：整数与浮点指数都支持。**浮点 `%` 未实现**（报错）。
 - 每个二元算符有对应的复合赋值 `a <算符>= b`。
 - 条件表达式 `a if c else b`：条件必须 `spy.bool`；编译期条件只保留选中分支。
@@ -652,7 +666,8 @@ def logic(a: bool, b: bool) -> bool:
 
 @func()
 def true_div(a: i32, b: i32) -> f64:
-    return a / b
+    # 运行期整数不能直接做真除法：显式转成浮点
+    return int_to_float(a, f64) / int_to_float(b, f64)
 
 @func()
 def pow_int(a: i32) -> i32:
@@ -1471,11 +1486,11 @@ assert unrolled_sum() == 6
 
 - `std.core.undefined()`：任意类型的 undefined，写进目标时按其类型定型；undefined 作条件报错。
 - `std.core.compile_error(msg)`：以编译期字节串为消息中止编译；非字节串/运行时消息报错；死分支不触发。
-- `std.core.coerce(value, T)`：把 value 具体化成类型 `T`（同 store 的转换）。
+- `std.core.coerce(value, T)`：把 value 具体化成类型 `T`——与 store 相同的**隐式转换**，只允许同类型或扩宽：整型按范围覆盖（`u32 → u64`、`i32 → i64`），浮点 `f32 → f64`，合法的指针转换，以及浮点实数 `→ Complex[T]`；**收窄一律报错**。编译期值按值检查（`x: i8 = 12` 可以）。收窄要用 `std.int.truncate`/`int_cast` 或 `std.float.float_truncate`。
 - `std.core.lub_type(t1, t2)`：两个类型的最小上界——两者共同的 peer 类型（`t1.resolve_peer_type(t2)`），如类型与其 `Option`、变体与其 tagged union、无类型整数与其整型。结果是编译期类型值，可用于命名声明类型或喂给 `type[X]` 形参；两者无共同类型时得到 `None`。peer 规则对两个参数是对称的，唯一例外是签名里的 result 类型（返回类型 + 异常集）：此时取 `t1` 的返回类型、`t1` 的异常在前，所以这些情形下结果与参数顺序有关。
 - `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`）；未设置时是缺失值（`None`）。
 - `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
-- `std.core.bitcast(value, T)` / `std.int.truncate(value, T)`：标量的同位宽重解释 / 整数收窄。
+- `std.core.bitcast(value, T)` / `std.int.truncate(value, T)` / `std.float.float_truncate(value, T)`：标量的同位宽重解释 / 整数收窄 / 浮点收窄。
 - `std.core.int_to_float_unchecked(value, T)` / `std.core.float_to_int_unchecked(value, T)`：整数↔浮点转换（`sitofp`/`uitofp` 与 `fptosi`/`fptoui`，后者向零取整），**不做任何检查**；编译期值装不进目标类型时得到 `undefined`。
 
 ```python
@@ -1497,8 +1512,8 @@ def pick(c: bool, a: i32, b: i32) -> i32:
     return v
 
 @func()
-def narrowed(x: i32) -> i8:
-    return coerce(x, i8)
+def coerced_widen(x: i32) -> i64:
+    return coerce(x, i64)        # coerce 只做同类型/扩宽
 
 @func()
 def same_bits(x: f32) -> u32:
@@ -1507,6 +1522,10 @@ def same_bits(x: f32) -> u32:
 @func()
 def truncated(x: u32) -> u8:
     return truncate(x, u8)
+
+@func()
+def float_truncated(x: f64) -> f32:
+    return float_truncate(x, f32)
 
 @func()
 def to_f64(x: u64) -> f64:
@@ -1525,7 +1544,8 @@ def widen(x: i32) -> i64:
 
 assert dead_branch() == 1
 assert pick(True, 1, 2) == 1 and pick(False, 1, 2) == 2
-assert narrowed(128) == -128
+assert coerced_widen(3) == 3
+assert float_truncated(1.5) == 1.5
 assert same_bits(1.0) == 0x3F800000
 assert truncated(300) == 44
 assert widen(3) == 3
@@ -1568,7 +1588,7 @@ def reified() -> i32:
 
 @func()
 def int_size() -> i32:
-    return coerce(size_of(i32), i32)
+    return int_cast(size_of(i32), i32)
 
 assert int_bits(i32) == 32
 assert float_bits(f32) == 32
@@ -1598,7 +1618,7 @@ def second_byte() -> i32:
 @func()
 def str_len() -> i32:
     s = sstr(b'hello')
-    return coerce(s.length, i32)
+    return int_cast(s.length, i32)
 
 assert byte_at() == 66
 assert second_byte() == 121
@@ -1614,6 +1634,7 @@ assert str_len() == 5
 | `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`/`lub_type`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`int_to_float_unchecked`/`float_to_int_unchecked`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option` |
 | `std.reflect` | `TypeInfo` 及变体、`StructField`、`type_info`、`reify` |
 | `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast`、`FloatCastError`、`try_int_to_float`/`int_to_float`、`try_float_to_int`/`float_to_int` |
+| `std.float` | `float_truncate`（内建） |
 | `std.mem` | `Layout`、`layout_of`/`size_of`/`align_of`、`AllocError`、`Allocator`（协议）、`AllocatorVtable`、`DynamicAllocator`、`CAllocator` |
 | `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf`（extern 声明）、`sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`atan`/`atanf`/`atan2`/`atan2f`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`/`pow`/`powf`/`exp`/`expf`/`log`/`logf`/`asin`/`asinf`/`acos`/`acosf`（libm）、`CError`、`FILE`、`fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`、`Writable`/`Readable`（协议） |

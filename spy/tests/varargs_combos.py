@@ -5,10 +5,12 @@ from ..compiler import (
     i32,
     syntax,
 )
+from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func
 from ..compiler.syntax import (
     Comptime,
 )
+from ..std.int import int_to_float
 
 # ---------------------------------------------------------------------------
 # every combination of an ordinary positional parameter (``p``), a
@@ -17,12 +19,24 @@ from ..compiler.syntax import (
 #
 # The varargs/kwargs are deliberately unannotated, so their element/value types
 # are inferred from the call, and the calls pass *mixed* ``i32``/``f64``
-# arguments.  Spy has no implicit ``i32``/``f64`` promotion in arithmetic, so a
-# mixed element is summed through a ``f64`` typed temporary - the store coerces
-# it (``sitofp`` for an integer, a no-op for a float).  Every function returns
-# the ``f64`` sum of every argument it was handed, which is what the calls
-# below assert.
+# arguments.  Spy has no implicit ``i32``/``f64`` promotion in arithmetic, and a
+# store no longer converts an integer to a float either, so a mixed element is
+# summed through a ``f64`` typed temporary explicitly: an annotated ``i32``
+# goes through ``int_to_float``, an inferred one through ``to_f64`` (which picks
+# ``int_to_float`` or a no-op by the compile-time ``typeof``).  Every function
+# returns the ``f64`` sum of every argument it was handed, which is what the
+# calls below assert.
 # ---------------------------------------------------------------------------
+
+
+@func()
+def to_f64[T](x: T) -> f64:  # pyright: ignore[reportInvalidTypeVarUse]
+    """Convert an inferred numeric argument to ``f64``: ``int_to_float`` for an
+    integer, the value itself for a float (the branch is resolved at compile
+    time from ``typeof(x)``)."""
+    if spy_typeof(x) == f64:
+        return x  # pyright: ignore[reportReturnType]
+    return int_to_float(x, f64)
 
 
 @func()
@@ -34,7 +48,7 @@ def c_none() -> f64:
 @func()
 def c_p(p: i32) -> f64:
     total: f64 = 0.0
-    tp: f64 = p
+    tp: f64 = int_to_float(p, f64)
     total = total + tp
     return total
 
@@ -42,7 +56,7 @@ def c_p(p: i32) -> f64:
 @func()
 def c_d(d: i32 = 7) -> f64:
     total: f64 = 0.0
-    td: f64 = d
+    td: f64 = int_to_float(d, f64)
     total = total + td
     return total
 
@@ -53,7 +67,7 @@ def c_v(*args) -> f64:
     i: Comptime = 0
     syntax.unroll()
     while i < len(args):
-        elem: f64 = args[i]
+        elem: f64 = to_f64(args[i])
         total = total + elem
         i = i + 1
     return total
@@ -62,8 +76,8 @@ def c_v(*args) -> f64:
 @func()
 def c_k(**kwargs) -> f64:
     total: f64 = 0.0
-    tx: f64 = kwargs['x']
-    ty: f64 = kwargs['y']
+    tx: f64 = to_f64(kwargs['x'])
+    ty: f64 = to_f64(kwargs['y'])
     total = total + tx
     total = total + ty
     return total
@@ -72,8 +86,8 @@ def c_k(**kwargs) -> f64:
 @func()
 def c_pd(p: i32, d: i32 = 7) -> f64:
     total: f64 = 0.0
-    tp: f64 = p
-    td: f64 = d
+    tp: f64 = int_to_float(p, f64)
+    td: f64 = int_to_float(d, f64)
     total = total + tp
     total = total + td
     return total
@@ -82,12 +96,12 @@ def c_pd(p: i32, d: i32 = 7) -> f64:
 @func()
 def c_pv(p: i32, *args) -> f64:
     total: f64 = 0.0
-    tp: f64 = p
+    tp: f64 = int_to_float(p, f64)
     total = total + tp
     i: Comptime = 0
     syntax.unroll()
     while i < len(args):
-        elem: f64 = args[i]
+        elem: f64 = to_f64(args[i])
         total = total + elem
         i = i + 1
     return total
@@ -96,10 +110,10 @@ def c_pv(p: i32, *args) -> f64:
 @func()
 def c_pk(p: i32, **kwargs) -> f64:
     total: f64 = 0.0
-    tp: f64 = p
+    tp: f64 = int_to_float(p, f64)
     total = total + tp
-    tx: f64 = kwargs['x']
-    ty: f64 = kwargs['y']
+    tx: f64 = to_f64(kwargs['x'])
+    ty: f64 = to_f64(kwargs['y'])
     total = total + tx
     total = total + ty
     return total
@@ -108,12 +122,12 @@ def c_pk(p: i32, **kwargs) -> f64:
 @func()
 def c_dv(d: i32 = 7, *args) -> f64:
     total: f64 = 0.0
-    td: f64 = d
+    td: f64 = int_to_float(d, f64)
     total = total + td
     i: Comptime = 0
     syntax.unroll()
     while i < len(args):
-        elem: f64 = args[i]
+        elem: f64 = to_f64(args[i])
         total = total + elem
         i = i + 1
     return total
@@ -122,10 +136,10 @@ def c_dv(d: i32 = 7, *args) -> f64:
 @func()
 def c_dk(d: i32 = 7, **kwargs) -> f64:
     total: f64 = 0.0
-    td: f64 = d
+    td: f64 = int_to_float(d, f64)
     total = total + td
-    tx: f64 = kwargs['x']
-    ty: f64 = kwargs['y']
+    tx: f64 = to_f64(kwargs['x'])
+    ty: f64 = to_f64(kwargs['y'])
     total = total + tx
     total = total + ty
     return total
@@ -137,11 +151,11 @@ def c_vk(*args, **kwargs) -> f64:
     i: Comptime = 0
     syntax.unroll()
     while i < len(args):
-        elem: f64 = args[i]
+        elem: f64 = to_f64(args[i])
         total = total + elem
         i = i + 1
-    tx: f64 = kwargs['x']
-    ty: f64 = kwargs['y']
+    tx: f64 = to_f64(kwargs['x'])
+    ty: f64 = to_f64(kwargs['y'])
     total = total + tx
     total = total + ty
     return total
@@ -150,14 +164,14 @@ def c_vk(*args, **kwargs) -> f64:
 @func()
 def c_pdv(p: i32, d: i32 = 7, *args) -> f64:
     total: f64 = 0.0
-    tp: f64 = p
-    td: f64 = d
+    tp: f64 = int_to_float(p, f64)
+    td: f64 = int_to_float(d, f64)
     total = total + tp
     total = total + td
     i: Comptime = 0
     syntax.unroll()
     while i < len(args):
-        elem: f64 = args[i]
+        elem: f64 = to_f64(args[i])
         total = total + elem
         i = i + 1
     return total
@@ -166,12 +180,12 @@ def c_pdv(p: i32, d: i32 = 7, *args) -> f64:
 @func()
 def c_pdk(p: i32, d: i32 = 7, **kwargs) -> f64:
     total: f64 = 0.0
-    tp: f64 = p
-    td: f64 = d
+    tp: f64 = int_to_float(p, f64)
+    td: f64 = int_to_float(d, f64)
     total = total + tp
     total = total + td
-    tx: f64 = kwargs['x']
-    ty: f64 = kwargs['y']
+    tx: f64 = to_f64(kwargs['x'])
+    ty: f64 = to_f64(kwargs['y'])
     total = total + tx
     total = total + ty
     return total
@@ -180,16 +194,16 @@ def c_pdk(p: i32, d: i32 = 7, **kwargs) -> f64:
 @func()
 def c_pvk(p: i32, *args, **kwargs) -> f64:
     total: f64 = 0.0
-    tp: f64 = p
+    tp: f64 = int_to_float(p, f64)
     total = total + tp
     i: Comptime = 0
     syntax.unroll()
     while i < len(args):
-        elem: f64 = args[i]
+        elem: f64 = to_f64(args[i])
         total = total + elem
         i = i + 1
-    tx: f64 = kwargs['x']
-    ty: f64 = kwargs['y']
+    tx: f64 = to_f64(kwargs['x'])
+    ty: f64 = to_f64(kwargs['y'])
     total = total + tx
     total = total + ty
     return total
@@ -198,16 +212,16 @@ def c_pvk(p: i32, *args, **kwargs) -> f64:
 @func()
 def c_dvk(d: i32 = 7, *args, **kwargs) -> f64:
     total: f64 = 0.0
-    td: f64 = d
+    td: f64 = int_to_float(d, f64)
     total = total + td
     i: Comptime = 0
     syntax.unroll()
     while i < len(args):
-        elem: f64 = args[i]
+        elem: f64 = to_f64(args[i])
         total = total + elem
         i = i + 1
-    tx: f64 = kwargs['x']
-    ty: f64 = kwargs['y']
+    tx: f64 = to_f64(kwargs['x'])
+    ty: f64 = to_f64(kwargs['y'])
     total = total + tx
     total = total + ty
     return total
@@ -216,18 +230,18 @@ def c_dvk(d: i32 = 7, *args, **kwargs) -> f64:
 @func()
 def c_pdvk(p: i32, d: i32 = 7, *args, **kwargs) -> f64:
     total: f64 = 0.0
-    tp: f64 = p
-    td: f64 = d
+    tp: f64 = int_to_float(p, f64)
+    td: f64 = int_to_float(d, f64)
     total = total + tp
     total = total + td
     i: Comptime = 0
     syntax.unroll()
     while i < len(args):
-        elem: f64 = args[i]
+        elem: f64 = to_f64(args[i])
         total = total + elem
         i = i + 1
-    tx: f64 = kwargs['x']
-    ty: f64 = kwargs['y']
+    tx: f64 = to_f64(kwargs['x'])
+    ty: f64 = to_f64(kwargs['y'])
     total = total + tx
     total = total + ty
     return total
@@ -237,8 +251,8 @@ class SpyVarargsCombinationTest(TestCase):
     """Every combination of an ordinary positional parameter, a default-valued
     one, ``*args`` and ``**kwargs``.  The varargs/kwargs are unannotated, so the
     calls pass mixed ``i32``/``f64`` values and the function sums whatever it
-    was handed (coercing each element to ``f64``), which pins down exactly which
-    arguments bound to which parameter."""
+    was handed (converting each element to ``f64`` explicitly), which pins down
+    exactly which arguments bound to which parameter."""
 
     def test_none(self) -> None:
         self.assertEqual(c_none(), 0.0)

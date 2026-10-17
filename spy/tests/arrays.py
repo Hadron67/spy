@@ -16,6 +16,7 @@ from ..compiler.syntax import (
     ref,
 )
 from ..std.core import const_array
+from ..std.int import int_cast
 from .comptime_structs import runtime_struct_unroll
 from .structs import Blank, Small
 
@@ -106,7 +107,8 @@ def copy_array(x: i32) -> i32:
 
 
 @func()
-def pass_array(a: Array[i32, Literal[2]], i: i32) -> i32:
+def pass_array(a: Array[i32, Literal[2]], i: usize) -> i32:
+    # an array subscript takes a ``usize`` index
     return a[i]
 
 
@@ -121,8 +123,8 @@ def call_pass_array(x: i32) -> i32:
 @func()
 def call_pass_array_runtime_index(x: i32, i: i32) -> i32:
     # a runtime index is a runtime address (the array's own type is what the
-    # address arithmetic uses)
-    return pass_array(array(x, x + 1, length=2), i)
+    # address arithmetic uses); it has to be ``usize``, so cast it explicitly
+    return pass_array(array(x, x + 1, length=2), int_cast(i, usize))
 
 
 @func()

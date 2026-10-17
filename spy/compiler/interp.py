@@ -1535,6 +1535,18 @@ def _scalar_of_bits(bits: int, t: sval.Type) -> sval.AnyValue:
         case _:
             raise AssertionError(f'{t} is not a scalar type')
 
+def _round_float(value: float, bits: int) -> float:
+    """The Python float ``value`` rounded to the precision (and range) of a
+    ``bits``-wide float - what an ``fptrunc`` to it produces: a value beyond the
+    target's largest finite one becomes an infinity (see
+    ``HirRunner._builtin_float_truncate``)."""
+    try:
+        return struct.unpack(
+            _FLOAT_STRUCT_FMT[bits], struct.pack(_FLOAT_STRUCT_FMT[bits], value)
+        )[0]
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
 def _check_comptime_args(
     sig: Signature, args: ArgList[ArgEntry[InterpVal]]
 ) -> None:
@@ -1644,13 +1656,9 @@ class HirRunner:
 
     def _usize_type(self) -> sval.IntType:
         """``usize``: the unsigned integer of the target's pointer width - the
-        type of a length, an index and a ``SlicePtr``'s own length."""
+        type of a length, an index, a pointer offset and a ``SlicePtr``'s own
+        length."""
         return sval.IntType(self._analyser._resolver.target_info().usize_bits, False)
-
-    def _isize_type(self) -> sval.IntType:
-        """``isize``: the signed integer of the target's pointer width - the
-        type of a pointer offset, so that a negative one walks backwards."""
-        return sval.IntType(self._analyser._resolver.target_info().usize_bits, True)
 
     @property
     def _compile_vars(self) -> CompileVars:
@@ -4408,11 +4416,17 @@ class HirRunner:
         converted by ``sval.coerce_const``, which understands the whole
         compile-time domain - a ``ComptimePtr`` (a compile-time *place*), an
         aggregate value form, a function value and the scalar values included -
-        while a runtime value gets whatever numeric conversion the target needs -
-        widening or narrowing, see ``_convert_inst``.  A committed slot is the
-        address of the value it holds (``_shallow_normalize``), which is what an
-        operation that takes a value without loading it (taking an address,
-        ``ref``) hands over.
+        while a runtime value may only convert to the same type or to a *wider*
+        one (``type.is_subtype_of(target)``).  This is the *implicit*
+        conversion - what a store, a call argument and ``std.core.coerce``
+        perform - so a narrowing is an error: an integer whose range the target
+        does not cover, an integer to a float, and ``f64`` to ``f32``.  The
+        explicit special conversions build the narrowing themselves through
+        ``_convert_inst`` (see ``std.int.truncate`` and
+        ``std.float.float_truncate``).  A committed slot is the address of the
+        value it holds (``_shallow_normalize``), which is what an operation that
+        takes a value without loading it (taking an address, ``ref``) hands
+        over.
 
         Raises :class:`~spy.errors.CoerceError` when the value has no
         materialization as ``target`` (see ``_try_coerce`` for the failing
@@ -4448,6 +4462,11 @@ class HirRunner:
             return self._coerce_complex(ev, target)
         match ev:
             case RuntimeVal(value, type):
+                if not type.is_subtype_of(target):
+                    raise CoerceError(
+                        f'cannot convert a {type} value to {target}: the target '
+                        f'does not cover the source'
+                    )
                 return RuntimeVal(self._convert(value, type, target), target)
             case _:
                 raise CoerceError('cannot materialize this value')
@@ -5533,8 +5552,9 @@ class HirRunner:
         """One operation on a pointer: ``mptr + n``, the address of the n-th
         element after the one the pointer carries.  Only a *multi* pointer may
         be offset (a single one names one place only, see ``subscript``), and
-        the index is a signed pointer-width integer, so a negative offset walks
-        backwards like C's.  It is what makes ``ref(mptr[n]) == mptr + n``."""
+        the index is a ``usize`` (the target's unsigned pointer-width integer) -
+        any other integer type has to be converted explicitly.  It is what makes
+        ``ref(mptr[n]) == mptr + n``."""
         if not isinstance(lhs_type, sval.PointerType):
             raise CompileError(f"cannot add a pointer to {lhs_type}")
         if lhs_type.variant != sval.PointerVariant.MULTI:
@@ -5549,7 +5569,7 @@ class HirRunner:
         base = self._arg_value(lhs)
         if not isinstance(base, RuntimeVal):
             raise CompileError('cannot offset a compile-time pointer')
-        offset = self._to_runtime(self._coerce(self._arg_value(rhs), self._isize_type()))
+        offset = self._to_runtime(self._coerce(self._arg_value(rhs), self._usize_type()))
         self.store(ret, RuntimeVal(self._emit(mir.Gep(base.value, offset)), lhs_type))
         return PollResult.AGAIN
 
@@ -5939,6 +5959,8 @@ class HirRunner:
             return self._builtin_as_func_ptr(binded, ret)
         if fn.name == 'truncate':
             return self._builtin_truncate(binded, ret)
+        if fn.name == 'float_truncate':
+            return self._builtin_float_truncate(binded, ret)
         if fn.name == 'int_to_float_unchecked':
             return self._builtin_int_to_float_unchecked(binded, ret)
         if fn.name == 'float_to_int_unchecked':
@@ -6095,7 +6117,8 @@ class HirRunner:
         """``std.int.truncate(value, T)``: narrow the integer ``value`` to the
         integer type ``T``, which must have the same signedness and fewer bits.
         A compile-time value is truncated in Python and stays compile-time; a
-        runtime value is ``mir.Convert('trunc')``."""
+        runtime value is the ``trunc`` conversion ``_convert_inst`` builds (the
+        narrowing the implicit ``_coerce`` rejects)."""
         target = self._type_value_arg(
             args.positional[1], 'the type argument of std.int.truncate'
         )
@@ -6119,11 +6142,44 @@ class HirRunner:
             bits = obj.value & ((1 << target.bits) - 1)
             self.store(ret, _scalar_of_bits(bits, target))
             return PollResult.AGAIN
-        target_mir = target.to_mir_type(self._mir_cache)
-        assert target_mir is not None
-        self.store(ret, RuntimeVal(
-            self._emit(mir.Convert('trunc', self._to_runtime(ev), target_mir)), target
-        ))
+        converted = _convert_inst(self._to_runtime(ev), source, target, self._mir_cache)
+        assert converted is not None
+        self.store(ret, RuntimeVal(self._emit(converted), target))
+        return PollResult.AGAIN
+
+    # -- ``std.float.float_truncate`` ----------------------------------------
+
+    def _builtin_float_truncate(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.float.float_truncate(value, T)``: narrow the float ``value`` to
+        the float type ``T``, which must have fewer bits (``f64`` -> ``f32``).
+        A compile-time value is rounded to the target's precision in Python and
+        stays compile-time; a runtime value is the ``fptrunc`` conversion
+        ``_convert_inst`` builds (the narrowing the implicit ``_coerce``
+        rejects)."""
+        target = self._type_value_arg(
+            args.positional[1], 'the type argument of std.float.float_truncate'
+        )
+        ev = self._arg_value(args.positional[0])
+        source = _type_of(ev)
+        if not isinstance(source, sval.FloatType) or not isinstance(target, sval.FloatType):
+            raise CompileError(
+                f'std.float.float_truncate supports only floats, got {source} '
+                f'and {target}'
+            )
+        if target.bits >= source.bits:
+            raise CompileError(
+                f'cannot truncate a {source} to {target}: the target must have '
+                f'fewer bits'
+            )
+        obj = ev if sval.is_sval(ev) else None
+        if isinstance(obj, sval.Float):
+            self.store(ret, sval.Float(_round_float(obj.value, target.bits), target))
+            return PollResult.AGAIN
+        converted = _convert_inst(self._to_runtime(ev), source, target, self._mir_cache)
+        assert converted is not None
+        self.store(ret, RuntimeVal(self._emit(converted), target))
         return PollResult.AGAIN
 
     # -- ``std.core.int_to_float_unchecked`` ---------------------------------
@@ -6226,11 +6282,12 @@ class HirRunner:
         self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
     ) -> PollResult:
         """``std.core.coerce(value, T)``: materialize ``value`` as the spy type
-        ``T`` - the same conversion a store into a location of ``T`` performs
-        (see ``_coerce``).  A compile-time value is converted in Python and
-        stays compile-time; a runtime value gets whatever numeric conversion
-        ``T`` needs (widening or narrowing).  The result is written into the
-        call's result location, which the store commits to the coerced type."""
+        ``T`` - the implicit conversion a store into a location of ``T``
+        performs (see ``_coerce``).  A compile-time value is converted in Python
+        by value and stays compile-time; a runtime value may only convert to the
+        same type or a *wider* one (a narrowing is an error).  The result is
+        written into the call's result location, which the store commits to the
+        coerced type."""
         ev = self._arg_value(args.positional[0])
         target = self._type_value_arg(
             args.positional[1], 'the type argument of std.core.coerce'
@@ -8077,7 +8134,7 @@ class HirRunner:
             return PollResult.AGAIN
         if not isinstance(pointer, RuntimeVal):
             raise CompileError('cannot index a compile-time pointer')
-        offset = self._to_runtime(self._coerce(index_ev, self._isize_type()))
+        offset = self._to_runtime(self._coerce(index_ev, self._usize_type()))
         # the place of the element, an address ``p + i`` away - a *single* pointer
         # to it, like the compile-time branch above labels its place
         self._frames[-1].regs[ret] = RuntimeVal(
@@ -8158,7 +8215,7 @@ class HirRunner:
         base_ev = self.load(base)
         element_ptr: InterpVal
         if isinstance(base_ev, RuntimeVal):
-            offset = self._to_runtime(self._coerce(start_ev, self._isize_type()))
+            offset = self._to_runtime(self._coerce(start_ev, self._usize_type()))
             element_ptr = RuntimeVal(
                 self._emit(mir.Gep(base_ev.value, offset)),
                 sval.PointerType(elem, is_const, sval.PointerVariant.MULTI),

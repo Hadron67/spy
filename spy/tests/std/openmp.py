@@ -12,9 +12,10 @@ cannot be found the tests are skipped, since the JIT would not resolve the
 from typing import Literal, cast
 from unittest import TestCase
 
-from ...compiler import CompileError, c64, c128, f32, f64, func, i32, i64, u8
+from ...compiler import CompileError, c64, c128, f32, f64, func, i32, i64, u8, usize
 from ...compiler.syntax import Array, ref
 from ...std.core import arr_slice, coerce, undefined
+from ...std.int import int_cast, int_to_float
 from ...std.openmp import parallel_loop
 
 
@@ -24,14 +25,14 @@ def parallel_fill_i32(n: i32) -> i64:
     out = arr_slice(ref(buf))
 
     def kernel(i: i32):
-        out[i] = i
+        out[int_cast(i, usize)] = i
 
     parallel_loop(n, kernel)
 
     total: i64 = 0
     j: i32 = 0
     while j < n:
-        total = total + cast(i64, out[j])
+        total = total + cast(i64, out[int_cast(j, usize)])
         j = j + 1
     return total
 
@@ -42,14 +43,14 @@ def parallel_fill_i64(n: i64) -> i64:
     out = arr_slice(ref(buf))
 
     def kernel(i: i64):
-        out[i] = i
+        out[int_cast(i, usize)] = i
 
     parallel_loop(n, kernel)
 
     total: i64 = 0
     j: i64 = 0
     while j < n:
-        total = total + out[j]
+        total = total + out[int_cast(j, usize)]
         j = j + 1
     return total
 
@@ -138,7 +139,7 @@ def parallel_void_with_reducer(n: i32) -> i32:
 def parallel_sum_f64(n: i32) -> f64:
     # a floating-point reduction: the values and the accumulator are ``f64``
     def kernel(i: i32) -> f64:
-        return coerce(i, f64)
+        return int_to_float(i, f64)
 
     def add(a: f64, b: f64) -> f64:
         return a + b
@@ -151,7 +152,7 @@ def parallel_sum_f32(n: i32) -> f32:
     # a 32-bit float reduction (every partial sum is an integer below 2**24, so
     # the result is exact whatever the schedule)
     def kernel(i: i32) -> f32:
-        return coerce(i, f32)
+        return int_to_float(i, f32)
 
     def add(a: f32, b: f32) -> f32:
         return a + b
@@ -163,7 +164,7 @@ def parallel_sum_f32(n: i32) -> f32:
 def parallel_sum_c128(n: i32) -> c128:
     # a complex128 reduction: each kernel result is ``i + 1j``
     def kernel(i: i32) -> c128:
-        z: c128 = coerce(i, f64)
+        z: c128 = int_to_float(i, f64)
         return z + 1j
 
     def add(a: c128, b: c128) -> c128:
@@ -176,7 +177,7 @@ def parallel_sum_c128(n: i32) -> c128:
 def parallel_sum_c64(n: i32) -> c64:
     # a complex64 reduction: each kernel result is the real value ``i``
     def kernel(i: i32) -> c64:
-        z: c64 = coerce(i, f32)
+        z: c64 = int_to_float(i, f32)
         return z
 
     def add(a: c64, b: c64) -> c64:
@@ -193,7 +194,7 @@ def parallel_write_and_reduce(n: i32) -> i64:
     out = arr_slice(ref(buf))
 
     def kernel(i: i32) -> i64:
-        out[i] = i
+        out[int_cast(i, usize)] = i
         return coerce(i, i64)
 
     def add(a: i64, b: i64) -> i64:
@@ -204,7 +205,7 @@ def parallel_write_and_reduce(n: i32) -> i64:
     written: i64 = 0
     j: i32 = 0
     while j < n:
-        written = written + cast(i64, out[j])
+        written = written + cast(i64, out[int_cast(j, usize)])
         j = j + 1
     return total * 1000000 + written
 
@@ -216,7 +217,7 @@ def parallel_write_and_pair(n: i32) -> i64:
     out = arr_slice(ref(buf))
 
     def kernel(i: i32):
-        out[i] = i
+        out[int_cast(i, usize)] = i
         return coerce(i, i64), coerce(1, i64)
 
     def add(a, b):
@@ -227,7 +228,7 @@ def parallel_write_and_pair(n: i32) -> i64:
     written: i64 = 0
     j: i32 = 0
     while j < n:
-        written = written + cast(i64, out[j])
+        written = written + cast(i64, out[int_cast(j, usize)])
         j = j + 1
     return total * 1000000 + count * 1000 + written
 

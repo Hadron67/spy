@@ -30,6 +30,7 @@ from ...compiler import f32, f64, typeof, u32, u64, usize
 from ...compiler.dsl import func
 from ...compiler.syntax import comptime
 from ..core import Numeric, bitcast, coerce, compile_error
+from ..float import float_truncate
 from .pow import (
     _EXP2F_C0,
     _EXP2F_C1,
@@ -89,7 +90,7 @@ def exp[T: Numeric](x: T) -> T:
         r2 = r * r
         y = _EXPF_C2 * r + 1.0
         y = (_EXPF_C0 * r + _EXPF_C1) * r2 + y
-        return coerce(y * s, typ)
+        return float_truncate(y * s, typ)
     elif typ == f64:
         xd = coerce(x, f64)
         ix = bitcast(xd, u64)

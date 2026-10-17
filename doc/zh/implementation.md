@@ -328,8 +328,10 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 - `PendingSlot`：已执行但未 commit 的 `hir.Alloca`（见 §6.2）。
 - `ComptimeResultPtr(value, code, payload)`：函数结果位置的指针形态（value/code/payload 三个位置），**不是** `InterpVal`。
 - 判定：`_is_comptime_val`（`RuntimeVal` 一律不是；旧的「不引用寄存器」放宽已删除）、`_place_is_comptime`、`_references_register`。
-- `_coerce(ev, target)`：**编译期量一律交给 `sval.coerce_const`**（一个 `sval` 编译期值，含 `ComptimePtr` 这种指针值），运行期量走 `_convert_inst`（拓宽/收窄）；
-  失败抛 `CoerceError`（`_try_coerce` 吞掉它）。`Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` 的目标分支只处理运行期值。
+- `_coerce(ev, target)`：store、实参、返回与 `std.core.coerce` 共用的**隐式转换**。**编译期量一律交给 `sval.coerce_const`**（一个 `sval` 编译期值，含 `ComptimePtr` 这种指针值），所以编译期量是按**值**收窄的；
+  运行期量只有 `src.is_subtype_of(target)`（同类型或拓宽）才放行，否则抛 `CoerceError`——即整数收窄、整数→浮点、`f64 -> f32` 都是运行期编译错误
+  （显式形式 `std.int.truncate`、`std.int.int_cast`、`std.float.float_truncate` 各自经 `_convert_inst` 构造 `mir.Convert`，收窄仍在那里发生）。`CoerceError` 由 `_try_coerce` 吞掉。
+  `Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` 的目标分支只处理运行期值。
 
 ### 6.2 Compile-time 存储与 pending slot
 
@@ -416,7 +418,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 ### 6.8 内建与运算符
 
 - `_call_builtin` 按 `fn.name` 分派：`compile_log`、`type_info`、`reify`、`undefined`、`layout_of`、`panic`、`catch_unwind`、
-  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`int_to_float_unchecked`、`float_to_int_unchecked`、`coerce`、`compile_error`、`compile_option`、`atomic_load/store/rmw/cmpxchg/fence`；
+  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`float_truncate`、`int_to_float_unchecked`、`float_to_int_unchecked`、`coerce`、`compile_error`、`compile_option`、`atomic_load/store/rmw/cmpxchg/fence`；
   未知名字报 `cannot call the spy builtin ...`。
 - 运算符：`_eval_binary` 依序判定 `|` 的 union 含义 → struct 重载 → complex → `/` → `//` → `**` → 位运算 → 双常量折叠 → 指针算术 → 数值 peer 类型发 `mir.Arith`；
   `_eval_cmp`（struct 重载/枚举成员/双常量/数值 `mir.Cmp`）、`_eval_not`、`_eval_unary`、`_eval_ord`、`binary_assign`。

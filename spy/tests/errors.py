@@ -13,6 +13,7 @@ from ..compiler import (
 from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
 from ..compiler.lower import LLVMBackend
 from ..compiler.util import StrBiMap
+from ..std.int import truncate
 from .returns import mir_signature
 from .structs import MIR_CACHE, ExternMixed, Large, Small, struct_type
 
@@ -540,7 +541,8 @@ def catch_big(n: i32) -> i32:
     try:
         raise_big(n)
     except ErrorBig as e:
-        return e.a + e.b + e.c
+        # the fields are ``i64``: narrow the sum back explicitly
+        return truncate(e.a + e.b + e.c, i32)
     return 0
 
 

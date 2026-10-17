@@ -33,6 +33,8 @@ from ...compiler import f32, f64, i32, i64, typeof, u32, u64, usize
 from ...compiler.dsl import func
 from ...compiler.syntax import array, comptime, const_comptime
 from ..core import Numeric, bitcast, coerce, compile_error, int_to_float_unchecked
+from ..float import float_truncate
+from ..int import int_cast, truncate
 
 
 def _hex(s: bytes) -> float:
@@ -372,15 +374,15 @@ def _invalid(x: f64) -> f64:
 def _checkint(iy: u64) -> i32:
     """``checkint(iy)``: 0 when ``iy`` is not an integer, 1 when it is an odd
     one, 2 when it is an even one."""
-    e = coerce((iy >> 52) & 0x7FF, i32)
+    e = int_cast((iy >> 52) & 0x7FF, i32)
     if e < 0x3FF:
         return 0
     if e > 0x3FF + 52:
         return 2
     n = 0x3FF + 52 - e
-    if (iy & ((coerce(1, u64) << coerce(n, u64)) - 1)) != 0:
+    if (iy & ((coerce(1, u64) << int_cast(n, u64)) - 1)) != 0:
         return 0
-    if (iy & (coerce(1, u64) << coerce(n, u64))) != 0:
+    if (iy & (coerce(1, u64) << int_cast(n, u64))) != 0:
         return 1
     return 2
 
@@ -457,7 +459,7 @@ def _specialcase(tmp: f64, sbits: u64, ki: u64) -> f64:
 def _exp_inline(x: f64, xtail: f64, sign_bias: u32) -> f64:
     """``exp_inline(x, xtail, sign_bias)``: ``sign * exp(x + xtail)``, the sign
     set to -1 by a nonzero ``sign_bias`` and to +1 by 0."""
-    abstop = coerce(bitcast(x, u64) >> 52, u32) & 0x7FF
+    abstop = truncate(bitcast(x, u64) >> 52, u32) & 0x7FF
     if (abstop - _TOP12_1P54) >= (_TOP12_512 - _TOP12_1P54):
         if (abstop - _TOP12_1P54) >= 0x80000000:
             # tiny |x|: avoid a spurious underflow
@@ -507,15 +509,15 @@ def _invalidf(x: f32) -> f32:
 @func()
 def _checkint32(iy: u32) -> i32:
     """``checkint(iy)`` for the single-precision bit pattern ``iy``."""
-    e = coerce((iy >> 23) & 0xFF, i32)
+    e = int_cast((iy >> 23) & 0xFF, i32)
     if e < 0x7F:
         return 0
     if e > 0x7F + 23:
         return 2
     n = 0x7F + 23 - e
-    if (iy & ((coerce(1, u32) << coerce(n, u32)) - 1)) != 0:
+    if (iy & ((coerce(1, u32) << int_cast(n, u32)) - 1)) != 0:
         return 0
-    if (iy & (coerce(1, u32) << coerce(n, u32))) != 0:
+    if (iy & (coerce(1, u32) << int_cast(n, u32))) != 0:
         return 1
     return 2
 
@@ -564,7 +566,7 @@ def _exp2_inline(xd: f64, sign_bias: u32) -> f32:
     r2 = r * r
     y = _EXP2F_C2 * r + 1.0
     y = z * r2 + y
-    return coerce(y * s, f32)
+    return float_truncate(y * s, f32)
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +604,7 @@ def pow[T: Numeric](x: T, y: T) -> T:
                 if (ix & 0x80000000) != 0 and _checkint32(iy) == 1:
                     x2 = _neg32(x2)
                 if (iy & 0x80000000) != 0:
-                    return coerce(1.0 / x2, typ)
+                    return float_truncate(1.0 / x2, typ)
                 return coerce(x2, typ)
             # x and y are non-zero finite
             if (ix & 0x80000000) != 0:
@@ -634,8 +636,8 @@ def pow[T: Numeric](x: T, y: T) -> T:
         yd = coerce(y, f64)
         ix = bitcast(xd, u64)
         iy = bitcast(yd, u64)
-        topx = coerce(ix >> 52, u32)
-        topy = coerce(iy >> 52, u32)
+        topx = truncate(ix >> 52, u32)
+        topy = truncate(iy >> 52, u32)
         if (topx - 0x001) >= (0x7FF - 0x001) or ((topy & 0x7FF) - 0x3BE) >= (0x43E - 0x3BE):
             if _zeroinfnan(iy):
                 if 2 * iy == 0:

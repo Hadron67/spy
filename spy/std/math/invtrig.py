@@ -43,6 +43,8 @@ from ...compiler import f32, f64, i32, typeof, u32, u64
 from ...compiler.dsl import func
 from ...compiler.syntax import comptime
 from ..core import Numeric, bitcast, coerce, compile_error
+from ..float import float_truncate
+from ..int import truncate
 from .sqrt import _invalid_f32, _invalid_f64
 from .sqrt import sqrt as _sqrt
 
@@ -259,7 +261,7 @@ def asin[T: Numeric](x: T) -> T:
         if ix >= 0x3F800000:
             if ix == 0x3F800000:
                 # asin(+-1) = +-pi/2
-                return coerce(coerce(x, f64) * _PIO2_HI, typ)
+                return float_truncate(coerce(x, f64) * _PIO2_HI, typ)
             return coerce(_invalid_f32(coerce(x, f32)), typ)
         if ix < 0x3F000000:
             # |x| < 0.5: a small |x| from 2**-126 to 2**-12 yields x itself, so
@@ -267,22 +269,22 @@ def asin[T: Numeric](x: T) -> T:
             if ix < 0x39800000 and ix >= 0x00800000:
                 return x
             xd = coerce(x, f64)
-            return coerce(xd + xd * _r32(xd * xd), typ)
+            return float_truncate(xd + xd * _r32(xd * xd), typ)
         # 1 > |x| >= 0.5
         xd = coerce(x, f64)
-        z = coerce((1.0 - _fabs64(xd)) * 0.5, f32)
+        z = float_truncate((1.0 - _fabs64(xd)) * 0.5, f32)
         zf = coerce(z, f64)
         s = _sqrt(zf)
         res = _PIO2_HI - 2.0 * (s + s * _r32(zf))
         if (bits >> 31) != 0:
             res = -res
-        return coerce(res, typ)
+        return float_truncate(res, typ)
     elif typ == f64:
         bits = bitcast(x, u64)
-        hx = coerce(bits >> 32, u32)
+        hx = truncate(bits >> 32, u32)
         ix = hx & 0x7FFFFFFF
         if ix >= 0x3FF00000:
-            if ((ix - 0x3FF00000) | coerce(bits & 0xFFFFFFFF, u32)) == 0:
+            if ((ix - 0x3FF00000) | truncate(bits & 0xFFFFFFFF, u32)) == 0:
                 # asin(+-1) = +-pi/2
                 return coerce(coerce(x, f64) * _PIO2_HI, typ)
             return coerce(_invalid_f64(coerce(x, f64)), typ)
@@ -336,30 +338,30 @@ def acos[T: Numeric](x: T) -> T:
                 # |x| < 2**-26
                 return coerce(_PIO2_HI_F, typ)
             xd = coerce(x, f64)
-            return coerce(_PIO2_HI_F - (xd - (_PIO2_LO_F - xd * _r32(xd * xd))), typ)
+            return float_truncate(_PIO2_HI_F - (xd - (_PIO2_LO_F - xd * _r32(xd * xd))), typ)
         xd = coerce(x, f64)
         if (bits >> 31) != 0:
             # x < -0.5
-            z = coerce((1.0 + xd) * 0.5, f32)
+            z = float_truncate((1.0 + xd) * 0.5, f32)
             zf = coerce(z, f64)
             s = _sqrt(zf)
             w = _r32(zf) * s - _PIO2_LO_F
-            return coerce(2.0 * (_PIO2_HI_F - (s + w)), typ)
+            return float_truncate(2.0 * (_PIO2_HI_F - (s + w)), typ)
         # x > 0.5
-        z = coerce((1.0 - xd) * 0.5, f32)
+        z = float_truncate((1.0 - xd) * 0.5, f32)
         zf = coerce(z, f64)
         s32 = _sqrt(z)
         s = coerce(s32, f64)
         df = coerce(_clear_low32(s32), f64)
         c = (zf - df * df) / (s + df)
         w = _r32(zf) * s + c
-        return coerce(2.0 * (df + w), typ)
+        return float_truncate(2.0 * (df + w), typ)
     elif typ == f64:
         bits = bitcast(x, u64)
-        hx = coerce(bits >> 32, u32)
+        hx = truncate(bits >> 32, u32)
         ix = hx & 0x7FFFFFFF
         if ix >= 0x3FF00000:
-            if ((ix - 0x3FF00000) | coerce(bits & 0xFFFFFFFF, u32)) == 0:
+            if ((ix - 0x3FF00000) | truncate(bits & 0xFFFFFFFF, u32)) == 0:
                 # acos(1) = 0, acos(-1) = pi
                 if (hx >> 31) != 0:
                     return coerce(2.0 * _PIO2_HI, typ)
@@ -444,17 +446,17 @@ def atan[T: Numeric](x: T) -> T:
         s1 = z * (_AT0_F32 + w * (_AT2_F32 + w * _AT4_F32))
         s2 = w * (_AT1_F32 + w * _AT3_F32)
         if id < 0:
-            return coerce(xa - xa * (s1 + s2), typ)
+            return float_truncate(xa - xa * (s1 + s2), typ)
         res = _atan_hi_f32(id) - ((xa * (s1 + s2) - _atan_lo_f32(id)) - xa)
         if sign != 0:
             res = -res
-        return coerce(res, typ)
+        return float_truncate(res, typ)
     elif typ == f64:
         bits = bitcast(x, u64)
-        hx = coerce(bits >> 32, u32)
+        hx = truncate(bits >> 32, u32)
         sign = hx >> 31
         ix = hx & 0x7FFFFFFF
-        lx = coerce(bits & 0xFFFFFFFF, u32)
+        lx = truncate(bits & 0xFFFFFFFF, u32)
         if ix >= 0x44100000:
             # |x| >= 2**66 (or a NaN)
             if ix > 0x7FF00000 or (ix == 0x7FF00000 and lx != 0):
@@ -520,7 +522,7 @@ def atan2[T: Numeric](y: T, x: T) -> T:
         iy = yb & 0x7FFFFFFF
         if ix > 0x7F800000 or iy > 0x7F800000:
             # a NaN in either argument
-            return coerce(coerce(x, f64) + coerce(y, f64), typ)
+            return float_truncate(coerce(x, f64) + coerce(y, f64), typ)
         if xb == 0x3F800000:
             # x = 1.0
             return atan(y)
@@ -570,23 +572,23 @@ def atan2[T: Numeric](y: T, x: T) -> T:
             # |y/x| < 2**-26, x < 0: the result is pi, so no underflow
             zf = coerce(0.0, f32)
         else:
-            ratio = coerce(_fabs64(yd / xd), f32)
+            ratio = float_truncate(_fabs64(yd / xd), f32)
             zf = atan(ratio)
         if m == 0:
             return coerce(zf, typ)
         elif m == 1:
             return coerce(_neg_f32(zf), typ)
         elif m == 2:
-            return coerce(_PI_F32 - (coerce(zf, f64) - _PI_LO_F32), typ)
+            return float_truncate(_PI_F32 - (coerce(zf, f64) - _PI_LO_F32), typ)
         else:
-            return coerce((coerce(zf, f64) - _PI_LO_F32) - _PI_F32, typ)
+            return float_truncate((coerce(zf, f64) - _PI_LO_F32) - _PI_F32, typ)
     elif typ == f64:
         xb = bitcast(x, u64)
         yb = bitcast(y, u64)
-        hx = coerce(xb >> 32, u32)
-        hy = coerce(yb >> 32, u32)
-        lx = coerce(xb & 0xFFFFFFFF, u32)
-        ly = coerce(yb & 0xFFFFFFFF, u32)
+        hx = truncate(xb >> 32, u32)
+        hy = truncate(yb >> 32, u32)
+        lx = truncate(xb & 0xFFFFFFFF, u32)
+        ly = truncate(yb & 0xFFFFFFFF, u32)
         ix = hx & 0x7FFFFFFF
         iy = hy & 0x7FFFFFFF
         if (ix > 0x7FF00000 or (ix == 0x7FF00000 and lx != 0)

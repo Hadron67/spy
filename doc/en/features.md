@@ -54,6 +54,7 @@ from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
     int_to_float, try_int_to_float, float_to_int, try_float_to_int,
 )
+from spy.std.float import float_truncate
 from spy.std.atomic import (
     MemoryOrder, RmwOp,
     atomic_load, atomic_store, atomic_rmw, atomic_cmpxchg, atomic_fence, atomic_fetch_add,
@@ -87,7 +88,8 @@ def arith(a: i32, b: i32) -> i32:
 
 @func()
 def to_float(a: i32, b: i32) -> f64:
-    return a / b                 # integer / is true division -> f64
+    # runtime integers cannot take part in true division (see §4): convert first
+    return int_to_float(a, f64) / int_to_float(b, f64)
 
 @func()
 def width_and_literals() -> i32:
@@ -270,9 +272,15 @@ assert is_absent(None) is True and is_absent(5) is False
 def tuple_use(a: i32, b: i32) -> i32:
     t = (a, b)                   # a runtime tuple value
     t[1] = t[1] + 1
-    return t[0] + t[1] + len(t)
+    return t[0] + t[1]
 
-assert tuple_use(3, 4) == 3 + 5 + 2
+@func()
+def tuple_len(a: i32, b: i32, c: i32) -> usize:
+    t = (a, b, c)                # a runtime tuple value
+    return len(t)                # a compile-time integer
+
+assert tuple_use(3, 4) == 3 + 5
+assert tuple_len(1, 2, 3) == 3
 ```
 
 ### 1.7 Untagged union (`UnionType`)
@@ -331,7 +339,7 @@ assert tu_match(A(9)) == 9
 
 Complex types `spy.c64` / `spy.c128`: the real part and the imaginary part are each a floating-point element.
 
-- A Python `complex` maps to `c128`; there is an implicit `T → Complex[T]` conversion for reals/integers (imaginary part 0), and `Complex[f32]` widens to `Complex[f64]`.
+- A Python `complex` maps to `c128`; there is an implicit `T → Complex[T]` conversion for **float** reals (imaginary part 0), and `Complex[f32]` widens to `Complex[f64]`. An integer has to be converted to a float first (a compile-time integer constant is checked by value, so `z: c128 = 3` is still allowed).
 - Supports `+ - * /` (component-wise) and the fields `z.real` / `z.imag`.
 - `std.reflect.type_info` yields the `ComplexType` reflection variant.
 
@@ -348,9 +356,15 @@ def cparts(z: c128) -> f64:
 def widen(x: f64) -> c128:
     return x                     # implicit T -> Complex[T]
 
+@func()
+def widen_int_literal() -> c128:
+    z: c128 = 3                  # a compile-time integer constant is checked by value
+    return z
+
 assert cmul(1 + 2j, 3 + 4j) == (1 + 2j) * (3 + 4j)
 assert cparts(3 + 4j) == 7.0
 assert widen(2.5) == complex(2.5, 0.0)
+assert widen_int_literal() == complex(3, 0.0)
 ```
 
 ### 1.10 Integer enums
@@ -589,7 +603,7 @@ def static_read() -> i32:
     return p[...]
 
 @func()
-def const_array_read(i: i32) -> i32:
+def const_array_read(i: usize) -> i32:
     arr: ConstComptime[Array[i32, Literal[3]]] = array(10, 20, 30)
     return arr[i]                # a runtime index materializes it into a global constant
 
@@ -627,7 +641,7 @@ assert infer_runtime(1) == 2
 - Arithmetic `+ - * / // % **` (integers and floats), bit operations `| & ^ << >> ~`, unary minus, `not` (only `spy.bool`),
   comparisons `== != < <= > >=` (**chained comparisons are not supported**).
 - When both sides are compile-time constants it is folded at compile time; when a runtime value is involved it is computed at runtime.
-- Integer `/` is true division (the result defaults to `f64`); integer `//` defaults to floor division; float `//` is `floor(a/b)`.
+- Integer `/` is true division (the result defaults to `f64`): an integer operand may only be a **compile-time constant** (e.g. `1 / 3`, `float_var / 10`), or the other side must be a float; a **runtime integer** cannot take part - convert it to a float explicitly (`int_to_float`) or use `//`. Integer `//` defaults to floor division; float `//` is `floor(a/b)`.
 - `**`: both integer and float exponents are supported. **Float `%` is not implemented** (it is an error).
 - Every binary operator has a corresponding compound assignment `a <operator>= b`.
 - Conditional expression `a if c else b`: the condition must be `spy.bool`; a compile-time condition keeps only the selected branch.
@@ -652,7 +666,8 @@ def logic(a: bool, b: bool) -> bool:
 
 @func()
 def true_div(a: i32, b: i32) -> f64:
-    return a / b
+    # runtime integers cannot take part in true division: convert first
+    return int_to_float(a, f64) / int_to_float(b, f64)
 
 @func()
 def pow_int(a: i32) -> i32:
@@ -1468,11 +1483,11 @@ assert unrolled_sum() == 6
 
 - `std.core.undefined()`: undefined of any type, typed according to its type when written into a target; undefined as a condition is an error.
 - `std.core.compile_error(msg)`: aborts compilation with a compile-time byte string message; a non-byte-string/runtime message is an error; a dead branch does not trigger.
-- `std.core.coerce(value, T)`: concretizes value into type `T` (the same conversion as store).
+- `std.core.coerce(value, T)`: concretizes value into type `T` - the **implicit conversion** a store performs, which only allows the same type or a widening one: integers by range coverage (`u32 → u64`, `i32 → i64`), floats `f32 → f64`, the legal pointer conversions, and a float real `→ Complex[T]`; **narrowing is always an error**. A compile-time value is checked by value (`x: i8 = 12` is fine). To narrow, use `std.int.truncate`/`int_cast` or `std.float.float_truncate`.
 - `std.core.lub_type(t1, t2)`: the least upper bound of two types - the common type both peer to (`t1.resolve_peer_type(t2)`), such as a type with its `Option` or a variant with its tagged union. The result is a compile-time type value, able to name a declaration's type or feed a `type[X]` parameter; two types with no common type yield `None`.
 - `std.core.compile_option(name)`: reads a compile-time option the host context stores (`CompileContext.get_compile_option`); an option that is not set is the absent value (`None`).
 - `std.core.compile(fn)`: manually compiles a **non-generic** function value (precompiles its default specialization).
-- `std.core.bitcast(value, T)` / `std.int.truncate(value, T)`: same-bit-width reinterpretation of a scalar / integer narrowing.
+- `std.core.bitcast(value, T)` / `std.int.truncate(value, T)` / `std.float.float_truncate(value, T)`: same-bit-width reinterpretation of a scalar / integer narrowing / float narrowing.
 - `std.core.int_to_float_unchecked(value, T)` / `std.core.float_to_int_unchecked(value, T)`: integer↔float conversion (`sitofp`/`uitofp` and `fptosi`/`fptoui`, the latter truncating towards zero), with **no check at all**; a compile-time value that does not fit the target type becomes `undefined`.
 
 ```python
@@ -1494,8 +1509,8 @@ def pick(c: bool, a: i32, b: i32) -> i32:
     return v
 
 @func()
-def narrowed(x: i32) -> i8:
-    return coerce(x, i8)
+def coerced_widen(x: i32) -> i64:
+    return coerce(x, i64)        # coerce only does the same type or a widening one
 
 @func()
 def same_bits(x: f32) -> u32:
@@ -1504,6 +1519,10 @@ def same_bits(x: f32) -> u32:
 @func()
 def truncated(x: u32) -> u8:
     return truncate(x, u8)
+
+@func()
+def float_truncated(x: f64) -> f32:
+    return float_truncate(x, f32)
 
 @func()
 def to_f64(x: u64) -> f64:
@@ -1522,7 +1541,8 @@ def widen(x: i32) -> i64:
 
 assert dead_branch() == 1
 assert pick(True, 1, 2) == 1 and pick(False, 1, 2) == 2
-assert narrowed(128) == -128
+assert coerced_widen(3) == 3
+assert float_truncated(1.5) == 1.5
 assert same_bits(1.0) == 0x3F800000
 assert truncated(300) == 44
 assert widen(3) == 3
@@ -1565,7 +1585,7 @@ def reified() -> i32:
 
 @func()
 def int_size() -> i32:
-    return coerce(size_of(i32), i32)
+    return int_cast(size_of(i32), i32)
 
 assert int_bits(i32) == 32
 assert float_bits(f32) == 32
@@ -1595,7 +1615,7 @@ def second_byte() -> i32:
 @func()
 def str_len() -> i32:
     s = sstr(b'hello')
-    return coerce(s.length, i32)
+    return int_cast(s.length, i32)
 
 assert byte_at() == 66
 assert second_byte() == 121
@@ -1611,6 +1631,7 @@ assert str_len() == 5
 | `std.core` | `Numeric`, `StopIteration`, `slice`, `range`, `SlicePtr`/`ConstSlicePtr`, `arr_slice`/`const_arr_slice`/`const_arr_ptr`, `NullException`, `unwrap`/`unwrap_or`, `undefined`, `coerce`/`typed_undefined`/`lub_type`, `const_array`, `compile_error`, `sstr`, `compile`, `bitcast`, `int_to_float_unchecked`/`float_to_int_unchecked`, `DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`, `panic`, `catch_unwind`, `compile_option` |
 | `std.reflect` | `TypeInfo` and its variants, `StructField`, `type_info`, `reify` |
 | `std.int` | `truncate` (builtin), `IntCastError`, `valid_range`, `try_int_cast`/`int_cast`, `FloatCastError`, `try_int_to_float`/`int_to_float`, `try_float_to_int`/`float_to_int` |
+| `std.float` | `float_truncate` (builtin) |
 | `std.mem` | `Layout`, `layout_of`/`size_of`/`align_of`, `AllocError`, `Allocator` (protocol), `AllocatorVtable`, `DynamicAllocator`, `CAllocator` |
 | `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf` (extern declarations), `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`atan`/`atanf`/`atan2`/`atan2f`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`/`pow`/`powf`/`exp`/`expf`/`log`/`logf`/`asin`/`asinf`/`acos`/`acosf` (libm), `CError`, `FILE`, `fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`, `Writable`/`Readable` (protocols) |

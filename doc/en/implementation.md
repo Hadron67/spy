@@ -310,8 +310,10 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - `PendingSlot`: an executed but uncommitted `hir.Alloca` (see §6.2).
 - `ComptimeResultPtr(value, code, payload)`: the pointer form of a function result location (the three positions value/code/payload), **not** an `InterpVal`.
 - Predicates: `_is_comptime_val` (`RuntimeVal` is never one; the old "does not reference a register" relaxation has been removed), `_place_is_comptime`, `_references_register`.
-- `_coerce(ev, target)`: **every compile-time value goes to `sval.coerce_const`** (an `sval` compile-time value, the `ComptimePtr` pointer value included), while a runtime value goes through `_convert_inst`
-  (widening/narrowing); a failure raises `CoerceError` (which `_try_coerce` swallows). The `Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` target branches handle runtime values only.
+- `_coerce(ev, target)`: the **implicit conversion** shared by a store, a call argument, a return and `std.core.coerce`. **Every compile-time value goes to `sval.coerce_const`** (an `sval` compile-time value, the `ComptimePtr` pointer value included), so a compile-time value narrows by value;
+  a *runtime* value is accepted only when `src.is_subtype_of(target)` (the same type, or a widening one), otherwise it raises `CoerceError` - so an integer narrowing, an integer -> float and `f64 -> f32` are compile errors on a runtime value
+  (the explicit forms `std.int.truncate`, `std.int.int_cast` and `std.float.float_truncate` build their own `mir.Convert` through `_convert_inst`, which still performs every narrowing). `CoerceError` is swallowed by `_try_coerce`.
+  The `Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` target branches handle runtime values only.
 
 ### 6.2 Compile-time storage and pending slot
 
@@ -399,7 +401,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 ### 6.8 Builtins and operators
 
 - `_call_builtin` dispatches by `fn.name`: `compile_log`, `type_info`, `reify`, `undefined`, `layout_of`, `panic`, `catch_unwind`,
-  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `int_to_float_unchecked`, `float_to_int_unchecked`, `coerce`, `compile_error`, `compile_option`, `atomic_load/store/rmw/cmpxchg/fence`;
+  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `float_truncate`, `int_to_float_unchecked`, `float_to_int_unchecked`, `coerce`, `compile_error`, `compile_option`, `atomic_load/store/rmw/cmpxchg/fence`;
   an unknown name raises `cannot call the spy builtin ...`.
 - Operators: `_eval_binary` decides in order the union meaning of `|` -> struct overload -> complex -> `/` -> `//` -> `**` -> bitwise -> fold both constants -> pointer arithmetic -> emit `mir.Arith` for numeric peer types;
   `_eval_cmp` (struct overload / enum member / both constants / numeric `mir.Cmp`), `_eval_not`, `_eval_unary`, `_eval_ord`, `binary_assign`.

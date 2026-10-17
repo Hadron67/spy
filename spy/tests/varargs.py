@@ -9,6 +9,7 @@ from ..compiler.dsl import func
 from ..compiler.syntax import (
     Comptime,
 )
+from ..std.int import truncate
 
 # ---------------------------------------------------------------------------
 # ``*args``/``**kwargs``: a spy function may declare them, and a call's excess
@@ -37,8 +38,9 @@ def sum_args(*args: i32) -> i32:
 
 @func()
 def first_arg(*args) -> i32:
-    # an unannotated ``*args``: the element type is inferred from the call
-    return args[0]
+    # an unannotated ``*args``: the element type is inferred from the call, and
+    # a Python int marshals to ``i64``, so the narrowing to ``i32`` is explicit
+    return truncate(args[0], i32)
 
 
 @func()

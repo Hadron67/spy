@@ -9,6 +9,7 @@ from ..compiler import (
     u64,
 )
 from ..compiler.dsl import func, struct
+from ..std.int import int_to_float
 
 # ---------------------------------------------------------------------------
 # operators: the complete integer/float operator set (true division, floor
@@ -19,7 +20,9 @@ from ..compiler.dsl import func, struct
 
 @func()
 def int_true_div(a: i32, b: i32) -> f64:
-    return a / b
+    # an integer is not implicitly converted to a float, and a runtime
+    # ``int / int`` is not a true division any more: convert explicitly
+    return int_to_float(a, f64) / int_to_float(b, f64)
 
 
 @func()
@@ -84,17 +87,17 @@ def int_pow_const(a: i32) -> i32:
 
 @func()
 def int_pow_neg_const(a: i32) -> f64:
-    return a ** -2
+    return int_to_float(a, f64) ** -2
 
 
 @func()
 def int_pow_runtime(a: i32, e: i32) -> f64:
-    return a ** e
+    return int_to_float(a, f64) ** int_to_float(e, f64)
 
 
 @func()
 def uint_pow_runtime(a: u64, e: u64) -> f64:
-    return a ** e
+    return int_to_float(a, f64) ** int_to_float(e, f64)
 
 
 @func()
@@ -135,7 +138,7 @@ def augmented_ops(a: i32, b: i32) -> f64:
     a -= b
     a *= b
     a //= b
-    return a / b
+    return int_to_float(a, f64) / int_to_float(b, f64)
 
 
 @struct()

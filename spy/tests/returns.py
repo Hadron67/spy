@@ -11,6 +11,7 @@ from ..compiler import (
 )
 from ..compiler.dsl import func
 from ..compiler.syntax import Comptime, Option
+from ..std.int import truncate
 from .structs import Large, Small, struct_mirror
 
 # ---------------------------------------------------------------------------
@@ -76,7 +77,7 @@ def mixed_multi(x: i32) -> tuple[i32, Large, Small]:
 @func()
 def use_mixed_multi(x: i32) -> i32:
     n, large, small = mixed_multi(x)
-    return n * 10000 + small.b * 1000 + large.d * 100 + small.a
+    return n * 10000 + small.b * 1000 + truncate(large.d, i32) * 100 + small.a
 
 
 @func()
@@ -87,7 +88,7 @@ def big_first(x: i32) -> tuple[Large, i32]:
 @func()
 def use_big_first(x: i32) -> i32:
     large, n = big_first(x)
-    return n * 1000 + large.d
+    return n * 1000 + truncate(large.d, i32)
 
 
 @func()
@@ -98,7 +99,7 @@ def two_larges(x: i32) -> tuple[Large, Large]:
 @func()
 def use_two_larges(x: i32) -> i32:
     p, q = two_larges(x)
-    return p.d * 100 + q.d
+    return truncate(p.d, i32) * 100 + truncate(q.d, i32)
 
 
 @func()
@@ -127,7 +128,7 @@ def nested_multi(x: i32) -> tuple[i32, tuple[i32, Large], Small]:
 @func()
 def use_nested_multi(x: i32) -> i32:
     n, (m, large), small = nested_multi(x)
-    return n * 100000 + m * 10000 + large.d * 100 + small.b
+    return n * 100000 + m * 10000 + truncate(large.d, i32) * 100 + small.b
 
 
 @func()
@@ -138,7 +139,7 @@ def forward_nested_multi(x: i32) -> tuple[i32, tuple[i32, Large], Small]:
 @func()
 def use_forward_nested_multi(x: i32) -> i32:
     n, (m, large), small = forward_nested_multi(x)
-    return n * 100000 + m * 10000 + large.d * 100 + small.b
+    return n * 100000 + m * 10000 + truncate(large.d, i32) * 100 + small.b
 
 
 @func()
@@ -147,7 +148,7 @@ def packed_nested_multi(x: i32) -> i32:
     # result being a tuple value of its own: indexed nested (see
     # ``test_nested_packed_into_a_plain_variable``)
     packed = nested_multi(x)
-    return packed[0] * 100000 + packed[1][0] * 10000 + packed[1][1].d * 100 + packed[2].b
+    return packed[0] * 100000 + packed[1][0] * 10000 + truncate(packed[1][1].d, i32) * 100 + packed[2].b
 
 
 @func()
@@ -158,7 +159,7 @@ def nested_group_first(x: i32) -> tuple[tuple[Large, i32], i32]:
 @func()
 def use_nested_group_first(x: i32) -> i32:
     (large, n), m = nested_group_first(x)
-    return large.d * 1000 + n * 100 + m
+    return truncate(large.d, i32) * 1000 + n * 100 + m
 
 
 @func()
@@ -172,7 +173,7 @@ def group_target_held_whole(x: i32) -> i32:
     # runtime value of its own now, so it can be held in a plain variable (it
     # used to have to be unpacked into a tuple target)
     _n, inner, _small = nested_multi(x)
-    return inner[0] + inner[1].d
+    return inner[0] + truncate(inner[1].d, i32)
 
 
 @func()
@@ -263,7 +264,7 @@ def infer_mixed(x: i32):
 @func()
 def use_infer_mixed(x: i32) -> i32:
     n, large, small = infer_mixed(x)
-    return n * 10000 + small.b * 1000 + large.d * 100 + small.a
+    return n * 10000 + small.b * 1000 + truncate(large.d, i32) * 100 + small.a
 
 
 @func()
@@ -274,7 +275,7 @@ def infer_nested(x: i32):
 @func()
 def use_infer_nested(x: i32) -> i32:
     n, (m, large), small = infer_nested(x)
-    return n * 100000 + m * 10000 + large.d * 100 + small.b
+    return n * 100000 + m * 10000 + truncate(large.d, i32) * 100 + small.b
 
 
 @func()
@@ -285,7 +286,7 @@ def infer_group_first(x: i32):
 @func()
 def use_infer_group_first(x: i32) -> i32:
     (large, n), m = infer_group_first(x)
-    return large.d * 1000 + n * 100 + m
+    return truncate(large.d, i32) * 1000 + n * 100 + m
 
 
 @func()
@@ -398,7 +399,7 @@ def nested_struct(x: i32) -> tuple[i32, i32, tuple[Large, Small]]:
 @func()
 def use_packed_nested_struct(x: i32) -> i32:
     ret = nested_struct(x)
-    return ret[0] * 10000 + ret[1] * 1000 + ret[2][0].d * 10 + ret[2][1].b
+    return ret[0] * 10000 + ret[1] * 1000 + truncate(ret[2][0].d, i32) * 10 + ret[2][1].b
 
 
 @func()
@@ -416,14 +417,14 @@ def nested_groups(x: i32) -> tuple[tuple[Large, i32], i32, tuple[Small, i32]]:
 @func()
 def use_packed_nested_groups(x: i32) -> i32:
     ret = nested_groups(x)
-    return ret[0][0].d * 100000 + ret[0][1] * 10000 + ret[1] * 100 + ret[2][0].b
+    return truncate(ret[0][0].d, i32) * 100000 + ret[0][1] * 10000 + ret[1] * 100 + ret[2][0].b
 
 
 @func()
 def use_destructured_nested_groups(x: i32) -> i32:
     # the same shape destructured: each struct group is bound whole
     (large, n), m, (small, k) = nested_groups(x)
-    return large.d * 1000 + n * 100 + m * 10 + small.b + k
+    return truncate(large.d, i32) * 1000 + n * 100 + m * 10 + small.b + k
 
 
 @func()
@@ -438,7 +439,7 @@ def use_packed_nested_deep_struct(x: i32) -> i32:
     return (
         ret[0] * 100000
         + ret[1][0].b * 10000
-        + ret[1][1][0].d * 1000
+        + truncate(ret[1][1][0].d, i32) * 1000
         + ret[1][1][1] * 100
     )
 

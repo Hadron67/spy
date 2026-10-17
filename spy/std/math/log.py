@@ -28,6 +28,8 @@ from ...compiler import f32, f64, i32, i64, typeof, u32, u64, usize
 from ...compiler.dsl import func
 from ...compiler.syntax import array, comptime, const_comptime
 from ..core import Numeric, bitcast, coerce, compile_error, int_to_float_unchecked
+from ..float import float_truncate
+from ..int import truncate
 from .pow import _hex, _invalid, _invalidf
 
 # ``log_data.c``: the split ``ln2``, the two polynomials and the reduction
@@ -287,11 +289,11 @@ def log[T: Numeric](x: T) -> T:
         y = _LOGF_A1 * r + _LOGF_A2
         y = _LOGF_A0 * r2 + y
         y = y * r2 + (y0 + r)
-        return coerce(y, typ)
+        return float_truncate(y, typ)
     elif typ == f64:
         xd = coerce(x, f64)
         ix = bitcast(xd, u64)
-        top = coerce(ix >> 48, u32)
+        top = truncate(ix >> 48, u32)
         if ix - _LOG_LO < _LOG_NEAR:
             # inputs close to 1.0
             if ix == 0x3FF0000000000000:

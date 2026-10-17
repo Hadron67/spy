@@ -16,7 +16,7 @@ The public entry points are :func:`sin`, :func:`cos` and :func:`tan`, generic ov
 
 from typing import Literal
 
-from ...compiler import bool, f32, f64, i32, typeof, u32, u64
+from ...compiler import bool, f32, f64, i32, typeof, u32, u64, usize
 from ...compiler.dsl import func
 from ...compiler.syntax import Array, Comptime, array, comptime, const_comptime
 from ..core import (
@@ -27,6 +27,8 @@ from ..core import (
     int_to_float_unchecked,
     undefined,
 )
+from ..float import float_truncate
+from ..int import int_cast, truncate
 
 # ---------------------------------------------------------------------------
 # constants
@@ -119,6 +121,12 @@ _TWO_PI = 6.283185307179586
 # ---------------------------------------------------------------------------
 
 
+@func(inline=True)
+def _ix(i: i32) -> usize:
+    """A runtime ``i32`` index as a ``usize`` (non-negative at every use here)."""
+    return int_cast(i, usize)
+
+
 @func()
 def _scalbn(x: f64, n: i32) -> f64:
     """``x * 2**n``, computed by repeated (exact) scaling by two.  ``n`` stays
@@ -194,9 +202,9 @@ def _tan_kernel(is_32: Comptime[bool], x: f64, y: f64, odd: i32) -> f64:
         if odd != 0:
             return -1.0 / r32
         return r32
-    hx = coerce(bitcast(x, u64) >> 32, u32)
+    hx = truncate(bitcast(x, u64) >> 32, u32)
     big = (hx & 0x7FFFFFFF) >= 0x3FE59428  # |x| >= 0.6744
-    sign = coerce(hx >> 31, i32)
+    sign = int_cast(hx >> 31, i32)
     xa: f64 = x
     ya: f64 = y
     if big:
@@ -213,7 +221,7 @@ def _tan_kernel(is_32: Comptime[bool], x: f64, y: f64, odd: i32) -> f64:
     r = ya + z * (s * (r + v) + ya) + s * _DT0
     w = xa + r
     if big:
-        s = 1.0 - 2.0 * coerce(odd, f64)
+        s = 1.0 - 2.0 * int_to_float_unchecked(odd, f64)
         v = s - 2.0 * (xa + (r - w * w / (w + s)))
         if sign != 0:
             return -v
@@ -303,9 +311,9 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
     i = 0
     while i <= m:
         if jf < 0:
-            f[i] = 0.0
+            f[_ix(i)] = 0.0
         else:
-            f[i] = int_to_float_unchecked(ipio2[jf], f64)
+            f[_ix(i)] = int_to_float_unchecked(ipio2[_ix(jf)], f64)
         jf = jf + 1
         i = i + 1
 
@@ -315,9 +323,9 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
         fw = 0.0
         j = 0
         while j <= jx:
-            fw = fw + x[j] * f[jx + i - j]
+            fw = fw + x[_ix(j)] * f[_ix(jx + i - j)]
             j = j + 1
-        q[i] = fw
+        q[_ix(i)] = fw
         i = i + 1
 
     jz = jk
@@ -328,12 +336,12 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
     while True:
         # distill q[] into iq[] reversingly
         j = jz
-        z = q[jz]
+        z = q[_ix(jz)]
         i = 0
         while j > 0:
             fw = int_to_float_unchecked(float_to_int_unchecked(_M24 * z, i32), f64)
-            iq[i] = float_to_int_unchecked(z - _P24 * fw, i32)
-            z = q[j - 1] + fw
+            iq[_ix(i)] = float_to_int_unchecked(z - _P24 * fw, i32)
+            z = q[_ix(j - 1)] + fw
             i = i + 1
             j = j - 1
 
@@ -344,12 +352,12 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
         z = z - int_to_float_unchecked(n, f64)
         ih = 0
         if q0 > 0:
-            ii: i32 = iq[jz - 1] >> (24 - q0)
+            ii: i32 = iq[_ix(jz - 1)] >> (24 - q0)
             n = n + ii
-            iq[jz - 1] = iq[jz - 1] - (ii << (24 - q0))
-            ih = iq[jz - 1] >> (23 - q0)
+            iq[_ix(jz - 1)] = iq[_ix(jz - 1)] - (ii << (24 - q0))
+            ih = iq[_ix(jz - 1)] >> (23 - q0)
         elif q0 == 0:
-            ih = iq[jz - 1] >> 23
+            ih = iq[_ix(jz - 1)] >> 23
         elif z >= 0.5:
             ih = 2
 
@@ -359,19 +367,19 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
             carry: i32 = 0
             i = 0
             while i < jz:
-                jj: i32 = iq[i]
+                jj: i32 = iq[_ix(i)]
                 if carry == 0:
                     if jj != 0:
                         carry = 1
-                        iq[i] = 0x1000000 - jj
+                        iq[_ix(i)] = 0x1000000 - jj
                 else:
-                    iq[i] = 0xFFFFFF - jj
+                    iq[_ix(i)] = 0xFFFFFF - jj
                 i = i + 1
             if q0 > 0:
                 if q0 == 1:
-                    iq[jz - 1] = iq[jz - 1] & 0x7FFFFF
+                    iq[_ix(jz - 1)] = iq[_ix(jz - 1)] & 0x7FFFFF
                 elif q0 == 2:
-                    iq[jz - 1] = iq[jz - 1] & 0x3FFFFF
+                    iq[_ix(jz - 1)] = iq[_ix(jz - 1)] & 0x3FFFFF
             if ih == 2:
                 z = 1.0 - z
                 if carry != 0:
@@ -383,21 +391,21 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
             acc: i32 = 0
             i = jz - 1
             while i >= jk:
-                acc = acc | iq[i]
+                acc = acc | iq[_ix(i)]
                 i = i - 1
             if acc == 0:
                 k = 1
-                while iq[jk - k] == 0:
+                while iq[_ix(jk - k)] == 0:
                     k = k + 1
                 i = jz + 1
                 while i <= jz + k:
-                    f[jx + i] = int_to_float_unchecked(ipio2[jv + i], f64)
+                    f[_ix(jx + i)] = int_to_float_unchecked(ipio2[_ix(jv + i)], f64)
                     fw = 0.0
                     j = 0
                     while j <= jx:
-                        fw = fw + x[j] * f[jx + i - j]
+                        fw = fw + x[_ix(j)] * f[_ix(jx + i - j)]
                         j = j + 1
-                    q[i] = fw
+                    q[_ix(i)] = fw
                     i = i + 1
                 jz = jz + k
                 need = True
@@ -409,25 +417,25 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
     if z == 0.0:
         jz = jz - 1
         q0 = q0 - 24
-        while iq[jz] == 0:
+        while iq[_ix(jz)] == 0:
             jz = jz - 1
             q0 = q0 - 24
     else:
         z = _scalbn(z, -q0)
         if z >= _P24:
             fw = int_to_float_unchecked(float_to_int_unchecked(_M24 * z, i32), f64)
-            iq[jz] = float_to_int_unchecked(z - _P24 * fw, i32)
+            iq[_ix(jz)] = float_to_int_unchecked(z - _P24 * fw, i32)
             jz = jz + 1
             q0 = q0 + 24
-            iq[jz] = float_to_int_unchecked(fw, i32)
+            iq[_ix(jz)] = float_to_int_unchecked(fw, i32)
         else:
-            iq[jz] = float_to_int_unchecked(z, i32)
+            iq[_ix(jz)] = float_to_int_unchecked(z, i32)
 
     # convert the integer "bit" chunks to floating point
     fw = _scalbn(1.0, q0)
     i = jz
     while i >= 0:
-        q[i] = fw * int_to_float_unchecked(iq[i], f64)
+        q[_ix(i)] = fw * int_to_float_unchecked(iq[_ix(i)], f64)
         fw = fw * _M24
         i = i - 1
 
@@ -437,9 +445,9 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
         fw = 0.0
         k = 0
         while k <= jp and k <= jz - i:
-            fw = fw + pio2[k] * q[i + k]
+            fw = fw + pio2[_ix(k)] * q[_ix(i + k)]
             k = k + 1
-        fq[jz - i] = fw
+        fq[_ix(jz - i)] = fw
         i = i - 1
 
     # compress fq[] into y[]
@@ -449,7 +457,7 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
         fw = 0.0
         i = jz
         while i >= 0:
-            fw = fw + fq[i]
+            fw = fw + fq[_ix(i)]
             i = i - 1
         y0s = fw
         if ih != 0:
@@ -459,7 +467,7 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
     fw = 0.0
     i = jz
     while i >= 0:
-        fw = fw + fq[i]
+        fw = fw + fq[_ix(i)]
         i = i - 1
     y0s = fw
     if ih != 0:
@@ -467,7 +475,7 @@ def _rem_pio2_large(x: Array[f64, Literal[3]], e0: i32, nx: i32, prec: i32) -> t
     fw = fq[0] - fw
     i = 1
     while i <= jz:
-        fw = fw + fq[i]
+        fw = fw + fq[_ix(i)]
         i = i + 1
     y1s = fw
     if ih != 0:
@@ -500,8 +508,8 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
         if ix >= 0x7F800000:
             return 0, xf - xf, 0.0
         sgn = bits >> 31
-        e032 = coerce(ix >> 23, i32) - (0x7F + 23)
-        u2 = coerce(ix, u32) - bitcast(e032 << 23, u32)
+        e032 = int_cast(ix >> 23, i32) - (0x7F + 23)
+        u2 = truncate(ix, u32) - bitcast(e032 << 23, u32)
         tx32: Array[f64, Literal[3]] = undefined()
         tx32[0] = coerce(bitcast(u2, f32), f64)
         tx32[1] = 0.0
@@ -574,8 +582,8 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
             r = xf - fn * _PIO2_1
             w = fn * _PIO2_1T
         y0b = r - w
-        ey = coerce((bitcast(y0b, u64) >> 52) & 0x7FF, i32)
-        ex = coerce(ix64 >> 20, i32)
+        ey = int_cast((bitcast(y0b, u64) >> 52) & 0x7FF, i32)
+        ex = int_cast(ix64 >> 20, i32)
         if ex - ey > 16:
             # second round
             t = r
@@ -583,7 +591,7 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
             r = t - w
             w = fn * _PIO2_2T - ((t - r) - w)
             y0b = r - w
-            ey = coerce((bitcast(y0b, u64) >> 52) & 0x7FF, i32)
+            ey = int_cast((bitcast(y0b, u64) >> 52) & 0x7FF, i32)
             if ex - ey > 49:
                 # third round
                 t = r
@@ -606,9 +614,9 @@ def _rem_pio2(is_32: Comptime[bool], bits: u64, xf: f64) -> tuple[i32, f64, f64]
     z = (z - tx[1]) * _P24
     tx[2] = z
     i: i32 = 2
-    while tx[i] == 0.0:
+    while tx[_ix(i)] == 0.0:
         i = i - 1
-    e0 = coerce(ix64 >> 20, i32) - (0x3FF + 23)
+    e0 = int_cast(ix64 >> 20, i32) - (0x3FF + 23)
     n, ty0, ty1 = _rem_pio2_large(tx, e0, i + 1, 1)
     if sign != 0:
         return -n, -ty0, -ty1
@@ -656,20 +664,20 @@ def sin[T](x: T) -> T:
         if ix <= 0x3F490FDA:
             if ix < 0x39800000:
                 return x
-            return coerce(_sin_kernel(True, xf64, 0.0, 0), typ)
+            return float_truncate(_sin_kernel(True, xf64, 0.0, 0), typ)
         neg: bool = (bits >> 31) != 0
         if ix <= 0x407B53D1:
             if ix <= 0x4016CBE3:
-                return coerce(-_cos_kernel(True, xf64 + _PIO2, 0.0) if neg else _cos_kernel(True, xf64 - _PIO2, 0.0), typ)
-            return coerce(_sin_kernel(True, -(xf64 + _PI) if neg else -(xf64 - _PI), 0.0, 0), typ)
+                return float_truncate(-_cos_kernel(True, xf64 + _PIO2, 0.0) if neg else _cos_kernel(True, xf64 - _PIO2, 0.0), typ)
+            return float_truncate(_sin_kernel(True, -(xf64 + _PI) if neg else -(xf64 - _PI), 0.0, 0), typ)
         if ix <= 0x40E231D5:
             if ix <= 0x40AFEDDF:
-                return coerce(_cos_kernel(True, xf64 + _THREE_PIO2, 0.0) if neg else -_cos_kernel(True, xf64 - _THREE_PIO2, 0.0), typ)
-            return coerce(_sin_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0, 0), typ)
+                return float_truncate(_cos_kernel(True, xf64 + _THREE_PIO2, 0.0) if neg else -_cos_kernel(True, xf64 - _THREE_PIO2, 0.0), typ)
+            return float_truncate(_sin_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0, 0), typ)
         if ix >= 0x7F800000:
-            return coerce(xf64 - xf64, typ)
+            return float_truncate(xf64 - xf64, typ)
         n, y0, y1 = _rem_pio2(True, coerce(bits, u64), coerce(x, f64))
-        return coerce(_sin_switch(True, n, y0, y1), typ)
+        return float_truncate(_sin_switch(True, n, y0, y1), typ)
     elif typ == f64:
         bits64 = bitcast(x, u64)
         ix64 = (bits64 >> 32) & 0x7FFFFFFF
@@ -697,20 +705,20 @@ def cos[T](x: T) -> T:
         if ix <= 0x3F490FDA:
             if ix < 0x39800000:
                 return coerce(1.0, typ)
-            return coerce(_cos_kernel(True, xf64, 0.0), typ)
+            return float_truncate(_cos_kernel(True, xf64, 0.0), typ)
         neg = (bits >> 31) != 0
         if ix <= 0x407B53D1:
             if ix > 0x4016CBE3:
-                return coerce(-_cos_kernel(True, xf64 + _PI if neg else xf64 - _PI, 0.0), typ)
-            return coerce(_sin_kernel(True, xf64 + _PIO2 if neg else _PIO2 - xf64, 0.0, 0), typ)
+                return float_truncate(-_cos_kernel(True, xf64 + _PI if neg else xf64 - _PI, 0.0), typ)
+            return float_truncate(_sin_kernel(True, xf64 + _PIO2 if neg else _PIO2 - xf64, 0.0, 0), typ)
         if ix <= 0x40E231D5:
             if ix > 0x40AFEDDF:
-                return coerce(_cos_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0), typ)
-            return coerce(_sin_kernel(True, -xf64 - _THREE_PIO2 if neg else xf64 - _THREE_PIO2, 0.0, 0), typ)
+                return float_truncate(_cos_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0), typ)
+            return float_truncate(_sin_kernel(True, -xf64 - _THREE_PIO2 if neg else xf64 - _THREE_PIO2, 0.0, 0), typ)
         if ix >= 0x7F800000:
-            return coerce(xf64 - xf64, typ)
+            return float_truncate(xf64 - xf64, typ)
         n, y0, y1 = _rem_pio2(True, bits, xf64)
-        return coerce(_cos_switch(True, n, y0, y1), typ)
+        return float_truncate(_cos_switch(True, n, y0, y1), typ)
     elif typ == f64:
         bits64 = bitcast(x, u64)
         ix64 = (bits64 >> 32) & 0x7FFFFFFF
@@ -740,19 +748,19 @@ def tan[T](x: T) -> T:
         if ix <= 0x3F490FDA:
             if ix < 0x39800000:
                 return x
-            return coerce(_tan_kernel(True, xf64, 0.0, 0), typ)
+            return float_truncate(_tan_kernel(True, xf64, 0.0, 0), typ)
         if ix <= 0x407B53D1:
             if ix <= 0x4016CBE3:
-                return coerce(_tan_kernel(True, xf64 + _PIO2 if neg else xf64 - _PIO2, 0.0, 1), typ)
-            return coerce(_tan_kernel(True, xf64 + _PI if neg else xf64 - _PI, 0.0, 0), typ)
+                return float_truncate(_tan_kernel(True, xf64 + _PIO2 if neg else xf64 - _PIO2, 0.0, 1), typ)
+            return float_truncate(_tan_kernel(True, xf64 + _PI if neg else xf64 - _PI, 0.0, 0), typ)
         if ix <= 0x40E231D5:
             if ix <= 0x40AFEDDF:
-                return coerce(_tan_kernel(True, xf64 + _THREE_PIO2 if neg else xf64 - _THREE_PIO2, 0.0, 1), typ)
-            return coerce(_tan_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0, 0), typ)
+                return float_truncate(_tan_kernel(True, xf64 + _THREE_PIO2 if neg else xf64 - _THREE_PIO2, 0.0, 1), typ)
+            return float_truncate(_tan_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0, 0), typ)
         if ix >= 0x7F800000:
-            return coerce(xf64 - xf64, typ)
+            return float_truncate(xf64 - xf64, typ)
         n, y0, y1 = _rem_pio2(True, coerce(bits, u64), xf64)
-        return coerce(_tan_kernel(True, y0, y1, n & 1), typ)
+        return float_truncate(_tan_kernel(True, y0, y1, n & 1), typ)
     elif typ == f64:
         bits64 = bitcast(x, u64)
         ix64 = (bits64 >> 32) & 0x7FFFFFFF

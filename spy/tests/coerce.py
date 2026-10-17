@@ -3,6 +3,7 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    f32,
     f64,
     i8,
     i32,
@@ -28,12 +29,16 @@ from ..compiler.syntax import (
     ref,
 )
 from ..std.core import coerce, const_array, typed_undefined
+from ..std.float import float_truncate
+from ..std.int import int_to_float, truncate
 
 # ---------------------------------------------------------------------------
 # ``std.core.coerce(value, T)``: materialize ``value`` as the spy type ``T`` -
 # the same conversion a store into a location of ``T`` performs.  A
 # compile-time value is converted in Python and stays compile-time; a runtime
-# value gets the numeric conversion ``T`` needs (widening or narrowing)
+# value only widens (``src.is_subtype_of(dst)``) - a narrowing or an
+# integer -> float conversion has to be spelled out (``std.int.truncate``,
+# ``std.float.float_truncate``, ``std.int.int_to_float``)
 # ---------------------------------------------------------------------------
 
 
@@ -44,12 +49,31 @@ def coerce_widen(x: u32) -> u64:
 
 @func()
 def coerce_narrow(x: i32) -> i8:
+    # a runtime narrowing is no longer an implicit conversion: ``coerce`` only
+    # widens, so this is a compile error (see ``truncate`` below)
     return coerce(x, i8)
 
 
 @func()
 def coerce_int_to_float(x: i32) -> f64:
+    # likewise a runtime integer no longer converts to a float implicitly
     return coerce(x, f64)
+
+
+@func()
+def truncate_narrow(x: i32) -> i8:
+    # the explicit narrowing: ``truncate`` to the same-signedness type
+    return truncate(x, i8)
+
+
+@func()
+def int_to_float_convert(x: i32) -> f64:
+    return int_to_float(x, f64)
+
+
+@func()
+def float_truncate_narrow(x: f64) -> f32:
+    return float_truncate(x, f32)
 
 
 @func()
@@ -269,12 +293,24 @@ class SpyCoerceTest(TestCase):
         self.assertEqual(coerce_widen(0xFFFFFFFF), 0xFFFFFFFF)
 
     def test_narrow(self) -> None:
-        self.assertEqual(coerce_narrow(100), 100)
-        # the high bits are dropped: 128 truncates to the i8 value -128
-        self.assertEqual(coerce_narrow(128), -128)
+        # a runtime narrowing is a compile error now; the explicit form is
+        # ``std.int.truncate``, which drops the high bits (128 -> -128)
+        with self.assertRaises(CompileError):
+            coerce_narrow(100)
+        self.assertEqual(truncate_narrow(100), 100)
+        self.assertEqual(truncate_narrow(128), -128)
 
     def test_int_to_float(self) -> None:
-        self.assertEqual(coerce_int_to_float(3), 3.0)
+        # a runtime integer no longer converts to a float implicitly; the
+        # explicit form is ``std.int.int_to_float``
+        with self.assertRaises(CompileError):
+            coerce_int_to_float(3)
+        self.assertEqual(int_to_float_convert(3), 3.0)
+
+    def test_float_narrow(self) -> None:
+        # ``std.float.float_truncate`` is the explicit ``f64`` -> ``f32``
+        # narrowing
+        self.assertAlmostEqual(float_truncate_narrow(1.5), 1.5)
 
     def test_comptime_fold(self) -> None:
         self.assertEqual(coerce_comptime_fold(), 1)
