@@ -28,8 +28,8 @@ NaN), ``NaN``/``+-inf`` come out unchanged and ``cbrt(+-0)`` is ``+-0``.
 
 from ...compiler import f32, f64, typeof, u32, u64
 from ...compiler.dsl import func
-from ...compiler.syntax import Comptime, comptime
-from ..core import Numeric, bitcast, coerce
+from ...compiler.syntax import comptime
+from ..core import Numeric, bitcast, coerce, compile_error
 
 # ``cbrt.c`` (f64): the exponent bias folded into the bits for the rough
 # estimate, and the polynomial approximating ``1/cbrt(r)`` with error < 2**-23.5.
@@ -57,8 +57,7 @@ def cbrt[T: Numeric](x: T) -> T:
     a port of musl's ``cbrtf``/``cbrt``."""
     comptime()
     typ = typeof(x)
-    is_32: Comptime = typ == f32
-    if is_32:
+    if typ == f32:
         ix = bitcast(x, u32)
         hx = ix & 0x7FFFFFFF
         if hx >= 0x7F800000:
@@ -83,36 +82,37 @@ def cbrt[T: Numeric](x: T) -> T:
 
         # rounding to 24 bits is perfect in round-to-nearest mode
         return coerce(t, typ)
+    elif typ == f64:
+        xd = coerce(x, f64)
+        ix = bitcast(x, u64)
+        hx = coerce(ix >> 32, u32) & 0x7FFFFFFF
+        if hx >= 0x7FF00000:
+            # cbrt(NaN, +-inf) is itself
+            return x + x
+        if hx < 0x00100000:
+            # zero or subnormal?
+            scaled = xd * coerce(_SCALE_F64, f64)
+            hx = coerce(bitcast(scaled, u64) >> 32, u32) & 0x7FFFFFFF
+            if hx == 0:
+                return x  # cbrt(+-0) is itself
+            hx = (hx // 3) + _B2_F64
+        else:
+            hx = (hx // 3) + _B1_F64
+        u = (ix & 0x8000000000000000) | (coerce(hx, u64) << 32)
+        t = bitcast(u, f64)
 
-    xd = coerce(x, f64)
-    ix = bitcast(x, u64)
-    hx = coerce(ix >> 32, u32) & 0x7FFFFFFF
-    if hx >= 0x7FF00000:
-        # cbrt(NaN, +-inf) is itself
-        return x + x
-    if hx < 0x00100000:
-        # zero or subnormal?
-        scaled = xd * coerce(_SCALE_F64, f64)
-        hx = coerce(bitcast(scaled, u64) >> 32, u32) & 0x7FFFFFFF
-        if hx == 0:
-            return x  # cbrt(+-0) is itself
-        hx = (hx // 3) + _B2_F64
-    else:
-        hx = (hx // 3) + _B1_F64
-    u = (ix & 0x8000000000000000) | (coerce(hx, u64) << 32)
-    t = bitcast(u, f64)
+        # rough cbrt to 5 bits, refined to 23 bits by the polynomial
+        r = (t * t) * (t / xd)
+        t = t * ((_P0 + r * (_P1 + r * _P2)) + ((r * r) * r) * (_P3 + r * _P4))
 
-    # rough cbrt to 5 bits, refined to 23 bits by the polynomial
-    r = (t * t) * (t / xd)
-    t = t * ((_P0 + r * (_P1 + r * _P2)) + ((r * r) * r) * (_P3 + r * _P4))
+        # round t away from zero to 23 bits
+        u = (bitcast(t, u64) + 0x80000000) & 0xFFFFFFFFC0000000
+        t = bitcast(u, f64)
 
-    # round t away from zero to 23 bits
-    u = (bitcast(t, u64) + 0x80000000) & 0xFFFFFFFFC0000000
-    t = bitcast(u, f64)
-
-    # one Newton iteration to 53 bits with error < 0.667 ulps
-    s = t * t
-    r = xd / s
-    w = t + t
-    r = (r - t) / (w + r)
-    return coerce(t + t * r, typ)
+        # one Newton iteration to 53 bits with error < 0.667 ulps
+        s = t * t
+        r = xd / s
+        w = t + t
+        r = (r - t) / (w + r)
+        return coerce(t + t * r, typ)
+    compile_error("only f32 or f64")

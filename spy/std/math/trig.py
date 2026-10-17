@@ -20,6 +20,7 @@ from ...compiler.syntax import Array, Comptime, array, comptime, const_comptime
 from ..core import (
     bitcast,
     coerce,
+    compile_error,
     float_to_int_unchecked,
     int_to_float_unchecked,
     undefined,
@@ -563,49 +564,40 @@ def sin[T](x: T) -> T:
     port of musl's ``sinf``/``sin``."""
     comptime()
     typ = typeof(x)
-    is_32: Comptime = typ == f32
-    if is_32:
+    if typ == f32:
+        xf64 = coerce(x, f64)
         bits: u32 = bitcast(x, u32)
         ix: u32 = bits & 0x7FFFFFFF
         if ix <= 0x3F490FDA:
             if ix < 0x39800000:
                 return x
-            return coerce(_sin_kernel(is_32, coerce(x, f64), 0.0, 0), typ)
+            return coerce(_sin_kernel(True, xf64, 0.0, 0), typ)
         neg: bool = (bits >> 31) != 0
         if ix <= 0x407B53D1:
             if ix <= 0x4016CBE3:
-                if neg:
-                    return coerce(-_cos_kernel(is_32, coerce(x, f64) + _PIO2, 0.0), typ)
-                return coerce(_cos_kernel(is_32, coerce(x, f64) - _PIO2, 0.0), typ)
-            if neg:
-                return coerce(_sin_kernel(is_32, -(coerce(x, f64) + _PI), 0.0, 0), typ)
-            return coerce(_sin_kernel(is_32, -(coerce(x, f64) - _PI), 0.0, 0), typ)
+                return coerce(-_cos_kernel(True, xf64 + _PIO2, 0.0) if neg else _cos_kernel(True, xf64 - _PIO2, 0.0), typ)
+            return coerce(_sin_kernel(True, -(xf64 + _PI) if neg else -(xf64 - _PI), 0.0, 0), typ)
         if ix <= 0x40E231D5:
             if ix <= 0x40AFEDDF:
-                if neg:
-                    return coerce(_cos_kernel(is_32, coerce(x, f64) + _THREE_PIO2, 0.0), typ)
-                return coerce(-_cos_kernel(is_32, coerce(x, f64) - _THREE_PIO2, 0.0), typ)
-            if neg:
-                return coerce(_sin_kernel(is_32, coerce(x, f64) + _TWO_PI, 0.0, 0), typ)
-            return coerce(_sin_kernel(is_32, coerce(x, f64) - _TWO_PI, 0.0, 0), typ)
+                return coerce(_cos_kernel(True, xf64 + _THREE_PIO2, 0.0) if neg else -_cos_kernel(True, xf64 - _THREE_PIO2, 0.0), typ)
+            return coerce(_sin_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0, 0), typ)
         if ix >= 0x7F800000:
-            xf32: f64 = coerce(x, f64)
-            return coerce(xf32 - xf32, typ)
-        n, y0, y1 = _rem_pio2(is_32, coerce(bits, u64), coerce(x, f64))
-        return coerce(_sin_switch(is_32, n, y0, y1), typ)
-
-    bits64 = bitcast(x, u64)
-    ix64 = (bits64 >> 32) & 0x7FFFFFFF
-    if ix64 <= 0x3FE921FB:
-        if ix64 < 0x3E500000:
-            return x
-        return coerce(_sin_kernel(is_32, coerce(x, f64), 0.0, 0), typ)
-    if ix64 >= 0x7FF00000:
-        xf64 = coerce(x, f64)
-        return coerce(xf64 - xf64, typ)
-    n, y0, y1 = _rem_pio2(is_32, bits64, coerce(x, f64))
-    return coerce(_sin_switch(is_32, n, y0, y1), typ)
-
+            return coerce(xf64 - xf64, typ)
+        n, y0, y1 = _rem_pio2(True, coerce(bits, u64), coerce(x, f64))
+        return coerce(_sin_switch(True, n, y0, y1), typ)
+    elif typ == f64:
+        bits64 = bitcast(x, u64)
+        ix64 = (bits64 >> 32) & 0x7FFFFFFF
+        if ix64 <= 0x3FE921FB:
+            if ix64 < 0x3E500000:
+                return x
+            return coerce(_sin_kernel(False, coerce(x, f64), 0.0, 0), typ)
+        if ix64 >= 0x7FF00000:
+            xf64 = coerce(x, f64)
+            return coerce(xf64 - xf64, typ)
+        n, y0, y1 = _rem_pio2(False, bits64, coerce(x, f64))
+        return coerce(_sin_switch(False, n, y0, y1), typ)
+    compile_error("only f32 or f64")
 
 @func()
 def cos[T](x: T) -> T:
@@ -613,48 +605,40 @@ def cos[T](x: T) -> T:
     port of musl's ``cosf``/``cos``."""
     comptime()
     typ = typeof(x)
-    is_32: Comptime = typ == f32
-    if is_32:
+    if typ == f32:
+        xf64 = coerce(x, f64)
         bits = bitcast(x, u32)
         ix = bits & 0x7FFFFFFF
         if ix <= 0x3F490FDA:
             if ix < 0x39800000:
                 return coerce(1.0, typ)
-            return coerce(_cos_kernel(is_32, coerce(x, f64), 0.0), typ)
+            return coerce(_cos_kernel(True, xf64, 0.0), typ)
         neg = (bits >> 31) != 0
         if ix <= 0x407B53D1:
             if ix > 0x4016CBE3:
-                if neg:
-                    return coerce(-_cos_kernel(is_32, coerce(x, f64) + _PI, 0.0), typ)
-                return coerce(-_cos_kernel(is_32, coerce(x, f64) - _PI, 0.0), typ)
-            if neg:
-                return coerce(_sin_kernel(is_32, coerce(x, f64) + _PIO2, 0.0, 0), typ)
-            return coerce(_sin_kernel(is_32, _PIO2 - coerce(x, f64), 0.0, 0), typ)
+                return coerce(-_cos_kernel(True, xf64 + _PI if neg else xf64 - _PI, 0.0), typ)
+            return coerce(_sin_kernel(True, xf64 + _PIO2 if neg else _PIO2 - xf64, 0.0, 0), typ)
         if ix <= 0x40E231D5:
             if ix > 0x40AFEDDF:
-                if neg:
-                    return coerce(_cos_kernel(is_32, coerce(x, f64) + _TWO_PI, 0.0), typ)
-                return coerce(_cos_kernel(is_32, coerce(x, f64) - _TWO_PI, 0.0), typ)
-            if neg:
-                return coerce(_sin_kernel(is_32, -coerce(x, f64) - _THREE_PIO2, 0.0, 0), typ)
-            return coerce(_sin_kernel(is_32, coerce(x, f64) - _THREE_PIO2, 0.0, 0), typ)
+                return coerce(_cos_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0), typ)
+            return coerce(_sin_kernel(True, -xf64 - _THREE_PIO2 if neg else xf64 - _THREE_PIO2, 0.0, 0), typ)
         if ix >= 0x7F800000:
-            xfc32: f64 = coerce(x, f64)
-            return coerce(xfc32 - xfc32, typ)
-        n, y0, y1 = _rem_pio2(is_32, coerce(bits, u64), coerce(x, f64))
-        return coerce(_cos_switch(is_32, n, y0, y1), typ)
-
-    bits64 = bitcast(x, u64)
-    ix64 = (bits64 >> 32) & 0x7FFFFFFF
-    if ix64 <= 0x3FE921FB:
-        if ix64 < 0x3E46A09E:
-            return coerce(1.0, typ)
-        return coerce(_cos_kernel(is_32, coerce(x, f64), 0.0), typ)
-    if ix64 >= 0x7FF00000:
-        xfc64 = coerce(x, f64)
-        return coerce(xfc64 - xfc64, typ)
-    n, y0, y1 = _rem_pio2(is_32, bits64, coerce(x, f64))
-    return coerce(_cos_switch(is_32, n, y0, y1), typ)
+            return coerce(xf64 - xf64, typ)
+        n, y0, y1 = _rem_pio2(True, bits, xf64)
+        return coerce(_cos_switch(True, n, y0, y1), typ)
+    elif typ == f64:
+        bits64 = bitcast(x, u64)
+        ix64 = (bits64 >> 32) & 0x7FFFFFFF
+        if ix64 <= 0x3FE921FB:
+            if ix64 < 0x3E46A09E:
+                return coerce(1.0, typ)
+            return coerce(_cos_kernel(False, coerce(x, f64), 0.0), typ)
+        if ix64 >= 0x7FF00000:
+            xfc64 = coerce(x, f64)
+            return coerce(xfc64 - xfc64, typ)
+        n, y0, y1 = _rem_pio2(False, bits64, coerce(x, f64))
+        return coerce(_cos_switch(False, n, y0, y1), typ)
+    compile_error("only f32 or f64")
 
 
 @func()

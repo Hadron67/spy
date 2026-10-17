@@ -21,8 +21,8 @@ changes the returned number.
 
 from ...compiler import f32, f64, typeof, u16, u32, u64, usize
 from ...compiler.dsl import func
-from ...compiler.syntax import Comptime, array, comptime, const_comptime
-from ..core import Numeric, bitcast, coerce
+from ...compiler.syntax import array, comptime, const_comptime
+from ..core import Numeric, bitcast, coerce, compile_error
 
 
 @func(inline=True)
@@ -103,8 +103,7 @@ def sqrt[T: Numeric](x: T) -> T:
     implementation: a port of musl's ``sqrtf``/``sqrt``."""
     comptime()
     typ = typeof(x)
-    is_32: Comptime = typ == f32
-    if is_32:
+    if typ == f32:
         ix = bitcast(x, u32)
         if ix - 0x00800000 >= 0x7F800000 - 0x00800000:
             if ix * 2 == 0:
@@ -133,39 +132,40 @@ def sqrt[T: Numeric](x: T) -> T:
         d1 = s - d0
         s = (s + (d1 >> 31)) & 0x007FFFFF
         return coerce(bitcast(s | ey, f32), typ)
-
-    ix = bitcast(x, u64)
-    top = ix >> 52
-    if top - 0x001 >= 0x7FF - 0x001:
-        if ix * 2 == 0:
-            return x
-        if ix == 0x7FF0000000000000:
-            return x
-        if ix > 0x7FF0000000000000:
-            return coerce(_invalid_f64(coerce(x, f64)), typ)
-        # x is subnormal: scale it into the normal range first
-        ix = bitcast(coerce(x, f64) * 4503599627370496.0, u64)
-        top = (ix >> 52) - 52
-    m = (ix << 11) | 0x8000000000000000
-    if (top & 1) != 0:
-        m = m >> 1
-    top = (top + 0x3FF) >> 1
-    r = coerce(_rsqrt_tab(coerce((ix >> 46) % 128, usize)) << 16, u64)
-    s = coerce(_mul32(coerce(m >> 32, u32), coerce(r, u32)), u64)
-    d = coerce(_mul32(coerce(s, u32), coerce(r, u32)), u64)
-    u = 0xC0000000 - d
-    r = coerce(_mul32(coerce(r, u32), coerce(u, u32)) << 1, u64)
-    s = coerce(_mul32(coerce(s, u32), coerce(u, u32)) << 1, u64)
-    d = coerce(_mul32(coerce(s, u32), coerce(r, u32)), u64)
-    u = 0xC0000000 - d
-    r = coerce(_mul32(coerce(r, u32), coerce(u, u32)) << 1, u64)
-    r = r << 32
-    s = _mul64(m, r)
-    d = _mul64(s, r)
-    u = (coerce(0xC0000000, u64) << 32) - d
-    s = _mul64(s, u)
-    s = (s - 2) >> 9
-    d0 = (m << 42) - s * s
-    d1 = s - d0
-    s = (s + (d1 >> 63)) & 0x000FFFFFFFFFFFFF
-    return coerce(bitcast(s | (top << 52), f64), typ)
+    elif typ == f64:
+        ix = bitcast(x, u64)
+        top = ix >> 52
+        if top - 0x001 >= 0x7FF - 0x001:
+            if ix * 2 == 0:
+                return x
+            if ix == 0x7FF0000000000000:
+                return x
+            if ix > 0x7FF0000000000000:
+                return coerce(_invalid_f64(coerce(x, f64)), typ)
+            # x is subnormal: scale it into the normal range first
+            ix = bitcast(coerce(x, f64) * 4503599627370496.0, u64)
+            top = (ix >> 52) - 52
+        m = (ix << 11) | 0x8000000000000000
+        if (top & 1) != 0:
+            m = m >> 1
+        top = (top + 0x3FF) >> 1
+        r = coerce(_rsqrt_tab(coerce((ix >> 46) % 128, usize)) << 16, u64)
+        s = coerce(_mul32(coerce(m >> 32, u32), coerce(r, u32)), u64)
+        d = coerce(_mul32(coerce(s, u32), coerce(r, u32)), u64)
+        u = 0xC0000000 - d
+        r = coerce(_mul32(coerce(r, u32), coerce(u, u32)) << 1, u64)
+        s = coerce(_mul32(coerce(s, u32), coerce(u, u32)) << 1, u64)
+        d = coerce(_mul32(coerce(s, u32), coerce(r, u32)), u64)
+        u = 0xC0000000 - d
+        r = coerce(_mul32(coerce(r, u32), coerce(u, u32)) << 1, u64)
+        r = r << 32
+        s = _mul64(m, r)
+        d = _mul64(s, r)
+        u = (coerce(0xC0000000, u64) << 32) - d
+        s = _mul64(s, u)
+        s = (s - 2) >> 9
+        d0 = (m << 42) - s * s
+        d1 = s - d0
+        s = (s + (d1 >> 63)) & 0x000FFFFFFFFFFFFF
+        return coerce(bitcast(s | (top << 52), f64), typ)
+    compile_error("only f32 or f64")
