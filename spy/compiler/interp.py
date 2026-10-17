@@ -1371,11 +1371,6 @@ def _no_runtime_type(type: sval.Type) -> CompileError:
     has to declare the type such a value is resolvable at compile time with.
     A zero-sized type never gets here: it has a value (its unit value) and no
     runtime location needs to hold it."""
-    if isinstance(type, sval.TupleType):
-        return CompileError(
-            'a multi-value result must be destructured (``a, b = f()``) or held '
-            'by a compile-time variable (``a: Comptime = f()``)'
-        )
     if type.classify() == sval.SpecialTypeKind.COMPTIME:
         return CompileError(
             f'{type} is a compile-time-only type: a runtime location cannot '

@@ -428,10 +428,23 @@ class TypeVar(ScalarType):
 
 @dataclass(frozen=True)
 class TupleType(AggregateType):
-    """A Python ``tuple[T1, T2, ...]``: the return annotation of a function
-    that returns several values.  It is a compile-time type only - a tuple
-    of values has no runtime representation of its own; every function that
-    returns one delivers its elements separately (see ``make_ret_spec``)."""
+    """A Python ``tuple[T1, T2, ...]``: an aggregate of its elements, laid
+    out like a struct of the same field types (a tuple mirrors to a
+    synthesised struct with one positional field per element, see
+    ``MirLowerCache.tuple_struct``, and maps its element indices onto the
+    mirror through ``get_field_mir_indices``).  A tuple whose elements all
+    have a runtime representation is therefore an ordinary runtime
+    aggregate: a location can hold it and a value of it can be copied as a
+    whole (when every element is copyable, see ``is_copyable``).  An element
+    with no runtime representation of its own (a type, a ``bytes``, a type
+    variable) - and likewise the varying-length shape ``tuple[T, ...]`` -
+    leaves the whole tuple a compile-time-only value (see ``classify``).
+
+    Two positions treat a tuple specially: a parameter annotation passes it
+    flattened - one argument per element, which the callee rebinds into one
+    place tree (see ``fn.CompoundArgNode``) - and a return annotation is a
+    multiple return value, whose elements a function delivers separately
+    (see ``make_ret_spec``)."""
 
     types: tuple[Type, ...]
     has_ellipsis: bool
