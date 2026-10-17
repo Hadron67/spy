@@ -48,7 +48,7 @@ from spy.std.core import (
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
-from spy.std.math import sin, cos, tan, asin, acos, sqrt, cbrt, pow, exp, log
+from spy.std.math import sin, cos, tan, asin, acos, atan, atan2, sqrt, cbrt, pow, exp, log
 from spy.std.mem import Layout, layout_of, size_of, align_of
 from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
@@ -1612,9 +1612,9 @@ assert str_len() == 5
 | `std.reflect` | `TypeInfo` and its variants, `StructField`, `type_info`, `reify` |
 | `std.int` | `truncate` (builtin), `IntCastError`, `valid_range`, `try_int_cast`/`int_cast`, `FloatCastError`, `try_int_to_float`/`int_to_float`, `try_float_to_int`/`float_to_int` |
 | `std.mem` | `Layout`, `layout_of`/`size_of`/`align_of`, `AllocError`, `Allocator` (protocol), `AllocatorVtable`, `DynamicAllocator`, `CAllocator` |
-| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf` (extern declarations), `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`/`pow`/`powf`/`exp`/`expf`/`log`/`logf`/`asin`/`asinf`/`acos`/`acosf` (libm), `CError`, `FILE`, `fopen`/`fclose`/`fread`/`fwrite` |
+| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf` (extern declarations), `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`atan`/`atanf`/`atan2`/`atan2f`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`/`pow`/`powf`/`exp`/`expf`/`log`/`logf`/`asin`/`asinf`/`acos`/`acosf` (libm), `CError`, `FILE`, `fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`, `Writable`/`Readable` (protocols) |
-| `std.math` | `sin`/`cos`/`tan`/`asin`/`acos`/`sqrt`/`cbrt`/`pow`/`exp`/`log` (the implementation is chosen at compile time by the option `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode`: `llvm`/`libc`/`software`) |
+| `std.math` | `sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sqrt`/`cbrt`/`pow`/`exp`/`log` (the implementation is chosen at compile time by the option `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode`: `llvm`/`libc`/`software`) |
 | `std.vec` | `Vec[T, A]` dynamic array |
 | `std.atomic` | `MemoryOrder`/`RmwOp`, `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`, convenience wrappers |
 | `std.openmp` | `load_openmp_runtime`, `parallel_loop` |
@@ -1683,20 +1683,23 @@ def parallel_sum_count(n: i32) -> i64:
 
 `std.math.sin(x)` / `std.math.cos(x)` / `std.math.tan(x)` return the sine/cosine/tangent of an `f32` or `f64` `x` (the result
 has the same type), `std.math.asin(x)` / `std.math.acos(x)` return its arc sine (in `[-pi/2, pi/2]`) / arc cosine (in
-`[0, pi]`) (a NaN for `|x| > 1`), `std.math.sqrt(x)` returns its square root (a non-negative `x`), `std.math.cbrt(x)` its cube root (a
+`[0, pi]`) (a NaN for `|x| > 1`), `std.math.atan(x)` returns its arc tangent (in `(-pi/2, pi/2)`), `std.math.atan2(y, x)` returns the
+arc tangent of `y/x` (in `[-pi, pi]`; the two arguments take a common float type, which the result has too, and their signs
+select the quadrant), `std.math.sqrt(x)` returns its square root (a non-negative `x`), `std.math.cbrt(x)` its cube root (a
 negative `x` is fine), `std.math.pow(x, y)` raises `x` to the `y`-th power (the two arguments take a common float type,
 which the result has too), `std.math.exp(x)` returns `e**x`, and `std.math.log(x)` returns the natural logarithm `ln(x)`.
 Which implementation runs is picked **at compile time** by the host's compile-time option
-`sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode`:
+`sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode`:
 
-- `llvm` - the LLVM intrinsic (`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.asin.*`/`llvm.acos.*`/`llvm.sqrt.*`/`llvm.cbrt.*`/`llvm.pow.*`/`llvm.exp.*`/
+- `llvm` - the LLVM intrinsic (`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.asin.*`/`llvm.acos.*`/`llvm.atan.*`/`llvm.atan2.*`/`llvm.sqrt.*`/`llvm.cbrt.*`/`llvm.pow.*`/`llvm.exp.*`/
   `llvm.log.*`; `llvm.cbrt.*` is an intrinsic only from LLVM 21 on, so it is unavailable on an older LLVM);
-- `libc` - the C library `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`asinf`/`asin`/`acosf`/`acos`/`sqrtf`/`sqrt`/`cbrtf`/`cbrt`/`powf`/`pow`/`expf`/`exp`/
+- `libc` - the C library `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`asinf`/`asin`/`acosf`/`acos`/`atanf`/`atan`/`atan2f`/`atan2`/`sqrtf`/`sqrt`/`cbrtf`/`cbrt`/`powf`/`pow`/`expf`/`exp`/
   `logf`/`log` (the extern declarations in `std.c`);
 - `software` (the default, also when the option is unset) - a pure spy port of musl's `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`
   in `std.math.trig` (where they share the kernels and the argument reduction);
-  musl's `asin`/`asinf`/`acos`/`acosf` in `std.math.invtrig` (they share the `R(x**2)` rational approximation, and an
-  `f32` path evaluates it in `f64`, rounding once at the end);
+  musl's `asin`/`asinf`/`acos`/`acosf`/`atan`/`atanf`/`atan2`/`atan2f` in `std.math.invtrig` (`asin`/`acos` share the
+  `R(x**2)` rational approximation, `atan` uses an odd polynomial per interval, and `atan2` reduces the quadrants to
+  `atan`; an `f32` path evaluates the arithmetic in `f64`, rounding once at the end);
   musl's `sqrt`/`sqrtf` in `std.math.sqrt`, `cbrt`/`cbrtf` in `std.math.cbrt`, `pow`/`powf` in `std.math.pow`,
   `exp`/`expf` in `std.math.exp` (the `f64` path reuses the exp kernel of `pow`), and `log`/`logf` in `std.math.log`
   (using the full `log_data.c`/`logf_data.c` tables).
@@ -1705,14 +1708,17 @@ Only the selected implementation is typed and lowered, so the choice costs nothi
 error. The software port of `sin`/`cos` and `sqrt` is correctly rounded for both `f32` and `f64`, `tan`/`tanf`'s are about
 1 ULP, `cbrt`'s error is below
 0.667 ULP, `pow`/`powf`'s (the Arm `pow`/`powf` of musl) are below 0.54 and 0.82 ULP, `exp`/`expf`'s are about 0.51 ULP,
-and `log`/`logf`'s are about 0.51 and 0.82 ULP, and `asin`/`acos`'s are about 1 ULP. A negative `sqrt` argument (and a
+and `log`/`logf`'s are about 0.51 and 0.82 ULP, and `asin`/`acos`/`atan`/`atan2` are about 1 ULP. A negative `sqrt` argument (and a
 NaN) yields a NaN, and `sqrt(-0.0)` is `-0.0`; `cbrt` is odd (`cbrt(-x) == -cbrt(x)`), so a negative argument is computed,
 and `cbrt(+-0)` is `+-0`; `pow`'s `x**0` is `1` (including `0**0`), a negative base with an integer exponent is computed (even
 gives a positive, odd a negative, and `pow(-0.0, 3)` is `-0.0`), a negative base with a non-integer exponent yields a NaN,
 and `|x|`/`y` `+-inf`, overflow and underflow follow C's `pow`; `exp(+-0)` is `1`, `exp(-inf)` is `+0`, `exp(+inf)` is `+inf`,
 and `exp(NaN)` is NaN; `log(1)` is `+0`, `log(+-0)` is `-inf`, `log(+inf)` is `+inf`, a negative argument and `log(NaN)` are
 NaN, and a subnormal argument is computed normally. `asin(+-1)` is `+-pi/2`, `acos(1)` is `+0`, `acos(-1)` is `pi`,
-`|x| > 1` (a NaN included) yields a NaN, `asin` is odd, and `acos(+-0)` is `pi/2`.
+`|x| > 1` (a NaN included) yields a NaN, `asin` is odd, and `acos(+-0)` is `pi/2`. `atan` is odd, `atan(+-0)` is `+-0`,
+`atan(+-inf)` is `+-pi/2`, and a NaN yields a NaN; `atan2` follows C's `atan2` for the signed zeros, the four quadrants,
+`+-inf` and NaN (for example `atan2(+-0, +1)` is `+-0`, `atan2(+-0, -1)` is `+-pi`, and `atan2(+-inf, +-inf)` is `+-pi/4`
+or `+-3pi/4`).
 
 ```python
 @func()
@@ -1755,6 +1761,14 @@ def my_asin(x: f64) -> f64:
 def my_acos(x: f64) -> f64:
     return acos(x)
 
+@func()
+def my_atan(x: f64) -> f64:
+    return atan(x)
+
+@func()
+def my_atan2(y: f64, x: f64) -> f64:
+    return atan2(y, x)
+
 assert abs(my_sin(0.5) - 0.479425538604203) < 1e-15
 assert abs(my_sin(1.0) - 0.8414709848078965) < 1e-15
 assert abs(my_cos(0.5) - 0.8775825618903728) < 1e-15
@@ -1776,6 +1790,9 @@ assert abs(my_asin(0.5) - 0.5235987755982988) < 1e-15
 assert abs(my_acos(0.5) - 1.0471975511965976) < 1e-15
 assert my_acos(1.0) == 0.0
 assert abs(my_acos(-1.0) - 3.141592653589793) < 1e-15
+assert abs(my_atan(1.0) - 0.7853981633974483) < 1e-15
+assert abs(my_atan2(1.0, 1.0) - 0.7853981633974483) < 1e-15
+assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 ```
 
 ---

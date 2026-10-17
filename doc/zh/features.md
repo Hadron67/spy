@@ -48,7 +48,7 @@ from spy.std.core import (
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
-from spy.std.math import sin, cos, tan, asin, acos, sqrt, cbrt, pow, exp, log
+from spy.std.math import sin, cos, tan, asin, acos, atan, atan2, sqrt, cbrt, pow, exp, log
 from spy.std.mem import Layout, layout_of, size_of, align_of
 from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
@@ -1615,9 +1615,9 @@ assert str_len() == 5
 | `std.reflect` | `TypeInfo` 及变体、`StructField`、`type_info`、`reify` |
 | `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast`、`FloatCastError`、`try_int_to_float`/`int_to_float`、`try_float_to_int`/`float_to_int` |
 | `std.mem` | `Layout`、`layout_of`/`size_of`/`align_of`、`AllocError`、`Allocator`（协议）、`AllocatorVtable`、`DynamicAllocator`、`CAllocator` |
-| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf`（extern 声明）、`sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`/`pow`/`powf`/`exp`/`expf`/`log`/`logf`/`asin`/`asinf`/`acos`/`acosf`（libm）、`CError`、`FILE`、`fopen`/`fclose`/`fread`/`fwrite` |
+| `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf`（extern 声明）、`sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`atan`/`atanf`/`atan2`/`atan2f`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`/`pow`/`powf`/`exp`/`expf`/`log`/`logf`/`asin`/`asinf`/`acos`/`acosf`（libm）、`CError`、`FILE`、`fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`、`Writable`/`Readable`（协议） |
-| `std.math` | `sin`/`cos`/`tan`/`asin`/`acos`/`sqrt`/`cbrt`/`pow`/`exp`/`log`（实现由编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode` 在编译期选定：`llvm`/`libc`/`software`） |
+| `std.math` | `sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sqrt`/`cbrt`/`pow`/`exp`/`log`（实现由编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode` 在编译期选定：`llvm`/`libc`/`software`） |
 | `std.vec` | `Vec[T, A]` 动态数组 |
 | `std.atomic` | `MemoryOrder`/`RmwOp`、`atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`、便捷包装 |
 | `std.openmp` | `load_openmp_runtime`、`parallel_loop` |
@@ -1683,14 +1683,14 @@ def parallel_sum_count(n: i32) -> i64:
 
 ### 9.3 数学
 
-`std.math.sin(x)` / `std.math.cos(x)` / `std.math.tan(x)` 返回 `f32` 或 `f64` 的 `x` 的正弦/余弦/正切（结果类型与 `x` 相同），`std.math.asin(x)` / `std.math.acos(x)` 返回其反正弦（值域 `[-pi/2, pi/2]`）/反余弦（值域 `[0, pi]`）（`|x| > 1` 为 NaN），`std.math.sqrt(x)` 返回其平方根（非负 `x`），`std.math.cbrt(x)` 返回其立方根（可为负 `x`），`std.math.pow(x, y)` 返回 `x` 的 `y` 次幂（两个参数是相容的浮点类型，结果取它们的共同类型），`std.math.exp(x)` 返回 `e**x`，`std.math.log(x)` 返回自然对数 `ln(x)`（`x` 为 `f32` 或 `f64`）。具体用哪个实现在**编译期**由宿主的编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode` 选定：
+`std.math.sin(x)` / `std.math.cos(x)` / `std.math.tan(x)` 返回 `f32` 或 `f64` 的 `x` 的正弦/余弦/正切（结果类型与 `x` 相同），`std.math.asin(x)` / `std.math.acos(x)` 返回其反正弦（值域 `[-pi/2, pi/2]`）/反余弦（值域 `[0, pi]`）（`|x| > 1` 为 NaN），`std.math.atan(x)` 返回其反正切（值域 `(-pi/2, pi/2)`），`std.math.atan2(y, x)` 返回 `y/x` 的反正切（值域 `[-pi, pi]`，两个参数是相容的浮点类型，结果取它们的共同类型，并按两者的符号选择象限），`std.math.sqrt(x)` 返回其平方根（非负 `x`），`std.math.cbrt(x)` 返回其立方根（可为负 `x`），`std.math.pow(x, y)` 返回 `x` 的 `y` 次幂（两个参数是相容的浮点类型，结果取它们的共同类型），`std.math.exp(x)` 返回 `e**x`，`std.math.log(x)` 返回自然对数 `ln(x)`（`x` 为 `f32` 或 `f64`）。具体用哪个实现在**编译期**由宿主的编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode` 选定：
 
-- `llvm`：LLVM 内建（`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.asin.*`/`llvm.acos.*`/`llvm.sqrt.*`/`llvm.cbrt.*`/`llvm.pow.*`/`llvm.exp.*`/`llvm.log.*`；其中 `llvm.cbrt.*` 是 LLVM 21 才引入的内建，更早的 LLVM 上不可用）；
-- `libc`：C 标准库的 `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`asinf`/`asin`/`acosf`/`acos`/`sqrtf`/`sqrt`/`cbrtf`/`cbrt`/`powf`/`pow`/`expf`/`exp`/`logf`/`log`（即 `std.c` 中的 extern 声明）；
-- `software`（默认值，选项未设置时也是它）：musl 的 `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf` 的纯 spy 移植（`std.math.trig`，共用内核与参数规约）；musl 的 `asin`/`asinf`/`acos`/`acosf` 的在 `std.math.invtrig`（两者共用 `R(x**2)` 有理逼近，`f32` 路径在 `f64` 中求值并在最后舍入）；musl 的 `sqrt`/`sqrtf` 的纯 spy 移植在 `std.math.sqrt`，`cbrt`/`cbrtf` 的在 `std.math.cbrt`，`pow`/`powf` 的在 `std.math.pow`，`exp`/`expf` 的在 `std.math.exp`（`f64` 复用 `pow` 的 exp 内核），`log`/`logf` 的在 `std.math.log`（使用完整的 `log_data.c`/`logf_data.c` 数据表）。
+- `llvm`：LLVM 内建（`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.asin.*`/`llvm.acos.*`/`llvm.atan.*`/`llvm.atan2.*`/`llvm.sqrt.*`/`llvm.cbrt.*`/`llvm.pow.*`/`llvm.exp.*`/`llvm.log.*`；其中 `llvm.cbrt.*` 是 LLVM 21 才引入的内建，更早的 LLVM 上不可用）；
+- `libc`：C 标准库的 `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`asinf`/`asin`/`acosf`/`acos`/`atanf`/`atan`/`atan2f`/`atan2`/`sqrtf`/`sqrt`/`cbrtf`/`cbrt`/`powf`/`pow`/`expf`/`exp`/`logf`/`log`（即 `std.c` 中的 extern 声明）；
+- `software`（默认值，选项未设置时也是它）：musl 的 `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf` 的纯 spy 移植（`std.math.trig`，共用内核与参数规约）；musl 的 `asin`/`asinf`/`acos`/`acosf`/`atan`/`atanf`/`atan2`/`atan2f` 的在 `std.math.invtrig`（`asin`/`acos` 共用 `R(x**2)` 有理逼近，`atan` 按区间使用奇多项式，`atan2` 按象限规约到 `atan`；`f32` 路径在 `f64` 中求值并在最后舍入）；musl 的 `sqrt`/`sqrtf` 的纯 spy 移植在 `std.math.sqrt`，`cbrt`/`cbrtf` 的在 `std.math.cbrt`，`pow`/`powf` 的在 `std.math.pow`，`exp`/`expf` 的在 `std.math.exp`（`f64` 复用 `pow` 的 exp 内核），`log`/`logf` 的在 `std.math.log`（使用完整的 `log_data.c`/`logf_data.c` 数据表）。
 
 只有被选中的实现会被类型推导并 lowering，因此选择在运行时没有开销；非法取值是编译错误。`sin`/`cos` 与 `sqrt` 的软件实现对 `f32` 与 `f64`
-都是正确舍入的，`tan`/`tanf` 的软件实现误差约小于 1 ULP，`cbrt` 的软件实现误差小于 0.667 ULP，`pow`/`powf` 的软件实现（musl 的 Arm `pow`/`powf` 移植）误差分别小于 0.54 与 0.82 ULP，`exp`/`expf` 的误差约小于 0.51 ULP，`log`/`logf` 的误差分别约小于 0.51 与 0.82 ULP，`asin`/`acos` 的软件实现误差约小于 1 ULP。`sqrt` 的负参数（以及 NaN）得到 NaN，`sqrt(-0.0)` 是 `-0.0`；`cbrt` 是奇函数（`cbrt(-x) == -cbrt(x)`），负参数正常计算，`cbrt(±0)` 是 `±0`；`pow` 的 `x**0` 是 `1`（含 `0**0`），负底数配整数指数正常计算（偶数得正、奇数得负，`pow(-0.0, 3)` 是 `-0.0`），负底数配非整数指数得到 NaN，`|x|` 与 `y` 的 `±inf`、溢出与下溢都按 C 的 `pow` 处理；`exp(±0)` 是 `1`，`exp(-inf)` 是 `+0`，`exp(+inf)` 是 `+inf`，`exp(NaN)` 是 NaN；`log(1)` 是 `+0`，`log(±0)` 是 `-inf`，`log(+inf)` 是 `+inf`，负参数与 `log(NaN)` 是 NaN，次正规参数正常计算。`asin(±1)` 是 `±pi/2`，`acos(1)` 是 `+0`、`acos(-1)` 是 `pi`，`|x| > 1`（含 NaN）得到 NaN，`asin` 是奇函数、`acos(±0)` 是 `pi/2`。
+都是正确舍入的，`tan`/`tanf` 的软件实现误差约小于 1 ULP，`cbrt` 的软件实现误差小于 0.667 ULP，`pow`/`powf` 的软件实现（musl 的 Arm `pow`/`powf` 移植）误差分别小于 0.54 与 0.82 ULP，`exp`/`expf` 的误差约小于 0.51 ULP，`log`/`logf` 的误差分别约小于 0.51 与 0.82 ULP，`asin`/`acos`/`atan`/`atan2` 的软件实现误差约小于 1 ULP。`sqrt` 的负参数（以及 NaN）得到 NaN，`sqrt(-0.0)` 是 `-0.0`；`cbrt` 是奇函数（`cbrt(-x) == -cbrt(x)`），负参数正常计算，`cbrt(±0)` 是 `±0`；`pow` 的 `x**0` 是 `1`（含 `0**0`），负底数配整数指数正常计算（偶数得正、奇数得负，`pow(-0.0, 3)` 是 `-0.0`），负底数配非整数指数得到 NaN，`|x|` 与 `y` 的 `±inf`、溢出与下溢都按 C 的 `pow` 处理；`exp(±0)` 是 `1`，`exp(-inf)` 是 `+0`，`exp(+inf)` 是 `+inf`，`exp(NaN)` 是 NaN；`log(1)` 是 `+0`，`log(±0)` 是 `-inf`，`log(+inf)` 是 `+inf`，负参数与 `log(NaN)` 是 NaN，次正规参数正常计算。`asin(±1)` 是 `±pi/2`，`acos(1)` 是 `+0`、`acos(-1)` 是 `pi`，`|x| > 1`（含 NaN）得到 NaN，`asin` 是奇函数、`acos(±0)` 是 `pi/2`。`atan` 是奇函数，`atan(±0)` 是 `±0`，`atan(±inf)` 是 `±pi/2`，NaN 得到 NaN；`atan2` 的带符号零、四个象限、`±inf` 与 NaN 按 C 的 `atan2` 处理（例如 `atan2(±0, +1)` 是 `±0`、`atan2(±0, -1)` 是 `±pi`、`atan2(±inf, ±inf)` 是 `±pi/4` 或 `±3pi/4`）。
 
 ```python
 @func()
@@ -1733,6 +1733,14 @@ def my_asin(x: f64) -> f64:
 def my_acos(x: f64) -> f64:
     return acos(x)
 
+@func()
+def my_atan(x: f64) -> f64:
+    return atan(x)
+
+@func()
+def my_atan2(y: f64, x: f64) -> f64:
+    return atan2(y, x)
+
 assert abs(my_sin(0.5) - 0.479425538604203) < 1e-15
 assert abs(my_sin(1.0) - 0.8414709848078965) < 1e-15
 assert abs(my_cos(0.5) - 0.8775825618903728) < 1e-15
@@ -1754,6 +1762,9 @@ assert abs(my_asin(0.5) - 0.5235987755982988) < 1e-15
 assert abs(my_acos(0.5) - 1.0471975511965976) < 1e-15
 assert my_acos(1.0) == 0.0
 assert abs(my_acos(-1.0) - 3.141592653589793) < 1e-15
+assert abs(my_atan(1.0) - 0.7853981633974483) < 1e-15
+assert abs(my_atan2(1.0, 1.0) - 0.7853981633974483) < 1e-15
+assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 ```
 
 ---

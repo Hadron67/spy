@@ -9,11 +9,26 @@ from ...compiler import CompileError, f32, f64
 from ...compiler import as_ as spy_as
 from ...compiler.dsl import _Context, func
 from ...compiler.lower import LLVMBackend
-from ...std.math import acos, asin, cbrt, cos, exp, log, pow, sin, sqrt, tan
+from ...std.math import (
+    acos,
+    asin,
+    atan,
+    atan2,
+    cbrt,
+    cos,
+    exp,
+    log,
+    pow,
+    sin,
+    sqrt,
+    tan,
+)
 from ...std.math.cbrt import cbrt as software_cbrt
 from ...std.math.exp import exp as software_exp
 from ...std.math.invtrig import acos as software_acos
 from ...std.math.invtrig import asin as software_asin
+from ...std.math.invtrig import atan as software_atan
+from ...std.math.invtrig import atan2 as software_atan2
 from ...std.math.log import log as software_log
 from ...std.math.pow import pow as software_pow
 from ...std.math.sqrt import sqrt as software_sqrt
@@ -22,11 +37,12 @@ from ...std.math.trig import sin as software_sin
 from ...std.math.trig import tan as software_tan
 
 # ---------------------------------------------------------------------------
-# ``std.math.sin``/``cos``/``tan``/``asin``/``acos``/``sqrt``/``cbrt``/``pow``/
-# ``exp``/``log``: the mathematical functions of an ``f32``/``f64``, each
-# dispatched at compile time by the host's compile-time option
-# ``sin_mode``/``cos_mode``/``tan_mode``/``asin_mode``/``acos_mode``/
-# ``sqrt_mode``/``cbrt_mode``/``pow_mode``/``exp_mode``/``log_mode`` - ``llvm``
+# ``std.math.sin``/``cos``/``tan``/``asin``/``acos``/``atan``/``atan2``/
+# ``sqrt``/``cbrt``/``pow``/``exp``/``log``: the mathematical functions of an
+# ``f32``/``f64``, each dispatched at compile time by the host's compile-time
+# option ``sin_mode``/``cos_mode``/``tan_mode``/``asin_mode``/``acos_mode``/
+# ``atan_mode``/``atan2_mode``/``sqrt_mode``/``cbrt_mode``/``pow_mode``/
+# ``exp_mode``/``log_mode`` - ``llvm``
 # (the LLVM intrinsic), ``libc`` (the C ``sinf``/``sin``/...) or ``software``
 # (the pure spy port of musl in ``std.math.trig``/``std.math.invtrig``/
 # ``std.math.sqrt``/``std.math.cbrt``/``std.math.pow``/``std.math.exp``/
@@ -180,6 +196,61 @@ _ASIN_ACOS_F32_VALUES = [
     0.975, 0.99, 1.0,
 ]
 
+# ``atan`` is odd, so both signs are covered, together with the two zeros, the
+# reduction boundaries (0.4375, 0.6875, 1.1875, 2.4375), the tiny/large cutoffs
+# and the special values.
+_ATAN_F64_VALUES = [
+    -math.inf, -1e300, -2.0 ** 66, -1e16, -3.0, -2.5, -2.4375, -1.1875,
+    -1.0, -0.7, -0.6875, -0.5, -0.4375, -0.4, -0.1, -2.0 ** -26,
+    -2.0 ** -27, -5e-324, -0.0, 0.0, 5e-324, 2.0 ** -27, 2.0 ** -26, 0.1,
+    0.4, 0.4375, 0.5, 0.6875, 0.7, 1.0, 1.1875, 2.4375, 2.5, 3.0,
+    1e16, 2.0 ** 66, 1e300, math.inf,
+]
+
+_ATAN_F32_VALUES = [
+    -math.inf, -3.4e38, -2.0 ** 27, -1e7, -3.0, -2.5, -2.4375, -1.1875,
+    -1.0, -0.7, -0.6875, -0.5, -0.4375, -0.4, -0.1, -2.0 ** -12,
+    -2.0 ** -13, -1.4e-45, -0.0, 0.0, 1.4e-45, 2.0 ** -13, 2.0 ** -12, 0.1,
+    0.4, 0.4375, 0.5, 0.6875, 0.7, 1.0, 1.1875, 2.4375, 2.5, 3.0,
+    1e7, 2.0 ** 26, 3.4e38, math.inf,
+]
+
+# ``atan2``: every quadrant, the signed zeros, the infinities, the `x == 1` fast
+# path and the `|y/x| = 2**+-64` (f64) / `2**+-26` (f32) cutoffs.
+_ATAN2_F64_VALUES = [
+    (0.0, 0.0), (-0.0, 0.0), (0.0, -0.0), (-0.0, -0.0),
+    (0.0, 1.0), (-0.0, 1.0), (0.0, -1.0), (-0.0, -1.0),
+    (1.0, 0.0), (-1.0, 0.0), (1.0, -0.0), (-1.0, -0.0),
+    (1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0),
+    (0.1, 0.2), (-0.1, 0.2), (0.1, -0.2), (-0.1, -0.2),
+    (0.5, 1.0), (-0.5, 1.0), (0.5, -1.0), (-0.5, -1.0),
+    (1.0, math.inf), (-1.0, math.inf), (1.0, -math.inf), (-1.0, -math.inf),
+    (math.inf, 1.0), (-math.inf, 1.0), (math.inf, -1.0), (-math.inf, -1.0),
+    (math.inf, math.inf), (-math.inf, math.inf), (math.inf, -math.inf),
+    (-math.inf, -math.inf),
+    (2.0 ** 65, 1.0), (-2.0 ** 65, 1.0), (2.0 ** 65, -1.0), (-2.0 ** 65, -1.0),
+    (1.0, 2.0 ** 65), (-1.0, 2.0 ** 65), (1.0, -2.0 ** 65), (-1.0, -2.0 ** 65),
+    (2.0 ** -65, 1.0), (-2.0 ** -65, 1.0), (2.0 ** -65, -1.0), (-2.0 ** -65, -1.0),
+    (1e300, 1e300), (-1e300, 1e300), (1e300, -1e300), (-1e300, -1e300),
+]
+
+_ATAN2_F32_VALUES = [
+    (0.0, 0.0), (-0.0, 0.0), (0.0, -0.0), (-0.0, -0.0),
+    (0.0, 1.0), (-0.0, 1.0), (0.0, -1.0), (-0.0, -1.0),
+    (1.0, 0.0), (-1.0, 0.0), (1.0, -0.0), (-1.0, -0.0),
+    (1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0),
+    (0.1, 0.2), (-0.1, 0.2), (0.1, -0.2), (-0.1, -0.2),
+    (0.5, 1.0), (-0.5, 1.0), (0.5, -1.0), (-0.5, -1.0),
+    (1.0, math.inf), (-1.0, math.inf), (1.0, -math.inf), (-1.0, -math.inf),
+    (math.inf, 1.0), (-math.inf, 1.0), (math.inf, -1.0), (-math.inf, -1.0),
+    (math.inf, math.inf), (-math.inf, math.inf), (math.inf, -math.inf),
+    (-math.inf, -math.inf),
+    (2.0 ** 27, 1.0), (-2.0 ** 27, 1.0), (2.0 ** 27, -1.0), (-2.0 ** 27, -1.0),
+    (1.0, 2.0 ** 27), (-1.0, 2.0 ** 27), (1.0, -2.0 ** 27), (-1.0, -2.0 ** 27),
+    (2.0 ** -27, 1.0), (-2.0 ** -27, 1.0), (2.0 ** -27, -1.0), (-2.0 ** -27, -1.0),
+    (3.4e38, 3.4e38), (-3.4e38, 3.4e38), (3.4e38, -3.4e38), (-3.4e38, -3.4e38),
+]
+
 
 # -- software implementation: the port itself, tested directly ---------------
 
@@ -202,6 +273,26 @@ def sw_acos_f64(x: f64) -> f64:
 @func()
 def sw_acos_f32(x: f32) -> f32:
     return software_acos(x)
+
+
+@func()
+def sw_atan_f64(x: f64) -> f64:
+    return software_atan(x)
+
+
+@func()
+def sw_atan_f32(x: f32) -> f32:
+    return software_atan(x)
+
+
+@func()
+def sw_atan2_f64(y: f64, x: f64) -> f64:
+    return software_atan2(y, x)
+
+
+@func()
+def sw_atan2_f32(y: f32, x: f32) -> f32:
+    return software_atan2(y, x)
 
 
 @func()
@@ -295,6 +386,8 @@ def _context_with_mode(mode: bytes | None) -> _Context:
         ctx.set_compile_option(b'tan_mode', mode)
         ctx.set_compile_option(b'asin_mode', mode)
         ctx.set_compile_option(b'acos_mode', mode)
+        ctx.set_compile_option(b'atan_mode', mode)
+        ctx.set_compile_option(b'atan2_mode', mode)
         ctx.set_compile_option(b'sqrt_mode', mode)
         ctx.set_compile_option(b'cbrt_mode', mode)
         ctx.set_compile_option(b'pow_mode', mode)
@@ -486,6 +579,56 @@ def libm_acos_bogus(x: f64) -> f64:
 
 
 @_CTX_LLVM.func()
+def libm_atan_llvm[T](x: T) -> T:
+    return atan(x)
+
+
+@_CTX_LIBC.func()
+def libm_atan_libc[T](x: T) -> T:
+    return atan(x)
+
+
+@_CTX_SOFTWARE.func()
+def libm_atan_software[T](x: T) -> T:
+    return atan(x)
+
+
+@_CTX_DEFAULT.func()
+def libm_atan_default[T](x: T) -> T:
+    return atan(x)
+
+
+@_CTX_BOGUS.func()
+def libm_atan_bogus(x: f64) -> f64:
+    return atan(x)
+
+
+@_CTX_LLVM.func()
+def libm_atan2_llvm[T](y: T, x: T) -> T:
+    return atan2(y, x)
+
+
+@_CTX_LIBC.func()
+def libm_atan2_libc[T](y: T, x: T) -> T:
+    return atan2(y, x)
+
+
+@_CTX_SOFTWARE.func()
+def libm_atan2_software[T](y: T, x: T) -> T:
+    return atan2(y, x)
+
+
+@_CTX_DEFAULT.func()
+def libm_atan2_default[T](y: T, x: T) -> T:
+    return atan2(y, x)
+
+
+@_CTX_BOGUS.func()
+def libm_atan2_bogus(y: f64, x: f64) -> f64:
+    return atan2(y, x)
+
+
+@_CTX_LLVM.func()
 def libm_pow_llvm[T](x: T, y: T) -> T:
     return pow(x, y)
 
@@ -598,6 +741,26 @@ class _TrigUlpTest(TestCase):
         for v in _TAN_F32_VALUES:
             got = float(fn(spy_as(v, f32)))
             self.assert_rel_close(got, math.tan(_to_f32(v)), tol, repr(v))
+
+    def check_atan2_f64(
+        self,
+        fn: Callable[[float, float], float],
+        tol: int,
+        values: list[tuple[float, float]] = _ATAN2_F64_VALUES,
+    ) -> None:
+        for y, x in values:
+            self.assertLessEqual(_f64_ulp(fn(y, x), math.atan2(y, x)), tol, msg=repr((y, x)))
+
+    def check_atan2_f32(
+        self,
+        fn: Callable[[f32, f32], f32],
+        tol: int,
+        values: list[tuple[float, float]] = _ATAN2_F32_VALUES,
+    ) -> None:
+        for y, x in values:
+            want = _to_f32(math.atan2(_to_f32(y), _to_f32(x)))
+            got = float(fn(spy_as(y, f32), spy_as(x, f32)))
+            self.assertLessEqual(_f32_ulp(got, want), tol, msg=repr((y, x)))
 
     def check_pow_f64(
         self,
@@ -788,6 +951,118 @@ class SpyAsinAcosModeTest(_TrigUlpTest):
             libm_asin_bogus(0.5)
         with self.assertRaises(CompileError):
             libm_acos_bogus(0.5)
+
+
+class SpySoftwareAtanAtan2Test(_TrigUlpTest):
+    """The pure spy ``atan``/``atan2`` (the musl port): both ``f32`` and
+    ``f64`` are within 1 ULP of the correctly rounded result, and the special
+    values (the signed zeros, the quadrants, the infinities and a NaN) come out
+    as C's do."""
+
+    def test_atan_f64(self) -> None:
+        self.check_f64(sw_atan_f64, math.atan, 1, _ATAN_F64_VALUES)
+
+    def test_atan_f32(self) -> None:
+        self.check_f32(sw_atan_f32, math.atan, 1, _ATAN_F32_VALUES)
+
+    def test_atan2_f64(self) -> None:
+        self.check_atan2_f64(sw_atan2_f64, 1)
+
+    def test_atan2_f32(self) -> None:
+        self.check_atan2_f32(sw_atan2_f32, 1)
+
+    def test_atan_of_a_zero_keeps_its_sign(self) -> None:
+        self.assertEqual(sw_atan_f64(0.0), 0.0)
+        self.assertEqual(math.copysign(1.0, sw_atan_f64(-0.0)), -1.0)
+        self.assertEqual(math.copysign(1.0, float(sw_atan_f32(spy_as(-0.0, f32)))), -1.0)
+
+    def test_atan_of_a_nan(self) -> None:
+        self.assertTrue(math.isnan(sw_atan_f64(math.nan)))
+        self.assertTrue(math.isnan(float(sw_atan_f32(spy_as(math.nan, f32)))))
+
+    def test_atan_is_odd(self) -> None:
+        for v in _ATAN_F64_VALUES:
+            if v > 0.0 and math.isfinite(v):
+                self.assertEqual(sw_atan_f64(-v), -sw_atan_f64(v), msg=repr(v))
+
+    def test_atan2_of_the_signed_zeros(self) -> None:
+        cases = [
+            (0.0, 1.0, 0.0), (-0.0, 1.0, -0.0),
+            (0.0, -1.0, math.pi), (-0.0, -1.0, -math.pi),
+        ]
+        for y, x, want in cases:
+            got = sw_atan2_f64(y, x)
+            self.assertEqual(got, want, msg=repr((y, x)))
+            if want == 0.0:
+                self.assertEqual(math.copysign(1.0, got), math.copysign(1.0, want), msg=repr((y, x)))
+        for y, x, want in cases:
+            got32 = float(sw_atan2_f32(spy_as(y, f32), spy_as(x, f32)))
+            self.assertEqual(got32, _to_f32(want), msg=repr((y, x)))
+            if want == 0.0:
+                self.assertEqual(math.copysign(1.0, got32), math.copysign(1.0, want), msg=repr((y, x)))
+
+    def test_atan2_of_zero_x(self) -> None:
+        for y in (1.0, -1.0, 1e300, -1e300):
+            self.assertLessEqual(
+                _f64_ulp(sw_atan2_f64(y, 0.0), math.atan2(y, 0.0)), 1, msg=repr(y)
+            )
+
+    def test_atan2_of_infinities(self) -> None:
+        for y, x in ((math.inf, math.inf), (-math.inf, math.inf),
+                     (math.inf, -math.inf), (-math.inf, -math.inf),
+                     (1.0, math.inf), (-1.0, math.inf),
+                     (1.0, -math.inf), (-1.0, -math.inf),
+                     (math.inf, 1.0), (-math.inf, 1.0),
+                     (math.inf, -1.0), (-math.inf, -1.0)):
+            self.assertLessEqual(
+                _f64_ulp(sw_atan2_f64(y, x), math.atan2(y, x)), 1, msg=repr((y, x))
+            )
+
+    def test_atan2_of_a_nan(self) -> None:
+        for y, x in ((math.nan, 1.0), (1.0, math.nan), (math.nan, math.nan)):
+            self.assertTrue(math.isnan(sw_atan2_f64(y, x)), msg=repr((y, x)))
+        for y, x in ((math.nan, 1.0), (1.0, math.nan)):
+            self.assertTrue(
+                math.isnan(float(sw_atan2_f32(spy_as(y, f32), spy_as(x, f32)))),
+                msg=repr((y, x)),
+            )
+
+
+class SpyAtanAtan2ModeTest(_TrigUlpTest):
+    """``atan_mode``/``atan2_mode`` select the ``llvm``/``libc``/``software``
+    implementation at compile time; an unset option defaults to ``software``."""
+
+    def test_llvm(self) -> None:
+        self.check_f64(libm_atan_llvm, math.atan, 2, _ATAN_F64_VALUES)
+        self.check_f32(libm_atan_llvm, math.atan, 2, _ATAN_F32_VALUES)
+        self.check_atan2_f64(libm_atan2_llvm, 2)
+        self.check_atan2_f32(libm_atan2_llvm, 2)
+
+    def test_libc(self) -> None:
+        self.check_f64(libm_atan_libc, math.atan, 2, _ATAN_F64_VALUES)
+        self.check_f32(libm_atan_libc, math.atan, 2, _ATAN_F32_VALUES)
+        self.check_atan2_f64(libm_atan2_libc, 2)
+        self.check_atan2_f32(libm_atan2_libc, 2)
+
+    def test_software(self) -> None:
+        self.check_f64(libm_atan_software, math.atan, 1, _ATAN_F64_VALUES)
+        self.check_f32(libm_atan_software, math.atan, 1, _ATAN_F32_VALUES)
+        self.check_atan2_f64(libm_atan2_software, 1)
+        self.check_atan2_f32(libm_atan2_software, 1)
+
+    def test_default_is_software(self) -> None:
+        # the software implementation is deterministic, so the default (an unset
+        # option) has to match it bit for bit
+        for v in _ATAN_F64_VALUES:
+            self.assertEqual(libm_atan_default(v), sw_atan_f64(v), msg=repr(v))
+        for y, x in _ATAN2_F64_VALUES:
+            self.assertEqual(libm_atan2_default(y, x), sw_atan2_f64(y, x), msg=repr((y, x)))
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            libm_atan_bogus(0.5)
+        with self.assertRaises(CompileError):
+            libm_atan2_bogus(0.5, 0.5)
 
 
 class SpySoftwareSqrtTest(_TrigUlpTest):

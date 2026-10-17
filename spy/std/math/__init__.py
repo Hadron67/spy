@@ -1,18 +1,21 @@
 """Math functions (``std.math``).
 
 :func:`sin`, :func:`cos`, :func:`tan`, :func:`asin`, :func:`acos`,
-:func:`sqrt`, :func:`cbrt`, :func:`pow`, :func:`exp` and :func:`log` each
-dispatch to one of three implementations at compile time, chosen by the host's
-compile-time option ``sin_mode``/``cos_mode``/``tan_mode``/``asin_mode``/
-``acos_mode``/``sqrt_mode``/``cbrt_mode``/``pow_mode``/``exp_mode``/
-``log_mode``:
+:func:`atan`, :func:`atan2`, :func:`sqrt`, :func:`cbrt`, :func:`pow`,
+:func:`exp` and :func:`log` each dispatch to one of three implementations at
+compile time, chosen by the host's compile-time option
+``sin_mode``/``cos_mode``/``tan_mode``/``asin_mode``/``acos_mode``/
+``atan_mode``/``atan2_mode``/``sqrt_mode``/``cbrt_mode``/``pow_mode``/
+``exp_mode``/``log_mode``:
 
 * ``llvm`` - the LLVM intrinsic (``llvm.sin.*``/``llvm.cos.*``/``llvm.tan.*``/
-  ``llvm.asin.*``/``llvm.acos.*``/``llvm.sqrt.*``/``llvm.cbrt.*``/
-  ``llvm.pow.*``/``llvm.exp.*``/``llvm.log.*``),
+  ``llvm.asin.*``/``llvm.acos.*``/``llvm.atan.*``/``llvm.atan2.*``/
+  ``llvm.sqrt.*``/``llvm.cbrt.*``/``llvm.pow.*``/``llvm.exp.*``/
+  ``llvm.log.*``),
 * ``libc`` - the C library ``sinf``/``sin``/``cosf``/``cos``/``tanf``/``tan``/
-  ``asinf``/``asin``/``acosf``/``acos``/``sqrtf``/``sqrt``/``cbrtf``/``cbrt``/
-  ``powf``/``pow``/``expf``/``exp``/``logf``/``log`` (see ``std.c``),
+  ``asinf``/``asin``/``acosf``/``acos``/``atanf``/``atan``/``atan2f``/
+  ``atan2``/``sqrtf``/``sqrt``/``cbrtf``/``cbrt``/``powf``/``pow``/
+  ``expf``/``exp``/``logf``/``log`` (see ``std.c``),
 * ``software`` (the default, also when the option is unset) - the pure spy port
   in ``std.math.trig``/``std.math.invtrig``/``std.math.sqrt``/``std.math.cbrt``/
   ``std.math.pow``/``std.math.exp``/``std.math.log``.
@@ -29,6 +32,10 @@ from ..c import acos as c_acos
 from ..c import acosf as c_acosf
 from ..c import asin as c_asin
 from ..c import asinf as c_asinf
+from ..c import atan as c_atan
+from ..c import atan2 as c_atan2
+from ..c import atan2f as c_atan2f
+from ..c import atanf as c_atanf
 from ..c import cbrt as c_cbrt
 from ..c import cbrtf as c_cbrtf
 from ..c import cos as c_cos
@@ -50,6 +57,10 @@ from ..llvm import acos_f32 as llvm_acos_f32
 from ..llvm import acos_f64 as llvm_acos_f64
 from ..llvm import asin_f32 as llvm_asin_f32
 from ..llvm import asin_f64 as llvm_asin_f64
+from ..llvm import atan2_f32 as llvm_atan2_f32
+from ..llvm import atan2_f64 as llvm_atan2_f64
+from ..llvm import atan_f32 as llvm_atan_f32
+from ..llvm import atan_f64 as llvm_atan_f64
 from ..llvm import cbrt_f32 as llvm_cbrt_f32
 from ..llvm import cbrt_f64 as llvm_cbrt_f64
 from ..llvm import cos_f32 as llvm_cos_f32
@@ -70,6 +81,8 @@ from .cbrt import cbrt as software_cbrt
 from .exp import exp as software_exp
 from .invtrig import acos as software_acos
 from .invtrig import asin as software_asin
+from .invtrig import atan as software_atan
+from .invtrig import atan2 as software_atan2
 from .log import log as software_log
 from .pow import pow as software_pow
 from .sqrt import sqrt as software_sqrt
@@ -171,6 +184,25 @@ def acos[T](x: T) -> T:
     as the compile-time option ``acos_mode`` (``llvm``/``libc``/``software``)
     selects.  An unknown mode is a compile error."""
     return _dispatch(x, "acos_mode", llvm_acos_f32, llvm_acos_f64, c_acosf, c_acos, software_acos)
+
+
+@func(inline=True)
+def atan[T](x: T) -> T:
+    """The arc tangent of ``x`` in ``(-pi/2, pi/2)`` (``f32`` or ``f64``):
+    ``llvm.atan.*``, the libc ``atanf``/``atan``, or the pure spy implementation,
+    as the compile-time option ``atan_mode`` (``llvm``/``libc``/``software``)
+    selects.  An unknown mode is a compile error."""
+    return _dispatch(x, "atan_mode", llvm_atan_f32, llvm_atan_f64, c_atanf, c_atan, software_atan)
+
+
+@func(inline=True)
+def atan2[T](y: T, x: T) -> T:
+    """The arc tangent of ``y/x`` in ``[-pi, pi]``, using the signs of both
+    arguments to select the quadrant (``f32`` or ``f64``): ``llvm.atan2.*``,
+    the libc ``atan2f``/``atan2``, or the pure spy implementation, as the
+    compile-time option ``atan2_mode`` (``llvm``/``libc``/``software``) selects.
+    An unknown mode is a compile error."""
+    return _dispatch2(y, x, "atan2_mode", llvm_atan2_f32, llvm_atan2_f64, c_atan2f, c_atan2, software_atan2)
 
 @func(inline=True)
 def sqrt[T](x: T) -> T:
