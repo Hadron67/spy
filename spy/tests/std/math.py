@@ -9,8 +9,10 @@ from ...compiler import CompileError, f32, f64
 from ...compiler import as_ as spy_as
 from ...compiler.dsl import _Context, func
 from ...compiler.lower import LLVMBackend
-from ...std.math import cbrt, cos, pow, sin, sqrt, tan
+from ...std.math import cbrt, cos, exp, log, pow, sin, sqrt, tan
 from ...std.math.cbrt import cbrt as software_cbrt
+from ...std.math.exp import exp as software_exp
+from ...std.math.log import log as software_log
 from ...std.math.pow import pow as software_pow
 from ...std.math.sqrt import sqrt as software_sqrt
 from ...std.math.trig import cos as software_cos
@@ -18,13 +20,15 @@ from ...std.math.trig import sin as software_sin
 from ...std.math.trig import tan as software_tan
 
 # ---------------------------------------------------------------------------
-# ``std.math.sin``/``cos``/``tan``/``sqrt``/``cbrt``: the mathematical functions
-# of an ``f32``/``f64``, each dispatched at compile time by the host's
-# compile-time option
-# ``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode``/``cbrt_mode`` - ``llvm``
-# (the LLVM intrinsic), ``libc`` (the C ``sinf``/``sin``/...) or ``software``
-# (the pure spy port of musl in ``std.math.trig``/``std.math.sqrt``/
-# ``std.math.cbrt``, also the default when the option is unset).
+# ``std.math.sin``/``cos``/``tan``/``sqrt``/``cbrt``/``pow``/``exp``/``log``:
+# the mathematical functions of an ``f32``/``f64``, each dispatched at compile
+# time by the host's compile-time option
+# ``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode``/``cbrt_mode``/
+# ``pow_mode``/``exp_mode``/``log_mode`` - ``llvm`` (the LLVM intrinsic),
+# ``libc`` (the C ``sinf``/``sin``/...) or ``software`` (the pure spy port of
+# musl in ``std.math.trig``/``std.math.sqrt``/``std.math.cbrt``/
+# ``std.math.pow``/``std.math.exp``/``std.math.log``, also the default when the
+# option is unset).
 #
 # The mode is read while the function is compiled and the specialization is
 # cached per host context, so each mode is exercised in a context of its own.
@@ -135,6 +139,29 @@ _POW_F32_VALUES = [
     (0.1, 5.0), (-2.0, 3.0), (7.0, 0.5), (1.25, 8.0), (2.0, -4.0), (0.8, 20.0),
 ]
 
+# ``exp`` and ``log`` cover the ordinary range, the subnormal range and the
+# values close to 1 where ``log`` uses its dedicated polynomial.
+_EXP_F64_VALUES = [
+    0.0, -0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 10.0, -10.0,
+    100.0, -100.0, 700.0, -700.0, 709.0, -745.0, 1e-8, -1e-8, 1e-16,
+]
+
+_EXP_F32_VALUES = [
+    0.0, -0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 10.0, -10.0,
+    80.0, -80.0, 88.0, -88.0, 1e-4, -1e-4, 1e-8,
+]
+
+_LOG_F64_VALUES = [
+    0.5, 1.0, 2.0, 10.0, 0.1, 1.0 - 2.0 ** -4,
+    1.0 + float.fromhex('0x1.09p-4'), 1e-8, 1e-30, 1e-300, 5e-324,
+    2.2250738585072014e-308, 1e300, 123456.789, 999999.0, 2.0 ** -20,
+]
+
+_LOG_F32_VALUES = [
+    0.5, 1.0, 2.0, 10.0, 0.1, 0.9, 1.1, 1e-4, 1e-30, 1.4e-45,
+    1.1754944e-38, 1e7, 1e30, 3.4e38,
+]
+
 
 # -- software implementation: the port itself, tested directly ---------------
 
@@ -199,6 +226,26 @@ def sw_pow_f32(x: f32, y: f32) -> f32:
     return software_pow(x, y)
 
 
+@func()
+def sw_exp_f64(x: f64) -> f64:
+    return software_exp(x)
+
+
+@func()
+def sw_exp_f32(x: f32) -> f32:
+    return software_exp(x)
+
+
+@func()
+def sw_log_f64(x: f64) -> f64:
+    return software_log(x)
+
+
+@func()
+def sw_log_f32(x: f32) -> f32:
+    return software_log(x)
+
+
 # -- one host context per mode (the option names cover every function) -------
 
 
@@ -211,6 +258,8 @@ def _context_with_mode(mode: bytes | None) -> _Context:
         ctx.set_compile_option(b'sqrt_mode', mode)
         ctx.set_compile_option(b'cbrt_mode', mode)
         ctx.set_compile_option(b'pow_mode', mode)
+        ctx.set_compile_option(b'exp_mode', mode)
+        ctx.set_compile_option(b'log_mode', mode)
     return ctx
 
 
@@ -369,6 +418,56 @@ def libm_pow_default[T](x: T, y: T) -> T:
 @_CTX_BOGUS.func()
 def libm_pow_bogus(x: f64, y: f64) -> f64:
     return pow(x, y)
+
+
+@_CTX_LLVM.func()
+def libm_exp_llvm[T](x: T) -> T:
+    return exp(x)
+
+
+@_CTX_LIBC.func()
+def libm_exp_libc[T](x: T) -> T:
+    return exp(x)
+
+
+@_CTX_SOFTWARE.func()
+def libm_exp_software[T](x: T) -> T:
+    return exp(x)
+
+
+@_CTX_DEFAULT.func()
+def libm_exp_default[T](x: T) -> T:
+    return exp(x)
+
+
+@_CTX_BOGUS.func()
+def libm_exp_bogus(x: f64) -> f64:
+    return exp(x)
+
+
+@_CTX_LLVM.func()
+def libm_log_llvm[T](x: T) -> T:
+    return log(x)
+
+
+@_CTX_LIBC.func()
+def libm_log_libc[T](x: T) -> T:
+    return log(x)
+
+
+@_CTX_SOFTWARE.func()
+def libm_log_software[T](x: T) -> T:
+    return log(x)
+
+
+@_CTX_DEFAULT.func()
+def libm_log_default[T](x: T) -> T:
+    return log(x)
+
+
+@_CTX_BOGUS.func()
+def libm_log_bogus(x: f64) -> f64:
+    return log(x)
 
 
 class _TrigUlpTest(TestCase):
@@ -726,6 +825,133 @@ class SpyPowModeTest(_TrigUlpTest):
             libm_pow_bogus(2.0, 3.0)
 
 
+class SpySoftwareExpTest(_TrigUlpTest):
+    """The pure spy ``exp`` (the musl port): both ``f32`` and ``f64`` are within
+    1 ULP of the correctly rounded result, and the special values (the zeros,
+    ``+-inf``, a NaN, overflow and underflow) come out as C's do."""
+
+    def test_exp_f64(self) -> None:
+        self.check_f64(sw_exp_f64, math.exp, 1, _EXP_F64_VALUES)
+
+    def test_exp_f32(self) -> None:
+        self.check_f32(sw_exp_f32, math.exp, 1, _EXP_F32_VALUES)
+
+    def test_exp_of_zero(self) -> None:
+        self.assertEqual(sw_exp_f64(0.0), 1.0)
+        self.assertEqual(sw_exp_f64(-0.0), 1.0)
+
+    def test_exp_of_inf_and_nan(self) -> None:
+        self.assertEqual(sw_exp_f64(math.inf), math.inf)
+        self.assertEqual(sw_exp_f64(-math.inf), 0.0)
+        self.assertTrue(math.isnan(sw_exp_f64(math.nan)))
+
+    def test_exp_overflow_and_underflow(self) -> None:
+        self.assertEqual(sw_exp_f64(1000.0), math.inf)
+        self.assertEqual(sw_exp_f64(-1000.0), 0.0)
+        self.assertEqual(float(sw_exp_f32(spy_as(100.0, f32))), math.inf)
+        self.assertEqual(float(sw_exp_f32(spy_as(-110.0, f32))), 0.0)
+
+    def test_exp_f32_of_inf_and_nan(self) -> None:
+        self.assertEqual(float(sw_exp_f32(spy_as(math.inf, f32))), math.inf)
+        self.assertEqual(float(sw_exp_f32(spy_as(-math.inf, f32))), 0.0)
+        self.assertTrue(math.isnan(float(sw_exp_f32(spy_as(math.nan, f32)))))
+
+
+class SpyExpModeTest(_TrigUlpTest):
+    """``exp_mode`` selects the ``llvm``/``libc``/``software`` implementation at
+    compile time; an unset option defaults to ``software``."""
+
+    def test_llvm(self) -> None:
+        self.check_f64(libm_exp_llvm, math.exp, 1, _EXP_F64_VALUES)
+        self.check_f32(libm_exp_llvm, math.exp, 1, _EXP_F32_VALUES)
+
+    def test_libc(self) -> None:
+        self.check_f64(libm_exp_libc, math.exp, 1, _EXP_F64_VALUES)
+        self.check_f32(libm_exp_libc, math.exp, 1, _EXP_F32_VALUES)
+
+    def test_software(self) -> None:
+        self.check_f64(libm_exp_software, math.exp, 1, _EXP_F64_VALUES)
+        self.check_f32(libm_exp_software, math.exp, 1, _EXP_F32_VALUES)
+
+    def test_default_is_software(self) -> None:
+        for v in _EXP_F64_VALUES:
+            self.assertEqual(libm_exp_default(v), sw_exp_f64(v), msg=repr(v))
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            libm_exp_bogus(1.0)
+
+
+class SpySoftwareLogTest(_TrigUlpTest):
+    """The pure spy ``log`` (the musl port): both ``f32`` and ``f64`` are within
+    1 ULP of the correctly rounded result, and the special values (the zeros,
+    ``+-inf``, a NaN, a negative argument and subnormals) come out as C's do."""
+
+    def test_log_f64(self) -> None:
+        self.check_f64(sw_log_f64, math.log, 1, _LOG_F64_VALUES)
+
+    def test_log_f32(self) -> None:
+        self.check_f32(sw_log_f32, math.log, 1, _LOG_F32_VALUES)
+
+    def test_log_of_one(self) -> None:
+        self.assertEqual(sw_log_f64(1.0), 0.0)
+        self.assertEqual(math.copysign(1.0, sw_log_f64(1.0)), 1.0)
+
+    def test_log_of_zero(self) -> None:
+        for v in (0.0, -0.0):
+            self.assertEqual(sw_log_f64(v), -math.inf, msg=repr(v))
+
+    def test_log_of_inf_and_nan(self) -> None:
+        self.assertEqual(sw_log_f64(math.inf), math.inf)
+        self.assertTrue(math.isnan(sw_log_f64(math.nan)))
+
+    def test_log_of_negative_is_nan(self) -> None:
+        for v in (-1.0, -0.5, -5e-324, -1e300):
+            self.assertTrue(math.isnan(sw_log_f64(v)), msg=repr(v))
+        for v in (-1.0, -0.5, -1e30):
+            self.assertTrue(math.isnan(float(sw_log_f32(spy_as(v, f32)))), msg=repr(v))
+
+    def test_log_of_subnormal(self) -> None:
+        self.assertLessEqual(
+            _f64_ulp(sw_log_f64(5e-324), math.log(5e-324)), 1
+        )
+        self.assertLessEqual(
+            _f32_ulp(float(sw_log_f32(spy_as(1.4e-45, f32))), _to_f32(math.log(_to_f32(1.4e-45)))), 1
+        )
+
+    def test_log_f32_special_values(self) -> None:
+        for v in (0.0, -0.0):
+            self.assertEqual(float(sw_log_f32(spy_as(v, f32))), -math.inf, msg=repr(v))
+        self.assertEqual(float(sw_log_f32(spy_as(math.inf, f32))), math.inf)
+        self.assertTrue(math.isnan(float(sw_log_f32(spy_as(math.nan, f32)))))
+        self.assertTrue(math.isnan(float(sw_log_f32(spy_as(-1.0, f32)))))
+
+
+class SpyLogModeTest(_TrigUlpTest):
+    """``log_mode`` selects the ``llvm``/``libc``/``software`` implementation at
+    compile time; an unset option defaults to ``software``."""
+
+    def test_llvm(self) -> None:
+        self.check_f64(libm_log_llvm, math.log, 1, _LOG_F64_VALUES)
+        self.check_f32(libm_log_llvm, math.log, 1, _LOG_F32_VALUES)
+
+    def test_libc(self) -> None:
+        self.check_f64(libm_log_libc, math.log, 1, _LOG_F64_VALUES)
+        self.check_f32(libm_log_libc, math.log, 1, _LOG_F32_VALUES)
+
+    def test_software(self) -> None:
+        self.check_f64(libm_log_software, math.log, 1, _LOG_F64_VALUES)
+        self.check_f32(libm_log_software, math.log, 1, _LOG_F32_VALUES)
+
+    def test_default_is_software(self) -> None:
+        for v in _LOG_F64_VALUES:
+            self.assertEqual(libm_log_default(v), sw_log_f64(v), msg=repr(v))
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            libm_log_bogus(1.0)
+
+
 all_tests = [
     SpySoftwareTrigTest,
     SpyTrigModeTest,
@@ -735,4 +961,8 @@ all_tests = [
     SpyCbrtModeTest,
     SpySoftwarePowTest,
     SpyPowModeTest,
+    SpySoftwareExpTest,
+    SpyExpModeTest,
+    SpySoftwareLogTest,
+    SpyLogModeTest,
 ]
