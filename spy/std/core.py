@@ -246,6 +246,17 @@ def coerce[T](value: Any, typ: type[T]) -> T: ...
 def typed_undefined[T](typ: type[T]) -> T:
     return coerce(undefined(), typ)
 
+# ``lub_type(t1, t2)``: the least upper bound of two types - the common type
+# both peer to (``t1.resolve_peer_type(t2)``), such as a type with its
+# ``Option``, a variant with its tagged union, or an untyped integer with an
+# integer type.  The result is a compile-time type value, so it can name the
+# type of a declaration or feed a ``type[X]`` parameter; two types with no
+# common type yield ``None``.  See ``interp.HirRunner._builtin_lub_type``.
+# ``Any`` types the arguments and the result for the Python checker only (a spy
+# type value has no Python type); the compiler ignores the annotation.
+@builtin_func
+def lub_type(t1: Any, t2: Any) -> Any: ...
+
 @builtin_func
 def int_to_float_unchecked[T: float](value: int, typ: type[T]) -> T: ...
 

@@ -22,13 +22,15 @@ from ..compiler.syntax import (
     Array,
     MultiPtr,
     Opaque,
+    Option,
     Ptr,
     array,
+    comptime,
     ref,
 )
 from ..compiler.util import TriState
-from ..std.core import ptr_cast
 from ..std import compile
+from ..std.core import coerce, lub_type, ptr_cast
 from ..std.mem import align_of, layout_of, size_of
 from .cross_context import _CROSS_CONTEXT
 from .func_types import IntUnary
@@ -243,6 +245,52 @@ def ptr_cast_index(x: i32) -> i32:
     a = array(x, x + 1, x + 2, x + 3)
     m = ptr_cast(ref(a), MultiPtr[i32])
     return m[2]
+
+
+@func()
+def lub_type_widens_integers(x: i32) -> i32:
+    # the least upper bound of two integer types is the wider one, which a value
+    # of the narrower converts to; the compile-time result is a type value
+    comptime()
+    t = lub_type(i32, i64)
+    if t == i64:
+        return 1
+    return 0
+
+
+@func()
+def lub_type_names_a_declaration(x: i32) -> i64:
+    # the computed type names the type of a declaration
+    comptime()
+    t = lub_type(i32, i64)
+    y: t = x  # pyright: ignore
+    return y + 1
+
+
+@func()
+def lub_type_feeds_a_type_parameter(x: i32) -> i64:
+    # the result feeds a ``type[T]`` parameter directly
+    return coerce(x, lub_type(i32, i64))
+
+
+@func()
+def lub_type_with_option(x: i32) -> i32:
+    # a type and its option have the option as their least upper bound
+    comptime()
+    t = lub_type(Ptr[i32], Option[Ptr[i32]])
+    if t == Option[Ptr[i32]]:
+        return 1
+    return 0
+
+
+@func()
+def lub_type_of_unrelated_types(x: i32) -> i32:
+    # two unrelated types have no common type: the result is ``None``
+    comptime()
+    t = lub_type(i32, Ptr[i32])
+    if t is None:
+        return 1
+    return 0
 
 
 def _make_struct(*fields: tuple[str, sval.Type]) -> sval.StructType:
@@ -620,10 +668,33 @@ class SpyCTypeTest(TestCase):
         self.assertEqual(c_struct_sum(5), 10)
 
 
+class SpyLubTypeTest(TestCase):
+    """``std.core.lub_type``: the least upper bound of two types - the common
+    type both peer to (``t1.resolve_peer_type(t2)``).  The result is a
+    compile-time type value, so it can name a declaration's type or feed a
+    ``type[T]`` parameter; two types with no common type yield ``None``."""
+
+    def test_integer_types_unify_to_the_wider_one(self) -> None:
+        self.assertEqual(lub_type_widens_integers(3), 1)
+
+    def test_the_result_names_a_declaration(self) -> None:
+        self.assertEqual(lub_type_names_a_declaration(3), 4)
+
+    def test_the_result_feeds_a_type_parameter(self) -> None:
+        self.assertEqual(lub_type_feeds_a_type_parameter(3), 3)
+
+    def test_a_type_and_its_option_unify_to_the_option(self) -> None:
+        self.assertEqual(lub_type_with_option(3), 1)
+
+    def test_unrelated_types_have_no_common_type(self) -> None:
+        self.assertEqual(lub_type_of_unrelated_types(3), 1)
+
+
 all_tests = [
     SpyTypeClassifyTest,
     SpyDstTest,
     SpyOpaqueAndUnsizedTest,
     SpyLayoutOfTest,
     SpyCTypeTest,
+    SpyLubTypeTest,
 ]

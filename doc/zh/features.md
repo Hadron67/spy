@@ -44,7 +44,7 @@ from spy.std import (
 )
 from spy.std.core import (
     panic, catch_unwind, UnwindException, coerce, typed_undefined, bitcast,
-    ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error,
+    ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error, lub_type,
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
@@ -1472,6 +1472,7 @@ assert unrolled_sum() == 6
 - `std.core.undefined()`：任意类型的 undefined，写进目标时按其类型定型；undefined 作条件报错。
 - `std.core.compile_error(msg)`：以编译期字节串为消息中止编译；非字节串/运行时消息报错；死分支不触发。
 - `std.core.coerce(value, T)`：把 value 具体化成类型 `T`（同 store 的转换）。
+- `std.core.lub_type(t1, t2)`：两个类型的最小上界——两者共同的 peer 类型（`t1.resolve_peer_type(t2)`），如类型与其 `Option`、变体与其 tagged union。结果是编译期类型值，可用于命名声明类型或喂给 `type[X]` 形参；两者无共同类型时得到 `None`。
 - `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`）；未设置时是缺失值（`None`）。
 - `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)`：标量的同位宽重解释 / 整数收窄。
@@ -1515,11 +1516,19 @@ def to_f64(x: u64) -> f64:
 def to_i32(x: f64) -> i32:
     return float_to_int(x, i32)          # in range, else panics
 
+@func()
+def widen(x: i32) -> i64:
+    comptime()
+    t = lub_type(i32, i64)               # i32 与 i64 的最小上界
+    y: t = x                             # 算出的类型命名声明类型
+    return y
+
 assert dead_branch() == 1
 assert pick(True, 1, 2) == 1 and pick(False, 1, 2) == 2
 assert narrowed(128) == -128
 assert same_bits(1.0) == 0x3F800000
 assert truncated(300) == 44
+assert widen(3) == 3
 assert to_f64(9007199254740992) == 9007199254740992.0
 assert to_i32(3.9) == 3
 ```
@@ -1602,7 +1611,7 @@ assert str_len() == 5
 
 | 模块 | 内容 |
 |---|---|
-| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`int_to_float_unchecked`/`float_to_int_unchecked`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option` |
+| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`/`lub_type`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`int_to_float_unchecked`/`float_to_int_unchecked`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option` |
 | `std.reflect` | `TypeInfo` 及变体、`StructField`、`type_info`、`reify` |
 | `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast`、`FloatCastError`、`try_int_to_float`/`int_to_float`、`try_float_to_int`/`float_to_int` |
 | `std.mem` | `Layout`、`layout_of`/`size_of`/`align_of`、`AllocError`、`Allocator`（协议）、`AllocatorVtable`、`DynamicAllocator`、`CAllocator` |

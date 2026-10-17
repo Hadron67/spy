@@ -5931,6 +5931,8 @@ class HirRunner:
             return self._builtin_float_to_int_unchecked(binded, ret)
         if fn.name == 'coerce':
             return self._builtin_coerce(binded, ret)
+        if fn.name == 'lub_type':
+            return self._builtin_lub_type(binded, ret)
         if fn.name == 'compile_error':
             return self._builtin_compile_error(binded)
         if fn.name == 'compile_option':
@@ -6220,6 +6222,28 @@ class HirRunner:
             args.positional[1], 'the type argument of std.core.coerce'
         )
         self.store(ret, self._coerce(ev, target))
+        return PollResult.AGAIN
+
+    # -- ``std.core.lub_type`` -----------------------------------------------
+
+    def _builtin_lub_type(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.lub_type(t1, t2)``: the least upper bound of the two spy
+        types - the common type both peer to (see
+        ``sval.Type.resolve_peer_type``), such as a type with its ``Option``, a
+        variant with its tagged union, or an untyped integer with an integer
+        type.  The result is a compile-time type value, so it can name the type
+        of a declaration or feed a ``type[X]`` parameter; two types with no
+        common type yield the null value (``None``)."""
+        t1 = self._type_value_arg(
+            args.positional[0], 'the first argument of std.core.lub_type'
+        )
+        t2 = self._type_value_arg(
+            args.positional[1], 'the second argument of std.core.lub_type'
+        )
+        peer = t1.resolve_peer_type(t2)
+        self.store(ret, sval.Null() if peer is None else peer)
         return PollResult.AGAIN
 
     # -- ``std.atomic`` ------------------------------------------------------
