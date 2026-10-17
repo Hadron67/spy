@@ -5572,20 +5572,34 @@ class HirRunner:
 
         if lhs_type is None or rhs_type is None:
             raise CompileError(f"cannot apply '{op}' to untyped objects")
+        if isinstance(lhs_type, sval.BoolType) and isinstance(rhs_type, sval.BoolType):
+            # two bools: an ``i1`` compares with the same ``mir.Cmp`` an integer
+            # does, and the operands already share their type (so there is no
+            # peer type to find)
+            lv = self._arg_value(lhs)
+            rv = self._arg_value(rhs)
+            return self._emit_cmp(op, lv, rv, lhs_type, ret_reg)
         if sval.is_numeric_type(lhs_type) and sval.is_numeric_type(rhs_type):
             lv = self._arg_value(lhs)
             rv = self._arg_value(rhs)
             type = lhs_type.resolve_peer_type(rhs_type)
             if type is None:
                 raise CompileError(f'cannot compare {lhs_type} and {rhs_type}')
-            lc = self._coerce(lv, type)
-            rc = self._coerce(rv, type)
-            value = self._emit(
-                mir.Cmp(op, self._to_runtime(lc), self._to_runtime(rc))
-            )
-            self._frames[-1].regs[ret_reg] = RuntimeVal(value, sval.BoolType())
-            return PollResult.AGAIN
+            return self._emit_cmp(op, lv, rv, type, ret_reg)
         raise CompileError(f'unsupported operand types: {lhs_type} and {rhs_type}')
+
+    def _emit_cmp(self, op: CompareOp, lv: InterpVal, rv: InterpVal, type: sval.Type, ret_reg: hir.Inst) -> PollResult:
+        """``a op b`` of the two operand *values*, both converted to ``type``:
+        the result is a runtime ``bool``.  A ``bool`` is an ``i1``, so the
+        backend compares it with the same ``icmp`` an integer uses (see
+        ``lower``)."""
+        lc = self._coerce(lv, type)
+        rc = self._coerce(rv, type)
+        value = self._emit(
+            mir.Cmp(op, self._to_runtime(lc), self._to_runtime(rc))
+        )
+        self._frames[-1].regs[ret_reg] = RuntimeVal(value, sval.BoolType())
+        return PollResult.AGAIN
 
     def _eval_enum_cmp(self, op: CompareOp, lhs: ArgEntry[InterpVal], rhs: ArgEntry[InterpVal], lhs_type: sval.Type | None, rhs_type: sval.Type | None, ret_reg: hir.Inst) -> PollResult:
         """``a == b`` / ``a != b`` of two values of the *same* integer

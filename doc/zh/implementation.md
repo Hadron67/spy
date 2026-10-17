@@ -238,6 +238,25 @@ flowchart TD
 - **复数**：`{real, imag}` 两个元素浮点（`complex_mir`）。
 - **无标签 union**：存储即最大变体，各变体都在偏移 0（见 §7.1）。
 
+### 4.10 peer 规则（`resolve_peer_type`）
+
+- `Type.resolve_peer_type(other)`：两个类型的**共同类型**（最小上界）——任一方的值可转换成的那个类型，无共同类型时 `None`。
+  它给「未声明类型的存储」定型（`interp.PendingSlot.committed_type`、`interp._common_element_type`、`_build_tuple_value` 都是**从左到右**折叠），
+  也是 `std.core.lub_type` 的实现。
+- 阶梯（自上而下）：**两个 bottom**（`UndefinedType`、`EmptyType`）是单位元（对方胜出）；`NullType` 把对方变成 `Option[T]`；
+  `OptionType` 穿透到 child；变体与含它的 `TaggedUnionType` 互为 peer；其余比对**双向**子类型（`self ⊑ other → other`，
+  `other ⊑ self → self`，都不成立 → `None`）。
+- 各具体类型的覆写只保留「同族合并」，其余一律回落 `super()`（基类负责 bottom/null/option/union/双向子类型）：
+  整数取最小可容纳两者的类型（`min_int_type`）、浮点取较宽者、指针要求 pointee 相同且 const 相加/降为单指针、
+  实参与复数的转换由 `ComplexType` 一侧决定（实数 → 零虚部；两个复数 → 加宽元素浮点）。
+- 两个 bottom 相碰取规范的 `undefined`（`UndefinedType` 特判 `EmptyType → self`）；`EmptyType` 正是 `TypeVarSolver.finish` 折叠的初值。
+- `null ⋄ void` 是 `Option[void]` 而**不是** `void`：`None` 仍可用在要求 void 值的位置，但那是 `coerce_const` 的转换；
+  若 peer 到 `void`，则 `null`、`void` 与含 `void` 变体的 union 三者的折叠将不再结合。同理 `null` **不是**任何 union 的变体。
+- **唯一不对称**的是 `ResultType ⋄ ResultType`：取左侧的返回类型、左侧的异常在前（这正是调用方折叠顺序所依赖的），
+  所以 `lub_type(t1, t2)` 对 result 类型按参数顺序敏感；其余所有类型满足 `a ⋄ b == b ⋄ a`。
+- 注意 `ValueType`（字面量类型）目前无任何构造点（`_type_of` 的 `allow_value_type` 参数从未被传 `True`），
+  它的 `resolve_peer_type`/`IntType` 的 `case ValueType()` 分支都是死代码。
+
 ---
 
 ## 5. 函数模型（`fn.py`）与声明 DSL（`dsl.py`）
@@ -315,7 +334,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 ### 6.2 Compile-time 存储与 pending slot
 
 - `PendingSlot(insertion, is_comptime: bool | None, is_const, runtime_pos, stores: list[_PendingAction], committed, declared)`：
-  - `committed_type()`：优先 `declared`，否则把各 action 的 `info()[0]` 用 `resolve_peer_type` 折叠（不兼容则报错）。
+  - `committed_type()`：优先 `declared`，否则把各 action 的 `info()[0]` 用 `resolve_peer_type` **从左到右**折叠（不兼容则报错；规则见 §4.10）。
   - `use_comptime_storage()`：`is_comptime` 固定时用它，否则「所有写入都是 inline 编译期值」才为编译期。
 - `_PendingAction` 变体：`_PendingStore`、`_PendingPtrConvertion`、`_PendingTuple`、`_PendingAggregate`、`_PendingErrorCodeWrite`。
 - 记账：`_record_pending_store`（拒绝运行时值进 `is_comptime=True` 槽；`is_inline = 未跨运行期块 且 是编译期值`）、`_record_pending_action`。

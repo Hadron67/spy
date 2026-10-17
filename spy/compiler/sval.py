@@ -244,9 +244,28 @@ class Type(Value):
         return isinstance(other, self.__class__)
 
     def resolve_peer_type(self, other: Type) -> Type | None:
-        if isinstance(other, UndefinedType):
-            # the undefined type is the bottom: a value of it is a value of any
-            # type, so the other type wins
+        """The *peer type* of this type and ``other``: the type a value of
+        either one converts to, or ``None`` when the two have no common type.
+        It is the rule a location of no declared type is typed by, folding left
+        to right over the types of the values written into it (see
+        ``interp.PendingSlot`` and ``interp._common_element_type``), and what
+        ``std.core.lub_type`` reports.
+
+        The two *bottom* types (:class:`UndefinedType`, the type of
+        ``undefined``, and :class:`EmptyType`, the type of a location that is
+        never written) are the identity: a value of one is a value of any type.
+        ``null`` (:class:`NullType`) makes the other type optional, an
+        :class:`OptionType` peers through its child, and a variant peers with
+        the :class:`TaggedUnionType` that holds it.  Two ordinary types peer to
+        the one that converts to the other, in whichever direction that is.
+
+        The rule is commutative for every type except :class:`ResultType`,
+        whose peer keeps its own return type and puts its own exceptions first
+        (see :meth:`ResultType.resolve_peer_type`); a caller must therefore fold
+        in a fixed, documented order."""
+        if isinstance(other, (UndefinedType, EmptyType)):
+            # a bottom: a value of it is a value of any type, so the other type
+            # wins
             return self
         if isinstance(other, NullType):
             # a type and the null value peer to the option of the type
@@ -257,7 +276,12 @@ class Type(Value):
             # a tagged union on the other side knows which of its variants this
             # type is: a value of one of them peers with the union itself
             return other.resolve_peer_type(self)
-        return other if self.is_subtype_of(other) else None
+        if self.is_subtype_of(other):
+            return other
+        if other.is_subtype_of(self):
+            # the reverse direction: a value of ``other`` converts to this one
+            return self
+        return None
 
     @abstractmethod
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
@@ -697,7 +721,7 @@ class TaggedUnionType(AggregateType):
 
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
-        if isinstance(other, UndefinedType):
+        if isinstance(other, (UndefinedType, EmptyType)):
             return self
         if isinstance(other, TaggedUnionType):
             # the union with the smaller variant set is the peer type: a value
@@ -707,9 +731,15 @@ class TaggedUnionType(AggregateType):
             if all(variant in self.types for variant in other.types):
                 return self
             return None
+        if isinstance(other, (NullType, OptionType)):
+            # ``null`` is never one of the variants, not even of a union that
+            # holds ``void``: the union peers to its option instead (which is
+            # what ``NullType.resolve_peer_type`` does as well)
+            return super().resolve_peer_type(other)
         if self.variant_index_for(other) is not None:
+            # a value of one of the variants peers with the union itself
             return self
-        return None
+        return super().resolve_peer_type(other)
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
@@ -879,11 +909,18 @@ class ResultType(Type):
         """The peer of two result types: the union of their exception sets, in
         first-delivery order (this one's exceptions first), with this one's
         return type.  A result type is never the type of a runtime value, so
-        this is only reached for the parts of a signature."""
-        if isinstance(other, UndefinedType):
+        this is only reached for the parts of a signature.
+
+        Note that this is deliberately *not* commutative (nor associative): the
+        peer keeps the *left* operand's return type and puts its exceptions
+        first, which is the delivery order the caller folds in.  Every other
+        type peers symmetrically, so this is the one exception to the rule
+        ``a.resolve_peer_type(b) == b.resolve_peer_type(a)`` (see
+        :meth:`Type.resolve_peer_type`)."""
+        if isinstance(other, (UndefinedType, EmptyType)):
             return self
         if not isinstance(other, ResultType):
-            return None
+            return super().resolve_peer_type(other)
         types = list(self.types)
         for type in other.types:
             if type not in types:
@@ -1037,7 +1074,12 @@ class EmptyType(ScalarType):
 
     For the machinery of the compiler it behaves like a zero-sized type: it
     has no mirror of its own and the value a slot of it holds is the "no
-    value" marker ``Void()``."""
+    value" marker ``Void()``.
+
+    It is a *bottom* of the peer rule as well, exactly like
+    :class:`UndefinedType`: paired with any type it is that type (see
+    :meth:`Type.resolve_peer_type`), which is what makes it the identity the
+    fold in ``TypeVarSolver.finish`` starts from."""
 
     def get_type(self) -> Type:
         return TYPE_TYPE
@@ -1088,14 +1130,6 @@ class VoidType(ScalarType):
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
-    @override
-    def resolve_peer_type(self, other: Type) -> Type | None:
-        # the null value converts to the void type: the peer of the two is the
-        # void type itself (rather than the option of a void value)
-        if isinstance(other, NullType):
-            return self
-        return super().resolve_peer_type(other)
-
     def __str__(self) -> str:
         return 'void'
 
@@ -1135,13 +1169,16 @@ class NullType(ScalarType):
 
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
-        # Null is the absent value: it peers with the void type (it converts
-        # to it), with an option (it is one of its values), and with any other
-        # type by making it optional
-        if isinstance(other, UndefinedType):
+        # Null is the absent value: it peers with an option (it is one of its
+        # values) and with any other type by making it optional.  It does *not*
+        # peer to the void type: ``None`` is still usable where a void value is
+        # expected, but that is a coercion (see ``coerce_const``), not this
+        # rule - peering the two would make the peer of ``null`` and a tagged
+        # union holding ``void`` ambiguous
+        if isinstance(other, (UndefinedType, EmptyType)):
             return self
         match other:
-            case NullType() | VoidType() | OptionType():
+            case NullType() | OptionType():
                 return other
             case _:
                 return OptionType(other)
@@ -1222,7 +1259,7 @@ class OptionType(AggregateType):
 
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
-        if isinstance(other, UndefinedType):
+        if isinstance(other, (UndefinedType, EmptyType)):
             return self
         match other:
             case NullType():
@@ -1818,19 +1855,21 @@ class AnyIntType(ScalarType):
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
         return None
 
+    @override
+    def is_subtype_of(self, other: Type) -> bool:
+        # the untyped integer converts to any integer type
+        return isinstance(other, (AnyIntType, IntType))
+
     def __str__(self) -> str:
         return 'int'
 
     def resolve_peer_type(self, other: Type) -> Type | None:
-        if isinstance(other, UndefinedType):
-            return self
         if isinstance(other, (IntType, AnyIntType)):
             return other
-        if isinstance(other, NullType):
-            return OptionType(self)
-        if isinstance(other, OptionType):
-            return _resolve_option_peer(self, other)
-        return None
+        if isinstance(other, ComplexType):
+            # an integer is a real number: the complex side owns the conversion
+            return other.resolve_peer_type(self)
+        return super().resolve_peer_type(other)
 
 @dataclass(frozen=True)
 class IntType(ScalarType):
@@ -1872,12 +1911,6 @@ class IntType(ScalarType):
         return min_int_type(lower, upper)
 
     def resolve_peer_type(self, other: Type) -> Type | None:
-        if isinstance(other, UndefinedType):
-            return self
-        if isinstance(other, NullType):
-            return OptionType(self)
-        if isinstance(other, OptionType):
-            return _resolve_option_peer(self, other)
         match other:
             case IntType():
                 self_range = int_range(self)
@@ -1891,7 +1924,11 @@ class IntType(ScalarType):
                         return self.peer_type_with_value(other.value)
                     case Int():
                         return self.peer_type_with_value(other.value.value)
-        return None
+            case ComplexType():
+                # an integer is a real number: the complex side owns the
+                # conversion
+                return other.resolve_peer_type(self)
+        return super().resolve_peer_type(other)
 
     def __str__(self) -> str:
         return f'{'i' if self.signed else 'u'}{self.bits}'
@@ -2053,6 +2090,14 @@ class FloatType(ScalarType):
             return False
         return self.bits <= other.bits
 
+    @override
+    def resolve_peer_type(self, other: Type) -> Type | None:
+        if isinstance(other, ComplexType):
+            # a real float is a complex one with a zero imaginary part: the
+            # complex side owns the conversion
+            return other.resolve_peer_type(self)
+        return super().resolve_peer_type(other)
+
     def __str__(self) -> str:
         return f"f{self.bits}"
 
@@ -2104,12 +2149,6 @@ class ComplexType(AggregateType):
 
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
-        if isinstance(other, UndefinedType):
-            return self
-        if isinstance(other, NullType):
-            return OptionType(self)
-        if isinstance(other, OptionType):
-            return _resolve_option_peer(self, other)
         if isinstance(other, (IntType, AnyIntType)):
             # a real integer operand is taken as a complex one of the element
             # float, with a zero imaginary part (like a float does)
@@ -2121,7 +2160,7 @@ class ComplexType(AggregateType):
             # a real float operand widens the element type, and the value
             # converts to the complex one with a zero imaginary part
             return ComplexType(FloatType(max(self.elem.bits, other.bits)))
-        return other if self.is_subtype_of(other) else None
+        return super().resolve_peer_type(other)
 
     def field_index(self, name: str) -> int | None:
         """The index of the component the field name ``name`` names: the real
@@ -2229,12 +2268,6 @@ class PointerType(ScalarType):
         types have to match, the result is const when either is, and it is a
         single pointer as soon as either is (a multi pointer converts to a
         single one, not the other way around)."""
-        if isinstance(other, UndefinedType):
-            return self
-        if isinstance(other, NullType):
-            return OptionType(self)
-        if isinstance(other, OptionType):
-            return _resolve_option_peer(self, other)
         if isinstance(other, PointerType):
             if self.elem != other.elem:
                 return None
@@ -2246,7 +2279,7 @@ class PointerType(ScalarType):
                 # convert to
                 variant = PointerVariant.SINGLE
             return PointerType(self.elem, is_const, variant)
-        return other if self.is_subtype_of(other) else None
+        return super().resolve_peer_type(other)
 
     @override
     def get_type(self) -> Type:
@@ -2629,6 +2662,9 @@ class UndefinedType(ScalarType):
     @override
     def resolve_peer_type(self, other: Type) -> Type | None:
         # undefined takes the type of whatever it is paired with
+        if isinstance(other, EmptyType):
+            # the two bottoms peer to the canonical one (``undefined``)
+            return self
         return other
 
     @override

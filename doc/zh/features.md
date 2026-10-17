@@ -1472,7 +1472,7 @@ assert unrolled_sum() == 6
 - `std.core.undefined()`：任意类型的 undefined，写进目标时按其类型定型；undefined 作条件报错。
 - `std.core.compile_error(msg)`：以编译期字节串为消息中止编译；非字节串/运行时消息报错；死分支不触发。
 - `std.core.coerce(value, T)`：把 value 具体化成类型 `T`（同 store 的转换）。
-- `std.core.lub_type(t1, t2)`：两个类型的最小上界——两者共同的 peer 类型（`t1.resolve_peer_type(t2)`），如类型与其 `Option`、变体与其 tagged union。结果是编译期类型值，可用于命名声明类型或喂给 `type[X]` 形参；两者无共同类型时得到 `None`。
+- `std.core.lub_type(t1, t2)`：两个类型的最小上界——两者共同的 peer 类型（`t1.resolve_peer_type(t2)`），如类型与其 `Option`、变体与其 tagged union、无类型整数与其整型。结果是编译期类型值，可用于命名声明类型或喂给 `type[X]` 形参；两者无共同类型时得到 `None`。peer 规则对两个参数是对称的，唯一例外是签名里的 result 类型（返回类型 + 异常集）：此时取 `t1` 的返回类型、`t1` 的异常在前，所以这些情形下结果与参数顺序有关。
 - `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`）；未设置时是缺失值（`None`）。
 - `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)`：标量的同位宽重解释 / 整数收窄。

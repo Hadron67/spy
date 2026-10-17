@@ -2,7 +2,7 @@
 
 这里记录在实现各项特性时发现、但**本任务不处理**的顺带问题（多为既有实现里已存在的问题）。每节给出原状、最小复现/后果与（若有）规避办法。
 
-> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、往 `Option[零尺寸类型]` 的构造不置 present、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽、编译期「元素视图」指针物化只按视图生成存储、无返回注解的函数返回编译期聚合值（`complex`/struct/option 等）时把物化指令发到已收尾区块而崩溃）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除，末者随 `sval.pointer_object_type` 的修复移除），已从本文件移除。
+> 说明：此前记录的若干问题（嵌套运行时-tag option/union 的 `ArgNode` 编码、`as_copy=True` 的 ZST 捕获边界、运行期控制流之后的闭包/编译期声明、`comptime()` 标记的元组解包紧跟内联调用后再跟声明、`if <编译期bool> and <编译期bool>:` 不折叠、`Comptime` 元组的元素 place 在运行期控制流里不可写、无类型标注的 `const_array(undefined(), N)` 再赋指针元素挂死、反射类型用于 `ptr_cast(..., Ptr[T])` 命中 `exec_ptr_cast` 断言、编译期聚合目的地上的 `store` 缺少隐式转换、内联 tuple 形参槽被 commit 成编译期 box、内联函数的 `type[T]` 形参在实参以值传入（如指针类型 `Ptr[...]`）时形参槽被定成它的内层类型、前置声明把带类型的 `comptime` 局部变量的 `Alloca` 提升到入口块而无法做编译期下标、往 `Option[零尺寸类型]` 的构造不置 present、前置声明把同一 block 内被就地声明的编译期变量抢成运行时槽、编译期「元素视图」指针物化只按视图生成存储、无返回注解的函数返回编译期聚合值（`complex`/struct/option 等）时把物化指令发到已收尾区块而崩溃）已随相关重构或修复解决（后二者随「前置声明只覆盖连续 `def`」的改动移除，末者随 `sval.pointer_object_type` 的修复移除），已从本文件移除。此外，「运行时两个 `bool` 的比较未实现」已随 `interp._eval_cmp` 的 `BoolType` 分支修复而移除；「未标注局部变量的推断类型为编译期专属时报错不指向 `comptime()`」经核实与文档一致（`astgen` 对未标注新声明定 `is_comptime=False`），不是缺陷，也未保留条目。
 
 ---
 

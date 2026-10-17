@@ -9,6 +9,8 @@ from ..compiler import (
     c_uchar,
     c_uint,
     c_ulonglong,
+    f32,
+    f64,
     i32,
     i64,
     mir,
@@ -293,6 +295,48 @@ def lub_type_of_unrelated_types(x: i32) -> i32:
     return 0
 
 
+@func()
+def lub_type_of_a_variant_and_its_union(x: i32) -> i32:
+    # a variant and the tagged union holding it have the *union* as their least
+    # upper bound (a value of the variant is a value of the union)
+    comptime()
+    t = lub_type(i32 | i64, i32)
+    if t == (i32 | i64):
+        return 1
+    return 0
+
+
+@func()
+def lub_type_of_a_variant_and_its_union_reflected(x: i32) -> i32:
+    # ... in either operand order: the peer rule is symmetric
+    comptime()
+    t = lub_type(i32, i32 | i64)
+    if t == (i32 | i64):
+        return 1
+    return 0
+
+
+@func()
+def lub_type_widens_floats(x: f64) -> i32:
+    # two float widths have the wider one as their least upper bound (the
+    # narrower one converts to it)
+    comptime()
+    t = lub_type(f64, f32)
+    if t == f64:
+        return 1
+    return 0
+
+
+@func()
+def lub_type_widens_floats_reflected(x: f32) -> i32:
+    # ... in either operand order
+    comptime()
+    t = lub_type(f32, f64)
+    if t == f64:
+        return 1
+    return 0
+
+
 def _make_struct(*fields: tuple[str, sval.Type]) -> sval.StructType:
     head = sval.StructTypeHead('T')
     for name, type in fields:
@@ -434,6 +478,143 @@ class SpyTypeClassifyTest(TestCase):
         # ... while one context reuses the one it made
         self.assertIs(union.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache), global_mir)
         self.assertIsNot(union.to_mir_type(_CROSS_CONTEXT.mir_lower_cache), global_mir)
+
+
+class SpyPeerTypeTest(TestCase):
+    """``sval.Type.resolve_peer_type``: the type a value of either of two types
+    converts to.  The rule is a fold (a location of no declared type is typed by
+    folding it left to right over the values written into it, see
+    ``interp.PendingSlot``), the bottom types are its identity, an option peers
+    through its child, a variant peers with its union, and a real type with a
+    complex one.  It is symmetric - except for two result types, whose peer
+    keeps the *left* operand's return type and exception order, which is what
+    the caller relies on."""
+
+    def test_the_bottom_types_are_the_identity(self) -> None:
+        i32_type = sval.IntType(32, True)
+        for bottom in (sval.EmptyType(), sval.UndefinedType()):
+            self.assertIs(i32_type.resolve_peer_type(bottom), i32_type)
+            self.assertIs(bottom.resolve_peer_type(i32_type), i32_type)
+        # ... and the two of them peer to the canonical one
+        self.assertIsInstance(
+            sval.EmptyType().resolve_peer_type(sval.UndefinedType()), sval.UndefinedType
+        )
+        self.assertIsInstance(
+            sval.UndefinedType().resolve_peer_type(sval.EmptyType()), sval.UndefinedType
+        )
+
+    def test_a_variant_peers_with_its_union(self) -> None:
+        i32_type = sval.IntType(32, True)
+        union = sval.tagged_union_of((i32_type, sval.IntType(64, True)))
+        self.assertEqual(i32_type.resolve_peer_type(union), union)
+        self.assertEqual(union.resolve_peer_type(i32_type), union)
+        # ... and an untyped integer finds the variant it converts to
+        self.assertEqual(sval.AnyIntType().resolve_peer_type(union), union)
+        self.assertEqual(union.resolve_peer_type(sval.AnyIntType()), union)
+
+    def test_a_variant_peers_with_a_union_holding_void(self) -> None:
+        # ``null`` is never one of the variants, not even of a union that holds
+        # ``void``: the union is made optional instead (which is what makes the
+        # union, ``null`` and ``void`` fold associatively)
+        void = sval.VoidType()
+        union = sval.tagged_union_of((void, sval.IntType(32, True)))
+        option = sval.OptionType(union)
+        self.assertEqual(sval.NullType().resolve_peer_type(union), option)
+        self.assertEqual(union.resolve_peer_type(sval.NullType()), option)
+        self.assertEqual(void.resolve_peer_type(union), union)
+        self.assertEqual(union.resolve_peer_type(void), union)
+
+    def test_a_narrower_type_peers_to_the_wider_one(self) -> None:
+        f32_type = sval.FloatType(32)
+        f64_type = sval.FloatType(64)
+        self.assertEqual(f32_type.resolve_peer_type(f64_type), f64_type)
+        self.assertEqual(f64_type.resolve_peer_type(f32_type), f64_type)
+
+    def test_a_complex_number_takes_a_real_operand(self) -> None:
+        # a real value converts to the complex one with a zero imaginary part,
+        # whoever the pair is asked from
+        c64 = sval.ComplexType(sval.FloatType(32))
+        for real in (sval.IntType(32, True), sval.FloatType(32), sval.AnyIntType()):
+            self.assertEqual(real.resolve_peer_type(c64), c64)
+            self.assertEqual(c64.resolve_peer_type(real), c64)
+        # two complex ones widen their element type
+        c128 = sval.ComplexType(sval.FloatType(64))
+        self.assertEqual(c64.resolve_peer_type(c128), c128)
+        self.assertEqual(c128.resolve_peer_type(c64), c128)
+
+    def test_a_type_peers_with_its_option(self) -> None:
+        i32_type = sval.IntType(32, True)
+        option = sval.OptionType(i32_type)
+        self.assertEqual(i32_type.resolve_peer_type(option), option)
+        self.assertEqual(option.resolve_peer_type(i32_type), option)
+        # the absent value makes the other type optional
+        self.assertEqual(sval.NullType().resolve_peer_type(i32_type), option)
+        self.assertEqual(i32_type.resolve_peer_type(sval.NullType()), option)
+
+    def test_a_null_and_a_void_peer_to_the_option_of_void(self) -> None:
+        # ``None`` is still usable where a void value is expected, but that is a
+        # coercion (see ``coerce_const``), not this rule: peering ``null`` to
+        # ``void`` would make the peer of ``null`` and a tagged union holding
+        # ``void`` ambiguous (see the test above)
+        null = sval.NullType()
+        void = sval.VoidType()
+        self.assertEqual(null.resolve_peer_type(void), sval.OptionType(void))
+        self.assertEqual(void.resolve_peer_type(null), sval.OptionType(void))
+
+    def test_two_result_types_keep_the_left_operands(self) -> None:
+        # the one deliberate exception to the symmetry of the rule: the peer
+        # keeps the *left* operand's return type, its own exceptions first
+        left = sval.ResultType(sval.IntType(32, True), sval.FrozenArraySet())
+        right = sval.ResultType(sval.IntType(64, True), sval.FrozenArraySet())
+        self.assertEqual(
+            left.resolve_peer_type(right),
+            sval.ResultType(sval.IntType(32, True), sval.FrozenArraySet()),
+        )
+        self.assertEqual(
+            right.resolve_peer_type(left),
+            sval.ResultType(sval.IntType(64, True), sval.FrozenArraySet()),
+        )
+        # ... while every other pair of a result type is symmetric
+        self.assertEqual(
+            sval.NullType().resolve_peer_type(left), sval.OptionType(left)
+        )
+        self.assertEqual(
+            left.resolve_peer_type(sval.NullType()), sval.OptionType(left)
+        )
+
+    def test_the_rule_is_symmetric_for_every_type_except_a_result_type(self) -> None:
+        i32_type = sval.IntType(32, True)
+        void = sval.VoidType()
+        sample: list[sval.Type] = [
+            i32_type,
+            sval.IntType(64, True),
+            sval.FloatType(32),
+            sval.FloatType(64),
+            sval.ComplexType(sval.FloatType(32)),
+            sval.BoolType(),
+            void,
+            sval.NullType(),
+            sval.UndefinedType(),
+            sval.EmptyType(),
+            sval.AnyIntType(),
+            sval.PointerType(i32_type),
+            sval.OptionType(i32_type),
+            sval.ArrayType(i32_type, 3),
+            sval.tagged_union_of((i32_type, sval.BoolType())),
+            sval.tagged_union_of((void, i32_type)),
+            # the deliberate exception, which the loop below skips
+            sval.ResultType(i32_type, sval.FrozenArraySet()),
+        ]
+        for left in sample:
+            for right in sample:
+                if isinstance(left, sval.ResultType) or isinstance(right, sval.ResultType):
+                    # the deliberate exception (see the test above)
+                    continue
+                self.assertEqual(
+                    left.resolve_peer_type(right),
+                    right.resolve_peer_type(left),
+                    f'{left} and {right}',
+                )
 
 
 class SpyDstTest(TestCase):
@@ -689,9 +870,18 @@ class SpyLubTypeTest(TestCase):
     def test_unrelated_types_have_no_common_type(self) -> None:
         self.assertEqual(lub_type_of_unrelated_types(3), 1)
 
+    def test_a_variant_and_its_union_unify_in_either_order(self) -> None:
+        self.assertEqual(lub_type_of_a_variant_and_its_union(3), 1)
+        self.assertEqual(lub_type_of_a_variant_and_its_union_reflected(3), 1)
+
+    def test_two_float_widths_unify_in_either_order(self) -> None:
+        self.assertEqual(lub_type_widens_floats(1.0), 1)
+        self.assertEqual(lub_type_widens_floats_reflected(1.0), 1)
+
 
 all_tests = [
     SpyTypeClassifyTest,
+    SpyPeerTypeTest,
     SpyDstTest,
     SpyOpaqueAndUnsizedTest,
     SpyLayoutOfTest,

@@ -3,6 +3,7 @@ from unittest import TestCase
 from ..compiler import as_ as spy_as
 from ..compiler import bool as spy_bool
 from ..compiler import (
+    f32,
     f64,
     i32,
     u64,
@@ -27,8 +28,53 @@ def int_floor_div(a: i32, b: i32) -> i32:
 
 
 @func()
+def bool_comparisons(a: bool, b: bool) -> i32:
+    # a ``bool`` is an ``i1``: every comparison operator is defined on it, and
+    # the ordering is the ``i1`` one (``False < True``)
+    n: i32 = 0
+    if a == b:
+        n = n + 1
+    if a != b:
+        n = n + 2
+    if a < b:
+        n = n + 4
+    if a <= b:
+        n = n + 8
+    if a > b:
+        n = n + 16
+    if a >= b:
+        n = n + 32
+    return n
+
+
+@func()
+def bool_compared_with_a_literal(x: bool) -> i32:
+    # a literal is a compile-time ``bool``: it converts to the runtime operand
+    n: i32 = 0
+    if x == True:
+        n = n + 1
+    if False != x:
+        n = n + 2
+    if x != True:
+        n = n + 4
+    return n
+
+
+@func()
 def float_floor_div(a: f64, b: f64) -> f64:
     return a // b
+
+
+@func()
+def mixed_float_add(a: f32, b: f64) -> f64:
+    # the narrower float converts to the wider one, whichever operand it is (the
+    # peer type of the two is what the operation is computed in)
+    return a + b
+
+
+@func()
+def mixed_float_add_reflected(a: f64, b: f32) -> f64:
+    return a + b
 
 
 @func()
@@ -198,6 +244,21 @@ class SpyOperatorTest(TestCase):
     def test_float_floor_division(self) -> None:
         self.assertAlmostEqual(float_floor_div(7.5, 2.0), 3.0)
         self.assertAlmostEqual(float_floor_div(-7.5, 2.0), -4.0)
+
+    def test_mixed_float_widths_widen_in_either_order(self) -> None:
+        self.assertAlmostEqual(mixed_float_add(1.5, 2.25), 3.75)
+        self.assertAlmostEqual(mixed_float_add_reflected(1.5, 2.25), 3.75)
+
+    def test_bool_comparisons(self) -> None:
+        # ``False`` is the smaller one, and each operator contributes its bit
+        self.assertEqual(bool_comparisons(False, False), 41)
+        self.assertEqual(bool_comparisons(False, True), 14)
+        self.assertEqual(bool_comparisons(True, False), 50)
+        self.assertEqual(bool_comparisons(True, True), 41)
+
+    def test_a_bool_compares_with_a_literal(self) -> None:
+        self.assertEqual(bool_compared_with_a_literal(True), 3)
+        self.assertEqual(bool_compared_with_a_literal(False), 4)
 
     def test_compile_time_exponent(self) -> None:
         self.assertEqual(int_pow_const(3), 27)
