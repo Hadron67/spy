@@ -1,16 +1,16 @@
 """Math functions (``std.math``).
 
-:func:`sin`, :func:`cos`, :func:`tan`, :func:`sqrt` and :func:`cbrt` each
-dispatch to one of three implementations at compile time, chosen by the host's
-compile-time option
-``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode``/``cbrt_mode``:
+:func:`sin`, :func:`cos`, :func:`tan`, :func:`sqrt`, :func:`cbrt` and
+:func:`pow` each dispatch to one of three implementations at compile time,
+chosen by the host's compile-time option
+``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode``/``cbrt_mode``/``pow_mode``:
 
 * ``llvm`` - the LLVM intrinsic (``llvm.sin.*``/``llvm.cos.*``/``llvm.tan.*``/
-  ``llvm.sqrt.*``/``llvm.cbrt.*``),
+  ``llvm.sqrt.*``/``llvm.cbrt.*``/``llvm.pow.*``),
 * ``libc`` - the C library ``sinf``/``sin``/``cosf``/``cos``/``tanf``/``tan``/
-  ``sqrtf``/``sqrt``/``cbrtf``/``cbrt`` (see ``std.c``),
+  ``sqrtf``/``sqrt``/``cbrtf``/``cbrt``/``powf``/``pow`` (see ``std.c``),
 * ``software`` (the default, also when the option is unset) - the pure spy port
-  in ``std.math.trig``/``std.math.sqrt``/``std.math.cbrt``.
+  in ``std.math.trig``/``std.math.sqrt``/``std.math.cbrt``/``std.math.pow``.
 
 The mode is read while the function is compiled (``compile_option``) and only the
 selected implementation is typed and lowered, so the choice costs nothing at run
@@ -24,6 +24,8 @@ from ..c import cbrt as c_cbrt
 from ..c import cbrtf as c_cbrtf
 from ..c import cos as c_cos
 from ..c import cosf as c_cosf
+from ..c import pow as c_pow
+from ..c import powf as c_powf
 from ..c import sin as c_sin
 from ..c import sinf as c_sinf
 from ..c import sqrt as c_sqrt
@@ -35,6 +37,8 @@ from ..llvm import cbrt_f32 as llvm_cbrt_f32
 from ..llvm import cbrt_f64 as llvm_cbrt_f64
 from ..llvm import cos_f32 as llvm_cos_f32
 from ..llvm import cos_f64 as llvm_cos_f64
+from ..llvm import pow_f32 as llvm_pow_f32
+from ..llvm import pow_f64 as llvm_pow_f64
 from ..llvm import sin_f32 as llvm_sin_f32
 from ..llvm import sin_f64 as llvm_sin_f64
 from ..llvm import sqrt_f32 as llvm_sqrt_f32
@@ -42,6 +46,7 @@ from ..llvm import sqrt_f64 as llvm_sqrt_f64
 from ..llvm import tan_f32 as llvm_tan_f32
 from ..llvm import tan_f64 as llvm_tan_f64
 from .cbrt import cbrt as software_cbrt
+from .pow import pow as software_pow
 from .sqrt import sqrt as software_sqrt
 from .trig import cos as software_cos
 from .trig import sin as software_sin
@@ -72,6 +77,30 @@ def _dispatch(x, opt_name, llvm_f32_fn, llvm_f64_fn, libc_f32_fn, libc_f64_fn, s
         return _dispatch_float(x, libc_f32_fn, libc_f64_fn)
     elif mode == b'software' or mode is None:
         return spy_fn(x)
+    else:
+        compile_error('mode must be "llvm", "libc" or "software"')
+
+@func(inline=True)
+def _dispatch_float2(x, y, f32_fn, f64_fn):
+    comptime()
+    typ = typeof(x)
+    if typ == f32:
+        return f32_fn(x, y)
+    elif typ == f64:
+        return f64_fn(x, y)
+    else:
+        compile_error("must use f32 or f64")
+
+@func(inline=True)
+def _dispatch2(x, y, opt_name, llvm_f32_fn, llvm_f64_fn, libc_f32_fn, libc_f64_fn, spy_fn):
+    comptime()
+    mode = compile_option(opt_name)
+    if mode == b'llvm':
+        return _dispatch_float2(x, y, llvm_f32_fn, llvm_f64_fn)
+    elif mode == b'libc':
+        return _dispatch_float2(x, y, libc_f32_fn, libc_f64_fn)
+    elif mode == b'software' or mode is None:
+        return spy_fn(x, y)
     else:
         compile_error('mode must be "llvm", "libc" or "software"')
 
@@ -116,3 +145,12 @@ def cbrt[T](x: T) -> T:
     option ``cbrt_mode`` (``llvm``/``libc``/``software``) selects.  An unknown
     mode is a compile error."""
     return _dispatch(x, "cbrt_mode", llvm_cbrt_f32, llvm_cbrt_f64, c_cbrtf, c_cbrt, software_cbrt)
+
+@func(inline=True)
+def pow[T](x: T, y: T) -> T:
+    """The power ``x ** y`` (``f32`` or ``f64``, the result taking their common
+    type): ``llvm.pow.*``, the libc ``powf``/``pow``, or the pure spy
+    implementation, as the compile-time option ``pow_mode``
+    (``llvm``/``libc``/``software``) selects.  An unknown mode is a compile
+    error."""
+    return _dispatch2(x, y, "pow_mode", llvm_pow_f32, llvm_pow_f64, c_powf, c_pow, software_pow)

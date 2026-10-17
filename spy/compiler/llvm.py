@@ -1,4 +1,5 @@
 import math
+import struct
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -355,7 +356,14 @@ class FloatValue(Value):
 
     @override
     def __str__(self) -> str:
-        return str(self.value)
+        if math.isfinite(self.value):
+            return str(self.value)
+        # LLVM spells a non-finite float constant by its raw (64-bit) bit
+        # pattern and converts it to the target type (``inf``/``nan`` and the
+        # ``pinf``/``ninf``/``qnan``/``snan`` keywords are not accepted by the
+        # parser); this is what LLVM's own writer emits for such a value
+        raw = struct.unpack('>Q', struct.pack('>d', self.value))[0]
+        return f'0x{raw:016x}'
 
     @override
     def get_type(self) -> Type:

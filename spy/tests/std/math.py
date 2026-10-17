@@ -9,8 +9,9 @@ from ...compiler import CompileError, f32, f64
 from ...compiler import as_ as spy_as
 from ...compiler.dsl import _Context, func
 from ...compiler.lower import LLVMBackend
-from ...std.math import cbrt, cos, sin, sqrt, tan
+from ...std.math import cbrt, cos, pow, sin, sqrt, tan
 from ...std.math.cbrt import cbrt as software_cbrt
+from ...std.math.pow import pow as software_pow
 from ...std.math.sqrt import sqrt as software_sqrt
 from ...std.math.trig import cos as software_cos
 from ...std.math.trig import sin as software_sin
@@ -119,6 +120,21 @@ _CBRT_F32_VALUES = [
     1.1754944e-38, 2.0**12, 2.0**23, 2.0**24, 1e7, -1e7, 1e8, 1e30, 3.4e38,
 ]
 
+# ``pow`` takes two arguments; the values stay where the result neither
+# overflows nor underflows and a negative base always has an integer exponent
+# (the special cases are exercised separately).
+_POW_F64_VALUES = [
+    (2.0, 10.0), (2.0, 0.5), (3.0, 3.0), (10.0, 3.5), (0.5, -2.0), (0.5, 2.5),
+    (1.5, -1.5), (3.7, 2.3), (123456.789, -1.234), (1e10, 0.3), (1e-10, 2.5),
+    (0.1, 0.1), (7.0, 7.0), (-2.0, 3.0), (-2.0, -3.0), (-1.5, 5.0), (2.5, 8.0),
+    (0.9, 100.0), (1.1, 1000.0), (2.0, -10.0),
+]
+
+_POW_F32_VALUES = [
+    (2.0, 10.0), (2.0, 0.5), (3.0, 3.0), (1.5, 2.5), (0.5, -2.0), (10.0, 3.3),
+    (0.1, 5.0), (-2.0, 3.0), (7.0, 0.5), (1.25, 8.0), (2.0, -4.0), (0.8, 20.0),
+]
+
 
 # -- software implementation: the port itself, tested directly ---------------
 
@@ -173,6 +189,16 @@ def sw_cbrt_f32(x: f32) -> f32:
     return software_cbrt(x)
 
 
+@func()
+def sw_pow_f64(x: f64, y: f64) -> f64:
+    return software_pow(x, y)
+
+
+@func()
+def sw_pow_f32(x: f32, y: f32) -> f32:
+    return software_pow(x, y)
+
+
 # -- one host context per mode (the option names cover every function) -------
 
 
@@ -184,6 +210,7 @@ def _context_with_mode(mode: bytes | None) -> _Context:
         ctx.set_compile_option(b'tan_mode', mode)
         ctx.set_compile_option(b'sqrt_mode', mode)
         ctx.set_compile_option(b'cbrt_mode', mode)
+        ctx.set_compile_option(b'pow_mode', mode)
     return ctx
 
 
@@ -319,6 +346,31 @@ def libm_cbrt_bogus(x: f64) -> f64:
     return cbrt(x)
 
 
+@_CTX_LLVM.func()
+def libm_pow_llvm[T](x: T, y: T) -> T:
+    return pow(x, y)
+
+
+@_CTX_LIBC.func()
+def libm_pow_libc[T](x: T, y: T) -> T:
+    return pow(x, y)
+
+
+@_CTX_SOFTWARE.func()
+def libm_pow_software[T](x: T, y: T) -> T:
+    return pow(x, y)
+
+
+@_CTX_DEFAULT.func()
+def libm_pow_default[T](x: T, y: T) -> T:
+    return pow(x, y)
+
+
+@_CTX_BOGUS.func()
+def libm_pow_bogus(x: f64, y: f64) -> f64:
+    return pow(x, y)
+
+
 class _TrigUlpTest(TestCase):
     """Shared comparison helpers (no tests of its own)."""
 
@@ -357,6 +409,26 @@ class _TrigUlpTest(TestCase):
         for v in _TAN_F32_VALUES:
             got = float(fn(spy_as(v, f32)))
             self.assert_rel_close(got, math.tan(_to_f32(v)), tol, repr(v))
+
+    def check_pow_f64(
+        self,
+        fn: Callable[[float, float], float],
+        tol: int,
+        values: list[tuple[float, float]] = _POW_F64_VALUES,
+    ) -> None:
+        for x, y in values:
+            self.assertLessEqual(_f64_ulp(fn(x, y), math.pow(x, y)), tol, msg=repr((x, y)))
+
+    def check_pow_f32(
+        self,
+        fn: Callable[[f32, f32], f32],
+        tol: int,
+        values: list[tuple[float, float]] = _POW_F32_VALUES,
+    ) -> None:
+        for x, y in values:
+            want = _to_f32(math.pow(_to_f32(x), _to_f32(y)))
+            got = float(fn(spy_as(x, f32), spy_as(y, f32)))
+            self.assertLessEqual(_f32_ulp(got, want), tol, msg=repr((x, y)))
 
 
 class SpySoftwareTrigTest(_TrigUlpTest):
@@ -567,6 +639,93 @@ class SpyCbrtModeTest(_TrigUlpTest):
             self.assertEqual(fn(-8.0), -2.0)
 
 
+class SpySoftwarePowTest(_TrigUlpTest):
+    """The pure spy ``pow`` (the musl port): both ``f32`` and ``f64`` are within
+    1 ULP of the correctly rounded result (musl bounds the error at < 0.54 ULP),
+    and the special values (the zeros, ``+-inf``, a NaN, a negative base with a
+    non-integer exponent, overflow and underflow) come out as C's do."""
+
+    def test_pow_f64(self) -> None:
+        self.check_pow_f64(sw_pow_f64, 1)
+
+    def test_pow_f32(self) -> None:
+        self.check_pow_f32(sw_pow_f32, 1)
+
+    def test_exact_powers(self) -> None:
+        for x, y, want in ((2.0, 10.0, 1024.0), (3.0, 4.0, 81.0), (5.0, 0.0, 1.0),
+                           (0.5, 3.0, 0.125), (-8.0, 3.0, -512.0), (-2.0, 2.0, 4.0),
+                           (16.0, 0.5, 4.0), (1000.0, 1.0, 1000.0)):
+            self.assertEqual(sw_pow_f64(x, y), want, msg=repr((x, y)))
+
+    def test_pow_of_zero_exponent(self) -> None:
+        for x in (0.0, -0.0, 2.0, -3.0, math.inf, math.nan):
+            self.assertEqual(sw_pow_f64(x, 0.0), 1.0, msg=repr(x))
+
+    def test_pow_of_zero_base(self) -> None:
+        self.assertEqual(sw_pow_f64(0.0, 2.0), 0.0)
+        self.assertEqual(math.copysign(1.0, sw_pow_f64(-0.0, 3.0)), -1.0)
+
+    def test_pow_of_negative_base(self) -> None:
+        self.assertEqual(sw_pow_f64(-8.0, 3.0), -512.0)
+        self.assertEqual(sw_pow_f64(-2.0, -3.0), -0.125)
+        for x, y in ((-8.0, 0.5), (-2.0, 1.5), (-0.5, 0.25)):
+            self.assertTrue(math.isnan(sw_pow_f64(x, y)), msg=repr((x, y)))
+
+    def test_pow_of_infinite_exponent(self) -> None:
+        self.assertEqual(sw_pow_f64(1.0, math.inf), 1.0)
+        self.assertEqual(sw_pow_f64(-1.0, math.inf), 1.0)
+        self.assertEqual(sw_pow_f64(2.0, math.inf), math.inf)
+        self.assertEqual(sw_pow_f64(0.5, math.inf), 0.0)
+        self.assertEqual(sw_pow_f64(2.0, -math.inf), 0.0)
+        self.assertEqual(sw_pow_f64(0.5, -math.inf), math.inf)
+
+    def test_pow_of_infinite_base(self) -> None:
+        self.assertEqual(sw_pow_f64(math.inf, 2.0), math.inf)
+        self.assertEqual(sw_pow_f64(math.inf, -2.0), 0.0)
+        self.assertEqual(sw_pow_f64(math.inf, 0.5), math.inf)
+        self.assertEqual(sw_pow_f64(-math.inf, 3.0), -math.inf)
+
+    def test_pow_overflow_and_underflow(self) -> None:
+        self.assertEqual(sw_pow_f64(1e200, 2.0), math.inf)
+        self.assertEqual(sw_pow_f64(1e-200, 2.0), 0.0)
+        self.assertEqual(sw_pow_f64(2.0, 3000.0), math.inf)
+        self.assertEqual(sw_pow_f64(2.0, -3000.0), 0.0)
+        self.assertEqual(sw_pow_f64(-1e200, 3.0), -math.inf)
+        self.assertEqual(sw_pow_f64(-1e200, 2.0), math.inf)
+
+
+class SpyPowModeTest(_TrigUlpTest):
+    """``pow_mode`` selects the ``llvm``/``libc``/``software`` implementation at
+    compile time; an unset option defaults to ``software``."""
+
+    def test_llvm(self) -> None:
+        self.check_pow_f64(libm_pow_llvm, 1)
+        self.check_pow_f32(libm_pow_llvm, 1)
+
+    def test_libc(self) -> None:
+        self.check_pow_f64(libm_pow_libc, 1)
+        self.check_pow_f32(libm_pow_libc, 1)
+
+    def test_software(self) -> None:
+        self.check_pow_f64(libm_pow_software, 1)
+        self.check_pow_f32(libm_pow_software, 1)
+
+    def test_default_is_software(self) -> None:
+        # the software implementation is deterministic, so the default (an unset
+        # option) has to match it bit for bit
+        for x, y in _POW_F64_VALUES:
+            self.assertEqual(libm_pow_default(x, y), sw_pow_f64(x, y), msg=repr((x, y)))
+
+    def test_mixed_float_types(self) -> None:
+        # two differing float types meet at their common type (f64 here)
+        self.assertEqual(libm_pow_software(2.0, spy_as(3.0, f32)), 8.0)
+        self.assertEqual(libm_pow_software(spy_as(2.0, f32), 3.0), 8.0)
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            libm_pow_bogus(2.0, 3.0)
+
+
 all_tests = [
     SpySoftwareTrigTest,
     SpyTrigModeTest,
@@ -574,4 +733,6 @@ all_tests = [
     SpySqrtModeTest,
     SpySoftwareCbrtTest,
     SpyCbrtModeTest,
+    SpySoftwarePowTest,
+    SpyPowModeTest,
 ]
