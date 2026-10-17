@@ -1,15 +1,17 @@
 """The software (pure spy) trigonometric functions (``std.math``).
 
-A port of musl's ``sin.c``/``sinf.c``/``cos.c``/``cosf.c`` and the kernels they
-build on (``__sin``/``__cos``/``__sindf``/``__cosdf``, ``__rem_pio2``/
+A port of musl's ``sin.c``/``sinf.c``/``cos.c``/``cosf.c``/``tan.c``/
+``tanf.c`` and the kernels they build on (``__sin``/``__cos``/``__sindf``/
+``__cosdf``, the tangent kernels ``__tan``/``__tandf``, ``__rem_pio2``/
 ``__rem_pio2f`` and ``__rem_pio2_large``).  Where C needs a separate ``float`` and
 ``double`` copy, a single function with a compile-time ``is_32`` flag serves both:
-only the branch of the requested float type is ever typed and lowered.  ``sin``
-and ``cos`` share the kernels and the argument reduction, so both live here.
+only the branch of the requested float type is ever typed and lowered.  ``sin``,
+``cos`` and ``tan`` share the kernels and the argument reduction, so all three
+live here.
 
-The public entry points are :func:`sin` and :func:`cos`, generic over
+The public entry points are :func:`sin`, :func:`cos` and :func:`tan`, generic over
 ``f32``/``f64``.  They are what ``std.math`` calls when the compile-time option
-``sin_mode``/``cos_mode`` is ``software`` (the default).
+``sin_mode``/``cos_mode``/``tan_mode`` is ``software`` (the default).
 """
 
 from typing import Literal
@@ -46,6 +48,24 @@ _DC4 = -2.75573143513906633035e-07
 _DC5 = 2.08757232129817482790e-09
 _DC6 = -1.13596475577881948265e-11
 
+# __tan (f64)
+_DT0 = 3.33333333333334091986e-01
+_DT1 = 1.33333333333201242699e-01
+_DT2 = 5.39682539762260521377e-02
+_DT3 = 2.18694882948595424599e-02
+_DT4 = 8.86323982359930005737e-03
+_DT5 = 3.59207910759131235356e-03
+_DT6 = 1.45620945432529025516e-03
+_DT7 = 5.88041240820264096874e-04
+_DT8 = 2.46463134818469906812e-04
+_DT9 = 7.81794442939557092300e-05
+_DT10 = 7.14072491382608190305e-05
+_DT11 = -1.85586374855275456654e-05
+_DT12 = 2.59073051863633712884e-05
+
+# __tan (f64): the tail of pi/4, ``pio4lo``
+_PIO4LO = 3.061616997868383e-17  # 0x3C81A626, 0x33145C07
+
 # __sindf (f32; evaluated in double)
 _FS1 = -0.166666666416265235595
 _FS2 = 8.3333293858894631756e-03
@@ -57,6 +77,14 @@ _FC0 = -0.499999997251031003120
 _FC1 = 4.16666233237390631894e-02
 _FC2 = -1.38867637746099294692e-03
 _FC3 = 2.43904487962774090654e-05
+
+# __tandf (f32; evaluated in double)
+_FT0 = 0.333331395030791399758
+_FT1 = 0.133392002712976742718
+_FT2 = 0.0533812378445670393523
+_FT3 = 0.0245283181166547278873
+_FT4 = 0.00297435743359967304927
+_FT5 = 0.00946564784943673166728
 
 # powers of two used to split/assemble the 24-bit chunks
 _P24 = 16777216.0  # 0x1p24
@@ -141,6 +169,63 @@ def _cos_kernel(is_32: Comptime[bool], x: f64, y: f64) -> f64:
     hz = 0.5 * z
     w2 = 1.0 - hz
     return w2 + (((1.0 - w2) - hz) + (z * r - x * y))
+
+
+@func()
+def _clear_low_word(x: f64) -> f64:
+    """``SET_LOW_WORD(x, 0)``: zero the low 32 bits of ``x``'s bit pattern."""
+    return bitcast(bitcast(x, u64) & 0xFFFFFFFF00000000, f64)
+
+
+@func()
+def _tan_kernel(is_32: Comptime[bool], x: f64, y: f64, odd: i32) -> f64:
+    """The tangent kernel on ``[-pi/4, pi/4]``: ``__tan`` for ``f64`` (with the
+    tail ``y``) and ``__tandf`` for ``f32`` (which ignores ``y``; evaluated in
+    double like the other ``f32`` kernels).  ``odd`` is the low bit of the
+    reduction count: when it is set ``-1/tan`` is returned."""
+    if is_32:
+        z32 = x * x
+        w32 = z32 * z32
+        s32 = z32 * x
+        r32 = _FT4 + z32 * _FT5
+        t32 = _FT2 + z32 * _FT3
+        v32 = _FT0 + z32 * _FT1
+        r32 = (x + s32 * v32) + (s32 * w32) * (t32 + w32 * r32)
+        if odd != 0:
+            return -1.0 / r32
+        return r32
+    hx = coerce(bitcast(x, u64) >> 32, u32)
+    big = (hx & 0x7FFFFFFF) >= 0x3FE59428  # |x| >= 0.6744
+    sign = coerce(hx >> 31, i32)
+    xa: f64 = x
+    ya: f64 = y
+    if big:
+        if sign != 0:
+            xa = -x
+            ya = -y
+        xa = (_PIO4 - xa) + (_PIO4LO - ya)
+        ya = 0.0
+    z = xa * xa
+    w = z * z
+    r = _DT1 + w * (_DT3 + w * (_DT5 + w * (_DT7 + w * (_DT9 + w * _DT11))))
+    v = z * (_DT2 + w * (_DT4 + w * (_DT6 + w * (_DT8 + w * (_DT10 + w * _DT12)))))
+    s = z * xa
+    r = ya + z * (s * (r + v) + ya) + s * _DT0
+    w = xa + r
+    if big:
+        s = 1.0 - 2.0 * coerce(odd, f64)
+        v = s - 2.0 * (xa + (r - w * w / (w + s)))
+        if sign != 0:
+            return -v
+        return v
+    if odd == 0:
+        return w
+    # -1.0/(x+r) has up to 2ulp error, so compute it accurately
+    w0 = _clear_low_word(w)
+    v = r - (w0 - xa)
+    a = -1.0 / w
+    a0 = _clear_low_word(a)
+    return a0 + a * (1.0 + a0 * w0 + a0 * v)
 
 
 @func()
@@ -643,6 +728,41 @@ def cos[T](x: T) -> T:
 
 @func()
 def tan[T](x: T) -> T:
-    """The tangent of ``x`` (``f32`` or ``f64``), the pure spy implementation:
-    ``sin(x) / cos(x)`` of the same (software) kernels."""
-    return sin(x) / cos(x)  # pyright: ignore[reportOperatorIssue]
+    """The tangent of ``x`` (``f32`` or ``f64``), the pure spy implementation: a
+    port of musl's ``tanf``/``tan``."""
+    comptime()
+    typ = typeof(x)
+    if typ == f32:
+        xf64 = coerce(x, f64)
+        bits = bitcast(x, u32)
+        neg: bool = (bits >> 31) != 0
+        ix: u32 = bits & 0x7FFFFFFF
+        if ix <= 0x3F490FDA:
+            if ix < 0x39800000:
+                return x
+            return coerce(_tan_kernel(True, xf64, 0.0, 0), typ)
+        if ix <= 0x407B53D1:
+            if ix <= 0x4016CBE3:
+                return coerce(_tan_kernel(True, xf64 + _PIO2 if neg else xf64 - _PIO2, 0.0, 1), typ)
+            return coerce(_tan_kernel(True, xf64 + _PI if neg else xf64 - _PI, 0.0, 0), typ)
+        if ix <= 0x40E231D5:
+            if ix <= 0x40AFEDDF:
+                return coerce(_tan_kernel(True, xf64 + _THREE_PIO2 if neg else xf64 - _THREE_PIO2, 0.0, 1), typ)
+            return coerce(_tan_kernel(True, xf64 + _TWO_PI if neg else xf64 - _TWO_PI, 0.0, 0), typ)
+        if ix >= 0x7F800000:
+            return coerce(xf64 - xf64, typ)
+        n, y0, y1 = _rem_pio2(True, coerce(bits, u64), xf64)
+        return coerce(_tan_kernel(True, y0, y1, n & 1), typ)
+    elif typ == f64:
+        bits64 = bitcast(x, u64)
+        ix64 = (bits64 >> 32) & 0x7FFFFFFF
+        if ix64 <= 0x3FE921FB:
+            if ix64 < 0x3E400000:
+                return x
+            return coerce(_tan_kernel(False, coerce(x, f64), 0.0, 0), typ)
+        if ix64 >= 0x7FF00000:
+            xfc64 = coerce(x, f64)
+            return coerce(xfc64 - xfc64, typ)
+        n, y0, y1 = _rem_pio2(False, bits64, coerce(x, f64))
+        return coerce(_tan_kernel(False, y0, y1, n & 1), typ)
+    compile_error("only f32 or f64")

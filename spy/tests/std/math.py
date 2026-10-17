@@ -622,8 +622,7 @@ class _TrigUlpTest(TestCase):
 
 class SpySoftwareTrigTest(_TrigUlpTest):
     """The pure spy ``sin``/``cos``/``tan`` (the musl port): both ``f32`` and
-    ``f64`` are correctly rounded (well within 1 ULP of the C library); ``tan``
-    is ``sin / cos`` of the same kernels."""
+    ``f64`` are correctly rounded (well within 1 ULP of the C library)."""
 
     def test_sin_f64(self) -> None:
         self.check_f64(sw_sin_f64, math.sin, 1)
@@ -638,14 +637,10 @@ class SpySoftwareTrigTest(_TrigUlpTest):
         self.check_f32(sw_cos_f32, math.cos, 1)
 
     def test_tan_f64(self) -> None:
-        self.check_tan_f64(sw_tan_f64, 1e-14)
+        self.check_tan_f64(sw_tan_f64, 1e-15)
 
     def test_tan_f32(self) -> None:
-        self.check_tan_f32(sw_tan_f32, 1e-5)
-
-    def test_tan_is_sin_over_cos(self) -> None:
-        for v in _TAN_F64_VALUES:
-            self.assertEqual(sw_tan_f64(v), sw_sin_f64(v) / sw_cos_f64(v), msg=repr(v))
+        self.check_tan_f32(sw_tan_f32, 2e-7)
 
     def test_sin_of_negative_zero(self) -> None:
         self.assertEqual(math.copysign(1.0, sw_sin_f64(-0.0)), -1.0)
@@ -685,8 +680,8 @@ class SpyTrigModeTest(_TrigUlpTest):
         self.check_f32(libm_sin_software, math.sin, 1)
         self.check_f64(libm_cos_software, math.cos, 1)
         self.check_f32(libm_cos_software, math.cos, 1)
-        self.check_tan_f64(libm_tan_software, 1e-14)
-        self.check_tan_f32(libm_tan_software, 1e-5)
+        self.check_tan_f64(libm_tan_software, 1e-15)
+        self.check_tan_f32(libm_tan_software, 2e-7)
 
     def test_default_is_software(self) -> None:
         # the software implementation is exact, so the default (an unset option)

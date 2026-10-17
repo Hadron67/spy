@@ -1693,8 +1693,8 @@ Which implementation runs is picked **at compile time** by the host's compile-ti
   `llvm.log.*`; `llvm.cbrt.*` is an intrinsic only from LLVM 21 on, so it is unavailable on an older LLVM);
 - `libc` - the C library `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`asinf`/`asin`/`acosf`/`acos`/`sqrtf`/`sqrt`/`cbrtf`/`cbrt`/`powf`/`pow`/`expf`/`exp`/
   `logf`/`log` (the extern declarations in `std.c`);
-- `software` (the default, also when the option is unset) - a pure spy port of musl's `sin`/`sinf`/`cos`/`cosf` in
-  `std.math.trig` (where the two share the kernels and the argument reduction), with `tan` defined as `sin(x) / cos(x)`;
+- `software` (the default, also when the option is unset) - a pure spy port of musl's `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`
+  in `std.math.trig` (where they share the kernels and the argument reduction);
   musl's `asin`/`asinf`/`acos`/`acosf` in `std.math.invtrig` (they share the `R(x**2)` rational approximation, and an
   `f32` path evaluates it in `f64`, rounding once at the end);
   musl's `sqrt`/`sqrtf` in `std.math.sqrt`, `cbrt`/`cbrtf` in `std.math.cbrt`, `pow`/`powf` in `std.math.pow`,
@@ -1702,7 +1702,8 @@ Which implementation runs is picked **at compile time** by the host's compile-ti
   (using the full `log_data.c`/`logf_data.c` tables).
 
 Only the selected implementation is typed and lowered, so the choice costs nothing at run time; an unknown mode is a compile
-error. The software port of `sin`/`cos` and `sqrt` is correctly rounded for both `f32` and `f64`, `cbrt`'s error is below
+error. The software port of `sin`/`cos` and `sqrt` is correctly rounded for both `f32` and `f64`, `tan`/`tanf`'s are about
+1 ULP, `cbrt`'s error is below
 0.667 ULP, `pow`/`powf`'s (the Arm `pow`/`powf` of musl) are below 0.54 and 0.82 ULP, `exp`/`expf`'s are about 0.51 ULP,
 and `log`/`logf`'s are about 0.51 and 0.82 ULP, and `asin`/`acos`'s are about 1 ULP. A negative `sqrt` argument (and a
 NaN) yields a NaN, and `sqrt(-0.0)` is `-0.0`; `cbrt` is odd (`cbrt(-x) == -cbrt(x)`), so a negative argument is computed,

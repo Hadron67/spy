@@ -150,9 +150,10 @@ def cos[T](x: T) -> T:
 @func(inline=True)
 def tan[T](x: T) -> T:
     """The tangent of ``x`` (``f32`` or ``f64``): ``llvm.tan.*``, the libc
-    ``tanf``/``tan``, or the pure spy implementation (``sin(x) / cos(x)``), as the
-    compile-time option ``tan_mode`` (``llvm``/``libc``/``software``) selects.  An
-    unknown mode is a compile error."""
+    ``tanf``/``tan``, or the pure spy implementation (a port of musl's
+    ``tanf``/``tan``), as the compile-time option ``tan_mode``
+    (``llvm``/``libc``/``software``) selects.  An unknown mode is a compile
+    error."""
     return _dispatch(x, "tan_mode", llvm_tan_f32, llvm_tan_f64, c_tanf, c_tan, software_tan)
 
 @func(inline=True)
