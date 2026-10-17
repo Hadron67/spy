@@ -356,12 +356,22 @@ class FloatValue(Value):
 
     @override
     def __str__(self) -> str:
+        # A ``float`` (``f32``) constant has to be exactly representable in
+        # ``f32`` for LLVM's parser to accept its decimal, so -- like clang --
+        # it is spelled by the raw (64-bit) bit pattern of its ``f32`` value
+        # instead (the compile-time value keeps full ``f64`` precision).  A
+        # non-finite value has no decimal either (and ``inf``/``nan`` and the
+        # ``pinf``/``ninf``/``qnan``/``snan`` keywords are not accepted by the
+        # parser).
+        if self.type.bits == 32:
+            try:
+                value = struct.unpack('<f', struct.pack('<f', self.value))[0]
+            except OverflowError:
+                value = math.copysign(math.inf, self.value)
+            raw = struct.unpack('>Q', struct.pack('>d', value))[0]
+            return f'0x{raw:016x}'
         if math.isfinite(self.value):
             return str(self.value)
-        # LLVM spells a non-finite float constant by its raw (64-bit) bit
-        # pattern and converts it to the target type (``inf``/``nan`` and the
-        # ``pinf``/``ninf``/``qnan``/``snan`` keywords are not accepted by the
-        # parser); this is what LLVM's own writer emits for such a value
         raw = struct.unpack('>Q', struct.pack('>d', self.value))[0]
         return f'0x{raw:016x}'
 

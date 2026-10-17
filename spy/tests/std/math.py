@@ -9,9 +9,11 @@ from ...compiler import CompileError, f32, f64
 from ...compiler import as_ as spy_as
 from ...compiler.dsl import _Context, func
 from ...compiler.lower import LLVMBackend
-from ...std.math import cbrt, cos, exp, log, pow, sin, sqrt, tan
+from ...std.math import acos, asin, cbrt, cos, exp, log, pow, sin, sqrt, tan
 from ...std.math.cbrt import cbrt as software_cbrt
 from ...std.math.exp import exp as software_exp
+from ...std.math.invtrig import acos as software_acos
+from ...std.math.invtrig import asin as software_asin
 from ...std.math.log import log as software_log
 from ...std.math.pow import pow as software_pow
 from ...std.math.sqrt import sqrt as software_sqrt
@@ -20,15 +22,15 @@ from ...std.math.trig import sin as software_sin
 from ...std.math.trig import tan as software_tan
 
 # ---------------------------------------------------------------------------
-# ``std.math.sin``/``cos``/``tan``/``sqrt``/``cbrt``/``pow``/``exp``/``log``:
-# the mathematical functions of an ``f32``/``f64``, each dispatched at compile
-# time by the host's compile-time option
-# ``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode``/``cbrt_mode``/
-# ``pow_mode``/``exp_mode``/``log_mode`` - ``llvm`` (the LLVM intrinsic),
-# ``libc`` (the C ``sinf``/``sin``/...) or ``software`` (the pure spy port of
-# musl in ``std.math.trig``/``std.math.sqrt``/``std.math.cbrt``/
-# ``std.math.pow``/``std.math.exp``/``std.math.log``, also the default when the
-# option is unset).
+# ``std.math.sin``/``cos``/``tan``/``asin``/``acos``/``sqrt``/``cbrt``/``pow``/
+# ``exp``/``log``: the mathematical functions of an ``f32``/``f64``, each
+# dispatched at compile time by the host's compile-time option
+# ``sin_mode``/``cos_mode``/``tan_mode``/``asin_mode``/``acos_mode``/
+# ``sqrt_mode``/``cbrt_mode``/``pow_mode``/``exp_mode``/``log_mode`` - ``llvm``
+# (the LLVM intrinsic), ``libc`` (the C ``sinf``/``sin``/...) or ``software``
+# (the pure spy port of musl in ``std.math.trig``/``std.math.invtrig``/
+# ``std.math.sqrt``/``std.math.cbrt``/``std.math.pow``/``std.math.exp``/
+# ``std.math.log``, also the default when the option is unset).
 #
 # The mode is read while the function is compiled and the specialization is
 # cached per host context, so each mode is exercised in a context of its own.
@@ -162,8 +164,44 @@ _LOG_F32_VALUES = [
     1.1754944e-38, 1e7, 1e30, 3.4e38,
 ]
 
+# ``asin``/``acos`` take ``[-1, 1]``: the values cover both halves (the ``|x| = 0.5``
+# split and the ``|x| = 0.975`` / ``2**-57`` / ``2**-26`` thresholds), the ends,
+# the tiny and subnormal arguments that have their own fast path, and both signs.
+_ASIN_ACOS_F64_VALUES = [
+    -1.0, -0.9999999999, -0.99, -0.975, -0.9749, -0.9, -0.75, -0.5,
+    -0.25, -0.1, -2.0 ** -26, -2.0 ** -56, -2.0 ** -57, -1e-8, -1e-20, -5e-324,
+    0.0, -0.0, 5e-324, 1e-20, 1e-8, 2.0 ** -57, 2.0 ** -56, 2.0 ** -26, 0.1,
+    0.25, 0.5, 0.75, 0.9, 0.9749, 0.975, 0.99, 0.9999999999, 1.0,
+]
+
+_ASIN_ACOS_F32_VALUES = [
+    -1.0, -0.99, -0.975, -0.9, -0.75, -0.5, -0.1, -2.0 ** -26, -1e-8,
+    -1.4e-45, 0.0, -0.0, 1.4e-45, 1e-8, 2.0 ** -26, 0.1, 0.5, 0.75, 0.9,
+    0.975, 0.99, 1.0,
+]
+
 
 # -- software implementation: the port itself, tested directly ---------------
+
+
+@func()
+def sw_asin_f64(x: f64) -> f64:
+    return software_asin(x)
+
+
+@func()
+def sw_asin_f32(x: f32) -> f32:
+    return software_asin(x)
+
+
+@func()
+def sw_acos_f64(x: f64) -> f64:
+    return software_acos(x)
+
+
+@func()
+def sw_acos_f32(x: f32) -> f32:
+    return software_acos(x)
 
 
 @func()
@@ -255,6 +293,8 @@ def _context_with_mode(mode: bytes | None) -> _Context:
         ctx.set_compile_option(b'sin_mode', mode)
         ctx.set_compile_option(b'cos_mode', mode)
         ctx.set_compile_option(b'tan_mode', mode)
+        ctx.set_compile_option(b'asin_mode', mode)
+        ctx.set_compile_option(b'acos_mode', mode)
         ctx.set_compile_option(b'sqrt_mode', mode)
         ctx.set_compile_option(b'cbrt_mode', mode)
         ctx.set_compile_option(b'pow_mode', mode)
@@ -393,6 +433,56 @@ def libm_sqrt_bogus(x: f64) -> f64:
 @_CTX_BOGUS.func()
 def libm_cbrt_bogus(x: f64) -> f64:
     return cbrt(x)
+
+
+@_CTX_LLVM.func()
+def libm_asin_llvm[T](x: T) -> T:
+    return asin(x)
+
+
+@_CTX_LIBC.func()
+def libm_asin_libc[T](x: T) -> T:
+    return asin(x)
+
+
+@_CTX_SOFTWARE.func()
+def libm_asin_software[T](x: T) -> T:
+    return asin(x)
+
+
+@_CTX_DEFAULT.func()
+def libm_asin_default[T](x: T) -> T:
+    return asin(x)
+
+
+@_CTX_BOGUS.func()
+def libm_asin_bogus(x: f64) -> f64:
+    return asin(x)
+
+
+@_CTX_LLVM.func()
+def libm_acos_llvm[T](x: T) -> T:
+    return acos(x)
+
+
+@_CTX_LIBC.func()
+def libm_acos_libc[T](x: T) -> T:
+    return acos(x)
+
+
+@_CTX_SOFTWARE.func()
+def libm_acos_software[T](x: T) -> T:
+    return acos(x)
+
+
+@_CTX_DEFAULT.func()
+def libm_acos_default[T](x: T) -> T:
+    return acos(x)
+
+
+@_CTX_BOGUS.func()
+def libm_acos_bogus(x: f64) -> f64:
+    return acos(x)
 
 
 @_CTX_LLVM.func()
@@ -618,6 +708,91 @@ class SpyTrigModeTest(_TrigUlpTest):
             libm_sqrt_bogus(0.5)
         with self.assertRaises(CompileError):
             libm_cbrt_bogus(0.5)
+
+
+class SpySoftwareAsinAcosTest(_TrigUlpTest):
+    """The pure spy ``asin``/``acos`` (the musl port): both ``f32`` and ``f64``
+    are within 1 ULP of the correctly rounded result, and the special values (the
+    ends, the arguments past ``+-1``, a NaN and the zeros) come out as C's do."""
+
+    def test_asin_f64(self) -> None:
+        self.check_f64(sw_asin_f64, math.asin, 1, _ASIN_ACOS_F64_VALUES)
+
+    def test_asin_f32(self) -> None:
+        self.check_f32(sw_asin_f32, math.asin, 1, _ASIN_ACOS_F32_VALUES)
+
+    def test_acos_f64(self) -> None:
+        self.check_f64(sw_acos_f64, math.acos, 1, _ASIN_ACOS_F64_VALUES)
+
+    def test_acos_f32(self) -> None:
+        self.check_f32(sw_acos_f32, math.acos, 1, _ASIN_ACOS_F32_VALUES)
+
+    def test_asin_f64_of_the_ends(self) -> None:
+        self.assertLessEqual(_f64_ulp(sw_asin_f64(1.0), math.asin(1.0)), 1)
+        self.assertLessEqual(_f64_ulp(sw_asin_f64(-1.0), math.asin(-1.0)), 1)
+
+    def test_asin_f64_of_a_zero_keeps_its_sign(self) -> None:
+        self.assertEqual(sw_asin_f64(0.0), 0.0)
+        self.assertEqual(math.copysign(1.0, sw_asin_f64(-0.0)), -1.0)
+
+    def test_acos_f64_of_the_ends(self) -> None:
+        self.assertEqual(sw_acos_f64(1.0), 0.0)
+        self.assertLessEqual(_f64_ulp(sw_acos_f64(-1.0), math.acos(-1.0)), 1)
+
+    def test_acos_f64_of_a_zero(self) -> None:
+        for v in (0.0, -0.0):
+            self.assertLessEqual(_f64_ulp(sw_acos_f64(v), math.pi / 2), 1, msg=repr(v))
+
+    def test_asin_is_odd(self) -> None:
+        for v in _ASIN_ACOS_F64_VALUES:
+            if v > 0.0:
+                self.assertEqual(sw_asin_f64(-v), -sw_asin_f64(v), msg=repr(v))
+
+    def test_out_of_range_is_nan(self) -> None:
+        for fn, v in ((sw_asin_f64, 2.0), (sw_asin_f64, -2.0), (sw_asin_f64, 1e300),
+                      (sw_acos_f64, 2.0), (sw_acos_f64, -2.0), (sw_acos_f64, 1e300),
+                      (sw_asin_f64, math.inf), (sw_asin_f64, math.nan),
+                      (sw_acos_f64, -math.inf), (sw_acos_f64, math.nan)):
+            self.assertTrue(math.isnan(fn(v)), msg=repr(v))
+        for fn in (sw_asin_f32, sw_acos_f32):
+            for v in (2.0, -2.0, math.inf, math.nan):
+                self.assertTrue(math.isnan(float(fn(spy_as(v, f32)))), msg=repr(v))
+
+
+class SpyAsinAcosModeTest(_TrigUlpTest):
+    """``asin_mode``/``acos_mode`` select the ``llvm``/``libc``/``software``
+    implementation at compile time; an unset option defaults to ``software``."""
+
+    def test_llvm(self) -> None:
+        self.check_f64(libm_asin_llvm, math.asin, 2, _ASIN_ACOS_F64_VALUES)
+        self.check_f32(libm_asin_llvm, math.asin, 2, _ASIN_ACOS_F32_VALUES)
+        self.check_f64(libm_acos_llvm, math.acos, 2, _ASIN_ACOS_F64_VALUES)
+        self.check_f32(libm_acos_llvm, math.acos, 2, _ASIN_ACOS_F32_VALUES)
+
+    def test_libc(self) -> None:
+        self.check_f64(libm_asin_libc, math.asin, 2, _ASIN_ACOS_F64_VALUES)
+        self.check_f32(libm_asin_libc, math.asin, 2, _ASIN_ACOS_F32_VALUES)
+        self.check_f64(libm_acos_libc, math.acos, 2, _ASIN_ACOS_F64_VALUES)
+        self.check_f32(libm_acos_libc, math.acos, 2, _ASIN_ACOS_F32_VALUES)
+
+    def test_software(self) -> None:
+        self.check_f64(libm_asin_software, math.asin, 1, _ASIN_ACOS_F64_VALUES)
+        self.check_f32(libm_asin_software, math.asin, 1, _ASIN_ACOS_F32_VALUES)
+        self.check_f64(libm_acos_software, math.acos, 1, _ASIN_ACOS_F64_VALUES)
+        self.check_f32(libm_acos_software, math.acos, 1, _ASIN_ACOS_F32_VALUES)
+
+    def test_default_is_software(self) -> None:
+        # the software implementation is deterministic, so the default (an unset
+        # option) has to match it bit for bit
+        for v in _ASIN_ACOS_F64_VALUES:
+            self.assertEqual(libm_asin_default(v), sw_asin_f64(v), msg=repr(v))
+            self.assertEqual(libm_acos_default(v), sw_acos_f64(v), msg=repr(v))
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            libm_asin_bogus(0.5)
+        with self.assertRaises(CompileError):
+            libm_acos_bogus(0.5)
 
 
 class SpySoftwareSqrtTest(_TrigUlpTest):
@@ -955,6 +1130,8 @@ class SpyLogModeTest(_TrigUlpTest):
 all_tests = [
     SpySoftwareTrigTest,
     SpyTrigModeTest,
+    SpySoftwareAsinAcosTest,
+    SpyAsinAcosModeTest,
     SpySoftwareSqrtTest,
     SpySqrtModeTest,
     SpySoftwareCbrtTest,

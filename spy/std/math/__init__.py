@@ -1,19 +1,21 @@
 """Math functions (``std.math``).
 
-:func:`sin`, :func:`cos`, :func:`tan`, :func:`sqrt`, :func:`cbrt`,
-:func:`pow`, :func:`exp` and :func:`log` each dispatch to one of three
-implementations at compile time, chosen by the host's compile-time option
-``sin_mode``/``cos_mode``/``tan_mode``/``sqrt_mode``/``cbrt_mode``/``pow_mode``/
-``exp_mode``/``log_mode``:
+:func:`sin`, :func:`cos`, :func:`tan`, :func:`asin`, :func:`acos`,
+:func:`sqrt`, :func:`cbrt`, :func:`pow`, :func:`exp` and :func:`log` each
+dispatch to one of three implementations at compile time, chosen by the host's
+compile-time option ``sin_mode``/``cos_mode``/``tan_mode``/``asin_mode``/
+``acos_mode``/``sqrt_mode``/``cbrt_mode``/``pow_mode``/``exp_mode``/
+``log_mode``:
 
 * ``llvm`` - the LLVM intrinsic (``llvm.sin.*``/``llvm.cos.*``/``llvm.tan.*``/
-  ``llvm.sqrt.*``/``llvm.cbrt.*``/``llvm.pow.*``/``llvm.exp.*``/``llvm.log.*``),
+  ``llvm.asin.*``/``llvm.acos.*``/``llvm.sqrt.*``/``llvm.cbrt.*``/
+  ``llvm.pow.*``/``llvm.exp.*``/``llvm.log.*``),
 * ``libc`` - the C library ``sinf``/``sin``/``cosf``/``cos``/``tanf``/``tan``/
-  ``sqrtf``/``sqrt``/``cbrtf``/``cbrt``/``powf``/``pow``/``expf``/``exp``/
-  ``logf``/``log`` (see ``std.c``),
+  ``asinf``/``asin``/``acosf``/``acos``/``sqrtf``/``sqrt``/``cbrtf``/``cbrt``/
+  ``powf``/``pow``/``expf``/``exp``/``logf``/``log`` (see ``std.c``),
 * ``software`` (the default, also when the option is unset) - the pure spy port
-  in ``std.math.trig``/``std.math.sqrt``/``std.math.cbrt``/``std.math.pow``/
-  ``std.math.exp``/``std.math.log``.
+  in ``std.math.trig``/``std.math.invtrig``/``std.math.sqrt``/``std.math.cbrt``/
+  ``std.math.pow``/``std.math.exp``/``std.math.log``.
 
 The mode is read while the function is compiled (``compile_option``) and only the
 selected implementation is typed and lowered, so the choice costs nothing at run
@@ -23,6 +25,10 @@ time.
 from ...compiler import f32, f64, typeof
 from ...compiler.dsl import func
 from ...compiler.syntax import comptime
+from ..c import acos as c_acos
+from ..c import acosf as c_acosf
+from ..c import asin as c_asin
+from ..c import asinf as c_asinf
 from ..c import cbrt as c_cbrt
 from ..c import cbrtf as c_cbrtf
 from ..c import cos as c_cos
@@ -40,6 +46,10 @@ from ..c import sqrtf as c_sqrtf
 from ..c import tan as c_tan
 from ..c import tanf as c_tanf
 from ..core import compile_error, compile_option
+from ..llvm import acos_f32 as llvm_acos_f32
+from ..llvm import acos_f64 as llvm_acos_f64
+from ..llvm import asin_f32 as llvm_asin_f32
+from ..llvm import asin_f64 as llvm_asin_f64
 from ..llvm import cbrt_f32 as llvm_cbrt_f32
 from ..llvm import cbrt_f64 as llvm_cbrt_f64
 from ..llvm import cos_f32 as llvm_cos_f32
@@ -58,6 +68,8 @@ from ..llvm import tan_f32 as llvm_tan_f32
 from ..llvm import tan_f64 as llvm_tan_f64
 from .cbrt import cbrt as software_cbrt
 from .exp import exp as software_exp
+from .invtrig import acos as software_acos
+from .invtrig import asin as software_asin
 from .log import log as software_log
 from .pow import pow as software_pow
 from .sqrt import sqrt as software_sqrt
@@ -142,6 +154,22 @@ def tan[T](x: T) -> T:
     compile-time option ``tan_mode`` (``llvm``/``libc``/``software``) selects.  An
     unknown mode is a compile error."""
     return _dispatch(x, "tan_mode", llvm_tan_f32, llvm_tan_f64, c_tanf, c_tan, software_tan)
+
+@func(inline=True)
+def asin[T](x: T) -> T:
+    """The arc sine of ``x`` in ``[-pi/2, pi/2]`` (``f32`` or ``f64``):
+    ``llvm.asin.*``, the libc ``asinf``/``asin``, or the pure spy implementation,
+    as the compile-time option ``asin_mode`` (``llvm``/``libc``/``software``)
+    selects.  An unknown mode is a compile error."""
+    return _dispatch(x, "asin_mode", llvm_asin_f32, llvm_asin_f64, c_asinf, c_asin, software_asin)
+
+@func(inline=True)
+def acos[T](x: T) -> T:
+    """The arc cosine of ``x`` in ``[0, pi]`` (``f32`` or ``f64``):
+    ``llvm.acos.*``, the libc ``acosf``/``acos``, or the pure spy implementation,
+    as the compile-time option ``acos_mode`` (``llvm``/``libc``/``software``)
+    selects.  An unknown mode is a compile error."""
+    return _dispatch(x, "acos_mode", llvm_acos_f32, llvm_acos_f64, c_acosf, c_acos, software_acos)
 
 @func(inline=True)
 def sqrt[T](x: T) -> T:
