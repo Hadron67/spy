@@ -380,6 +380,28 @@ class IdentityObj:
     def __eq__(self, value: object, /) -> bool:
         return self is value
 
+class IdentityKey[T]:
+    """A hashable key that compares by the *identity* of the object it wraps:
+    two keys are equal only when they wrap the same object, and it hashes by the
+    wrapped object's ``id``.  It is what keys an object-identity ``dict``/``set``
+    (see the ``AGENTS.md`` rule) - including one whose values are otherwise equal
+    by content, which such a map must not use."""
+
+    __slots__ = ('value',)
+
+    def __init__(self, value: T) -> None:
+        self.value = value
+
+    @override
+    def __hash__(self) -> int:
+        return object.__hash__(self.value)
+
+    @override
+    def __eq__(self, other: object, /) -> bool:
+        if not isinstance(other, IdentityKey):
+            return NotImplemented
+        return self.value is other.value
+
 class IndexedMap[K, V]:
     def __init__(self) -> None:
         self.by_id: list[V] = []

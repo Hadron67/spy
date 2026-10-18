@@ -513,7 +513,9 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
 - `_Lowerer._lower_function_no_cache`：算 `needs_personality`/`needs_slot`；建 `sllvm.Function` 并**先登记**（支持递归）；
   块映射（MIR entry → llvm entry）；把每个 `Alloca` **提升到 entry 块**；先提升「稳定的无副作用指令」（操作数为 `Param`/已降低的 `BitCast` 与常量 `Gep`）；
   其余按依赖顺序迭代降低（`Phi` 一旦有一个 incoming 就降低，其余待补；phi 插到块首）。
-- 全局常量：`_lower_global_constant`/`_lower_global_string`/`_lower_constant`；union 常量非存储变体按 clang 的 `{<variant>, [pad]}` 布局（`_needs_literal`/`_lower_literal_struct` 传播）。
+- 全局常量：`_lower_global_constant`/`_lower_global_string`/`_lower_constant`；union 常量非存储变体按 clang 的 `{<variant>, [pad]}` 布局（`_needs_literal`/`_lower_literal_struct` 传播）；
+  这类全局（`_raw_pointers` 标记）的地址按 **clang 的读法**处理：指向它的 `Gep` 发**字节 GEP**（`getelementptr inbounds i8`，偏移用 `_field_offset`/元素步长自算），
+  `Load` 聚合值走 `llvm.memcpy` 到规范类型槽再 `load`（标量仍是普通 `load`）——不再有按规范类型的 GEP/`load` 这种类型不匹配；标记随 `Gep`/`BitCast`/`Select`/`Phi` 前向传播。
 - `_lower_inst`：逐指令映射；`BitCast` 指针↔指针或同类型是无操作；`AsUnion`/`ExtractUnion`/`UnionCast` 按 clang 的做法重解释：
   两类型相同便直接用该值，否则把源值 store 进源类型槽，用 `llvm.memcpy`（`min(源, 目标)` 字节）拷进目标类型槽，再按目标类型 load；
   `Call` 的 `NoReturn` 后补 `unreachable`；`Gep` 显式传 pointee（因 MIR 指针 `BitCast` 是 no-op）。

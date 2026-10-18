@@ -38,7 +38,7 @@ from . import mir
 from .errors import CompileError
 from .fn import DEFAULT_OPTIMIZATION_OPTIONS, Backend, NativeFn, OptimizationOptions
 from .target import TargetInfo
-from .util import StrBiMap, sanitize_name
+from .util import IdentityKey, StrBiMap, sanitize_name
 
 llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
@@ -267,6 +267,11 @@ class _Lowerer:
         # the instructions already lowered (a terminator has no lowered value,
         # so ``_lowered`` alone cannot tell whether one was lowered)
         self._lowered_ids: set[int] = set()
+        # the values that address a global constant the lowering laid out with a
+        # literal type (see ``_lower_global_constant``): reads of such an object
+        # go byte by byte, the way clang reads a union global (see
+        # ``_lower_inst``)
+        self._raw_pointers: set[IdentityKey[mir.Value]] = set()
         self._globals = globals
         self.lowered_globals: dict[mir.GlobalValue, sllvm.GlobalValue] = {}
 
@@ -468,9 +473,61 @@ class _Lowerer:
         pointee = self._to_llvm(constant.type.elem)
         align = self._layout.align_of(pointee)
         lowered = self._lower_constant(constant.value)
+        content = constant.value
+        if (
+            isinstance(content, (mir.AggregateConstant, mir.UnionConstant))
+            and self._needs_literal(content)
+        ):
+            # the initializer is laid out with a literal type instead of the
+            # named one (a union member holds a variant other than the storage
+            # one): addresses into the global are byte-wise (see ``_lower_inst``)
+            self._raw_pointers.add(IdentityKey(constant))
         if isinstance(lowered, sllvm.AggregateConstant):
             return sllvm.GlobalAggregateValue(lowered, align=align)
         return sllvm.GlobalScalarValue(lowered, align=align)
+
+    def _is_raw(self, value: mir.Value) -> bool:
+        """Whether ``value`` addresses a global constant the lowering laid out
+        with a literal type - a union constant holding a variant other than its
+        storage variant (see ``_lower_global_constant``).  Such an object is
+        only ever read, and byte by byte, the way clang reads a union global
+        (see ``_lower_inst``)."""
+        return IdentityKey(value) in self._raw_pointers
+
+    def _field_offset(self, struct: sllvm.StructType | sllvm.LiteralStructType, index: int) -> int:
+        """The byte offset of field ``index`` of a struct type, laid out the way
+        LLVM lays it out: every field aligned to its own alignment."""
+        offset = 0
+        for field in struct.fields[:index]:
+            offset = sllvm.align_up(offset, self._layout.align_of(field))
+            offset += self._layout.size_of(field)
+        return sllvm.align_up(offset, self._layout.align_of(struct.fields[index]))
+
+    def _byte_offset(
+        self,
+        block: sllvm.BasicBlock,
+        pointee: sllvm.Type,
+        index: int | mir.Value,
+        index_value: int | sllvm.Value,
+    ) -> sllvm.Value:
+        """The byte offset of the field or element a ``Gep`` addresses within
+        ``pointee``: the offset of a struct field, or an element index scaled by
+        the element's size (see ``_lower_inst``)."""
+        match pointee:
+            case sllvm.StructType() | sllvm.LiteralStructType():
+                assert isinstance(index, int), 'a struct field index is a constant'
+                return sllvm.IntValue(self._field_offset(pointee, index), sllvm.I64)
+            case sllvm.ArrayType():
+                stride = self._layout.size_of(pointee.child)
+            case _:
+                stride = self._layout.size_of(pointee)
+        if isinstance(index_value, int):
+            return sllvm.IntValue(index_value * stride, sllvm.I64)
+        # a runtime index: scale it in 64 bits (a GEP's first index is an ``i64``)
+        index_type = index_value.get_type()
+        if isinstance(index_type, sllvm.IntType) and index_type.bits < 64:
+            index_value = block.zext(index_value, sllvm.I64)
+        return block.mul(index_value, sllvm.IntValue(stride, sllvm.I64))
 
     def _lower_global_string(self, value: mir.GlobalStringValue) -> sllvm.GlobalValue:
         """A global static constant holding a byte string: the bytes are emitted
@@ -490,13 +547,19 @@ class _Lowerer:
             case _:
                 return self._value(constant, ())
 
-    def _needs_literal(self, constant: mir.AggregateConstant | mir.UnionConstant) -> bool:
+    def _needs_literal(self, constant: mir.AggregateConstant | mir.UnionConstant | mir.Value) -> bool:
         """Whether the constant must be laid out with a literal type: an
         aggregate constant can use the named types of its fields only when no
         union along it holds a variant other than its storage variant."""
         match constant:
             case mir.UnionConstant():
-                return constant.variant != constant.union.payload
+                # the union itself needs a literal when its variant is not the
+                # storage one; a payload laid out as the storage variant can still
+                # hold a nested constant that does
+                return (
+                    constant.variant != constant.union.payload
+                    or self._needs_literal(constant.value)
+                )
             case mir.AggregateConstant():
                 return any(
                     self._needs_literal(member)
@@ -620,7 +683,23 @@ class _Lowerer:
                     self._value(inst.ptr, arg_values), self._value(inst.value, arg_values)
                 )
             case mir.Load():
-                result = block.load(self._value(inst.ptr, arg_values), self._to_llvm(inst.get_type()))
+                ptr = self._value(inst.ptr, arg_values)
+                loaded_type = self._to_llvm(inst.get_type())
+                if isinstance(loaded_type, sllvm.AggregateType) and self._is_raw(inst.ptr):
+                    # an aggregate read out of a global constant the lowering laid
+                    # out with a literal type: clang copies the bytes into a slot
+                    # of the loaded type and loads it, whereas a ``load`` of the
+                    # canonical type from an object of the literal type would be a
+                    # type mismatch
+                    slot = block.alloca(loaded_type)
+                    block.call(
+                        sllvm.LLVM_MEMCPY, slot, ptr,
+                        sllvm.IntValue(self._layout.size_of(loaded_type), sllvm.I64),
+                        sllvm.BOOL_FALSE,
+                    )
+                    result = block.load(slot, loaded_type)
+                else:
+                    result = block.load(ptr, loaded_type)
             case mir.AtomicLoad():
                 result = block.atomic_load(
                     self._value(inst.ptr, arg_values),
@@ -675,7 +754,18 @@ class _Lowerer:
                     self._to_llvm(pointee_type.elem)
                     if isinstance(pointee_type, mir.PointerType) else None
                 )
-                if isinstance(pointee, (sllvm.StructType, sllvm.ArrayType)):
+                if pointee is not None and self._is_raw(inst.ptr):
+                    # the address is inside a global constant the lowering laid out
+                    # with a literal type: clang addresses such an object with a
+                    # byte offset, never with a struct/element typed GEP whose
+                    # source type would not be the object's
+                    result = block.get_element_ptr(
+                        ptr,
+                        self._byte_offset(block, pointee, index, index_value),
+                        pointee=sllvm.I8,
+                    )
+                    self._raw_pointers.add(IdentityKey(inst))
+                elif isinstance(pointee, (sllvm.StructType, sllvm.ArrayType)):
                     # a field/element of the value the pointer points at: LLVM
                     # addresses it with the leading zero index
                     result = block.get_element_ptr(ptr, 0, index_value, pointee=pointee)
@@ -696,6 +786,10 @@ class _Lowerer:
                     self._value(inst.if_true, arg_values),
                     self._value(inst.if_false, arg_values),
                 )
+                if self._is_raw(inst.if_true) and self._is_raw(inst.if_false):
+                    # both branches address a literal-laid-out global: the result
+                    # still does (see ``_raw_pointers``)
+                    self._raw_pointers.add(IdentityKey(inst))
             case mir.Arith():
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)
@@ -771,6 +865,9 @@ class _Lowerer:
                     result = value
                 else:
                     result = block.bitcast(value, self._to_llvm(inst.type))
+                if self._is_raw(inst.value):
+                    # a reinterpreted pointer still addresses the same object
+                    self._raw_pointers.add(IdentityKey(inst))
             case mir.AsUnion() | mir.ExtractUnion() | mir.UnionCast():
                 # a union value is laid out as its storage (the largest variant),
                 # and the LLVM pointers are untyped (``ptr``): the storage bytes
@@ -827,6 +924,11 @@ class _Lowerer:
                     else:
                         available.append((value, pred))
                 assert available, 'a phi needs at least one available incoming'
+                if not pending and all(self._is_raw(value) for value, _ in available):
+                    # every incoming addresses the same literal-laid-out global
+                    # (a phi with pending incomings is decided once they are all
+                    # lowered, so it stays unmarked: see ``_raw_pointers``)
+                    self._raw_pointers.add(IdentityKey(inst))
                 first_value, first_block = available[0]
                 phi = sllvm.Phi((self._value(first_value, arg_values), block_map[id(first_block)]))
                 for value, pred in available[1:]:

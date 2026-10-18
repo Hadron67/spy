@@ -194,14 +194,17 @@ llvm_mod.data_layout = str(self._target_machine.target_data)
 llvm_mod.triple = self._target_machine.triple
 ```
 
-**验证**：修后上述用例在 `opt_level=2/3` 下通过；配合 #11 的用例修正，整套 1181 个测试现在跑在默认级别（`opt_level=2`）上并通过。
+**验证**：修后上述用例在 `opt_level=2/3` 下通过；配合 #11 的用例修正，整套测试现在跑在默认级别（`opt_level=2`）上并通过。
 
 **另（本任务已修）**：`lower._lower_inst` 的 `AsUnion`/`ExtractUnion`/`UnionCast` 原来用「较宽者 alloca + store + 按目标类型 load」重解释，是**跨类型**的 store/load（同一 slot 上类型不一致），属 UB。
 现按 clang 的做法改写：两类型相同便直接取值，否则「源类型槽 store 源值 → `llvm.memcpy`（`min(源, 目标)` 字节）拷进目标类型槽 → 按目标类型 load」
 （clang 对 union 成员访问正是一对 `memcpy`：写入拷成员大小字节，读出拷目标成员大小字节；O2 下同样会被折叠掉，已对照验证）。
 
-**同类隐患（未处理）**：含 union 非存储变体的**全局常量**用 literal 类型 `{<variant>, [pad]}` 声明（与 clang 一致，见上），但读取端是**按规范 union 类型 `load`**，
-而非 clang 的 `memcpy`。二者布局兼容（#10 的 data layout 修复后偏移一致）所以目前能跑，但类型仍不匹配，属 UB；若要彻底一致，可让这类全局的读取也走 `memcpy`。
+**同类隐患（本任务已修）**：含 union 非存储变体的**全局常量**用 literal 类型 `{<variant>, [pad]}` 声明（与 clang 一致，见上），但读取端曾是**按规范 union 类型 `load`**。
+现按 clang 的读法改写：这类全局在 `_raw_pointers` 里标记，指向它的 `Gep` 发**字节 GEP**（`getelementptr inbounds i8`，偏移用 `_field_offset`/元素步长自算），
+`Load` 聚合值走 `llvm.memcpy` 到规范类型槽再 `load`（标量仍普通 `load`）；标记随 `Gep`/`BitCast`/`Select`/`Phi` 前向传播。IR 现与 clang 一致（已对照），O2 下 memcpy/字节 GEP 照例被折叠。
+顺带修了 `_needs_literal`：`UnionConstant` 原来不递归其内部值（变体恰为存储变体时），会让外层用命名类型而内层产出 literal 成员（非法初始化器）——现改为递归。
+**备注**：带 pending incoming 的 `Phi` 不做标记（信息不全），因此那种链上仍可能发类型化 `load`；极罕见。
 
 ---
 

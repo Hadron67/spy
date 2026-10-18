@@ -6,6 +6,7 @@ from ..compiler import (
     f64,
     i32,
     i64,
+    usize,
 )
 from ..compiler import bool as spy_bool
 from ..compiler.dsl import decl_func, func, struct
@@ -214,6 +215,22 @@ def static_union_field() -> i32:
     p = ref(const_h)
     if isinstance(a := p[...].u, StaticUnionA):
         return a.x * 100 + p[...].tail
+    return -1
+
+
+@func()
+def static_union_array_read(index: usize) -> i32:
+    # a runtime index into a compile-time array of union constants: the address
+    # into the literal-laid-out global is computed byte-wise (see the lowering)
+    comptime()
+    v: StaticUnionA = StaticUnionA(5, 0)
+    comptime()
+    u: StaticUnionA | StaticUnionB = v
+    arr: ConstComptime[Array[StaticUnionA | StaticUnionB, Literal[2]]] = array(
+        u, u, length=2,
+    )
+    if isinstance(a := arr[index], StaticUnionA):
+        return a.x
     return -1
 
 
@@ -432,6 +449,27 @@ class StaticPtrTest(TestCase):
 
     def test_a_union_field(self) -> None:
         self.assertEqual(static_union_field(), 509)
+
+    def test_a_union_constant_is_read_the_way_clang_reads_it(self) -> None:
+        # a constant whose union holds a variant other than the storage one is
+        # laid out with a literal type: an address into it is byte-based, and an
+        # aggregate is read out through a memcpy - clang never uses a GEP or a
+        # load that claims the canonical type, which the object does not have
+        self.assertEqual(static_union_smaller(), 5)
+        text = _module_text(static_union_smaller)
+        self.assertIn('getelementptr inbounds i8, ptr @global', text)
+        self.assertIn('call void @llvm.memcpy', text)
+        self.assertNotIn('getelementptr inbounds %tagged_union', text)
+
+    def test_a_runtime_index_into_a_union_constant_array(self) -> None:
+        # the byte offset of a runtime index is the index scaled by the element
+        # size (a byte GEP), and the element itself is read through a memcpy
+        self.assertEqual(static_union_array_read(0), 5)
+        self.assertEqual(static_union_array_read(1), 5)
+        text = _module_text(static_union_array_read)
+        self.assertIn('mul i64 %', text)
+        self.assertIn('getelementptr inbounds i8, ptr @global, i64 %', text)
+        self.assertIn('call void @llvm.memcpy', text)
 
     def test_a_runtime_value_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
