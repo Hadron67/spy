@@ -30,7 +30,7 @@ from pathlib import Path
 
 # the ``spy`` package lives at the repository root (the parent of ``tools``);
 # running a script puts its own directory on ``sys.path``, not the cwd, so add
-# the root explicitly to make ``import spy.compiler`` resolve.
+# the root explicitly to make ``import spy`` resolve.
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))

@@ -18,11 +18,12 @@ For the compilation pipeline and the implementation of each stage, see `doc/impl
 
 ### 0.1 Example conventions
 
-All ```python blocks in this document are **runnable**, complete examples: they assume the following **shared import** (in real code
-the public entry point of `spy` is `spy.compiler`; here the equivalent form `import spy.compiler as spy` is used):
+All ```python blocks in this document are **runnable**, complete examples: they assume the following **shared import**.
+The public entry point is the `spy` package itself, so real code can `import spy` and use `spy.func`, `spy.u64`, `spy.typeof`, etc.;
+the examples below import the common names directly to keep their bodies short:
 
 ```python
-from spy.compiler import (
+from spy import (
     func, struct, decl_func, func_type, Enum,
     i8, i16, i32, i64, u8, u16, u32, u64, u0, usize, isize,
     f32, f64, c64, c128,
@@ -73,7 +74,7 @@ from typing import TYPE_CHECKING, Literal, Never, NoReturn
 
 ### 1.1 Integers and floats
 
-- Fixed-width integers `u8/u16/u32/u64`, `i8/i16/i32/i64`; zero-bit integer `u0` (ZST).
+- Fixed-width integers `u0`..`u64` and `i0`..`i64` (every width from 0 to 64 bits); `u0`/`i0` are zero-bit integers (ZSTs).
 - Floats `f32/f64`.
 - `spy.usize` / `spy.isize`: integers determined by the target platform's pointer width.
 - C integer types `c_char/c_uchar`, `c_short/c_ushort`, `c_int/c_uint`, `c_long/c_ulong`, `c_longlong/c_ulonglong`:

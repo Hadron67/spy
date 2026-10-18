@@ -18,11 +18,12 @@
 
 ### 0.1 示例约定
 
-本文所有 ```python 代码块都是**可运行**的完整示例：它们假定下面这段**共享导入**（在真实代码里
-`spy` 的公开入口是 `spy.compiler`；这里用 `import spy.compiler as spy` 的等价写法）：
+本文所有 ```python 代码块都是**可运行**的完整示例：它们假定下面这段**共享导入**。
+`spy` 的公开入口就是 `spy` 包本身，因此真实代码可以直接 `import spy` 并使用 `spy.func`、`spy.u64`、`spy.typeof` 等；
+下面的示例为了保持函数体简洁，把这些常用名字直接导入：
 
 ```python
-from spy.compiler import (
+from spy import (
     func, struct, decl_func, func_type, Enum,
     i8, i16, i32, i64, u8, u16, u32, u64, u0, usize, isize,
     f32, f64, c64, c128,
@@ -73,7 +74,7 @@ from typing import TYPE_CHECKING, Literal, Never, NoReturn
 
 ### 1.1 整数与浮点
 
-- 定宽整数 `u8/u16/u32/u64`、`i8/i16/i32/i64`；零位整数 `u0`（ZST）。
+- 定宽整数 `u0`..`u64`、`i0`..`i64`（覆盖 0 到 64 位的全部宽度）；`u0`/`i0` 是零位整数（ZST）。
 - 浮点 `f32/f64`。
 - `spy.usize` / `spy.isize`：按目标平台指针宽度决定的整数。
 - C 整数类型 `c_char/c_uchar`、`c_short/c_ushort`、`c_int/c_uint`、`c_long/c_ulong`、`c_longlong/c_ulonglong`：

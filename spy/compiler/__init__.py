@@ -18,17 +18,14 @@ concrete argument types (comptime semantics: ``spy.typeof``, compile-time
 typed MIR, which ``lower`` turns into native code via LLVM.
 """
 
-import builtins as pybuiltins
 from enum import Enum
-from types import NoneType
-from typing import TYPE_CHECKING
 
 from . import builtins as _builtins
-from . import syntax
-from .dsl import builtin_func, decl_func, func, func_type, struct
+from .dsl import Context, builtin_func, decl_func, func, func_type, struct
 from .errors import CompileError, SpyError, TypeMismatchError
 from .sval import BoolType, ComplexType, FloatType, IntType, VoidType
 from .syntax import ConstMultiPtr, ConstPtr, ISize, MultiPtr, Option, Ptr, USize, typeof
+from .types import *
 
 # ``spy.typeof`` is a ``syntax`` marker: ``astgen`` recognizes it by identity and
 # types its argument without emitting code (see ``syntax.typeof``).
@@ -38,77 +35,24 @@ compile_log = _builtins.spy_compile_log
 as_ = _builtins.spy_as
 globals()['as'] = _builtins.spy_as
 
-if TYPE_CHECKING:
-    u0 = int
-    u1 = int
-    u8 = int
-    u16 = int
-    u32 = int
-    u64 = int
-    i1 = int
-    i8 = int
-    i16 = int
-    i32 = int
-    i64 = int
-    f32 = float
-    f64 = float
-    c64 = complex
-    c128 = complex
-    usize = int
-    isize = int
-    c_char = int
-    c_uchar = int
-    c_short = int
-    c_ushort = int
-    c_int = int
-    c_uint = int
-    c_long = int
-    c_ulong = int
-    c_longlong = int
-    c_ulonglong = int
-    bool = pybuiltins.bool
-    void = NoneType
-else:
-    u0 = IntType(0, False)
-    u1 = IntType(1, False)
-    u8 = IntType(8, False)
-    u16 = IntType(16, False)
-    u32 = IntType(32, False)
-    u64 = IntType(64, False)
-    i1 = IntType(1, True)
-    i8 = IntType(8, True)
-    i16 = IntType(16, True)
-    i32 = IntType(32, True)
-    i64 = IntType(64, True)
-    usize = USize
-    isize = ISize
-    c_char = syntax.c_char
-    c_uchar = syntax.c_uchar
-    c_short = syntax.c_short
-    c_ushort = syntax.c_ushort
-    c_int = syntax.c_int
-    c_uint = syntax.c_uint
-    c_long = syntax.c_long
-    c_ulong = syntax.c_ulong
-    c_longlong = syntax.c_longlong
-    c_ulonglong = syntax.c_ulonglong
-    f32 = FloatType(32)
-    f64 = FloatType(64)
-    c64 = ComplexType(FloatType(32))
-    c128 = ComplexType(FloatType(64))
-    bool = BoolType()
-    void = VoidType()
-
 __all__ = [
+    'BoolType',
     'CompileError',
+    'ComplexType',
     'ConstMultiPtr',
     'ConstPtr',
+    'Context',
     'Enum',
+    'FloatType',
+    'ISize',
+    'IntType',
     'MultiPtr',
     'Option',
     'Ptr',
     'SpyError',
     'TypeMismatchError',
+    'USize',
+    'VoidType',
     'as_',
     'bool',
     'builtin_func',
@@ -130,18 +74,140 @@ __all__ = [
     'f64',
     'func',
     'func_type',
+    # signed integers, i0..i64
+    'i0',
     'i1',
+    'i2',
+    'i3',
+    'i4',
+    'i5',
+    'i6',
+    'i7',
     'i8',
+    'i9',
+    'i10',
+    'i11',
+    'i12',
+    'i13',
+    'i14',
+    'i15',
     'i16',
+    'i17',
+    'i18',
+    'i19',
+    'i20',
+    'i21',
+    'i22',
+    'i23',
+    'i24',
+    'i25',
+    'i26',
+    'i27',
+    'i28',
+    'i29',
+    'i30',
+    'i31',
     'i32',
+    'i33',
+    'i34',
+    'i35',
+    'i36',
+    'i37',
+    'i38',
+    'i39',
+    'i40',
+    'i41',
+    'i42',
+    'i43',
+    'i44',
+    'i45',
+    'i46',
+    'i47',
+    'i48',
+    'i49',
+    'i50',
+    'i51',
+    'i52',
+    'i53',
+    'i54',
+    'i55',
+    'i56',
+    'i57',
+    'i58',
+    'i59',
+    'i60',
+    'i61',
+    'i62',
+    'i63',
     'i64',
     'isize',
     'struct',
     'typeof',
+    # unsigned integers, u0..u64
+    'u0',
     'u1',
+    'u2',
+    'u3',
+    'u4',
+    'u5',
+    'u6',
+    'u7',
     'u8',
+    'u9',
+    'u10',
+    'u11',
+    'u12',
+    'u13',
+    'u14',
+    'u15',
     'u16',
+    'u17',
+    'u18',
+    'u19',
+    'u20',
+    'u21',
+    'u22',
+    'u23',
+    'u24',
+    'u25',
+    'u26',
+    'u27',
+    'u28',
+    'u29',
+    'u30',
+    'u31',
     'u32',
+    'u33',
+    'u34',
+    'u35',
+    'u36',
+    'u37',
+    'u38',
+    'u39',
+    'u40',
+    'u41',
+    'u42',
+    'u43',
+    'u44',
+    'u45',
+    'u46',
+    'u47',
+    'u48',
+    'u49',
+    'u50',
+    'u51',
+    'u52',
+    'u53',
+    'u54',
+    'u55',
+    'u56',
+    'u57',
+    'u58',
+    'u59',
+    'u60',
+    'u61',
+    'u62',
+    'u63',
     'u64',
     'usize',
 ]

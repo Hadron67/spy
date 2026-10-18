@@ -7,23 +7,22 @@
 ## 示例
 
 ```python
-from spy.compiler import func, u64
-from spy.compiler import as_ as spy_as
+import spy
 
 
-@func()                         # 注册；首次调用时编译
+@spy.func()                     # 注册；首次调用时编译
 def add[T](a: T, b: T) -> T:
     return a + b
 
 
-@func()
-def add_u64(a: u64, b: u64) -> u64:
+@spy.func()
+def add_u64(a: spy.u64, b: spy.u64) -> spy.u64:
     return a + b
 
 
 print(add(1, 2))                                  # 编译 add(i64, i64)
 print(add(1.5, 2.25))                             # 编译 add(f64, f64)
-print(add_u64(spy_as(2**63 - 1, u64), spy_as(2, u64)))
+print(add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64)))
 ```
 
 详细的特性文档见[doc/zh/features.md](doc/zh/features.md)。

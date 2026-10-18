@@ -7,7 +7,7 @@ from llvmlite.binding import llvm_version_info
 
 from ...compiler import CompileError, f32, f64
 from ...compiler import as_ as spy_as
-from ...compiler.dsl import _Context, func
+from ...compiler.dsl import Context, func
 from ...compiler.lower import LLVMBackend
 from ...std.math import (
     acos,
@@ -378,8 +378,8 @@ def sw_log_f32(x: f32) -> f32:
 # -- one host context per mode (the option names cover every function) -------
 
 
-def _context_with_mode(mode: bytes | None) -> _Context:
-    ctx = _Context(LLVMBackend())
+def _context_with_mode(mode: bytes | None) -> Context:
+    ctx = Context(LLVMBackend())
     if mode is not None:
         ctx.set_compile_option(b'sin_mode', mode)
         ctx.set_compile_option(b'cos_mode', mode)

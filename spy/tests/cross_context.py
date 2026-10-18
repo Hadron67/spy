@@ -4,7 +4,7 @@ from ..compiler import (
     i32,
     sval,
 )
-from ..compiler.dsl import _Context, func, struct
+from ..compiler.dsl import Context, func, struct
 from ..compiler.lower import LLVMBackend
 from .basics import smoke_test
 from .structs import struct_type
@@ -38,7 +38,7 @@ class CrossBox[T]:
 
 # a second host context: its own backend and symbol table, so it links the
 # functions and structs it reaches into its own modules
-_CROSS_CONTEXT = _Context(LLVMBackend())
+_CROSS_CONTEXT = Context(LLVMBackend())
 
 
 @_CROSS_CONTEXT.func()

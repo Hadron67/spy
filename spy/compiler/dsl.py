@@ -204,7 +204,7 @@ def _normalize_exceptions(
 
 
 class _RegisteredFn:
-    def __init__(self, fn, cls, meta: FnMetadata, context: _Context) -> None:
+    def __init__(self, fn, cls, meta: FnMetadata, context: Context) -> None:
         self.fn = fn
         self.cls = cls
         self.meta = meta
@@ -216,7 +216,7 @@ class _RegisteredFn:
         # -> its spy value (see ``astgen.parse_function``)
         self.context_type_vars: dict[TypeVar, sval.Value] = {}
 
-    def with_context(self, context: _Context) -> _RegisteredFn:
+    def with_context(self, context: Context) -> _RegisteredFn:
         # the handle of the same Python function in ``context``: its compiled
         # artifacts (and its native symbols) belong to that context, so a
         # handle resolved from another context must be re-bound there (see
@@ -287,7 +287,7 @@ class _RegisteredClass(StructDecl):
     are the fields, in declaration order, and the functions of the class body
     are its methods - and is cached on the handle (``get_entry``)."""
 
-    def __init__(self, cls: type, context: _Context, meta: StructMetadata) -> None:
+    def __init__(self, cls: type, context: Context, meta: StructMetadata) -> None:
         self.cls = cls
         self.context = context
         self.meta = meta
@@ -488,13 +488,13 @@ class _FuncTypeDecl:
     to name a pointer to it (``ConstPtr[...]``).
     """
 
-    def __init__(self, cls: type, meta: FuncTypeMetadata, context: _Context) -> None:
+    def __init__(self, cls: type, meta: FuncTypeMetadata, context: Context) -> None:
         self.cls = cls
         self.meta = meta
         self.context = context
         self.entry: sval.FunctionType | None = None
 
-    def with_context(self, context: _Context) -> _FuncTypeDecl:
+    def with_context(self, context: Context) -> _FuncTypeDecl:
         # this context's copy of the declaration (see ``_Context._local_func_type``)
         return _FuncTypeDecl(self.cls, self.meta, context)
 
@@ -576,7 +576,7 @@ def _class_declaration_locs(
 
 def _build_fn_type(
     fn: Callable[..., Any],
-    context: _Context,
+    context: Context,
     drop_receiver: bool,
     callconv: str,
     may_panic: bool,
@@ -718,13 +718,13 @@ class _DeclFuncDecl:
     ``interp``).  The declaration is resolved lazily because its annotations
     name objects of the resolving context."""
 
-    def __init__(self, fn: Any, meta: DeclFuncMetadata, context: _Context) -> None:
+    def __init__(self, fn: Any, meta: DeclFuncMetadata, context: Context) -> None:
         self.fn = fn
         self.meta = meta
         self.context = context
         self.entry: sval.DeclareFunction | None = None
 
-    def with_context(self, context: _Context) -> _DeclFuncDecl:
+    def with_context(self, context: Context) -> _DeclFuncDecl:
         # this context's copy of the declaration (see ``_Context._local_decl_func``)
         return _DeclFuncDecl(self.fn, self.meta, context)
 
@@ -742,7 +742,7 @@ class _DeclFuncDecl:
         return self.entry
 
 
-class _Context(CompileContext):
+class Context(CompileContext):
     def __init__(self, backend: Backend, target: TargetInfo | None = None) -> None:
         self.backend = backend
         # the parameters of the compile target this context compiles for (the
@@ -1016,7 +1016,7 @@ class _Context(CompileContext):
             return cast(type[T], result)
         return wrapper
 
-_GLOBAL_CONTEXT = _Context(LLVMBackend())
+_GLOBAL_CONTEXT = Context(LLVMBackend())
 
 func = _GLOBAL_CONTEXT.func
 struct = _GLOBAL_CONTEXT.struct
