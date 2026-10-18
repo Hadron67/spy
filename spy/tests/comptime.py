@@ -682,12 +682,12 @@ class SpyCompileErrorTest(TestCase):
     def test_a_string_literal(self) -> None:
         with self.assertRaises(CompileError) as ctx:
             compile_error_literal()
-        self.assertEqual(str(ctx.exception), 'boom')
+        self.assertEqual(ctx.exception.message, 'boom')
 
     def test_a_byte_string(self) -> None:
         with self.assertRaises(CompileError) as ctx:
             compile_error_bytes()
-        self.assertEqual(str(ctx.exception), 'boom')
+        self.assertEqual(ctx.exception.message, 'boom')
 
     def test_a_non_byte_string_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:

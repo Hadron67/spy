@@ -47,6 +47,7 @@ Python scalars (see ``interp``).  The ``spy.*`` builtins
 ``syntax`` marker, lowered by the parser to a type probe.
 """
 
+import ast
 import functools
 import inspect
 import types as pytypes
@@ -76,6 +77,7 @@ from .fn import (
 )
 from .interp import Analyser
 from .lower import LLVMBackend
+from .source import SourceLoc, fallback_loc, source_of_object
 from .sval import CompileContext, MirLowerCache, StructDecl
 from .target import TargetInfo
 from .util import FrozenArraySet, IndexedMap, frozendict
@@ -102,8 +104,10 @@ def _builtin_signature(fn: Callable[..., Any]) -> sval.BuiltinSignature:
             default = None if param.default is inspect.Parameter.empty else param.default
             positional.add(name, (name, default))
         else:
+            function_loc, _, _ = _declaration_locs(fn)
             raise CompileError(
-                f"the builtin {fn.__name__} may not take a keyword-only parameter"
+                f"the builtin {fn.__name__} may not take a keyword-only parameter",
+                loc=function_loc,
             )
     return sval.BuiltinSignature(positional, varargs, kwargs)
 
@@ -295,11 +299,13 @@ class _RegisteredClass(StructDecl):
 
     def get_entry(self) -> sval.StructTypeHead:
         if self.entry is None:
+            class_loc, field_locs = _class_declaration_locs(self.cls)
             if '__init__' in self.cls.__dict__:
                 raise CompileError(
                     f'struct {self.cls.__name__} cannot declare __init__: custom '
                     f'constructors are not supported; a construction initializes '
-                    f'the fields directly (a keyword argument names one)'
+                    f'the fields directly (a keyword argument names one)',
+                    loc=class_loc,
                 )
             # the declared generic type parameters (PEP 695 ``[T]``): one spy
             # ``sval.TypeVar`` per parameter, which the annotations of the
@@ -313,16 +319,23 @@ class _RegisteredClass(StructDecl):
                 if not isinstance(type_param, TypeVar):
                     raise CompileError(
                         f'unsupported type parameter {type_param!r} of struct '
-                        f'{self.cls.__name__}'
+                        f'{self.cls.__name__}',
+                        loc=class_loc,
                     )
                 spy_type = sval.TypeVar(type_param.__name__)
                 generic_args.append(spy_type)
                 self.class_type_vars[type_param] = spy_type
                 declared_default = getattr(type_param, '__default__', NoDefault)
-                generic_defaults.append(
-                    None if declared_default is NoDefault
-                    else sval.as_value(declared_default, self.context)
-                )
+                if declared_default is NoDefault:
+                    generic_defaults.append(None)
+                else:
+                    try:
+                        generic_defaults.append(
+                            sval.as_value(declared_default, self.context)
+                        )
+                    except CompileError as e:
+                        e.attach_loc(class_loc)
+                        raise
             head = sval.StructTypeHead(
                 self.cls.__name__,
                 tuple(generic_args),
@@ -339,9 +352,17 @@ class _RegisteredClass(StructDecl):
             # one of them (``inner: Pair[T]``) evaluates to an application
             # that resolves against the class' type parameters here
             for name, annotation in self.cls.__annotations__.items():
-                type = sval.as_value(annotation, self.context, self.class_type_vars)
+                field_loc = field_locs.get(name, class_loc)
+                try:
+                    type = sval.as_value(annotation, self.context, self.class_type_vars)
+                except CompileError as e:
+                    e.attach_loc(field_loc)
+                    raise
                 if type is None or not isinstance(type, sval.Type):
-                    raise CompileError(f'cannot convert annotation {annotation!r} to a value')
+                    raise CompileError(
+                        f'cannot convert annotation {annotation!r} to a value',
+                        loc=field_loc,
+                    )
                 # the value the class body assigned to the annotated attribute
                 # is the field's default, which a construction leaves it at when
                 # it is not given (``None`` - no value written - is the null
@@ -349,9 +370,13 @@ class _RegisteredClass(StructDecl):
                 # default has no entry in the class body at all)
                 default: sval.AnyValue | None = None
                 if name in self.cls.__dict__:
-                    default = sval.as_value(
-                        self.cls.__dict__[name], self.context, self.class_type_vars,
-                    )
+                    try:
+                        default = sval.as_value(
+                            self.cls.__dict__[name], self.context, self.class_type_vars,
+                        )
+                    except CompileError as e:
+                        e.attach_loc(field_loc)
+                        raise
                 head.add_field(name, type, default)
             # the ``self`` of every method is the struct *template*: a
             # specialization whose type arguments are the struct's own
@@ -480,8 +505,10 @@ class _FuncTypeDecl:
             return self.entry
         call = self.cls.__call__
         if getattr(call, '__code__', None) is None:
+            class_loc, _ = _class_declaration_locs(self.cls)
             raise CompileError(
-                f'function type {self.cls.__name__} must declare a Python __call__'
+                f'function type {self.cls.__name__} must declare a Python __call__',
+                loc=class_loc,
             )
         self.entry = _build_fn_type(
             call, self.context, drop_receiver=True,
@@ -496,6 +523,55 @@ class _FuncTypeDecl:
 
     def __ror__(self, other: Any) -> sval.TaggedUnionApplication:
         return sval.union_application(other, self)
+
+
+def _declaration_locs(
+    fn: Callable[..., Any],
+) -> tuple[SourceLoc | None, dict[str, SourceLoc], SourceLoc | None]:
+    """The locations of a declared function's ``def``, its parameters and its
+    return annotation, for the diagnostics of ``_build_fn_type``."""
+    parsed = source_of_object(fn)
+    if parsed is None:
+        return fallback_loc(fn), {}, None
+    source, tree = parsed
+    name = getattr(fn, '__name__', None)
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        function = node.name if name is None else name
+        arg_locs: dict[str, SourceLoc] = {}
+        args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        for arg in args:
+            arg_locs[arg.arg] = source.loc(arg.annotation or arg, function)
+        if node.args.vararg is not None:
+            vararg = node.args.vararg
+            arg_locs[vararg.arg] = source.loc(vararg.annotation or vararg, function)
+        if node.args.kwarg is not None:
+            kwarg = node.args.kwarg
+            arg_locs[kwarg.arg] = source.loc(kwarg.annotation or kwarg, function)
+        ret = None if node.returns is None else source.loc(node.returns, function)
+        return source.loc(node, function), arg_locs, ret
+    return fallback_loc(fn), {}, None
+
+
+def _class_declaration_locs(
+    cls: type,
+) -> tuple[SourceLoc | None, dict[str, SourceLoc]]:
+    """The locations of a class definition and its annotated fields."""
+    parsed = source_of_object(cls)
+    if parsed is None:
+        return fallback_loc(cls), {}
+    source, tree = parsed
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        class_loc = source.loc(node, cls.__name__)
+        field_locs: dict[str, SourceLoc] = {}
+        for stmt in node.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                field_locs[stmt.target.id] = source.loc(stmt.annotation, cls.__name__)
+        return class_loc, field_locs
+    return fallback_loc(cls), {}
 
 
 def _build_fn_type(
@@ -523,22 +599,28 @@ def _build_fn_type(
     code = getattr(fn, '__code__', None)
     if code is None:
         raise CompileError(f'{what} must declare a Python function')
+    function_loc, arg_locs, return_node = _declaration_locs(fn)
+    # ``arg_locs`` holds locations rather than AST nodes (the function object
+    # no longer exposes its AST), so the parameter/return lookups below are
+    # direct location lookups
     count = code.co_argcount
     names = code.co_varnames[:count]
     annotations = fn.__annotations__
     has_varargs = bool(code.co_flags & inspect.CO_VARARGS)
     if code.co_flags & inspect.CO_VARKEYWORDS:
-        raise CompileError(f'{what} may not declare **kwargs')
+        raise CompileError(f'{what} may not declare **kwargs', loc=function_loc)
     if has_varargs:
         if callconv == 'default':
             raise CompileError(
-                f'a default-callconv {what} may not declare *args'
+                f'a default-callconv {what} may not declare *args',
+                loc=function_loc,
             )
         vararg_name = code.co_varnames[count]
         if vararg_name in annotations:
             raise CompileError(
                 f'the *args of {what} may not be annotated: a C-variadic '
-                f'function passes every extra argument with its own type'
+                f'function passes every extra argument with its own type',
+                loc=arg_locs.get(vararg_name, function_loc),
             )
     defaults = fn.__defaults__ if fn.__defaults__ is not None else ()
     offset = count - len(defaults)
@@ -548,40 +630,67 @@ def _build_fn_type(
             # the receiver of a protocol method is not a parameter of the
             # function type
             continue
+        arg_loc = arg_locs.get(name, function_loc)
         if name not in annotations:
-            raise CompileError(f'every parameter of {what} must be annotated')
-        arg_type = sval.as_value(annotations[name], context)
+            raise CompileError(
+                f'every parameter of {what} must be annotated', loc=arg_loc,
+            )
+        try:
+            arg_type = sval.as_value(annotations[name], context)
+        except CompileError as e:
+            e.attach_loc(arg_loc)
+            raise
         if not isinstance(arg_type, sval.Type):
             raise CompileError(
                 f'cannot use {annotations[name]!r} as the type of parameter '
-                f'{name!r} of {what}'
+                f'{name!r} of {what}',
+                loc=arg_loc,
             )
         default: sval.AnyValue | None = None
         if i >= offset:
-            default = sval.as_value(defaults[i - offset], context)
+            try:
+                default = sval.as_value(defaults[i - offset], context)
+            except CompileError as e:
+                e.attach_loc(arg_loc)
+                raise
         args.append(sval.FormalArg(name, arg_type, default))
     if 'return' not in annotations or annotations['return'] is None:
         ret: sval.AnyValue = sval.VoidType()
     else:
-        ret = sval.as_value(annotations['return'], context)
+        try:
+            ret = sval.as_value(annotations['return'], context)
+        except CompileError as e:
+            e.attach_loc(return_node or function_loc)
+            raise
     if not isinstance(ret, sval.Type):
         raise CompileError(
-            f'cannot use {annotations.get("return")!r} as the return type of {what}'
+            f'cannot use {annotations.get("return")!r} as the return type of {what}',
+            loc=return_node or function_loc,
         )
     if exceptions == 'infer':
-        raise CompileError(f'the exceptions of {what} cannot be inferred')
+        raise CompileError(
+            f'the exceptions of {what} cannot be inferred', loc=function_loc,
+        )
     exception_types: list[sval.Type] = []
     if exceptions is not None:
         for exception in exceptions:
-            value = sval.as_value(exception, context)
+            try:
+                value = sval.as_value(exception, context)
+            except CompileError as e:
+                e.attach_loc(function_loc)
+                raise
             if not isinstance(value, sval.StructType):
                 raise CompileError(
                     f'cannot use {exception!r} as an exception of {what}: '
-                    f'an exception must be a spy struct'
+                    f'an exception must be a spy struct',
+                    loc=function_loc,
                 )
             exception_types.append(value)
     if callconv != 'default' and len(exception_types) > 0:
-        raise CompileError(f'a non-default-callconv {what} may not declare exceptions')
+        raise CompileError(
+            f'a non-default-callconv {what} may not declare exceptions',
+            loc=function_loc,
+        )
     return sval.FunctionType(
         tuple(args), ret, FrozenArraySet(exception_types), callconv, may_panic,
         has_varargs,

@@ -79,6 +79,7 @@ from typing import Any
 
 from .binop import BinaryOp, CompareOp, UnaryOp
 from .fn import ArgEntry, ClosureFunction, frozendict
+from .source import SourceLoc
 
 
 class Value:
@@ -144,7 +145,14 @@ class Arg(Value):
 
 
 class Inst(Value):
-    """An instruction; the object itself acts as its result register."""
+    """An instruction; the object itself acts as its result register.
+
+    ``loc`` is the source node the instruction was generated from (set by
+    ``astgen._Builder.add``): the interpreter attaches it to a ``CompileError``
+    raised while executing the instruction.  It is a class attribute rather
+    than a dataclass field so that no instruction constructor changes."""
+
+    loc: SourceLoc | None = None
 
     def __eq__(self, other: object, /) -> bool:
         return self is other

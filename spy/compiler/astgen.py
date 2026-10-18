@@ -54,10 +54,9 @@ it, see ``_resolve_closure``).
 
 import ast
 import builtins
-import inspect
-import textwrap
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, TypeVar, cast, get_args, get_origin
@@ -72,6 +71,7 @@ from .fn import (
     Signature,
     SignatureFormalArg,
 )
+from .source import SourceFile, SourceLoc, source_of_object
 from .sval import (
     AnyValue,
     BytesType,
@@ -254,9 +254,17 @@ class _Builder:
     through the stack.
     """
 
-    def __init__(self, fn: Any, fn_ir: FunctionIR, type_vars: dict[TypeVar, Value], resolver: CompileContext) -> None:
+    def __init__(
+        self, fn: Any, fn_ir: FunctionIR, type_vars: dict[TypeVar, Value],
+        resolver: CompileContext, source: SourceFile,
+    ) -> None:
         self.fn = fn
         self._fn_ir = fn_ir
+        # the original source of the function, for the locations of the nodes
+        # generated here (``_loc`` is the node currently being generated)
+        self._source = source
+        self._loc: SourceLoc | None = None
+        self._function_name = fn_ir.name
         # the host the annotations/declarations are resolved in (see
         # ``parse_function``); a closure's ``@syntax.closure(exceptions=...)``
         # is resolved through it
@@ -273,7 +281,9 @@ class _Builder:
         # unevaluated - be resolved (see ``_gen_ann_assign``)
         self._type_vars = type_vars
         self._generic_names: dict[str, Value] = {tp.__name__: v for tp, v in type_vars.items()}
-        self._pragmas: set[_Pragma] = set()
+        # the statement markers seen since the last statement, with the
+        # location of the marker (for the ``unused pragmas`` diagnostic)
+        self._pragmas: dict[_Pragma, SourceLoc | None] = {}
         self.insts: list[hir.Inst] = []
         # the type parameters of the closure body currently being generated, or
         # None outside one: a closure body may only name its own type
@@ -353,7 +363,34 @@ class _Builder:
         """Bind ``name`` to ``slot`` in the innermost open block."""
         self._scopes[-1].vars[name] = slot
 
+    def _loc_for(self, node: ast.AST | None) -> SourceLoc | None:
+        """The source location of ``node`` in the current function."""
+        if node is None:
+            return self._loc
+        return self._source.loc(node, self._function_name)
+
+    @contextmanager
+    def _at(self, node: ast.AST) -> Iterator[None]:
+        """Make ``node`` the current source location while generating it.
+
+        A ``CompileError`` raised below is given this node's location when it
+        does not already have a more specific one (the innermost node wins),
+        so the many ``raise CompileError(...)`` sites need no location of
+        their own."""
+        saved_loc = self._loc
+        self._loc = self._loc_for(node)
+        try:
+            yield
+        except CompileError as e:
+            e.attach_loc(self._loc)
+            raise
+        finally:
+            self._loc = saved_loc
+
     def add(self, inst: hir.Inst) -> hir.Inst:
+        # every instruction remembers the node it came from; the interpreter
+        # attaches it to a CompileError raised while running the instruction
+        inst.loc = self._loc
         self.insts.append(inst)
         return inst
 
@@ -409,11 +446,16 @@ class _Builder:
                 self._gen_stmt(stmt)
                 index += 1
         if self._pragmas:
-            raise CompileError('unused pragmas')
+            loc = next(iter(self._pragmas.values()))
+            raise CompileError('unused pragmas', loc=loc)
 
     def _gen_stmt(self, node: ast.stmt) -> None:
+        with self._at(node):
+            self._gen_stmt_impl(node)
+
+    def _gen_stmt_impl(self, node: ast.stmt) -> None:
         if (marker := self._as_marker(node)) is not None:
-            self._pragmas.add(marker)
+            self._pragmas[marker] = self._loc
             return
         is_unroll = _UNROLL in self._pragmas
         comptime_marker: _Pragma | None = None
@@ -1176,6 +1218,10 @@ class _Builder:
         return fn in _SYNTAX_CALLS
 
     def _gen_expr(self, node: ast.expr, allow_retloc: bool = True) -> tuple[ArgEntry[hir.Value], bool]:
+        with self._at(node):
+            return self._gen_expr_impl(node, allow_retloc)
+
+    def _gen_expr_impl(self, node: ast.expr, allow_retloc: bool = True) -> tuple[ArgEntry[hir.Value], bool]:
         """A reference to the value of ``node``: addressable names give
         their slot, the fields of a runtime struct value give their
         address (a :class:`hir.FieldAddr` chain rooted at the storage of
@@ -1585,6 +1631,10 @@ class _Builder:
         )
 
     def _gen_result_loc(self, node: ast.expr, result_loc: hir.FullResultLoc, allow_fall_back: bool = True) -> None:
+        with self._at(node):
+            self._gen_result_loc_impl(node, result_loc, allow_fall_back)
+
+    def _gen_result_loc_impl(self, node: ast.expr, result_loc: hir.FullResultLoc, allow_fall_back: bool = True) -> None:
         """Evaluate ``node`` writing its result into ``result_loc``
         (result-location semantics); no value register is produced."""
         fn_name = self._fn_ir.name
@@ -1861,6 +1911,7 @@ class _Builder:
             node.name, node.type_params, node.args, node.returns, gen_body,
             force_inline=inline, exceptions=exceptions,
             callconv=callconv, may_panic=may_panic, move=move,
+            loc=self._loc_for(node),
         )
         slot = self._lookup(node.name)
         assert slot is not None, 'the run declares every def name'
@@ -1878,6 +1929,7 @@ class _Builder:
             '<lambda>', (), node.args, None, gen_body,
             force_inline=True, exceptions=ArraySet(),
             callconv='default', may_panic=True,
+            loc=self._loc_for(node),
         )
 
     def _parse_closure_decorators(self, node: ast.FunctionDef) -> tuple[bool, ArraySet[Type] | None, str, bool, bool]:
@@ -1992,6 +2044,7 @@ class _Builder:
         callconv: str,
         may_panic: bool,
         move: bool = False,
+        loc: SourceLoc | None = None,
     ) -> hir.MakeClosure:
         """Parse one closure (a nested ``def`` or a ``lambda``) into a
         :class:`~spy.compiler.fn.ClosureFunction` and emit the ``hir.MakeClosure``
@@ -2000,22 +2053,32 @@ class _Builder:
         where the closure is created); the body is generated into an instruction
         list of its own, under a :class:`_ClosureScope` that records the captures
         it resolves through the enclosing scopes."""
+        closure_loc = self._loc if loc is None else loc
         if len(args.posonlyargs) > 0:
-            raise CompileError(f'positional-only arguments are not supported in spy closure {name}')
+            raise CompileError(
+                f'positional-only arguments are not supported in spy closure {name}',
+                loc=closure_loc,
+            )
         if len(args.kwonlyargs) > 0:
-            raise CompileError(f'keyword-only arguments are not supported in spy closure {name}')
+            raise CompileError(
+                f'keyword-only arguments are not supported in spy closure {name}',
+                loc=closure_loc,
+            )
 
         own: dict[str, Value] = {}
         generic_args: list[SpyTypeVar] = []
         for tp in type_params:
             tpname = getattr(tp, 'name', None)
             if tpname is None:
-                raise CompileError(f'unsupported type parameter in spy closure {name}')
+                raise CompileError(
+                    f'unsupported type parameter in spy closure {name}', loc=closure_loc,
+                )
             var = SpyTypeVar(tpname)
             own[tpname] = var
             generic_args.append(var)
 
         saved_generics = self._generic_names
+        saved_loc = self._loc
         self._generic_names = {**saved_generics, **own}
         try:
             param_names = [a.arg for a in args.args]
@@ -2067,6 +2130,7 @@ class _Builder:
                 arg_is_ref=tuple([False] * n),
                 generic_args=tuple(generic_args), force_inline=force_inline,
                 exceptions=exceptions, callconv=callconv, may_panic=may_panic,
+                loc=closure_loc,
             )
             scope = _ClosureScope(closure)
             self._scopes.append(scope)
@@ -2084,9 +2148,11 @@ class _Builder:
                 saved_insts = self.insts
                 saved_own = self._own_generic_names
                 saved_pragmas = self._pragmas
+                saved_function_name = self._function_name
                 self.insts = []
-                self._pragmas = set()
+                self._pragmas = {}
                 self._own_generic_names = set(own)
+                self._function_name = name
                 try:
                     body_gen()
                     closure.body = tuple(self.insts)
@@ -2094,8 +2160,12 @@ class _Builder:
                     self.insts = saved_insts
                     self._pragmas = saved_pragmas
                     self._own_generic_names = saved_own
+                    self._function_name = saved_function_name
             finally:
                 self._scopes.pop()
+            # the captures and the ``MakeClosure`` belong to the enclosing body,
+            # not to the last expression of the closure's own body
+            self._loc = closure_loc
             # the capture places, evaluated in the enclosing frame: a place more
             # than one closure boundary out is the enclosing frame's ``self``
             # field, materialized here
@@ -2111,6 +2181,7 @@ class _Builder:
             )))
         finally:
             self._generic_names = saved_generics
+            self._loc = saved_loc
 
     def _gen_name(self, name: str) -> ArgEntry[hir.Value]:
         """The entry the name ``name`` denotes: a binding (the pointer its slot
@@ -2179,26 +2250,36 @@ def parse_function(
     passed by reference is decided here, from the layout a mirror carries
     (see ``sval.pass_by_ref``).
     """
-    try:
-        source = inspect.getsource(fn)
-    except OSError as e:
+    parsed = source_of_object(fn)
+    if parsed is None:
         raise CompileError(
             f"cannot obtain the source of function {fn.__name__}; "
             "spy functions must be defined in a source file"
-        ) from e
-    tree = ast.parse(textwrap.dedent(source))
+        )
+    source, tree = parsed
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef):
         raise CompileError(
-            f"cannot parse function {fn.__name__}: expected a single function definition"
+            f"cannot parse function {fn.__name__}: expected a single function definition",
+            loc=source.line_loc(fn.__code__.co_firstlineno, fn.__name__),
         )
     node = tree.body[0]
+    function_loc = source.loc(node, node.name)
     if node.name != fn.__name__:
-        raise CompileError(f"function name mismatch: expected {node.name}, got {fn.__name__}")
+        raise CompileError(
+            f"function name mismatch: expected {node.name}, got {fn.__name__}",
+            loc=function_loc,
+        )
 
     if len(node.args.posonlyargs) > 0:
-        raise CompileError(f"positional-only arguments are not supported in spy function {node.name}")
+        raise CompileError(
+            f"positional-only arguments are not supported in spy function {node.name}",
+            loc=function_loc,
+        )
     if len(node.args.kwonlyargs) > 0:
-        raise CompileError(f"keyword-only arguments are not supported in spy function {node.name}")
+        raise CompileError(
+            f"keyword-only arguments are not supported in spy function {node.name}",
+            loc=function_loc,
+        )
 
     # ``fn.__type_params__`` exposes the declared PEP 695 type parameters
     # (Python 3.13+); the AST ``[T]`` syntax may parse on 3.12, but the
@@ -2212,7 +2293,8 @@ def parse_function(
     declared_type_params = getattr(fn, '__type_params__', ())
     if len(node.type_params) > 0 and len(declared_type_params) == 0:
         raise CompileError(
-            f"generic spy functions require Python 3.13 or newer (function {node.name})"
+            f"generic spy functions require Python 3.13 or newer (function {node.name})",
+            loc=function_loc,
         )
     generic_args: list[SpyTypeVar] = []
     type_vars: dict[TypeVar, Value] = dict(context_type_vars) if context_type_vars is not None else {}
@@ -2225,7 +2307,8 @@ def parse_function(
         for type_param in declared_type_params:
             if not isinstance(type_param, TypeVar):
                 raise CompileError(
-                    f"unsupported type parameter {type_param!r} in function {node.name}"
+                    f"unsupported type parameter {type_param!r} in function {node.name}",
+                    loc=function_loc,
                 )
             spy = SpyTypeVar(type_param.__name__)
             generic_args.append(spy)
@@ -2250,7 +2333,8 @@ def parse_function(
         defaults = fn.__defaults__ if fn.__defaults__ is not None else ()
     except Exception as e:
         raise CompileError(
-            f"cannot read the annotations of function {node.name}: {e}"
+            f"cannot read the annotations of function {node.name}: {e}",
+            loc=function_loc,
         ) from e
     if 'return' not in annotations:
         ret_annotation: Any = None
@@ -2263,7 +2347,7 @@ def parse_function(
         # the return type from the body
         ret_annotation = None
 
-    def convert(annotation: Any, what: str) -> AnyValue | None:
+    def convert(annotation: Any, what: str, where: ast.AST | None = None) -> AnyValue | None:
         """The spy-domain value of one evaluated annotation or default
         (see ``sval.as_value``); ``None`` (no annotation written, no
         default) stays ``None``."""
@@ -2273,22 +2357,23 @@ def parse_function(
             return as_value(annotation, resolver, type_vars)
         except Exception as e:
             raise CompileError(
-                f"cannot use {annotation!r} as {what} of function {node.name}: {e}"
+                f"cannot use {annotation!r} as {what} of function {node.name}: {e}",
+                loc=source.loc(where if where is not None else node, node.name),
             ) from e
 
-    def annotation_of(annotation: Any) -> Type | None:
+    def annotation_of(annotation: Any, where: ast.AST | None = None) -> Type | None:
         # an annotation is a spy type or a type parameter in practice;
         # anything else is kept as-is and rejected when the call is
         # specialized (``fn.Signature.specialize``)
-        return cast(Type | None, convert(annotation, 'the annotation'))
+        return cast(Type | None, convert(annotation, 'the annotation', where))
 
-    def default_of(value: Any) -> AnyValue | None:
+    def default_of(value: Any, where: ast.AST | None = None) -> AnyValue | None:
         # a default value of ``None`` is the null value: the absent value of
         # an option (see ``sval.as_value``).  ``default_value`` being ``None``
         # means the parameter has no default, so it cannot be the value itself
         if value is None:
             return Null()
-        return convert(value, 'a default value')
+        return convert(value, 'a default value', where)
 
     def exception_set() -> ArraySet[Type] | None:
         """The declared exception set of the function: ``None`` when it is to
@@ -2305,19 +2390,25 @@ def parse_function(
             if not isinstance(value, StructType):
                 raise CompileError(
                     f'cannot use {exception!r} as an exception of function '
-                    f'{node.name}: an exception must be a spy struct'
+                    f'{node.name}: an exception must be a spy struct',
+                    loc=function_loc,
                 )
             ret.add(value)
         return ret
 
     # the signature: the formal parameters, by declaration position
     all_args = list(node.args.args)
+    default_nodes = list(node.args.defaults)
     offset = len(all_args) - len(defaults)
     positional = IndexedMap[str, SignatureFormalArg]()
     arg_is_ref: list[bool] = []
     for i, arg in enumerate(all_args):
         has_default = i >= offset
-        default_value = default_of(defaults[i - offset]) if has_default else None
+        default_node = default_nodes[i - offset] if has_default else None
+        default_value = (
+            default_of(defaults[i - offset], default_node or arg)
+            if has_default else None
+        )
         # ``InferComptime`` only applies to a *local* declaration: a parameter
         # always has the storage its signature says (see ``SignatureFormalArg``)
         is_infer, _ = unwrap_infer_comptime(annotations.get(arg.arg))
@@ -2325,7 +2416,8 @@ def parse_function(
             raise CompileError(
                 f"parameter '{arg.arg}' of function {node.name} cannot be "
                 f"declared InferComptime: only a local declaration may infer its "
-                f"storage (use Comptime for a compile-time parameter)"
+                f"storage (use Comptime for a compile-time parameter)",
+                loc=source.loc(arg, node.name),
             )
         # ``Comptime``/``Comptime[T]`` annotate a compile-time parameter (see
         # ``SignatureFormalArg``): the marker is split off the annotation and
@@ -2344,10 +2436,11 @@ def parse_function(
             inner = get_args(annotated)
             if len(inner) != 1:
                 raise CompileError(
-                    f"type[...] of parameter '{arg.arg}' takes exactly one type argument"
+                    f"type[...] of parameter '{arg.arg}' takes exactly one type argument",
+                    loc=source.loc(arg.annotation or arg, node.name),
                 )
             annotated = inner[0]
-        arg_type = annotation_of(annotated)
+        arg_type = annotation_of(annotated, arg.annotation or arg)
         if i == 0 and self_type is not None:
             # the ``self`` of a method: ``"ptr"``/``"const ptr"`` type it as a
             # mutable/const pointer to the struct itself (the HIR reads the
@@ -2377,16 +2470,21 @@ def parse_function(
         if is_infer:
             raise CompileError(
                 f"*args/**kwargs of function {node.name} cannot be declared "
-                f"InferComptime: only a local declaration may infer its storage"
+                f"InferComptime: only a local declaration may infer its storage",
+                loc=source.loc(arg, node.name),
             )
         is_comptime, annotated = unwrap_comptime(annotations.get(arg.arg))
         if ignore_signature:
             annotated = None
         if get_origin(annotated) is type:
             raise CompileError(
-                f"*args/**kwargs of function {node.name} cannot be a type[...] parameter"
+                f"*args/**kwargs of function {node.name} cannot be a type[...] parameter",
+                loc=source.loc(arg, node.name),
             )
-        return SignatureFormalArg(annotation_of(annotated), is_comptime, None, TriState.UNKNOWN, False)
+        return SignatureFormalArg(
+            annotation_of(annotated, arg.annotation or arg),
+            is_comptime, None, TriState.UNKNOWN, False,
+        )
 
     varargs = vararg_formal(node.args.vararg)
     kwargs = vararg_formal(node.args.kwarg)
@@ -2396,21 +2494,23 @@ def parse_function(
         # ``dsl._build_fn_type``), but defining one - a body that reads its
         # arguments with ``va_arg`` - is not implemented yet
         raise CompileError(
-            f'a non-default-callconv function {node.name} may not declare *args/**kwargs'
+            f'a non-default-callconv function {node.name} may not declare *args/**kwargs',
+            loc=function_loc,
         )
 
     signature = Signature(
-        tuple(generic_args), positional, varargs, kwargs, annotation_of(ret_annotation), exception_set(),
+        tuple(generic_args), positional, varargs, kwargs,
+        annotation_of(ret_annotation, node.returns), exception_set(),
         callconv, may_panic,
     )
 
-    ir = FunctionIR(node.name, signature, tuple(arg_is_ref), ())
+    ir = FunctionIR(node.name, signature, tuple(arg_is_ref), (), loc=function_loc)
 
     # a name that denotes a type parameter (the function's own, or one of the
     # struct a method belongs to) refers to the compile-time value the call
     # solved it to; the function's own parameters are added last, so they
     # shadow a struct's parameter of the same name, like Python scoping
-    builder = _Builder(fn, ir, type_vars, resolver)
+    builder = _Builder(fn, ir, type_vars, resolver, source)
     # At HIR level, parameters are passed by ref (pointer); they are the
     # function body's block, the bottom scope of the builder's stack.  The
     # varargs/kwargs parameters come after every positional one, matching the

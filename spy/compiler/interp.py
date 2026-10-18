@@ -111,6 +111,7 @@ from .fn import (
     SignatureFormalArg,
     signature_of_fn_type,
 )
+from .source import SourceLoc
 from .sval import (
     CompileContext,
     PointerVariant,
@@ -789,7 +790,7 @@ class BlockFrame:
     data: BlockFrameData
 
 class InlineFrame:
-    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResultPtr, insts: tuple[hir.Inst, ...], fn_name: str, value_is_empty: bool = False, on_done: Callable[[], None] | None = None, compile_vars: CompileVars | None = None, closure_values: tuple[InterpVal, ...] = ()) -> None:
+    def __init__(self, generic_var_values: dict[sval.TypeVar, InterpVal], arg_values: tuple[InterpVal, ...], ret_loc: ComptimeResultPtr, insts: tuple[hir.Inst, ...], fn_name: str, value_is_empty: bool = False, on_done: Callable[[], None] | None = None, compile_vars: CompileVars | None = None, closure_values: tuple[InterpVal, ...] = (), fn_loc: SourceLoc | None = None, trace_name: str | None = None) -> None:
         self.generic_var_values = generic_var_values
         self.arg_values = arg_values
         # the name of the function this frame executes (the specialization's
@@ -797,6 +798,8 @@ class InlineFrame:
         # the inlined function's own name otherwise): a nested closure created
         # here prefixes its native name with it (see ``exec_make_closure``)
         self.fn_name = fn_name
+        # the plain name shown by a diagnostic's ``called from`` note
+        self.trace_name = fn_name if trace_name is None else trace_name
         # the capture places of a closure body (see ``hir.Closure``): the
         # enclosing slots an inlined closure captures, or the pointers a
         # compiled closure was passed - empty for an ordinary body
@@ -820,6 +823,12 @@ class InlineFrame:
         self.on_done: Callable[[], None] | None = on_done
         self.insts = insts
         self.pc: int = 0
+        # the instruction currently executing: the source location an error
+        # raised while it runs is attached to (see ``HirRunner._step``)
+        self.current_inst: hir.Inst | None = None
+        # the ``def``/``lambda`` this frame executes, for errors with no
+        # instruction of their own
+        self.fn_loc = fn_loc
         self.block_stack: list[BlockFrame] = []
         self.regs: dict[hir.Inst, FullInterpVal] = {}
         # the deferred bodies declared directly in the body's top-level region
@@ -1591,8 +1600,16 @@ class HirRunner:
     body calls are requested through ``Analyser._request_function``.
     """
 
-    def __init__(self, analyser: Analyser, fn_instance: FunctionInstance) -> None:
+    def __init__(
+        self, analyser: Analyser, fn_instance: FunctionInstance,
+        fn_loc: SourceLoc | None = None, fn_name: str | None = None,
+    ) -> None:
         self._analyser = analyser
+        # the source location/name of the function proper, for diagnostics that
+        # have no instruction of their own (a runner initialization failure, a
+        # return-convention failure in ``finish``)
+        self.fn_loc = fn_loc
+        self.fn_name = fn_name
         # the host's MIR-mirror interning table (see ``Analyser``), through
         # which every mirror a type is lowered to is made
         self._mir_cache = analyser.mir_lower_cache
@@ -1694,7 +1711,8 @@ class HirRunner:
                 self._error_types.add(exception)
         frame = InlineFrame(
             generic_var_values, (), self._reserve_result_loc(ret_sig), body,
-            self._fn_instance.mir.name_base,
+            self._fn_instance.mir.name_base, fn_loc=self.fn_loc,
+            trace_name=self.fn_name,
         )
         self._frames.append(frame)
         mir_args = self._fn_instance.mir.args
@@ -2460,7 +2478,35 @@ class HirRunner:
             return PollResult.AGAIN
         inst = frame.insts[frame.pc]
         frame.pc += 1
-        return self._exec_inst(inst)
+        frame.current_inst = inst
+        try:
+            return self._exec_inst(inst)
+        except CompileError as e:
+            # the instruction is the most specific location there is; an error
+            # that already carries one (raised by ``astgen`` while resolving a
+            # function the instruction references) keeps it
+            e.attach_loc(inst.loc if inst.loc is not None else frame.fn_loc)
+            raise
+
+    def _append_call_frames(self, error: CompileError) -> None:
+        """Add every frame of this runner as a ``called from`` note, innermost
+        first.  The frame holding the primary location is skipped: its
+        instruction *is* where the error happened, not a call site."""
+        for frame in reversed(self._frames):
+            inst = frame.current_inst
+            loc = frame.fn_loc if inst is None else inst.loc
+            if loc is None or loc == error.loc:
+                continue
+            error.add_call_frame(frame.trace_name, loc)
+
+    def _current_loc(self) -> SourceLoc | None:
+        """The location of the instruction currently executing, or the
+        function's own ``def`` line when no instruction is available."""
+        if len(self._frames) == 0:
+            return self.fn_loc
+        frame = self._frames[-1]
+        inst = frame.current_inst
+        return frame.fn_loc if inst is None else (inst.loc or frame.fn_loc)
 
     def _scan_block(self, entry: int) -> tuple[int | None, int]:
         return hir.scan_block(self._frames[-1].insts, entry)
@@ -4973,7 +5019,10 @@ class HirRunner:
             sig.generic_args, call_positional, sig.varargs, sig.kwargs, sig.ret_type,
             sig.exceptions, sig.callconv, sig.may_panic,
         )
-        call_ir = FunctionIR(f'{name_base}.__call__', call_sig, (True,) + fn.arg_is_ref, fn.body)
+        call_ir = FunctionIR(
+            f'{name_base}.__call__', call_sig, (True,) + fn.arg_is_ref, fn.body,
+            loc=fn.loc,
+        )
         head.methods['__call__'] = FunctionValue(
             f'{name_base}.__call__', call_ir, force_inline=fn.force_inline,
         )
@@ -5085,8 +5134,12 @@ class HirRunner:
             hir.CallInplace(slot, hir.CallArgs(args, ()), hir.ReturnLoc()),
             hir.Ret(),
         )
+        for inst in body:
+            inst.loc = method.hir.loc
         name = f'{method.name_base}$as_func_ptr'
-        hir_fn = FunctionIR(name, sig, method.hir.arg_is_ref[1:], body)
+        hir_fn = FunctionIR(
+            name, sig, method.hir.arg_is_ref[1:], body, loc=method.hir.loc,
+        )
         return FunctionValue(name, hir_fn)
 
     # -- operators ------------------------------------------------------------
@@ -9140,6 +9193,8 @@ class HirRunner:
                 param_types=param_types,
                 has_varargs=sig.varargs is not None,
                 has_kwargs=sig.kwargs is not None,
+                fn_loc=fn.hir.loc,
+                trace_name=fn.hir.name,
             )
         provided = self._provided_types(sig, binded_args)
         call_sig, partial_ret_sig = sig.specialize(provided, self._mir_cache)
@@ -9233,15 +9288,15 @@ class HirRunner:
                 mir_args.append(self._to_runtime(self._coerce(ev, sig_arg.type)))
 
         for arg, (_, sig_arg) in zip(args.positional, call_sig.positional):
-            convert_one(arg, sig_arg)
+            self._convert_arg(arg, sig_arg, convert_one)
 
         if call_sig.varargs is not None:
             for arg, sig_arg in zip(args.varargs, call_sig.varargs):
-                convert_one(arg, sig_arg)
+                self._convert_arg(arg, sig_arg, convert_one)
 
         if call_sig.kwargs is not None:
             for name, arg in args.kwargs.items():
-                convert_one(arg, call_sig.kwargs[name])
+                self._convert_arg(arg, call_sig.kwargs[name], convert_one)
 
         spec = ret_sig.ret_spec(self._mir_cache)
         callee_result = ret_sig.result_type()
@@ -9295,6 +9350,19 @@ class HirRunner:
             # ended (in a clause, or in the function's own error location)
             return self._cut()
         return PollResult.AGAIN
+
+    def _convert_arg(
+        self, arg: ArgEntry[InterpVal], sig_arg: ArgNode,
+        convert: Callable[[ArgEntry[InterpVal], ArgNode], None],
+    ) -> None:
+        """Run one argument conversion, pointing a failure at the argument's
+        own expression when its value still carries an instruction."""
+        try:
+            convert(arg, sig_arg)
+        except CompileError as e:
+            if isinstance(arg.value, hir.Inst):
+                e.attach_loc(arg.value.loc)
+            raise
 
     def _check_call_error(
         self,
@@ -9629,6 +9697,8 @@ class HirRunner:
         param_types: tuple[sval.Type | None, ...] | None = None,
         has_varargs: bool = False,
         has_kwargs: bool = False,
+        fn_loc: SourceLoc | None = None,
+        trace_name: str | None = None,
     ) -> PollResult:
         """Start the inlined body of a plain Python callee: convert its
         bound arguments into addressable values (the callee's ``hir.Arg``
@@ -9687,7 +9757,8 @@ class HirRunner:
             frame_values, tuple(arg_values),
             ComptimeResultPtr(ret, error.code, error.payload),
             body, fn_name, value_is_empty=value_is_empty, on_done=on_done,
-            compile_vars=self._inherit_compile_vars(),
+            compile_vars=self._inherit_compile_vars(), fn_loc=fn_loc,
+            trace_name=trace_name,
         )
         self._frames.append(frame)
         return PollResult.AGAIN
@@ -9890,42 +9961,78 @@ class Analyser:
         instance.call_sig = call_sig
         st.newly_compiled.add(instance)
         fn_entry.specs[call_sig] = instance
-        runner = HirRunner(self, instance)
+        runner = HirRunner(
+            self, instance, fn_entry.hir.loc, fn_entry.hir.name,
+        )
         frame_generic_values: dict[sval.TypeVar, InterpVal] = {}
         if generic_var_values is not None:
             frame_generic_values.update(generic_var_values)
         frame_generic_values.update(
             zip(fn_entry.hir.signature.generic_args, call_sig.generic_args)
         )
-        runner.run_function(
-            fn_entry.hir.body, fn_entry.hir.arg_is_ref,
-            call_sig, ret_sig, frame_generic_values,
-        )
+        try:
+            runner.run_function(
+                fn_entry.hir.body, fn_entry.hir.arg_is_ref,
+                call_sig, ret_sig, frame_generic_values,
+            )
+        except CompileError as e:
+            # a failure while the arguments/result location are set up has no
+            # instruction of its own; the function definition is the location
+            e.attach_loc(fn_entry.hir.loc)
+            raise
         self._analyse_stack.append(runner)
         return None
 
     def _run(self):
-        while self._analyse_stack:
-            top = self._analyse_stack[-1]
-            if top._run_machine() == PollResult.DONE:
-                top.finish()
-                assert top.ret_sig is not None
-                self._analyse_stack.pop()
-                instance = top._fn_instance
-                instance.ret_sig = top.ret_sig
-                instance.mir.is_complete = True
-                if self._analyse_stack:
-                    last_top = self._analyse_stack[-1]
-                    last_top.resume(instance.mir, top.ret_sig)
-                else:
-                    return instance.mir, top.ret_sig
+        # set while ``top.finish()`` runs: the frames of the finishing runner
+        # are not call sites, so its trace must not be appended when it fails
+        finishing = False
+        try:
+            while self._analyse_stack:
+                top = self._analyse_stack[-1]
+                if top._run_machine() == PollResult.DONE:
+                    finishing = True
+                    top.finish()
+                    finishing = False
+                    assert top.ret_sig is not None
+                    self._analyse_stack.pop()
+                    instance = top._fn_instance
+                    instance.ret_sig = top.ret_sig
+                    instance.mir.is_complete = True
+                    if self._analyse_stack:
+                        last_top = self._analyse_stack[-1]
+                        last_top.resume(instance.mir, top.ret_sig)
+                    else:
+                        return instance.mir, top.ret_sig
+        except CompileError as e:
+            # the error came out of the runner at the top of the stack; its
+            # inline frames are call sites inside that function, and every
+            # outer runner was suspended at the call that started the nested
+            # compilation.  ``_append_call_frames`` skips the frame holding the
+            # primary location, so an error in the function proper itself adds
+            # nothing here.  A failure of ``finish`` has no call site at all:
+            # its runner is left out and the function definition is the
+            # fallback location.
+            if self._analyse_stack and e.loc is None:
+                top = self._analyse_stack[-1]
+                e.attach_loc(top.fn_loc if finishing else top._current_loc())
+            stack = self._analyse_stack[:-1] if finishing else self._analyse_stack
+            for runner in reversed(stack):
+                runner._append_call_frames(e)
+            raise
         return None
 
     def analyse_function(self, fn_entry: FunctionValue, call_sig: CallSignature, ret_sig: PartialReturnSignature | None):
         """Type (and thereby compile) the specialization ``call_sig`` of
         ``fn_entry`` if it is not compiled yet."""
-        if self._request_function(fn_entry, call_sig, ret_sig) is None:
-            self._run()
+        try:
+            if self._request_function(fn_entry, call_sig, ret_sig) is None:
+                self._run()
+        except CompileError as e:
+            # a failure before any runner exists (signature specialization,
+            # argument setup) still knows which function was being compiled
+            e.attach_loc(fn_entry.hir.loc)
+            raise
 
     def finish(self) -> CompileBatch:
         return self._symbol_table

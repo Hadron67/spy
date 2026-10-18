@@ -48,7 +48,8 @@ flowchart TD
 | `compiler/glue.py` | Python ↔ spy 边界：ctypes 读写、实例包装、`invoke`、结果脱壳 |
 | `compiler/target.py` | `TargetInfo`（指针宽度、C 整数宽度、`usize` 宽度） |
 | `compiler/util.py` | 共用工具（`IdentityObj`、`IndexedMap`、`StrBiMap`、`FrozenArraySet`、`TriState`、`frozendict` 等） |
-| `compiler/errors.py` | `SpyError`/`CompileError`/`CoerceError`/`TypeMismatchError` |
+| `compiler/errors.py` | `SpyError`/`CompileError`（带 `loc` 与调用链）/`CoerceError`/`TypeMismatchError` |
+| `compiler/source.py` | `SourceFile`/`SourceLoc`/`TraceFrame`；AST 行号映射与诊断格式化（源码片段、caret、`called from`） |
 | `compiler/binop.py` | 运算符字面量类型（`UnaryOp`/`BinaryOp`/`CompareOp`/`BoolOp`） |
 
 ---
@@ -119,11 +120,19 @@ flowchart TD
   把形参绑到 `hir.Arg(i+1)`（`Arg(0)` 是闭包自身的匿名 struct），最后发 `hir.MakeClosure(...)`。
 - `_gen_function_def` 把闭包值存进该名字的 slot；`_gen_lambda` 是强制内联、body 为 `RLS(body, ReturnLoc())` + `Ret()` 的闭包。
 
+### 2.5 源码位置与诊断
+
+- `source.source_of_object(fn/cls)` 用 `inspect.getsourcelines` 取原始源码（含装饰器），在 `textwrap.dedent` 后解析，再用 `ast.increment_lineno(tree, start - 1)` 把所有节点行号变成**原始文件行号**。`SourceFile` 保存原始行、dedent 宽度和起始行；`SourceLoc` 是 1-based、end 指向范围之后的半开区间。
+- `parse_function` 把 `SourceFile` 交给 `_Builder`；`_Builder._gen_stmt`/`_gen_expr`/`_gen_result_loc` 用 `_at(node)` 维护当前节点，`add()` 把当前位置写进 `hir.Inst.loc`。`CompileError.attach_loc` 只在空位置时写入，所以最内层节点优先；`sval` 等中间层不需要位置参数。
+- `interp._step` 把当前指令的 `loc` 补到 `CompileError` 上；`Analyser._run` 在错误穿过 `_analyse_stack` 时，按“内层到外层”把每个 `HirRunner` 的当前指令位置追加为 `called from` 帧（同一 runner 的内联 `InlineFrame` 也按此顺序展开）。参数转换错误优先用实参值指令的 `loc`。
+- `CompileError.__str__`/`format()` 输出 `path:line:col: error: ...`、覆盖 `SourceLoc` 整个范围的源码片段与 caret，以及 `note: in function ...`/`note: called from ...` 调用链；`args[0]`/`message` 仍是原始消息。
+- `dsl._build_fn_type` 和 `_RegisteredClass.get_entry` 的位置来自函数/类的声明源码：参数错误指向注解节点，struct 字段错误指向字段注解。
+
 ---
 
 ## 3. HIR（`hir.py`）
 
-线性无类型指令流；每个 `Inst` 对象**自身即一个结果寄存器**（身份相等）。
+线性无类型指令流；每个 `Inst` 对象**自身即一个结果寄存器**（身份相等），并携带生成它的源码位置 `Inst.loc`（见 §2.5）。
 
 - `Value` 基类；`Const(value)`（字面量/不可变全局值）；`Arg(index)`（第 index 个参数的**地址**）。
 - `ReturnLoc`（**不是** `Value`）；`type ResultLocTree = hir.Value | tuple[ResultLocTree, ...]`；`type FullResultLoc = ResultLocTree | ReturnLoc`。

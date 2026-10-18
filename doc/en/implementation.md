@@ -48,7 +48,8 @@ Two layers of "type" run throughout:
 | `compiler/glue.py` | Python ↔ spy boundary: ctypes read/write, instance wrapping, `invoke`, result unwrapping |
 | `compiler/target.py` | `TargetInfo` (pointer width, C integer widths, `usize` width) |
 | `compiler/util.py` | Shared utilities (`IdentityObj`, `IndexedMap`, `StrBiMap`, `FrozenArraySet`, `TriState`, `frozendict`, etc.) |
-| `compiler/errors.py` | `SpyError`/`CompileError`/`CoerceError`/`TypeMismatchError` |
+| `compiler/errors.py` | `SpyError`/`CompileError` (with `loc` and a call chain)/`CoerceError`/`TypeMismatchError` |
+| `compiler/source.py` | `SourceFile`/`SourceLoc`/`TraceFrame`; AST line mapping and diagnostic formatting (source snippet, caret, `called from`) |
 | `compiler/binop.py` | Operator literal types (`UnaryOp`/`BinaryOp`/`CompareOp`/`BoolOp`) |
 
 ---
@@ -119,11 +120,19 @@ Expression highlights:
   binds the parameters to `hir.Arg(i+1)` (`Arg(0)` is the closure's own anonymous struct), and finally emits `hir.MakeClosure(...)`.
 - `_gen_function_def` stores the closure value into the slot of that name; `_gen_lambda` is a closure that is force-inlined, with a body of `RLS(body, ReturnLoc())` + `Ret()`.
 
+### 2.5 Source locations and diagnostics
+
+- `source.source_of_object(fn/cls)` reads the original source with `inspect.getsourcelines` (decorators included), parses it after `textwrap.dedent`, and then shifts every node with `ast.increment_lineno(tree, start - 1)` so line numbers are **absolute file lines**. `SourceFile` keeps the original lines, the dedent width and the first line; `SourceLoc` is 1-based with a half-open end range.
+- `parse_function` hands the `SourceFile` to `_Builder`; `_Builder._gen_stmt`/`_gen_expr`/`_gen_result_loc` maintain the current node through `_at(node)`, and `add()` writes the current location into `hir.Inst.loc`. `CompileError.attach_loc` only fills an empty location, so the innermost node wins; intermediate layers such as `sval` need no location parameters.
+- `interp._step` attaches the current instruction's `loc` to a `CompileError`; when the error crosses `_analyse_stack`, `Analyser._run` appends every `HirRunner`'s current instruction as a `called from` frame (innermost first), expanding a runner's inline `InlineFrame`s in the same order. An argument-conversion error prefers the argument value instruction's `loc`.
+- `CompileError.__str__`/`format()` renders `path:line:col: error: ...`, a snippet whose caret covers the whole `SourceLoc`, and the `note: in function ...`/`note: called from ...` chain; `args[0]`/`message` stay the bare message.
+- `dsl._build_fn_type` and `_RegisteredClass.get_entry` take their locations from the declaration source: a parameter error points at the annotation node, a struct field error at the field annotation.
+
 ---
 
 ## 3. HIR (`hir.py`)
 
-A linear, untyped instruction stream; each `Inst` object **is itself a result register** (identity equality).
+A linear untyped instruction stream; every `Inst` object is **its own result register** (identity equality) and carries the source location it was generated from (`Inst.loc`, see §2.5).
 
 - `Value` base class; `Const(value)` (literal / immutable global value); `Arg(index)` (the **address** of the index-th parameter).
 - `ReturnLoc` (**not** a `Value`); `type ResultLocTree = hir.Value | tuple[ResultLocTree, ...]`; `type FullResultLoc = ResultLocTree | ReturnLoc`.

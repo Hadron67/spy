@@ -8,6 +8,7 @@ from typing import override
 
 from . import hir, mir, opt
 from .errors import CompileError, TypeMismatchError
+from .source import SourceLoc
 from .sval import (
     AnyFunction,
     AnyIntType,
@@ -797,6 +798,9 @@ class FunctionIR:
     # (see ``interp``)
     arg_is_ref: tuple[bool, ...]
     body: tuple[hir.Inst, ...]
+    # the source location of the ``def`` (for diagnostics with no instruction
+    # of their own, e.g. a failure while the runner is initialized)
+    loc: SourceLoc | None = None
 
 class NativeFn:
     @abstractmethod
@@ -930,6 +934,8 @@ class ClosureFunction:
     exceptions: ArraySet[Type] | None
     callconv: str = 'default'
     may_panic: bool = True
+    # the source location of the nested ``def``/``lambda``
+    loc: SourceLoc | None = None
 
 class SymbolTable:
     """The link names of every compiled function of the process, and the
