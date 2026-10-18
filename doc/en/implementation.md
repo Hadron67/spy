@@ -158,7 +158,7 @@ with a few **identity** ones (`IdentityObj`): `TypeVar`, `StructType`/`StructTyp
 | `DST` | Dynamically-sized: only a **pointer to it** is a value | No (only `fam_mir_type`) | No |
 
 Derived: `is_zst()` = `classify()==ZST`; `is_copyable()` = `classify()!=DST` (containers override).
-Key types: `IntType` (subtyped by range), `FloatType` (narrow -> wide subtyping), `BoolType`, `ComplexType`,
+Key types: `IntType` (subtyped by range; an integer type is a subtype of a float type when its whole range lies within the float's exact integer range, see `float_exact_int_range`), `FloatType` (narrow -> wide subtyping), `BoolType`, `ComplexType`,
 `PointerType`, `ArrayType`, `OptionType`, `TupleType`, `StrDictType`, `StructType`, `UnionType`, `TaggedUnionType`,
 `ResultType`/`Success`, `FunctionType`/`AnyFunction`/`DeclareFunction`, `IntEnumType`,
 `TypeType`/`AnyType`/`TypeVar`/`BytesType`/`EmptyType`/`VoidType`/`NullType`/`TypedNull`/`UndefinedType`/`ValueType`/`OpaqueType`.
@@ -311,8 +311,8 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - `ComptimeResultPtr(value, code, payload)`: the pointer form of a function result location (the three positions value/code/payload), **not** an `InterpVal`.
 - Predicates: `_is_comptime_val` (`RuntimeVal` is never one; the old "does not reference a register" relaxation has been removed), `_place_is_comptime`, `_references_register`.
 - `_coerce(ev, target)`: the **implicit conversion** shared by a store, a call argument, a return and `std.core.coerce`. **Every compile-time value goes to `sval.coerce_const`** (an `sval` compile-time value, the `ComptimePtr` pointer value included), so a compile-time value narrows by value;
-  a *runtime* value is accepted only when `src.is_subtype_of(target)` (the same type, or a widening one), otherwise it raises `CoerceError` - so an integer narrowing, an integer -> float and `f64 -> f32` are compile errors on a runtime value
-  (the explicit forms `std.int.truncate`, `std.int.int_cast` and `std.float.float_truncate` build their own `mir.Convert` through `_convert_inst`, which still performs every narrowing). `CoerceError` is swallowed by `_try_coerce`.
+  a *runtime* value is accepted only when `src.is_subtype_of(target)` (the same type, or a widening one), otherwise it raises `CoerceError` - so an integer narrowing, a **lossy** integer -> float and `f64 -> f32` are compile errors on a runtime value; an integer -> float is implicit exactly when it is **lossless** (on a runtime value `IntType.is_subtype_of` tests whether the integer range lies within `float_exact_int_range`, on a compile-time value `coerce_const` tests the value)
+  (the explicit forms `std.int.truncate`, `std.int.int_cast`, `std.float.float_truncate` and the lossy `std.int.int_to_float` build their own `mir.Convert` through `_convert_inst`, which still performs every narrowing). `CoerceError` is swallowed by `_try_coerce`.
   The `Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` target branches handle runtime values only.
 
 ### 6.2 Compile-time storage and pending slot

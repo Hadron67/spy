@@ -79,7 +79,7 @@ from typing import TYPE_CHECKING, Literal, Never, NoReturn
 - C 整数类型 `c_char/c_uchar`、`c_short/c_ushort`、`c_int/c_uint`、`c_long/c_ulong`、`c_longlong/c_ulonglong`：
   宽度（及 `c_char` 的有符号性）由目标平台决定（例如 `c_long` 在 Windows 为 32 位、常见 64 位 Unix 为 64 位）。
 - 未定型的整数字面量：字面量 `1` 起初没有具体类型，由它被写入的位置或与它配对的类型决定。
-- 整数子类型按范围包含：`i8` 是 `i16` 的子类型，`u8` 不是 `i8` 的子类型。整数不是浮点。
+- 整数子类型按范围包含：`i8` 是 `i16` 的子类型，`u8` 不是 `i8` 的子类型。整数与浮点之间：整型是浮点的子类型，当且仅当该浮点能**无损**表示它的整个范围（`i16`/`u8 → f32`、`i32`/`u32` → `f64`；`i32` → `f32`、`i64`/`u64` → `f64` 都不行）。编译期整数则按其**值**判断。
 
 ```python
 @func()
@@ -88,8 +88,13 @@ def arith(a: i32, b: i32) -> i32:
 
 @func()
 def to_float(a: i32, b: i32) -> f64:
-    # 运行期整数不能直接做真除法（见 §4）：先显式转成浮点
-    return int_to_float(a, f64) / int_to_float(b, f64)
+    # 整数能无损转成 f64，真除法可直接用（见 §4）
+    return a / b
+
+@func()
+def to_float_explicit(x: u64) -> f64:
+    # u64 超出 f64 的精确整数范围：必须显式转换（超范围会 panic）
+    return int_to_float(x, f64)
 
 @func()
 def width_and_literals() -> i32:
@@ -339,7 +344,7 @@ assert tu_match(A(9)) == 9
 
 复数类型 `spy.c64` / `spy.c128`：实部与虚部各是一个浮点元素。
 
-- Python `complex` 映射到 `c128`；**浮点**实数有一条隐式 `T → Complex[T]` 转换（虚部 0），`Complex[f32]` 可扩宽到 `Complex[f64]`。整数要先显式转成浮点（编译期整数常量按值检查，`z: c128 = 3` 仍可直接写）。
+- Python `complex` 映射到 `c128`；**浮点**实数有一条隐式 `T → Complex[T]` 转换（虚部 0），`Complex[f32]` 可扩宽到 `Complex[f64]`。整数在能**无损**转成元素浮点时也走同一条转换（`i32 → c128`；编译期常量按值检查，`z: c128 = 3` 可写），不能无损转换的整数（如 `i64`）要先显式转成浮点。
 - 支持 `+ - * /`（逐分量）与字段 `z.real` / `z.imag`。
 - `std.reflect.type_info` 给出 `ComplexType` 反射变体。
 
@@ -361,10 +366,15 @@ def widen_int_literal() -> c128:
     z: c128 = 3                  # 编译期整数常量按值检查，仍可转
     return z
 
+@func()
+def widen_int(r: i32) -> c128:
+    return r                     # i32 -> f64 无损，因而 i32 -> c128 也隐式
+
 assert cmul(1 + 2j, 3 + 4j) == (1 + 2j) * (3 + 4j)
 assert cparts(3 + 4j) == 7.0
 assert widen(2.5) == complex(2.5, 0.0)
 assert widen_int_literal() == complex(3, 0.0)
+assert widen_int(3) == complex(3, 0.0)
 ```
 
 ### 1.10 整数枚举
@@ -641,7 +651,7 @@ assert infer_runtime(1) == 2
 - 算术 `+ - * / // % **`（整数与浮点）、位运算 `| & ^ << >> ~`、一元负号、`not`（仅 `spy.bool`）、
   比较 `== != < <= > >=`（**不支持链式比较**）。
 - 两侧都是编译期常量时在编译期折叠；含运行时值时在运行时计算。
-- 整数 `/` 是真除法（结果默认为 `f64`）：整数操作数只能是**编译期常量**（如 `1 / 3`、`float_var / 10`），或至少一侧是浮点；**运行期整数**不能直接参与，要么显式转成浮点（`int_to_float`），要么用 `//`。整数 `//` 默认向下取整；浮点 `//` 是 `floor(a/b)`。
+- 整数 `/` 是真除法（结果默认为 `f64`）：两侧都是编译期常量时在编译期折叠；含运行时整数时，只要整数能**无损**转成 `f64`（`i32`/`u32`/`i16`/…，见 §1.1）就能直接参与（如 `a / b`），否则也要么显式转成浮点（`int_to_float`），要么用 `//`。整数 `//` 默认向下取整；浮点 `//` 是 `floor(a/b)`。
 - `**`：整数与浮点指数都支持。**浮点 `%` 未实现**（报错）。
 - 每个二元算符有对应的复合赋值 `a <算符>= b`。
 - 条件表达式 `a if c else b`：条件必须 `spy.bool`；编译期条件只保留选中分支。
@@ -666,8 +676,8 @@ def logic(a: bool, b: bool) -> bool:
 
 @func()
 def true_div(a: i32, b: i32) -> f64:
-    # 运行期整数不能直接做真除法：显式转成浮点
-    return int_to_float(a, f64) / int_to_float(b, f64)
+    # 整数能无损转成 f64，真除法可直接用
+    return a / b
 
 @func()
 def pow_int(a: i32) -> i32:
@@ -1486,8 +1496,8 @@ assert unrolled_sum() == 6
 
 - `std.core.undefined()`：任意类型的 undefined，写进目标时按其类型定型；undefined 作条件报错。
 - `std.core.compile_error(msg)`：以编译期字节串为消息中止编译；非字节串/运行时消息报错；死分支不触发。
-- `std.core.coerce(value, T)`：把 value 具体化成类型 `T`——与 store 相同的**隐式转换**，只允许同类型或扩宽：整型按范围覆盖（`u32 → u64`、`i32 → i64`），浮点 `f32 → f64`，合法的指针转换，以及浮点实数 `→ Complex[T]`；**收窄一律报错**。编译期值按值检查（`x: i8 = 12` 可以）。收窄要用 `std.int.truncate`/`int_cast` 或 `std.float.float_truncate`。
-- `std.core.lub_type(t1, t2)`：两个类型的最小上界——两者共同的 peer 类型（`t1.resolve_peer_type(t2)`），如类型与其 `Option`、变体与其 tagged union、无类型整数与其整型。结果是编译期类型值，可用于命名声明类型或喂给 `type[X]` 形参；两者无共同类型时得到 `None`。peer 规则对两个参数是对称的，唯一例外是签名里的 result 类型（返回类型 + 异常集）：此时取 `t1` 的返回类型、`t1` 的异常在前，所以这些情形下结果与参数顺序有关。
+- `std.core.coerce(value, T)`：把 value 具体化成类型 `T`——与 store 相同的**隐式转换**，只允许同类型或扩宽：整型按范围覆盖（`u32 → u64`、`i32 → i64`），浮点 `f32 → f64`，**无损**的整数 → 浮点（运行期按类型范围、编译期按值，见 §1.1），合法的指针转换，以及（能无损转成元素浮点的）实数 `→ Complex[T]`；**收窄与有损的整数 → 浮点一律报错**。编译期值按值检查（`x: i8 = 12` 可以）。收窄要用 `std.int.truncate`/`int_cast` 或 `std.float.float_truncate`，有损的整数 → 浮点用 `std.int.int_to_float`。
+- `std.core.lub_type(t1, t2)`：两个类型的最小上界——两者共同的 peer 类型（`t1.resolve_peer_type(t2)`），如类型与其 `Option`、变体与其 tagged union、能无损容纳它的整型的无类型整数或浮点。结果是编译期类型值，可用于命名声明类型或喂给 `type[X]` 形参；两者无共同类型时得到 `None`。peer 规则对两个参数是对称的，唯一例外是签名里的 result 类型（返回类型 + 异常集）：此时取 `t1` 的返回类型、`t1` 的异常在前，所以这些情形下结果与参数顺序有关。
 - `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`）；未设置时是缺失值（`None`）。
 - `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)` / `std.float.float_truncate(value, T)`：标量的同位宽重解释 / 整数收窄 / 浮点收窄。

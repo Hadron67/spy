@@ -1,13 +1,15 @@
 from unittest import TestCase
 
-from ..compiler import as_ as spy_as
-from ..compiler import bool as spy_bool
 from ..compiler import (
+    CompileError,
     f32,
     f64,
     i32,
+    i64,
     u64,
 )
+from ..compiler import as_ as spy_as
+from ..compiler import bool as spy_bool
 from ..compiler.dsl import func, struct
 from ..std.int import int_to_float
 
@@ -20,9 +22,10 @@ from ..std.int import int_to_float
 
 @func()
 def int_true_div(a: i32, b: i32) -> f64:
-    # an integer is not implicitly converted to a float, and a runtime
-    # ``int / int`` is not a true division any more: convert explicitly
-    return int_to_float(a, f64) / int_to_float(b, f64)
+    # a runtime ``int / int`` divides in ``CompileVars.int_div_type`` (``f64`` by
+    # default), and the operands convert to it implicitly: an ``i32`` fits the
+    # exact integer range of ``f64``
+    return a / b
 
 
 @func()
@@ -77,6 +80,25 @@ def mixed_float_add(a: f32, b: f64) -> f64:
 
 @func()
 def mixed_float_add_reflected(a: f64, b: f32) -> f64:
+    return a + b
+
+
+@func()
+def mixed_int_float_add(a: i32, b: f64) -> f64:
+    # an integer that converts to the float losslessly takes part in the
+    # arithmetic: the peer type of the two is that float
+    return a + b
+
+
+@func()
+def mixed_int_float_mul_literal(a: f64) -> f64:
+    # an untyped integer literal converts to the float as well
+    return a * 2
+
+
+@func()
+def mixed_int_float_add_lossy(a: i64, b: f64) -> f64:
+    # ``i64`` does not fit the exact integer range of ``f64``: it does not join
     return a + b
 
 
@@ -251,6 +273,14 @@ class SpyOperatorTest(TestCase):
     def test_mixed_float_widths_widen_in_either_order(self) -> None:
         self.assertAlmostEqual(mixed_float_add(1.5, 2.25), 3.75)
         self.assertAlmostEqual(mixed_float_add_reflected(1.5, 2.25), 3.75)
+
+    def test_an_integer_joins_float_arithmetic_when_it_is_lossless(self) -> None:
+        self.assertAlmostEqual(mixed_int_float_add(3, 0.5), 3.5)
+        self.assertAlmostEqual(mixed_int_float_mul_literal(2.5), 5.0)
+
+    def test_an_inexact_integer_does_not_join_float_arithmetic(self) -> None:
+        with self.assertRaises(CompileError):
+            mixed_int_float_add_lossy(1, 0.5)
 
     def test_bool_comparisons(self) -> None:
         # ``False`` is the smaller one, and each operator contributes its bit

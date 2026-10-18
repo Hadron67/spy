@@ -4415,13 +4415,18 @@ class HirRunner:
         one (``type.is_subtype_of(target)``).  This is the *implicit*
         conversion - what a store, a call argument and ``std.core.coerce``
         perform - so a narrowing is an error: an integer whose range the target
-        does not cover, an integer to a float, and ``f64`` to ``f32``.  The
-        explicit special conversions build the narrowing themselves through
-        ``_convert_inst`` (see ``std.int.truncate`` and
-        ``std.float.float_truncate``).  A committed slot is the address of the
-        value it holds (``_shallow_normalize``), which is what an operation that
-        takes a value without loading it (taking an address, ``ref``) hands
-        over.
+        does not cover, an integer to a float that cannot represent it exactly,
+        and ``f64`` to ``f32``.  An integer *does* convert to a float
+        implicitly when the conversion is lossless - a runtime value when its
+        whole type range fits the float's exact integer range, a compile-time
+        value when its value does (see ``sval.IntType.is_subtype_of`` and
+        ``sval.coerce_const``).  The explicit special conversions build the
+        narrowing themselves through ``_convert_inst`` (see
+        ``std.int.truncate`` and ``std.float.float_truncate``, and
+        ``std.int.int_to_float`` for a lossy integer to float).  A committed
+        slot is the address of the value it holds (``_shallow_normalize``),
+        which is what an operation that takes a value without loading it
+        (taking an address, ``ref``) hands over.
 
         Raises :class:`~spy.errors.CoerceError` when the value has no
         materialization as ``target`` (see ``_try_coerce`` for the failing

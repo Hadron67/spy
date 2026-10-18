@@ -1870,8 +1870,12 @@ class AnyIntType(ScalarType):
 
     @override
     def is_subtype_of(self, other: Type) -> bool:
-        # the untyped integer converts to any integer type
-        return isinstance(other, (AnyIntType, IntType))
+        # the untyped integer converts to any integer type and to any float
+        # type: it only ever exists at compile time (a runtime location of it is
+        # rejected), so its *value*, which is what decides whether the
+        # conversion is lossless, is checked where the value is coerced (see
+        # ``coerce_const``)
+        return isinstance(other, (AnyIntType, IntType, FloatType))
 
     def __str__(self) -> str:
         return 'int'
@@ -1911,6 +1915,14 @@ class IntType(ScalarType):
     def is_subtype_of(self, other: Type) -> bool:
         if isinstance(other, AnyIntType):
             return True
+        if isinstance(other, FloatType):
+            # an integer converts to a float only when the float represents its
+            # whole range exactly, so that no value of it rounds (a *value*
+            # narrows by value, see ``coerce_const``; a runtime value can only
+            # go by its type, see ``float_exact_int_range``)
+            self_range = int_range(self)
+            exact_range = float_exact_int_range(other)
+            return self_range[0] >= exact_range[0] and self_range[1] <= exact_range[1]
         if not isinstance(other, IntType):
             return False
         self_range = int_range(self)
@@ -3398,6 +3410,19 @@ def int_range(type: IntType) -> tuple[int, int]:
         return (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
     return (0, 2 ** type.bits - 1)
 
+
+def float_exact_int_range(type: FloatType) -> tuple[int, int]:
+    """``[-(2**p), 2**p]``: the integers a float type represents exactly, ``p``
+    being the precision of its significand (24 for ``f32``, 53 for ``f64``).
+    Every integer in the range converts to the float without loss, and one
+    outside it may round to a neighbour.  It is the range an integer has to
+    stay within for the float conversion to be lossless: an integer *type*
+    checks its whole range against it (see ``IntType.is_subtype_of``), an
+    integer *value* its value (see ``coerce_const``), and
+    ``std.int.try_int_to_float`` the same range."""
+    p = 53 if type.bits == 64 else 24
+    return (-(1 << p), 1 << p)
+
 def min_int_type(lower: int, upper: int) -> IntType:
     """The smallest integer type whose range contains ``[lower, upper]``."""
     if lower < 0:
@@ -4386,13 +4411,15 @@ def _coerce_const_complex(value: AnyValue, type: ComplexType) -> AnyValue:
         # an already-typed spy numeric constant (the ``f64`` a compile-time
         # ``coerce`` folded to, say): its real part is the value, its imaginary
         # one zero
-        re, im = value.value, 0.0
+        re, im = value, 0.0
     elif isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CoerceError(f"cannot use {value!r} as a complex constant")
     else:
         re, im = value, 0.0
+    # the parts are coerced like any other value: an integer real part is
+    # checked for losslessness (see the ``FloatType`` case of ``coerce_const``)
     return AggregateValue(
-        (Float(float(re), type.elem), Float(float(im), type.elem)),
+        (coerce_const(re, type.elem), coerce_const(im, type.elem)),
         type,
     )
 
@@ -4549,6 +4576,17 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
         case FloatType():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise CoerceError(f"cannot use {value} as a float constant")
+            if isinstance(value, int):
+                # an integer converts to a float only when it is exactly
+                # representable: a value outside the exact range would round
+                # (the conversion has to be spelled out, see
+                # ``std.int.int_to_float``)
+                lo, hi = float_exact_int_range(type)
+                if not lo <= value <= hi:
+                    raise CoerceError(
+                        f"integer constant {value} is not exactly representable "
+                        f"as {type}"
+                    )
             return Float(float(value), type)
         case TypeType():
             if not isinstance(value, Type):

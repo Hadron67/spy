@@ -6,6 +6,7 @@ from ..compiler import (
     f32,
     f64,
     i8,
+    i16,
     i32,
     i64,
     u8,
@@ -36,9 +37,9 @@ from ..std.int import int_to_float, truncate
 # ``std.core.coerce(value, T)``: materialize ``value`` as the spy type ``T`` -
 # the same conversion a store into a location of ``T`` performs.  A
 # compile-time value is converted in Python and stays compile-time; a runtime
-# value only widens (``src.is_subtype_of(dst)``) - a narrowing or an
-# integer -> float conversion has to be spelled out (``std.int.truncate``,
-# ``std.float.float_truncate``, ``std.int.int_to_float``)
+# value only widens (``src.is_subtype_of(dst)``) - a narrowing, a *lossy*
+# integer -> float conversion and ``f64 -> f32`` have to be spelled out
+# (``std.int.truncate``, ``std.float.float_truncate``, ``std.int.int_to_float``)
 # ---------------------------------------------------------------------------
 
 
@@ -56,8 +57,42 @@ def coerce_narrow(x: i32) -> i8:
 
 @func()
 def coerce_int_to_float(x: i32) -> f64:
-    # likewise a runtime integer no longer converts to a float implicitly
+    # an integer converts to a float implicitly when it is lossless: the whole
+    # ``i32`` range fits the exact integer range of ``f64`` (``[-2**53, 2**53]``)
     return coerce(x, f64)
+
+
+@func()
+def coerce_int_to_float_lossy(x: i64) -> f64:
+    # ``i64`` does not fit that range, so a value of it may round: the
+    # conversion has to be spelled out (``std.int.int_to_float``, see below)
+    return coerce(x, f64)
+
+
+@func()
+def coerce_i16_to_f32(x: i16) -> f32:
+    # the whole ``i16`` range fits the exact integer range of ``f32``
+    return coerce(x, f32)
+
+
+@func()
+def coerce_i32_to_f32(x: i32) -> f32:
+    # ``i32`` does not fit it, even though ``i16`` does
+    return coerce(x, f32)
+
+
+@func()
+def coerce_comptime_int_to_float_exact() -> f64:
+    # a compile-time integer is checked by value: ``2**53`` is exact
+    x: f64 = 9007199254740992
+    return x
+
+
+@func()
+def coerce_comptime_int_to_float_lossy() -> f64:
+    # ``2**53 + 1`` is not exactly representable, so this is a compile error
+    x: f64 = 9007199254740993
+    return x
 
 
 @func()
@@ -301,11 +336,23 @@ class SpyCoerceTest(TestCase):
         self.assertEqual(truncate_narrow(128), -128)
 
     def test_int_to_float(self) -> None:
-        # a runtime integer no longer converts to a float implicitly; the
-        # explicit form is ``std.int.int_to_float``
+        # a lossless runtime integer converts to a float implicitly; a lossy one
+        # has to be spelled out (``std.int.int_to_float``)
+        self.assertEqual(coerce_int_to_float(3), 3.0)
         with self.assertRaises(CompileError):
-            coerce_int_to_float(3)
+            coerce_int_to_float_lossy(3)
         self.assertEqual(int_to_float_convert(3), 3.0)
+
+    def test_a_comptime_integer_to_a_float_is_checked_by_value(self) -> None:
+        self.assertEqual(coerce_comptime_int_to_float_exact(), 9007199254740992.0)
+        with self.assertRaises(CompileError):
+            coerce_comptime_int_to_float_lossy()
+
+    def test_a_runtime_integer_to_a_float_is_checked_by_its_type_range(self) -> None:
+        # the whole source range has to fit the exact integer range of the float
+        self.assertEqual(coerce_i16_to_f32(3), 3.0)
+        with self.assertRaises(CompileError):
+            coerce_i32_to_f32(3)
 
     def test_float_narrow(self) -> None:
         # ``std.float.float_truncate`` is the explicit ``f64`` -> ``f32``

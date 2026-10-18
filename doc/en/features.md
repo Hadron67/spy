@@ -79,7 +79,7 @@ from typing import TYPE_CHECKING, Literal, Never, NoReturn
 - C integer types `c_char/c_uchar`, `c_short/c_ushort`, `c_int/c_uint`, `c_long/c_ulong`, `c_longlong/c_ulonglong`:
   the width (and the signedness of `c_char`) is determined by the target platform (for example `c_long` is 32-bit on Windows and 64-bit on common 64-bit Unix).
 - Untyped integer literals: the literal `1` initially has no concrete type; it is determined by the location it is written into or the type it is paired with.
-- Integer subtyping follows range inclusion: `i8` is a subtype of `i16`, and `u8` is not a subtype of `i8`. Integers are not floats.
+- Integer subtyping follows range inclusion: `i8` is a subtype of `i16`, and `u8` is not a subtype of `i8`. Between an integer and a float: an integer type is a subtype of a float type exactly when the float represents its whole range **without loss** (`i16`/`u8 → f32`, `i32`/`u32` → `f64`; `i32` → `f32` and `i64`/`u64` → `f64` are not). A compile-time integer goes by its **value** instead.
 
 ```python
 @func()
@@ -88,8 +88,13 @@ def arith(a: i32, b: i32) -> i32:
 
 @func()
 def to_float(a: i32, b: i32) -> f64:
-    # runtime integers cannot take part in true division (see §4): convert first
-    return int_to_float(a, f64) / int_to_float(b, f64)
+    # an integer converts to `f64` without loss, so true division works directly (see §4)
+    return a / b
+
+def to_float_explicit(x: u64) -> f64:
+    # `u64` exceeds the exact integer range of `f64`: convert explicitly (a value
+    # out of range panics)
+    return int_to_float(x, f64)
 
 @func()
 def width_and_literals() -> i32:
@@ -339,7 +344,7 @@ assert tu_match(A(9)) == 9
 
 Complex types `spy.c64` / `spy.c128`: the real part and the imaginary part are each a floating-point element.
 
-- A Python `complex` maps to `c128`; there is an implicit `T → Complex[T]` conversion for **float** reals (imaginary part 0), and `Complex[f32]` widens to `Complex[f64]`. An integer has to be converted to a float first (a compile-time integer constant is checked by value, so `z: c128 = 3` is still allowed).
+- A Python `complex` maps to `c128`; there is an implicit `T → Complex[T]` conversion for **float** reals (imaginary part 0), and `Complex[f32]` widens to `Complex[f64]`. An integer takes the same conversion when it converts to the element float **without loss** (`i32 → c128`; a compile-time constant is checked by value, so `z: c128 = 3` is fine) - an integer that cannot (`i64`, say) has to be converted to a float first.
 - Supports `+ - * /` (component-wise) and the fields `z.real` / `z.imag`.
 - `std.reflect.type_info` yields the `ComplexType` reflection variant.
 
@@ -361,10 +366,15 @@ def widen_int_literal() -> c128:
     z: c128 = 3                  # a compile-time integer constant is checked by value
     return z
 
+@func()
+def widen_int(r: i32) -> c128:
+    return r                     # i32 -> f64 is lossless, so i32 -> c128 is implicit too
+
 assert cmul(1 + 2j, 3 + 4j) == (1 + 2j) * (3 + 4j)
 assert cparts(3 + 4j) == 7.0
 assert widen(2.5) == complex(2.5, 0.0)
 assert widen_int_literal() == complex(3, 0.0)
+assert widen_int(3) == complex(3, 0.0)
 ```
 
 ### 1.10 Integer enums
@@ -641,7 +651,7 @@ assert infer_runtime(1) == 2
 - Arithmetic `+ - * / // % **` (integers and floats), bit operations `| & ^ << >> ~`, unary minus, `not` (only `spy.bool`),
   comparisons `== != < <= > >=` (**chained comparisons are not supported**).
 - When both sides are compile-time constants it is folded at compile time; when a runtime value is involved it is computed at runtime.
-- Integer `/` is true division (the result defaults to `f64`): an integer operand may only be a **compile-time constant** (e.g. `1 / 3`, `float_var / 10`), or the other side must be a float; a **runtime integer** cannot take part - convert it to a float explicitly (`int_to_float`) or use `//`. Integer `//` defaults to floor division; float `//` is `floor(a/b)`.
+- Integer `/` is true division (the result defaults to `f64`): both operands compile-time constants fold at compile time; with a runtime integer, it takes part directly as long as the integer converts to `f64` **without loss** (`i32`/`u32`/`i16`/…, see §1.1, e.g. `a / b`) - otherwise convert it to a float explicitly (`int_to_float`) or use `//`. Integer `//` defaults to floor division; float `//` is `floor(a/b)`.
 - `**`: both integer and float exponents are supported. **Float `%` is not implemented** (it is an error).
 - Every binary operator has a corresponding compound assignment `a <operator>= b`.
 - Conditional expression `a if c else b`: the condition must be `spy.bool`; a compile-time condition keeps only the selected branch.
@@ -666,8 +676,8 @@ def logic(a: bool, b: bool) -> bool:
 
 @func()
 def true_div(a: i32, b: i32) -> f64:
-    # runtime integers cannot take part in true division: convert first
-    return int_to_float(a, f64) / int_to_float(b, f64)
+    # an integer converts to `f64` without loss, so true division works directly
+    return a / b
 
 @func()
 def pow_int(a: i32) -> i32:
@@ -1483,8 +1493,8 @@ assert unrolled_sum() == 6
 
 - `std.core.undefined()`: undefined of any type, typed according to its type when written into a target; undefined as a condition is an error.
 - `std.core.compile_error(msg)`: aborts compilation with a compile-time byte string message; a non-byte-string/runtime message is an error; a dead branch does not trigger.
-- `std.core.coerce(value, T)`: concretizes value into type `T` - the **implicit conversion** a store performs, which only allows the same type or a widening one: integers by range coverage (`u32 → u64`, `i32 → i64`), floats `f32 → f64`, the legal pointer conversions, and a float real `→ Complex[T]`; **narrowing is always an error**. A compile-time value is checked by value (`x: i8 = 12` is fine). To narrow, use `std.int.truncate`/`int_cast` or `std.float.float_truncate`.
-- `std.core.lub_type(t1, t2)`: the least upper bound of two types - the common type both peer to (`t1.resolve_peer_type(t2)`), such as a type with its `Option` or a variant with its tagged union. The result is a compile-time type value, able to name a declaration's type or feed a `type[X]` parameter; two types with no common type yield `None`.
+- `std.core.coerce(value, T)`: concretizes value into type `T` - the **implicit conversion** a store performs, which only allows the same type or a widening one: integers by range coverage (`u32 → u64`, `i32 → i64`), floats `f32 → f64`, a **lossless** integer → float (by type range on a runtime value, by value on a compile-time one, see §1.1), the legal pointer conversions, and a real that converts to the element float **without loss** `→ Complex[T]`; **narrowing and a lossy integer → float are always an error**. A compile-time value is checked by value (`x: i8 = 12` is fine). To narrow, use `std.int.truncate`/`int_cast` or `std.float.float_truncate`, and `std.int.int_to_float` for a lossy integer → float.
+- `std.core.lub_type(t1, t2)`: the least upper bound of two types - the common type both peer to (`t1.resolve_peer_type(t2)`), such as a type with its `Option`, a variant with its tagged union, or an untyped integer with the integer - or the float - that holds it losslessly. The result is a compile-time type value, able to name a declaration's type or feed a `type[X]` parameter; two types with no common type yield `None`.
 - `std.core.compile_option(name)`: reads a compile-time option the host context stores (`CompileContext.get_compile_option`); an option that is not set is the absent value (`None`).
 - `std.core.compile(fn)`: manually compiles a **non-generic** function value (precompiles its default specialization).
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)` / `std.float.float_truncate(value, T)`: same-bit-width reinterpretation of a scalar / integer narrowing / float narrowing.
