@@ -244,7 +244,7 @@ class _RegisteredFn:
         analyser = Analyser(self.context, self.context.mir_lower_cache)
         analyser.analyse_function(entry, call_sig, ret_sig)
         sym = analyser.finish()
-        sym.compile(self.context._symbol_table, self.context.backend, self.context.target_info())
+        sym.compile(self.context._symbol_table, self.context.backend, self.context)
 
         return glue.invoke(entry.specs[call_sig], call_sig, arglist, self.context)
 
@@ -939,7 +939,7 @@ class _Context(CompileContext):
         analyser = Analyser(self, self.mir_lower_cache)
         analyser.analyse_function(fn, call_sig, ret_sig)
         sym = analyser.finish()
-        sym.compile(self._symbol_table, self.backend, self.target_info())
+        sym.compile(self._symbol_table, self.backend, self)
 
     def func(self, self_arg: Literal["const ptr", "ptr", "value"] | None = None, extern: bool = False, linkname: str | None = None, exceptions: type | tuple[type, ...] | Literal["infer"] | None = None, callconv: str = 'default', may_panic: bool = True, inline: bool = False, ignore_signature: bool = False):
         meta = FnMetadata(

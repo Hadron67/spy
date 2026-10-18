@@ -849,7 +849,7 @@ assert use_add_on_exit(1) == 102
 - `std.core.panic(data)` throws a panic carrying `PanicData`.
 - `std.core.catch_unwind(fn)` (`fn` must be a **non-inlined closure** compiled into a runtime function) catches a panic and packs the data into `std.core.UnwindException`,
   thrown along the ordinary exception path (read with `except UnwindException as e: e.data`).
-- `may_panic` defaults to `True` for `@func`/`@syntax.closure`. An uncaught panic that unwinds to the Python boundary aborts the process.
+- `may_panic` defaults to `True` for `@func`/`@syntax.closure`. An uncaught panic that unwinds to the Python boundary is caught by the function's entry thunk and re-raised as `std.core.UnwindException` (with the payload in `e.data`); it no longer terminates the process.
 
 ```python
 @func()

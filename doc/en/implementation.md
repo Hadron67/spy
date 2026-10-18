@@ -281,14 +281,17 @@ Struct helpers (mostly iterative): `alignment_of`, `aggregate_type_length`, `sca
 ### 5.3 thunk (Python entry stub)
 
 ctypes cannot pass aggregates by value, so `_make_thunk` generates a MIR function per specialization: aggregate parameters are received as pointers and then `Load`ed;
-each storage leaf is delivered through a trailing `$result` out-pointer; the thunk returns void. `_thunk_call_sig`/`_thunk_ret` describe the shape glue must marshal.
+each storage leaf is delivered through a trailing `$result` out-pointer, followed by a hidden `$unwind: Ptr[PanicData]` naming the storage of `UnwindException.data`.
+The thunk calls the value form through `mir.CatchUnwind`; a caught `PanicData` is copied into `$unwind` (a typed `Load`/`Store`), `mir.EndCatch` releases the C++ exception object,
+and the thunk returns `bool` (`true` = panic, `false` = normal). `_thunk_call_sig`/`_thunk_ret` describe the shape glue must marshal.
 `native_fn` is the "value form" (used for spy-to-spy calls / `ExternAnonSymbol` resolution), and `wrapper_fn` is the thunk (used at the Python boundary).
 
 ### 5.4 Compile driver
 
 - `SymbolTable`: a process-level **link name ↔ NativeFn** map; cross-module calls use it to resolve `ExternAnonSymbol` back to an already-assigned name.
 - `CompileBatch`: compiles a batch of `FunctionInstance`s together — first builds thunks, collects symbols (`mir.collect_symbols`), runs `opt.simplify` on each body,
-  `SymbolTable._assign_names` assigns link names, then `backend.compile(structs, globals, target)`.
+  `SymbolTable._assign_names` assigns link names, then `backend.compile(structs, globals, target)`. `compile(..., resolver)` derives the target from `resolver.target_info()`
+  and, when the batch has new instances, lazily resolves `std.core.PanicData` to pass its MIR type to `_make_thunk` (the type is not stored on the batch).
 - `Backend.compile(structs, globals, target) -> dict[mir.GlobalValue, NativeFn]`: the real implementation is `lower.LLVMBackend`.
 
 ### 5.5 `dsl`: registration and per-host context
@@ -444,7 +447,7 @@ Instructions (identity objects, `get_children`/`map_values`): memory (`Alloca`/`
 atomic (`AtomicLoad`/`AtomicStore`/`AtomicRmw`/`AtomicCmpxchg`/`Fence`),
 aggregate/pointer (`Gep`/`ExtractValue`/`InsertValue`/`Select`),
 scalar (`Arith`/`Floor`/`Pow`/`Convert`/`Cmp`),
-union (`BitCast`/`AsUnion`/`ExtractUnion`/`UnionCast`), `Phi`/`Call`, and the placeholder `Insertion`.
+union (`BitCast`/`AsUnion`/`ExtractUnion`/`UnionCast`), `Phi`/`Call`, the exception `EndCatch`, and the placeholder `Insertion`.
 
 ### 7.3 Basic blocks, terminators, and defer instantiation
 
@@ -495,7 +498,8 @@ Construction-time peephole: `BasicBlock.emit` calls `try_evaluate` to fold const
 - `_lower_inst`: maps instruction by instruction; a `BitCast` between pointers or of the same type is a no-op; `AsUnion`/`ExtractUnion`/`UnionCast` reinterpret via "alloca of the wider one + store + load as the target type";
   a `NoReturn` `Call` gets an `unreachable` appended; `Gep` passes the pointee explicitly (because a MIR pointer `BitCast` is a no-op).
 - Exception unwind: `_UnwindCtx` (one `{ptr, i32}` slot per function); `_lower_panic` (`__cxa_allocate_exception` + memcpy + `__cxa_throw(obj, @_ZTIi, null)`,
-  using `invoke` when there is an unwind edge); `_lower_call_may_panic` (`invoke` + cleanup landing pad); `_lower_catch_unwind` (catching landing pad, stores the caught object).
+  using `invoke` when there is an unwind edge); `_lower_call_may_panic` (`invoke` + cleanup landing pad); `_lower_catch_unwind` (catching landing pad, stores the caught object);
+  `EndCatch` maps to `__cxa_end_catch`, emitted once the caught payload has been copied out (both in `catch_unwind` and in the Python-entry thunk).
 - `LLVMBackend`: `Target.from_default_triple` + `create_target_machine` + a **process-unique** LLJIT (`create_lljit_compiler`);
   `compile`: lower the module -> `Module.write()` -> `parse_assembly`/`verify` -> `JITLibraryBuilder().add_ir().add_current_process().add_jit_library(pre-library).export_symbol(...).link(...)`;
   each function takes its actual name and is `cast` to a `_NativeFn` per a ctypes prototype (the whole IR text is kept for tests' `print_all`).
@@ -523,11 +527,14 @@ The only place that turns Python values into spy values (and back); it does **no
 - Argument binding: `arg_spy_type` (`_StructInstance`/`_PtrInstance`, or `type_of(value,64)`), `boundary_arg` (normalization),
   `provided_arglist`/`provided_node` (builds `ArgList[ArgNode]` for `specialize`).
 - `invoke(instance, call_sig, arglist, context)`: marshals per `thunk_call_sig` (pointers/DSTs pass an address; by-reference aggregates are written into a buffer and its address is passed; scalars by value),
-  allocates a ctypes out-buffer per storage leaf and appends its address, calls `wrapper_fn.call`, and `_read_result` unwraps the result.
+  allocates a ctypes out-buffer per storage leaf and appends its address, then constructs a placeholder `UnwindException` and appends the address of its `data` field as the trailing `$unwind` argument.
+  It calls `wrapper_fn.call`; when the thunk returns `true` the placeholder is raised as the Python exception (`data` has been overwritten by the thunk), otherwise `_read_result` unwraps the result.
+  The `UnwindException` type is resolved lazily in the call's context (never in a global context).
 - `_read_result`: walks `ret_sig.ret_type_spec` (`RetValue`/`RetTuple`/`RetComptime`); for `RetComptime` it reads `instance.ret_comptime_values[leaf.index]` through `_comptime_to_python`;
   when the error code is non-zero, `_read_error_payload` raises an `_ExceptionInstance`.
 - `construct`/`_resolve_struct`/`specialized_struct`: Python-side instance construction (explicit specialization / non-generic / specialization inferred from field values),
-  `Foo[i32]` is callable, and `Foo[i32].m` does not implicitly pass `self`.
+  `Foo[i32]` is callable, and `Foo[i32].m` does not implicitly pass `self`; `construct(..., exception=True)` wraps the result as an `_ExceptionInstance`
+  (used for the placeholder `UnwindException`).
 - Boundary restriction: arrays cannot cross the boundary (`_read`/`_write` raise `SpyError`).
 
 ---

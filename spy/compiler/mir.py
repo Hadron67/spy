@@ -802,6 +802,19 @@ class Fence(Inst):
         return self
 
 
+@dataclass(eq=False, slots=True)
+class EndCatch(Inst):
+    """The caught exception a ``CatchUnwind`` landing pad began handling has
+    been copied out; release it.  ABI-neutral: ``lower`` maps it to the
+    target ABI's end-catch (``__cxa_end_catch`` on Itanium)."""
+
+    def get_children(self) -> tuple[Any, ...]:
+        return ()
+
+    def map_values(self, f: Callable[[Value], Value]) -> Self:
+        return self
+
+
 @dataclass(eq=False)
 class Gep(Inst):
     """The address of a struct field or of an array element: ``ptr`` must

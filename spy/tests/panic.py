@@ -353,6 +353,30 @@ class SpyPanicTest(TestCase):
         self.assertEqual(call_defer_combined_normal(0, 5), 105)
         self.assertEqual(call_defer_combined_panic(0, -1), 101)
 
+    def test_a_panic_crossing_the_python_boundary_is_re_raised(self) -> None:
+        # a Python call runs the thunk, which catches the panic and hands its
+        # ``PanicData`` back; the boundary re-raises it as an ``UnwindException``
+        with self.assertRaises(Exception) as ctx:
+            panic_i32(41)
+        self.assertEqual(ctx.exception.data, 41)  # pyright: ignore
+
+    def test_the_python_entry_thunk_releases_a_caught_panic(self) -> None:
+        with self.assertRaises(Exception):  # noqa: B017
+            panic_i32(41)
+        entry = panic_i32.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        native = instance.wrapper_fn
+        assert native is not None
+        self.assertIn('__cxa_end_catch', '\n'.join(native.print_all()))
+
+    def test_catch_unwind_releases_the_caught_panic(self) -> None:
+        self.assertEqual(catch_no_panic(5), 6)
+        entry = catch_no_panic.get_entry()  # pyright: ignore
+        instance = next(iter(entry.specs.values()))
+        native = instance.native_fn
+        assert native is not None
+        self.assertIn('__cxa_end_catch', '\n'.join(native.print_all()))
+
 
 all_tests = [
     SpyPanicTest,

@@ -2283,14 +2283,17 @@ class HirRunner:
         ``UnwindException`` through the ordinary construction path - the value is
         materialized with ``_to_runtime`` from an aggregate whose mirror is its
         single ``data`` field (see ``sval.StructType.mirror_is_a_field``) - and
-        then dispatched as a raise.  The current block is the catch block when
-        this runs."""
+        then dispatched as a raise.  Once the payload is copied out, the caught
+        C++ exception object is released (see ``mir.EndCatch``).  The current
+        block is the catch block when this runs."""
         exception = self._unwind_exception_type()
         pointer = self.load(catch_data)          # the ``Ptr[PanicData]`` caught
         data = self.load(pointer)                # the caught ``PanicData``
         slot = self.alloca(False)
         self._commit_pending_slot(slot, exception)
         self.store(self.field_index_addr(slot, _index_value(0)), data)
+        # the payload is copied out: release the C++ exception object
+        self._emit(mir.EndCatch())
         self._dispatch_exception(slot)
 
     # -- error locations ---------------------------------------------------

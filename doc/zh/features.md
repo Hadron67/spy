@@ -849,7 +849,7 @@ assert use_add_on_exit(1) == 102
 - `std.core.panic(data)` 抛出一个携带 `PanicData` 的 panic。
 - `std.core.catch_unwind(fn)`（`fn` 必须是编译成运行时函数的**非内联闭包**）捕获 panic，把数据包成 `std.core.UnwindException`
   沿普通异常路径抛出（`except UnwindException as e: e.data` 读取）。
-- `@func`/`@syntax.closure` 的 `may_panic` 默认 `True`。未捕获的 panic 展开到 Python 边界会中止进程。
+- `@func`/`@syntax.closure` 的 `may_panic` 默认 `True`。未捕获的 panic 展开到 Python 边界时，由该函数的入口 thunk 捕获并作为 `std.core.UnwindException` 重新抛出（`e.data` 是 payload），不再中止进程。
 
 ```python
 @func()

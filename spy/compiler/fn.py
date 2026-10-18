@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import override
 
-from . import hir, mir, opt
+from . import hir, mir, opt, sval
 from .errors import CompileError, TypeMismatchError
 from .source import SourceLoc
 from .sval import (
@@ -835,7 +835,8 @@ class FunctionInstance:
     # the Python-entry calling convention: ``thunk_call_sig`` mirrors
     # ``call_sig`` with the runtime arguments whose aggregate form is passed
     # as a pointer there, and ``thunk_ret`` walks the result leaves with every
-    # storage leaf delivered through a result pointer (the thunk returns void)
+    # storage leaf delivered through a result pointer (the thunk returns a bool
+    # saying whether the call panicked)
     thunk_call_sig: CallSignature | None = None
     thunk_ret: RetSpec | None = None
     # the compile-time result values of this specialization (see §7.3): one entry
@@ -993,17 +994,21 @@ def _storage_leaves(spec: RetSpec) -> list[RetValue]:
     ]
 
 
-def _make_thunk(fn: mir.Function, ret_spec: RetSpec, cache: MirLowerCache) -> mir.Function:
+def _make_thunk(
+    fn: mir.Function,
+    ret_spec: RetSpec,
+    cache: MirLowerCache,
+    panic_data_type: mir.Type,
+) -> mir.Function:
     """The always-generated Python-facing entry of this function: a MIR
     function that adapts its value form to the ABI ctypes can call.  A by-value
     aggregate argument is taken as a pointer and loaded; every *storage* result
     leaf - the one the value form returns by value included - is delivered
-    through a trailing out pointer, in depth-first declaration order (the thunk
-    finally returns void).  Spy-to-spy calls never go through it: they call the
-    value form directly.
-
-    A future revision catches a panic here (see ``may_panic``), which is why
-    every function has one."""
+    through a trailing out pointer, in depth-first declaration order.  A trailing
+    ``$unwind`` pointer names the storage of ``UnwindException.data``; a panic
+    thrown by the value form is caught, its ``PanicData`` is copied there, and
+    the thunk returns ``true`` (a normal return returns ``false``).  Spy-to-spy
+    calls never go through it: they call the value form directly."""
     # the value form's arguments are the declared ones followed by the result
     # pointers it was given for the leaves it delivers through one (see
     # ``interp._ret_leaf_ptr``)
@@ -1034,8 +1039,15 @@ def _make_thunk(fn: mir.Function, ret_spec: RetSpec, cache: MirLowerCache) -> mi
         arg_types.append(mir.PointerType(mir_type))
         arg_names.append('$result')
 
+    # where a caught ``PanicData`` is copied: the ``data`` field of the
+    # ``UnwindException`` the Python side re-raises (see ``glue.invoke``)
+    panic_ptr = mir.PointerType(panic_data_type)
+    unwind_index = len(arg_types)
+    arg_types.append(panic_ptr)
+    arg_names.append('$unwind')
+
     thunk = mir.Function(
-        f'{fn.name_base}.thunk', arg_types, arg_names, mir.VOID,
+        f'{fn.name_base}.thunk', arg_types, arg_names, mir.BoolType(),
         is_complete=True,
     )
 
@@ -1055,19 +1067,31 @@ def _make_thunk(fn: mir.Function, ret_spec: RetSpec, cache: MirLowerCache) -> mi
             index = n_declared + position
             call_args.append(mir.Param(index, arg_types[index]))
 
-    if isinstance(fn.ret_type, mir.NoReturn):
-        # the callee never returns, so neither does the thunk: its entry ends
-        # with the call (and a Python-side call of the function never returns
-        # either)
-        thunk.entry.emit(mir.Call(fn, tuple(call_args), mir.NORETURN))
-        return thunk
+    # the panic the value form may throw is caught here: the landing pad hands
+    # the caught ``PanicData`` pointer to ``catch`` through ``caught_slot``
+    caught_slot = mir.Alloca(panic_ptr)
+    thunk.entry.emit(caught_slot)
+    unwind = mir.Param(unwind_index, panic_ptr)
 
-    if isinstance(fn.ret_type, mir.VoidType):
-        thunk.entry.emit(mir.Call(fn, tuple(call_args), mir.VOID))
-    else:
+    normal = mir.BasicBlock()
+    catch = mir.BasicBlock()
+    call = mir.CatchUnwind(
+        fn, tuple(call_args), fn.ret_type, normal, catch, caught_slot,
+    )
+    thunk.entry.emit(call)
+
+    # catch: copy the ``PanicData`` out, then release the C++ exception object
+    # (``__cxa_end_catch``) and report the panic to Python
+    pointer = mir.Load(caught_slot)
+    catch.emit(pointer)
+    value = mir.Load(pointer)
+    catch.emit(value)
+    catch.emit(mir.Store(unwind, value))
+    catch.emit(mir.EndCatch())
+    catch.emit(mir.Ret(mir.BoolValue(True)))
+
+    if not isinstance(fn.ret_type, (mir.VoidType, mir.NoReturn)):
         # the value form's one by-value leaf is stored into its own out pointer
-        value = mir.Call(fn, tuple(call_args), fn.ret_type)
-        thunk.entry.emit(value)
         by_value_index = ret_by_value_index(ret_spec)
         assert by_value_index is not None
         by_value_leaf = all_leaves[by_value_index]
@@ -1076,8 +1100,8 @@ def _make_thunk(fn: mir.Function, ret_spec: RetSpec, cache: MirLowerCache) -> mi
             if leaf is by_value_leaf
         )
         index = n_declared + position
-        thunk.entry.emit(mir.Store(mir.Param(index, arg_types[index]), value))
-    thunk.entry.emit(mir.Ret(None))
+        normal.emit(mir.Store(mir.Param(index, arg_types[index]), call))
+    normal.emit(mir.Ret(mir.BoolValue(False)))
     return thunk
 
 
@@ -1163,14 +1187,36 @@ class CompileBatch:
         entry.extend(extra)
         return mir.collect_symbols(entry)
 
-    def compile(self, symbol_table: SymbolTable, backend: Backend, target: TargetInfo):
-        thunks: dict[mir.Function, mir.Function] = {}
+    def compile(
+        self,
+        symbol_table: SymbolTable,
+        backend: Backend,
+        resolver: sval.CompileContext,
+    ) -> None:
+        target = resolver.target_info()
         cache = self.mir_lower_cache
+
+        # every thunk catches a panic and copies the ``PanicData`` the Python
+        # side re-raises (see ``glue.invoke``), so the thunks of this round need
+        # its MIR type.  Resolving it here (and not storing it on the batch)
+        # keeps the type inside the round that actually builds thunks.
+        panic_data_type: mir.Type | None = None
+        if self.newly_compiled:
+            from ..std.core import PanicData
+            panic_type = sval.as_value(PanicData, resolver)
+            assert isinstance(panic_type, sval.Type)
+            panic_data_type = panic_type.to_mir_type(cache)
+            assert panic_data_type is not None
+
+        thunks: dict[mir.Function, mir.Function] = {}
         for instance in self.newly_compiled:
             ret_sig = instance.ret_sig
             assert ret_sig is not None
             ret_spec = ret_sig.ret_spec(cache)
-            thunks[instance.mir] = _make_thunk(instance.mir, ret_spec, cache)
+            assert panic_data_type is not None
+            thunks[instance.mir] = _make_thunk(
+                instance.mir, ret_spec, cache, panic_data_type,
+            )
             instance.thunk_ret = _thunk_ret(ret_spec)
             assert instance.call_sig is not None
             instance.thunk_call_sig = _thunk_call_sig(instance.call_sig, instance.mir)

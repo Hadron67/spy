@@ -299,14 +299,17 @@ flowchart TD
 ### 5.3 thunk（Python 入口桩）
 
 ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR 函数：聚合形参收成指针再 `Load`；
-每个存储叶经一个尾部 `$result` 出指针交付；thunk 返回 void。`_thunk_call_sig`/`_thunk_ret` 描述 glue 要 marshaling 的形态。
+每个存储叶经一个尾部 `$result` 出指针交付，最后再追加一个隐藏的 `$unwind: Ptr[PanicData]`，即 `UnwindException.data` 的存储地址。
+thunk 经 `mir.CatchUnwind` 调用值形态；捕获到的 `PanicData` 用 typed `Load`/`Store` 拷进 `$unwind`，`mir.EndCatch` 释放 C++ 异常对象，
+thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`_thunk_ret` 描述 glue 要 marshaling 的形态。
 `native_fn` 是「值形态」（spy 互调/`ExternAnonSymbol` 解析用），`wrapper_fn` 是 thunk（Python 边界用）。
 
 ### 5.4 编译驱动
 
 - `SymbolTable`：进程级 **link name ↔ NativeFn** 映射；跨模块调用靠它把 `ExternAnonSymbol` 解析回已分配的名字。
 - `CompileBatch`：一批 `FunctionInstance` 一起编译——先建 thunk，收集符号（`mir.collect_symbols`），`opt.simplify` 每个 body，
-  `SymbolTable._assign_names` 分配链接名，`backend.compile(structs, globals, target)`。
+  `SymbolTable._assign_names` 分配链接名，`backend.compile(structs, globals, target)`。`compile(..., resolver)` 从 `resolver.target_info()` 取 target，
+  并在本轮有新实例时 lazy 解析 `std.core.PanicData`，把它的 MIR 类型传给 `_make_thunk`（该类型不保存在 batch 上）。
 - `Backend.compile(structs, globals, target) -> dict[mir.GlobalValue, NativeFn]`：真实实现是 `lower.LLVMBackend`。
 
 ### 5.5 `dsl`：注册与每宿主上下文
@@ -461,7 +464,7 @@ ctypes 不能按值传聚合，故 `_make_thunk` 为每个特化生成一个 MIR
 原子（`AtomicLoad`/`AtomicStore`/`AtomicRmw`/`AtomicCmpxchg`/`Fence`）、
 聚合/指针（`Gep`/`ExtractValue`/`InsertValue`/`Select`）、
 标量（`Arith`/`Floor`/`Pow`/`Convert`/`Cmp`）、
-union（`BitCast`/`AsUnion`/`ExtractUnion`/`UnionCast`）、`Phi`/`Call`、占位 `Insertion`。
+union（`BitCast`/`AsUnion`/`ExtractUnion`/`UnionCast`）、`Phi`/`Call`、异常 `EndCatch`、占位 `Insertion`。
 
 ### 7.3 基本块、终结符与 defer 实例化
 
@@ -512,7 +515,8 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
 - `_lower_inst`：逐指令映射；`BitCast` 指针↔指针或同类型是无操作；`AsUnion`/`ExtractUnion`/`UnionCast` 用「较宽者 alloca + store + 按目标类型 load」重解释；
   `Call` 的 `NoReturn` 后补 `unreachable`；`Gep` 显式传 pointee（因 MIR 指针 `BitCast` 是 no-op）。
 - 异常展开：`_UnwindCtx`（每函数一个 `{ptr, i32}` slot）；`_lower_panic`（`__cxa_allocate_exception` + memcpy + `__cxa_throw(obj, @_ZTIi, null)`，
-  有 unwind 边则用 `invoke`）；`_lower_call_may_panic`（`invoke` + cleanup landing pad）；`_lower_catch_unwind`（catching landing pad，存下被捕获对象）。
+  有 unwind 边则用 `invoke`）；`_lower_call_may_panic`（`invoke` + cleanup landing pad）；`_lower_catch_unwind`（catching landing pad，存下被捕获对象）；
+  `EndCatch` 降成 `__cxa_end_catch`，在捕获的 payload 拷出之后发射（`catch_unwind` 与 Python 入口 thunk 都如此）。
 - `LLVMBackend`：`Target.from_default_triple` + `create_target_machine` + **进程唯一** LLJIT（`create_lljit_compiler`）；
   `compile`：降模块 → `Module.write()` → `parse_assembly`/`verify` → `JITLibraryBuilder().add_ir().add_current_process().add_jit_library(前置库).export_symbol(...).link(...)`；
   每个函数取实际名字、按 ctypes 原型 `cast` 成 `_NativeFn`（保留整段 IR 文本供测试 `print_all`）。
@@ -539,11 +543,14 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
 - 参数绑定：`arg_spy_type`（`_StructInstance`/`_PtrInstance` 或 `type_of(value,64)`）、`boundary_arg`（归一化）、
   `provided_arglist`/`provided_node`（构建 `ArgList[ArgNode]` 供 `specialize`）。
 - `invoke(instance, call_sig, arglist, context)`：按 `thunk_call_sig` marshal（指针/DST 传地址；按引用聚合写入缓冲传地址；标量按值），
-  为每个存储叶分配 ctypes 出缓冲并追加地址，调 `wrapper_fn.call`，`_read_result` 脱壳结果。
+  为每个存储叶分配 ctypes 出缓冲并追加地址，再构造一个占位 `UnwindException` 并把其 `data` 字段地址作为尾部 `$unwind` 实参追加。
+  调 `wrapper_fn.call`；thunk 返回 `true` 时把占位对象作为 Python 异常抛出（`data` 已被 thunk 覆盖），否则 `_read_result` 脱壳结果。
+  `UnwindException` 类型在本次调用的 context 里 lazy 解析（绝不用全局 context）。
 - `_read_result`：走 `ret_sig.ret_type_spec`（`RetValue`/`RetTuple`/`RetComptime`）；`RetComptime` 读 `instance.ret_comptime_values[leaf.index]` 经 `_comptime_to_python`；
   错误码非 0 时 `_read_error_payload` 抛 `_ExceptionInstance`。
 - `construct`/`_resolve_struct`/`specialized_struct`：Python 侧构造实例（显式特化 / 非泛型 / 从字段值推断特化）、
-  `Foo[i32]` 可调用、`Foo[i32].m` 不隐式传 `self`。
+  `Foo[i32]` 可调用、`Foo[i32].m` 不隐式传 `self`；`construct(..., exception=True)` 把结果包成 `_ExceptionInstance`
+  （占位 `UnwindException` 用）。
 - 边界限制：数组不能跨边界（`_read`/`_write` 报 `SpyError`）。
 
 ---

@@ -616,7 +616,9 @@ def invoke(
     """Call the thunk of the compiled specialization ``instance`` from Python:
     marshal the bound arguments, allocate an out pointer per result leaf, call
     the native thunk, and turn the results back into Python values (raising a
-    spy exception when the error code says so)."""
+    spy exception when the error code says so).  A panic the thunk reports is
+    re-raised as the ``UnwindException`` whose ``data`` storage the thunk
+    filled."""
     cache = context.mir_cache()
     native = instance.wrapper_fn
     thunk_sig = instance.thunk_call_sig
@@ -671,7 +673,23 @@ def invoke(
         buffers.append(buffer)
         py_args.append(ctypes.c_void_p(ctypes.addressof(buffer)))
 
-    native.call(*py_args)
+    # the storage the thunk writes a caught ``PanicData`` into: the ``data``
+    # field of the ``UnwindException`` re-raised below.  The placeholder value
+    # is irrelevant (the thunk overwrites tag and payload as a whole)
+    from ..std.core import UnwindException
+    unwind_type = sval.as_value(UnwindException, context)
+    assert isinstance(unwind_type, StructType)
+    unwind = construct(
+        unwind_type.head, unwind_type.generic_args, (0,), {}, context,
+        exception=True,
+    )
+    data_index = unwind_type.field_index('data')
+    assert data_index is not None
+    data_offset = _field_offset(unwind_type, data_index, cache)
+    py_args.append(ctypes.c_void_p(unwind._data._base() + data_offset))
+
+    if native.call(*py_args):
+        raise cast(_ExceptionInstance, unwind)
     return _read_result(instance, buffers, context)
 
 
@@ -838,16 +856,22 @@ def construct(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     context: CompileContext,
+    *,
+    exception: bool = False,
 ) -> _StructInstance:
     """Construct a spy struct from Python: ``Foo(...)`` (``generic_args`` is
     ``None``, the arguments of the specialization are inferred from the
     provided field values) or ``Foo[...](...)`` (``generic_args`` are the
-    explicit ones)."""
+    explicit ones).  ``exception`` wraps the result as an
+    :class:`_ExceptionInstance`, the Python exception a failed boundary call
+    raises."""
     cache = context.mir_cache()
     type = _resolve_struct(head, generic_args, args, kwargs, context)
     mir_type = type.get_mir_type(cache)
     if mir_type is None:
         # a zero-sized struct has no storage
+        if exception:
+            return _ExceptionInstance(type, 0, 0, context)
         return _StructInstance(type, 0, 0, context)
     buffer = to_ctype(mir_type)()
 
@@ -879,6 +903,8 @@ def construct(
             raise TypeError(
                 f'missing a value for field {field.name!r} of {head.name_base}'
             )
+    if exception:
+        return _ExceptionInstance(type, buffer, 0, context)
     return _StructInstance(type, buffer, 0, context)
 
 
