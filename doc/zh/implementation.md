@@ -33,7 +33,7 @@ flowchart TD
 
 | 文件 | 职责 |
 |---|---|
-| `compiler/__init__.py` | 公开接口：`func`/`struct`/`func_type`/`decl_func`/`typeof`/`compile_log`/`as_` 与各类型常量 |
+| `compiler/__init__.py` | 公开接口：`func`/`struct`/`func_type`/`decl_func`/`typeof` 与各类型常量 |
 | `compiler/syntax.py` | 函数体内的语法标记：指针类型、`ref`、`Array`/`array`、`Option`、`Comptime`/`ConstComptime`/`InferComptime`、`typeof`、`unroll`、`comptime()`、`defer` 与 `OK/RAISE/UNWIND/ERR/ALL`、`closure`、`Opaque`、C 整数 marker |
 | `compiler/dsl.py` | 装饰器与注册：`_Context`（每宿主编译上下文）、`_RegisteredFn`/`_RegisteredClass`/`_FuncTypeDecl`/`_DeclFuncDecl`、各 Metadata、`IntEnum` 支持 |
 | `compiler/astgen.py` | Python `ast` → HIR；签名解析（`parse_function`）、作用域、闭包、RLS、标记识别 |

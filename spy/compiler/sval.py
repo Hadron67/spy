@@ -338,6 +338,19 @@ class Type(Value):
     def __ror__(self, other: Any) -> TaggedUnionApplication:
         return union_application(other, self)
 
+    def __call__(self, value: Any) -> AnyValue:
+        """Build the typed spy value of ``value`` at the Python calling
+        boundary: the explicit-type spelling ``T(value)`` a caller uses where an
+        argument's type has to be named (``u64(2)`` for a plain Python ``int``,
+        which marshals to ``i64`` by default).  A scalar is concretized to the
+        compile-time constant ``coerce_const`` builds; a pointer (or a
+        dynamically-sized function value) is the raw address it carries (see
+        ``glue.pointer_value``)."""
+        if isinstance(self, PointerType) or self.classify() == SpecialTypeKind.DST:
+            from . import glue
+            return cast(AnyValue, glue.pointer_value(value, self))
+        return coerce_const(value, self)
+
 
 class ScalarType(Type):
     """Base of the *scalar* spy types: the types whose values are the atomic
@@ -1773,7 +1786,7 @@ def load_box_cells(box: Box | bytes, offset: int, type: Type) -> AnyValue:
 
 @dataclass(frozen=True, slots=True)
 class BuiltinSignature:
-    """The argument shape of a ``spy.*`` builtin the compile-time interpreter
+    """The argument shape of a spy builtin the compile-time interpreter
     evaluates (see :class:`BuiltinFn`).  A builtin is only ever called at
     compile time, on already-evaluated arguments, so - unlike a spy function's
     ``fn.Signature`` - it carries no types: the positional parameters in
@@ -1833,13 +1846,12 @@ class BuiltinSignature:
 
 
 class BuiltinFn(Value):
-    """A ``spy.*`` builtin that the compile-time interpreter evaluates
-    while running the HIR (``spy.compile_log``).  The name identifies the
+    """A spy builtin that the compile-time interpreter evaluates while
+    running the HIR (``std.core.compile_log``).  The name identifies the
     builtin to the interpreter; ``signature`` (see :class:`BuiltinSignature`)
     is what the interpreter binds the call's arguments with before evaluating
-    the builtin.  ``spy.as_`` is not a compile-time builtin (it only exists at
-    the call boundary), and ``spy.typeof`` is a ``syntax`` marker lowered to a
-    type probe rather than a builtin."""
+    the builtin.  ``spy.typeof`` is a ``syntax`` marker lowered to a type probe
+    rather than a builtin."""
 
     name: str
     signature: BuiltinSignature

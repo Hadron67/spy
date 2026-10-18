@@ -8,7 +8,6 @@ from ..compiler import (
     i64,
     u64,
 )
-from ..compiler import as_ as spy_as
 from ..compiler import bool as spy_bool
 from ..compiler.dsl import func, struct
 from ..std.int import int_to_float
@@ -306,7 +305,7 @@ class SpyOperatorTest(TestCase):
         self.assertAlmostEqual(int_pow_runtime(5, 0), 1.0)
 
     def test_runtime_unsigned_exponent(self) -> None:
-        self.assertAlmostEqual(uint_pow_runtime(spy_as(2, u64), spy_as(5, u64)), 32.0)
+        self.assertAlmostEqual(uint_pow_runtime(u64(2), u64(5)), 32.0)
 
     def test_float_exponent(self) -> None:
         self.assertAlmostEqual(float_pow(4.0, 0.5), 2.0)

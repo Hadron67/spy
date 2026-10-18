@@ -11,7 +11,6 @@ from ..compiler import (
     sval,
     syntax,
 )
-from ..compiler import as_ as spy_as
 from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type, struct
 from ..compiler.syntax import (
     ConstPtr,
@@ -315,14 +314,14 @@ class SpyFnPtrCallTest(TestCase):
         proto = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32, ctypes.c_int32)
         callback = proto(lambda a, b: a + b)
         pointer = ctypes.cast(callback, ctypes.c_void_p)
-        self.assertEqual(call_c_binary(spy_as(pointer, ptr_type), 2, 3), 5)  # pyright: ignore
+        self.assertEqual(call_c_binary(ptr_type(pointer), 2, 3), 5)  # pyright: ignore
 
     def test_the_default_of_a_function_pointer_is_filled_in(self) -> None:
         ptr_type = sval.as_value(ConstPtr[CWithDefault], _GLOBAL_CONTEXT)
         proto = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32, ctypes.c_int32)
         callback = proto(lambda a, b: a + b)
         pointer = ctypes.cast(callback, ctypes.c_void_p)
-        self.assertEqual(call_c_default(spy_as(pointer, ptr_type), 5), 15)  # pyright: ignore
+        self.assertEqual(call_c_default(ptr_type(pointer), 5), 15)  # pyright: ignore
 
     def test_calling_a_spy_function_pointer(self) -> None:
         # the default convention: the callee carries the error code and payload
@@ -338,7 +337,7 @@ class SpyFnPtrCallTest(TestCase):
 
         callback = proto(success)
         pointer = ctypes.cast(callback, ctypes.c_void_p)
-        self.assertEqual(call_fallible(spy_as(pointer, ptr_type), 5), 6)  # pyright: ignore
+        self.assertEqual(call_fallible(ptr_type(pointer), 5), 6)  # pyright: ignore
 
     def test_the_error_of_a_spy_function_pointer_is_routed(self) -> None:
         ptr_type = _GLOBAL_CONTEXT.resolve_global(Fallible)
@@ -353,7 +352,7 @@ class SpyFnPtrCallTest(TestCase):
 
         callback = proto(fail)
         pointer = ctypes.cast(callback, ctypes.c_void_p)
-        self.assertEqual(call_fallible(spy_as(pointer, ptr_type), 5), 1007)  # pyright: ignore
+        self.assertEqual(call_fallible(ptr_type(pointer), 5), 1007)  # pyright: ignore
 
 
 class SpyCallconvTest(TestCase):

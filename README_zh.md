@@ -22,7 +22,7 @@ def add_u64(a: spy.u64, b: spy.u64) -> spy.u64:
 
 print(add(1, 2))                                  # 编译 add(i64, i64)
 print(add(1.5, 2.25))                             # 编译 add(f64, f64)
-print(add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64)))
+print(add_u64(spy.u64(2**63 - 1), spy.u64(2)))
 ```
 
 详细的特性文档见[doc/zh/features.md](doc/zh/features.md)。

@@ -42,9 +42,8 @@ resolved to its function entry when the reference runs (see ``interp``);
 calling it is compiled to a native ``call``.  An *undecorated* plain
 Python function reached the same way becomes a ``sval.PyFunction``: a
 compile-time helper that is only ever called while the HIR runs, on plain
-Python scalars (see ``interp``).  The ``spy.*`` builtins
-(``spy.compile_log``) are evaluated at compile time; ``spy.typeof`` is a
-``syntax`` marker, lowered by the parser to a type probe.
+Python scalars (see ``interp``).  ``spy.typeof`` is a ``syntax`` marker,
+lowered by the parser to a type probe.
 """
 
 import ast
@@ -64,7 +63,6 @@ from typing import (
 )
 
 from . import astgen, glue, sval
-from .builtins import spy_as, spy_compile_log
 from .errors import CompileError
 from .fn import (
     AnyValue,
@@ -112,23 +110,15 @@ def _builtin_signature(fn: Callable[..., Any]) -> sval.BuiltinSignature:
     return sval.BuiltinSignature(positional, varargs, kwargs)
 
 
-# the ``spy.*`` builtins, by the name the interpreter knows them by
-_BUILTINS: dict[Any, sval.BuiltinFn] = {
-    spy_compile_log: sval.BuiltinFn('compile_log', _builtin_signature(spy_compile_log)),
-    spy_as: sval.BuiltinFn('as', _builtin_signature(spy_as)),
-}
-
-
 def builtin_func[T](fn: T) -> T:
     """Register a Python function as a spy builtin: the decorated name is bound
     to a :class:`sval.BuiltinFn` (not to the function itself), which the
     compile-time interpreter evaluates by name while running the HIR (see
-    ``interp._call_builtin``).  Unlike the ``spy.*`` builtins of
-    :mod:`spy.compiler.builtins`, which the host recognizes by object identity,
-    a ``@builtin_func`` builtin lives in a ``std`` module and is dispatched on
-    its own ``__name__``.  The builtin's ``def`` is also read into a
-    :class:`sval.BuiltinSignature` (see ``_builtin_signature``), which the
-    interpreter binds every call's arguments with before evaluating it."""
+    ``interp._call_builtin``).  A ``@builtin_func`` builtin lives in a ``std``
+    module and is dispatched on its own ``__name__``.  The builtin's ``def`` is
+    also read into a :class:`sval.BuiltinSignature` (see ``_builtin_signature``),
+    which the interpreter binds every call's arguments with before evaluating
+    it."""
     return cast(T, sval.BuiltinFn(cast(Any, fn).__name__, _builtin_signature(cast(Any, fn))))
 
 
@@ -828,9 +818,6 @@ class Context(CompileContext):
                 handle = value if value.context is self else self._local_decl_func(value)
                 return handle.as_spy_value()
             case pytypes.FunctionType():
-                builtin = _BUILTINS.get(value)
-                if builtin is not None:
-                    return builtin
                 # a plain Python function - one *not* decorated with ``@func``:
                 # a compile-time helper (``sval.PyFunction``) that is only ever
                 # called while the HIR runs.  The function object is wrapped as it

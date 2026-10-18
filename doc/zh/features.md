@@ -30,7 +30,7 @@ from spy import (
     c_char, c_uchar, c_short, c_ushort, c_int, c_uint,
     c_long, c_ulong, c_longlong, c_ulonglong,
     Ptr, ConstPtr, MultiPtr, ConstMultiPtr, Option,
-    typeof, compile_log, as_ as spy_as,
+    typeof,
 )
 from spy.compiler.syntax import (
     Array, Opaque, array,
@@ -45,7 +45,7 @@ from spy.std import (
 )
 from spy.std.core import (
     panic, catch_unwind, UnwindException, coerce, typed_undefined, bitcast,
-    ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error, lub_type,
+    ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error, compile_log, lub_type,
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
@@ -445,7 +445,7 @@ def take_opaque(x: i32, c: bool) -> bool:
     return c
 
 assert do_nothing(1) is None
-assert zero_bit(spy_as(0, u0)) == 1
+assert zero_bit(u0(0)) == 1
 assert take_opaque(1, False) is False
 ```
 
@@ -595,8 +595,8 @@ def comptime_marker_typed() -> i32:
     i = i + 1                    # still a compile-time box
     return i
 
-assert comptime_holds_type(spy_as(1, i32)) == 1
-assert comptime_holds_type(spy_as(1.5, f64)) == 0
+assert comptime_holds_type(i32(1)) == 1
+assert comptime_holds_type(f64(1.5)) == 0
 assert comptime_marker_typed() == 1
 ```
 
@@ -1370,8 +1370,7 @@ assert subscript_use(1) == 1 + 2 + 100
 ### 8.1 类型探针与编译期日志
 
 - `spy.typeof(x)`：查询静态类型（返回类型值），是一个**类型探针**：只做类型化、无运行时行为；其中引用的 spy 函数会被触发编译。被探测的调用若抛错离开探针则报错。
-- `spy.compile_log(...)`：编译期打印（运行时无动作）；bytes 渲染为文本，运行时值渲染为 `<T>`。
-- `spy.as_`：只能在 Python 调用边界用（函数体内调用报错）。
+- `std.core.compile_log(...)`：编译期打印（运行时无动作）；bytes 渲染为文本，运行时值渲染为 `<T>`。
 
 ```python
 @func()
@@ -1804,7 +1803,7 @@ assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 ## 10. Python ↔ spy 调用边界
 
 - Python 值到 spy 类型的映射：`bool`→`bool`，`int`→`i64`，`float`→`f64`，`complex`→`c128`，
-  `bytes`→编译期字节串，`None`→`Null`，`syntax.Ptr[T]`→指针；用 `spy.as_(value, T)` 显式指定类型。
+  `bytes`→编译期字节串，`None`→`Null`，`syntax.Ptr[T]`→指针；用 `T(value)`（如 `u64(x)`）显式指定类型。
 - 结构体实例支持字段读写、方法调用与视图语义；指针是非空的。
 - `Option[T]` 与 tagged union 回到 Python 时**脱壳**：`Option[T]` 是 `T` 值或 `None`，union 是其具体变体的值。
 - 复数 ↔ Python `complex`；整数枚举 ↔ Python 枚举成员。
@@ -1831,7 +1830,7 @@ p = Pt(1, 2)                          # a struct instance crosses the boundary
 assert p.x == 1 and p.y == 2
 q = swap_xy(p)
 assert q.x == 2 and q.y == 1
-assert id64(spy_as(2 ** 40, u64)) == 2 ** 40   # spy.as_ picks an explicit type
+assert id64(u64(2 ** 40)) == 2 ** 40   # u64(x) picks an explicit type
 ```
 
 ---

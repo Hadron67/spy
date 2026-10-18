@@ -11,7 +11,6 @@ from ..compiler import (
     sval,
     u8,
 )
-from ..compiler import as_ as spy_as
 from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type
 from ..compiler.syntax import closure, ref
 from ..std import Array, ptr_cast
@@ -175,11 +174,11 @@ class SpyCVariadicCallTest(TestCase):
         self.assertEqual(snprintf_first_digit(42), 4)
 
     def test_a_narrow_integer_is_promoted_to_int(self) -> None:
-        self.assertEqual(snprintf_narrow(spy_as(-5, i8)), 2)
-        self.assertEqual(snprintf_narrow(spy_as(100, i8)), 3)
+        self.assertEqual(snprintf_narrow(i8(-5)), 2)
+        self.assertEqual(snprintf_narrow(i8(100)), 3)
 
     def test_a_float_is_promoted_to_double(self) -> None:
-        self.assertEqual(snprintf_float(spy_as(1.5, f32)), 3)
+        self.assertEqual(snprintf_float(f32(1.5)), 3)
 
     def test_a_call_with_no_extra_argument(self) -> None:
         self.assertEqual(snprintf_no_vararg(), 2)

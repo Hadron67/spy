@@ -11,7 +11,6 @@ from ..compiler import (
     u32,
     u64,
 )
-from ..compiler import as_ as spy_as
 from ..compiler import bool as spy_bool
 from ..compiler.dsl import func
 from ..compiler.syntax import comptime, ref
@@ -132,15 +131,15 @@ class SpyBitcastTest(TestCase):
     through ``mir.BitCast`` otherwise."""
 
     def test_float_and_integer(self) -> None:
-        self.assertEqual(bitcast_f32_to_u32(spy_as(1.0, f32)), 0x3F800000)
-        self.assertAlmostEqual(bitcast_u32_to_f32(spy_as(0x3F800000, u32)), 1.0)
+        self.assertEqual(bitcast_f32_to_u32(f32(1.0)), 0x3F800000)
+        self.assertAlmostEqual(bitcast_u32_to_f32(u32(0x3F800000)), 1.0)
         self.assertEqual(bitcast_f64_to_u64(1.0), 0x3FF0000000000000)
-        self.assertAlmostEqual(bitcast_u64_to_f64(spy_as(0x3FF0000000000000, u64)), 1.0)
+        self.assertAlmostEqual(bitcast_u64_to_f64(u64(0x3FF0000000000000)), 1.0)
 
     def test_integer_signedness(self) -> None:
         # the same width, only the sign differs: the bits are reinterpreted
         self.assertEqual(bitcast_i32_to_u32(-1), 0xFFFFFFFF)
-        self.assertEqual(bitcast_u32_to_i32(spy_as(0xFFFFFFFF, u32)), -1)
+        self.assertEqual(bitcast_u32_to_i32(u32(0xFFFFFFFF)), -1)
 
     def test_bool(self) -> None:
         self.assertEqual(bitcast_bool_to_u1(True), 1)

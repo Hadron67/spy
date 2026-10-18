@@ -19,8 +19,9 @@ A spy value that lives on the Python side is one of:
   which is also a Python ``Exception``.
 
 An ``Option[T]`` and a tagged union are *unwrapped* at the boundary: a
-``None`` or the value of the ``T``/variant itself.  ``spy.as_`` returns the
-typed scalar constant itself (``sval.Int``/``sval.Float``/a plain bool).
+``None`` or the value of the ``T``/variant itself.  Calling a scalar type
+(``u64(x)``) returns the typed scalar constant itself (``sval.Int``/
+``sval.Float``/a plain bool).
 
 This module does not import ``dsl``: the declaration handles there delegate to
 the functions here.
@@ -418,8 +419,8 @@ def _as_address(value: Any) -> int | None:
 
 
 def pointer_value(value: Any, type: Type) -> _PtrInstance:
-    """A pointer-valued Python value (``spy.as_(address, Ptr[...])``): the raw
-    address it carries, tied to its spy type."""
+    """A pointer-valued Python value (a pointer type called with an address):
+    the raw address it carries, tied to its spy type."""
     address = _as_address(value)
     return _PtrInstance(type, 0 if address is None else address)
 

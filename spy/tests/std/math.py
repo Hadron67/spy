@@ -6,7 +6,6 @@ from unittest import TestCase, skipUnless
 from llvmlite.binding import llvm_version_info
 
 from ...compiler import CompileError, f32, f64
-from ...compiler import as_ as spy_as
 from ...compiler.dsl import Context, func
 from ...compiler.lower import LLVMBackend
 from ...std.math import (
@@ -725,7 +724,7 @@ class _TrigUlpTest(TestCase):
     ) -> None:
         for v in values:
             want = _to_f32(expect(_to_f32(v)))
-            self.assertLessEqual(_f32_ulp(float(fn(spy_as(v, f32))), want), tol, msg=repr(v))
+            self.assertLessEqual(_f32_ulp(float(fn(f32(v))), want), tol, msg=repr(v))
 
     def assert_rel_close(self, got: float, want: float, tol: float, msg: str) -> None:
         if got == want or (math.isnan(got) and math.isnan(want)):
@@ -739,7 +738,7 @@ class _TrigUlpTest(TestCase):
 
     def check_tan_f32(self, fn: Callable[[f32], f32], tol: float) -> None:
         for v in _TAN_F32_VALUES:
-            got = float(fn(spy_as(v, f32)))
+            got = float(fn(f32(v)))
             self.assert_rel_close(got, math.tan(_to_f32(v)), tol, repr(v))
 
     def check_atan2_f64(
@@ -759,7 +758,7 @@ class _TrigUlpTest(TestCase):
     ) -> None:
         for y, x in values:
             want = _to_f32(math.atan2(_to_f32(y), _to_f32(x)))
-            got = float(fn(spy_as(y, f32), spy_as(x, f32)))
+            got = float(fn(f32(y), f32(x)))
             self.assertLessEqual(_f32_ulp(got, want), tol, msg=repr((y, x)))
 
     def check_pow_f64(
@@ -779,7 +778,7 @@ class _TrigUlpTest(TestCase):
     ) -> None:
         for x, y in values:
             want = _to_f32(math.pow(_to_f32(x), _to_f32(y)))
-            got = float(fn(spy_as(x, f32), spy_as(y, f32)))
+            got = float(fn(f32(x), f32(y)))
             self.assertLessEqual(_f32_ulp(got, want), tol, msg=repr((x, y)))
 
 
@@ -914,7 +913,7 @@ class SpySoftwareAsinAcosTest(_TrigUlpTest):
             self.assertTrue(math.isnan(fn(v)), msg=repr(v))
         for fn in (sw_asin_f32, sw_acos_f32):
             for v in (2.0, -2.0, math.inf, math.nan):
-                self.assertTrue(math.isnan(float(fn(spy_as(v, f32)))), msg=repr(v))
+                self.assertTrue(math.isnan(float(fn(f32(v)))), msg=repr(v))
 
 
 class SpyAsinAcosModeTest(_TrigUlpTest):
@@ -974,11 +973,11 @@ class SpySoftwareAtanAtan2Test(_TrigUlpTest):
     def test_atan_of_a_zero_keeps_its_sign(self) -> None:
         self.assertEqual(sw_atan_f64(0.0), 0.0)
         self.assertEqual(math.copysign(1.0, sw_atan_f64(-0.0)), -1.0)
-        self.assertEqual(math.copysign(1.0, float(sw_atan_f32(spy_as(-0.0, f32)))), -1.0)
+        self.assertEqual(math.copysign(1.0, float(sw_atan_f32(f32(-0.0)))), -1.0)
 
     def test_atan_of_a_nan(self) -> None:
         self.assertTrue(math.isnan(sw_atan_f64(math.nan)))
-        self.assertTrue(math.isnan(float(sw_atan_f32(spy_as(math.nan, f32)))))
+        self.assertTrue(math.isnan(float(sw_atan_f32(f32(math.nan)))))
 
     def test_atan_is_odd(self) -> None:
         for v in _ATAN_F64_VALUES:
@@ -996,7 +995,7 @@ class SpySoftwareAtanAtan2Test(_TrigUlpTest):
             if want == 0.0:
                 self.assertEqual(math.copysign(1.0, got), math.copysign(1.0, want), msg=repr((y, x)))
         for y, x, want in cases:
-            got32 = float(sw_atan2_f32(spy_as(y, f32), spy_as(x, f32)))
+            got32 = float(sw_atan2_f32(f32(y), f32(x)))
             self.assertEqual(got32, _to_f32(want), msg=repr((y, x)))
             if want == 0.0:
                 self.assertEqual(math.copysign(1.0, got32), math.copysign(1.0, want), msg=repr((y, x)))
@@ -1023,7 +1022,7 @@ class SpySoftwareAtanAtan2Test(_TrigUlpTest):
             self.assertTrue(math.isnan(sw_atan2_f64(y, x)), msg=repr((y, x)))
         for y, x in ((math.nan, 1.0), (1.0, math.nan)):
             self.assertTrue(
-                math.isnan(float(sw_atan2_f32(spy_as(y, f32), spy_as(x, f32)))),
+                math.isnan(float(sw_atan2_f32(f32(y), f32(x)))),
                 msg=repr((y, x)),
             )
 
@@ -1090,7 +1089,7 @@ class SpySoftwareSqrtTest(_TrigUlpTest):
         for v in (-1.0, -0.5, -5e-324, -1e300):
             self.assertTrue(math.isnan(sw_sqrt_f64(v)), msg=repr(v))
         for v in (-1.0, -0.5, -1e30):
-            self.assertTrue(math.isnan(float(sw_sqrt_f32(spy_as(v, f32)))), msg=repr(v))
+            self.assertTrue(math.isnan(float(sw_sqrt_f32(f32(v)))), msg=repr(v))
 
 
 class SpySqrtModeTest(_TrigUlpTest):
@@ -1262,8 +1261,8 @@ class SpyPowModeTest(_TrigUlpTest):
 
     def test_mixed_float_types(self) -> None:
         # two differing float types meet at their common type (f64 here)
-        self.assertEqual(libm_pow_software(2.0, spy_as(3.0, f32)), 8.0)
-        self.assertEqual(libm_pow_software(spy_as(2.0, f32), 3.0), 8.0)
+        self.assertEqual(libm_pow_software(2.0, f32(3.0)), 8.0)
+        self.assertEqual(libm_pow_software(f32(2.0), 3.0), 8.0)
 
     def test_an_unknown_mode_is_rejected(self) -> None:
         with self.assertRaises(CompileError):
@@ -1293,13 +1292,13 @@ class SpySoftwareExpTest(_TrigUlpTest):
     def test_exp_overflow_and_underflow(self) -> None:
         self.assertEqual(sw_exp_f64(1000.0), math.inf)
         self.assertEqual(sw_exp_f64(-1000.0), 0.0)
-        self.assertEqual(float(sw_exp_f32(spy_as(100.0, f32))), math.inf)
-        self.assertEqual(float(sw_exp_f32(spy_as(-110.0, f32))), 0.0)
+        self.assertEqual(float(sw_exp_f32(f32(100.0))), math.inf)
+        self.assertEqual(float(sw_exp_f32(f32(-110.0))), 0.0)
 
     def test_exp_f32_of_inf_and_nan(self) -> None:
-        self.assertEqual(float(sw_exp_f32(spy_as(math.inf, f32))), math.inf)
-        self.assertEqual(float(sw_exp_f32(spy_as(-math.inf, f32))), 0.0)
-        self.assertTrue(math.isnan(float(sw_exp_f32(spy_as(math.nan, f32)))))
+        self.assertEqual(float(sw_exp_f32(f32(math.inf))), math.inf)
+        self.assertEqual(float(sw_exp_f32(f32(-math.inf))), 0.0)
+        self.assertTrue(math.isnan(float(sw_exp_f32(f32(math.nan)))))
 
 
 class SpyExpModeTest(_TrigUlpTest):
@@ -1354,22 +1353,22 @@ class SpySoftwareLogTest(_TrigUlpTest):
         for v in (-1.0, -0.5, -5e-324, -1e300):
             self.assertTrue(math.isnan(sw_log_f64(v)), msg=repr(v))
         for v in (-1.0, -0.5, -1e30):
-            self.assertTrue(math.isnan(float(sw_log_f32(spy_as(v, f32)))), msg=repr(v))
+            self.assertTrue(math.isnan(float(sw_log_f32(f32(v)))), msg=repr(v))
 
     def test_log_of_subnormal(self) -> None:
         self.assertLessEqual(
             _f64_ulp(sw_log_f64(5e-324), math.log(5e-324)), 1
         )
         self.assertLessEqual(
-            _f32_ulp(float(sw_log_f32(spy_as(1.4e-45, f32))), _to_f32(math.log(_to_f32(1.4e-45)))), 1
+            _f32_ulp(float(sw_log_f32(f32(1.4e-45))), _to_f32(math.log(_to_f32(1.4e-45)))), 1
         )
 
     def test_log_f32_special_values(self) -> None:
         for v in (0.0, -0.0):
-            self.assertEqual(float(sw_log_f32(spy_as(v, f32))), -math.inf, msg=repr(v))
-        self.assertEqual(float(sw_log_f32(spy_as(math.inf, f32))), math.inf)
-        self.assertTrue(math.isnan(float(sw_log_f32(spy_as(math.nan, f32)))))
-        self.assertTrue(math.isnan(float(sw_log_f32(spy_as(-1.0, f32)))))
+            self.assertEqual(float(sw_log_f32(f32(v))), -math.inf, msg=repr(v))
+        self.assertEqual(float(sw_log_f32(f32(math.inf))), math.inf)
+        self.assertTrue(math.isnan(float(sw_log_f32(f32(math.nan)))))
+        self.assertTrue(math.isnan(float(sw_log_f32(f32(-1.0)))))
 
 
 class SpyLogModeTest(_TrigUlpTest):

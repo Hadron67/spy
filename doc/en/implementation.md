@@ -33,7 +33,7 @@ Two layers of "type" run throughout:
 
 | File | Responsibility |
 |---|---|
-| `compiler/__init__.py` | Public interface: `func`/`struct`/`func_type`/`decl_func`/`typeof`/`compile_log`/`as_` and the various type constants |
+| `compiler/__init__.py` | Public interface: `func`/`struct`/`func_type`/`decl_func`/`typeof` and the various type constants |
 | `compiler/syntax.py` | Syntax markers inside function bodies: pointer types, `ref`, `Array`/`array`, `Option`, `Comptime`/`ConstComptime`/`InferComptime`, `typeof`, `unroll`, `comptime()`, `defer` and `OK/RAISE/UNWIND/ERR/ALL`, `closure`, `Opaque`, C integer markers |
 | `compiler/dsl.py` | Decorators and registration: `_Context` (per-host compile context), `_RegisteredFn`/`_RegisteredClass`/`_FuncTypeDecl`/`_DeclFuncDecl`, the various Metadata, `IntEnum` support |
 | `compiler/astgen.py` | Python `ast` -> HIR; signature parsing (`parse_function`), scopes, closures, RLS, marker recognition |

@@ -30,7 +30,7 @@ from spy import (
     c_char, c_uchar, c_short, c_ushort, c_int, c_uint,
     c_long, c_ulong, c_longlong, c_ulonglong,
     Ptr, ConstPtr, MultiPtr, ConstMultiPtr, Option,
-    typeof, compile_log, as_ as spy_as,
+    typeof,
 )
 from spy.compiler.syntax import (
     Array, Opaque, array,
@@ -45,7 +45,7 @@ from spy.std import (
 )
 from spy.std.core import (
     panic, catch_unwind, UnwindException, coerce, typed_undefined, bitcast,
-    ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error, lub_type,
+    ptr_cast, as_func_ptr, unwrap, unwrap_or, compile_error, compile_log, lub_type,
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
@@ -445,7 +445,7 @@ def take_opaque(x: i32, c: bool) -> bool:
     return c
 
 assert do_nothing(1) is None
-assert zero_bit(spy_as(0, u0)) == 1
+assert zero_bit(u0(0)) == 1
 assert take_opaque(1, False) is False
 ```
 
@@ -595,8 +595,8 @@ def comptime_marker_typed() -> i32:
     i = i + 1                    # still a compile-time box
     return i
 
-assert comptime_holds_type(spy_as(1, i32)) == 1
-assert comptime_holds_type(spy_as(1.5, f64)) == 0
+assert comptime_holds_type(i32(1)) == 1
+assert comptime_holds_type(f64(1.5)) == 0
 assert comptime_marker_typed() == 1
 ```
 
@@ -1367,8 +1367,7 @@ assert subscript_use(1) == 1 + 2 + 100
 ### 8.1 Type probes and compile-time logging
 
 - `spy.typeof(x)`: queries the static type (returning a type value); it is a **type probe**: it only types and has no runtime behavior; spy functions referenced in it are triggered to compile. If a probed call throws and leaves the probe, it is an error.
-- `spy.compile_log(...)`: prints at compile time (no runtime action); bytes are rendered as text and runtime values as `<T>`.
-- `spy.as_`: usable only at the Python calling boundary (calling it inside a function body is an error).
+- `std.core.compile_log(...)`: prints at compile time (no runtime action); bytes are rendered as text and runtime values as `<T>`.
 
 ```python
 @func()
@@ -1832,7 +1831,7 @@ assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 ## 10. The Python ↔ spy calling boundary
 
 - Mapping from Python values to spy types: `bool`→`bool`, `int`→`i64`, `float`→`f64`, `complex`→`c128`,
-  `bytes`→a compile-time byte string, `None`→`Null`, `syntax.Ptr[T]`→a pointer; use `spy.as_(value, T)` to specify the type explicitly.
+  `bytes`→a compile-time byte string, `None`→`Null`, `syntax.Ptr[T]`→a pointer; use `T(value)` (e.g. `u64(x)`) to specify the type explicitly.
 - A struct instance supports field reads/writes, method calls, and view semantics; pointers are non-null.
 - `Option[T]` and tagged unions are **unwrapped** when going back to Python: `Option[T]` is a `T` value or `None`, and a union is the value of its concrete variant.
 - Complex numbers ↔ Python `complex`; integer enums ↔ Python enum members.
@@ -1859,7 +1858,7 @@ p = Pt(1, 2)                          # a struct instance crosses the boundary
 assert p.x == 1 and p.y == 2
 q = swap_xy(p)
 assert q.x == 2 and q.y == 1
-assert id64(spy_as(2 ** 40, u64)) == 2 ** 40   # spy.as_ picks an explicit type
+assert id64(u64(2 ** 40)) == 2 ** 40   # u64(x) picks an explicit type
 ```
 
 ---

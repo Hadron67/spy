@@ -44,7 +44,7 @@ spy type always lowers to a valid MIR type (open loop), exactly like
 
 Calls are dispatched at compile time:
 
-* calls to the ``spy`` builtins (``spy.compile_log``) are evaluated eagerly,
+* calls to the spy builtins (``std.core.compile_log``) are evaluated eagerly,
 * calls to other spy functions (jit or aot) become native ``call``
   instructions to the specialization selected by the argument types,
 * calls to a plain Python function (a ``sval.PyFunction``) are evaluated at
@@ -5945,7 +5945,7 @@ class HirRunner:
     def _call_builtin(
         self, fn: sval.BuiltinFn, args: RawArgList[ArgEntry[InterpVal]], ret: FullInterpVal
     ) -> PollResult:
-        """Evaluate one ``spy.*`` builtin at compile time and hand its
+        """Evaluate one spy builtin at compile time and hand its
         result to the call's result location.  The arguments are first bound
         to the builtin's signature (see ``sval.BuiltinSignature.bind``), so
         every handler below reads a normalized ``ArgList``: exactly one entry

@@ -24,7 +24,7 @@ def add_u64(a: spy.u64, b: spy.u64) -> spy.u64:
 
 print(add(1, 2))                                  # compiles add(i64, i64)
 print(add(1.5, 2.25))                             # compiles add(f64, f64)
-print(add_u64(spy.as_(2**63 - 1, spy.u64), spy.as_(2, spy.u64)))
+print(add_u64(spy.u64(2**63 - 1), spy.u64(2)))
 ```
 
 See [doc/en/features.md](doc/en/features.md) for detailed feature documentation.

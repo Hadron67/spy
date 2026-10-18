@@ -4,14 +4,12 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
-    compile_log,
     f32,
     f64,
     i32,
     sval,
     u64,
 )
-from ..compiler import as_ as spy_as
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func
@@ -19,6 +17,7 @@ from ..compiler.syntax import Comptime
 from ..std import (
     Numeric,
 )
+from ..std.core import compile_log
 
 # ---------------------------------------------------------------------------
 # functions under test
@@ -346,8 +345,8 @@ class SpyFunctionCallTest(TestCase):
         self.assertAlmostEqual(scale(3.0, 0.5), 2.5)
 
     def test_non_default_integer_type(self) -> None:
-        # ``spy.as_`` binds an argument to an explicit spy type
-        self.assertEqual(add_u64(spy_as(2**63 - 1, u64), spy_as(2, u64)), 2**63 + 1)
+        # calling the type binds an argument to an explicit spy type
+        self.assertEqual(add_u64(u64(2**63 - 1), u64(2)), 2**63 + 1)
 
     def test_default_argument(self) -> None:
         self.assertEqual(add_default(41), 41)
@@ -419,9 +418,9 @@ class SpyFunctionCallTest(TestCase):
     def test_comptime_typeof(self) -> None:
         # a plain Python int marshals to i64 (see ``dsl._INT_LITERAL_BITS``)
         self.assertFalse(is_i32(1))
-        self.assertTrue(is_i32(spy_as(1, i32)))
+        self.assertTrue(is_i32(i32(1)))
         self.assertFalse(is_i32(1.0))
-        self.assertTrue(is_u64(spy_as(1, u64)))
+        self.assertTrue(is_u64(u64(1)))
 
     def test_void_function(self) -> None:
         self.assertIsNone(nothing(3))
@@ -444,7 +443,7 @@ class SpyFunctionCallTest(TestCase):
         self.assertEqual(twice_inc(10), 12)
 
     def test_f32(self) -> None:
-        self.assertAlmostEqual(id_f32(spy_as(0.5, f32)), 0.5)
+        self.assertAlmostEqual(id_f32(f32(0.5)), 0.5)
 
     def test_specialization_is_cached(self) -> None:
         # repeated calls reuse the compiled specialization
