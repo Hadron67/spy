@@ -126,6 +126,7 @@ flowchart TD
 - `parse_function` 把 `SourceFile` 交给 `_Builder`；`_Builder._gen_stmt`/`_gen_expr`/`_gen_result_loc` 用 `_at(node)` 维护当前节点，`add()` 把当前位置写进 `hir.Inst.loc`。`CompileError.attach_loc` 只在空位置时写入，所以最内层节点优先；`sval` 等中间层不需要位置参数。
 - `interp._step` 把当前指令的 `loc` 补到 `CompileError` 上；`Analyser._run` 在错误穿过 `_analyse_stack` 时，按“内层到外层”把每个 `HirRunner` 的当前指令位置追加为 `called from` 帧（同一 runner 的内联 `InlineFrame` 也按此顺序展开）。参数转换错误优先用实参值指令的 `loc`。
 - `CompileError.__str__`/`format()` 输出 `path:line:col: error: ...`、覆盖 `SourceLoc` 整个范围的源码片段与 caret，以及 `note: in function ...`/`note: called from ...` 调用链；`args[0]`/`message` 仍是原始消息。
+- 在 IPython/Jupyter 中，`source.format_location` 通过 `CachingCompiler.format_code_name()`（后备 `_filename_map`）把 cell 的临时文件路径映射为 `In[N]`，主位置和 `called from` 帧都使用它；普通脚本和 import 的模块仍显示真实路径。
 - `dsl._build_fn_type` 和 `_RegisteredClass.get_entry` 的位置来自函数/类的声明源码：参数错误指向注解节点，struct 字段错误指向字段注解。
 
 ---

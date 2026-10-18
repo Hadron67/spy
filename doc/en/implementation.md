@@ -126,6 +126,7 @@ Expression highlights:
 - `parse_function` hands the `SourceFile` to `_Builder`; `_Builder._gen_stmt`/`_gen_expr`/`_gen_result_loc` maintain the current node through `_at(node)`, and `add()` writes the current location into `hir.Inst.loc`. `CompileError.attach_loc` only fills an empty location, so the innermost node wins; intermediate layers such as `sval` need no location parameters.
 - `interp._step` attaches the current instruction's `loc` to a `CompileError`; when the error crosses `_analyse_stack`, `Analyser._run` appends every `HirRunner`'s current instruction as a `called from` frame (innermost first), expanding a runner's inline `InlineFrame`s in the same order. An argument-conversion error prefers the argument value instruction's `loc`.
 - `CompileError.__str__`/`format()` renders `path:line:col: error: ...`, a snippet whose caret covers the whole `SourceLoc`, and the `note: in function ...`/`note: called from ...` chain; `args[0]`/`message` stay the bare message.
+- In IPython/Jupyter, `source.format_location` maps a cell's temporary filename to `In[N]` through `CachingCompiler.format_code_name()` (with `_filename_map` as a fallback); both the primary location and the `called from` frames use it. Plain scripts and imported modules keep their real path.
 - `dsl._build_fn_type` and `_RegisteredClass.get_entry` take their locations from the declaration source: a parameter error points at the annotation node, a struct field error at the field annotation.
 
 ---

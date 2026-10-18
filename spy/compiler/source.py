@@ -170,8 +170,47 @@ def _code_filename(obj: Any) -> str | None:
     return None if code is None else code.co_filename
 
 
+def ipython_cell_name(path: str) -> str | None:
+    """The ``In[N]`` label IPython knows ``path`` by, if any.
+
+    A Jupyter cell is compiled from a temporary file whose name is a hash of
+    the cell's code (``ipykernel.compiler.get_file_name``), so the number in
+    the name is not the cell number.  ``CachingCompiler`` keeps the mapping
+    from that filename to the execution count that compiled it; the same map
+    is what IPython itself uses to render ``Cell In[N]`` in tracebacks.
+
+    ``None`` outside IPython, for a real source file, or when the interpreter
+    does not know the filename.  Importing IPython is lazy: the compiler has
+    no hard dependency on it.
+    """
+    try:
+        from IPython.core.getipython import get_ipython
+    except ImportError:
+        return None
+    shell = get_ipython()
+    if shell is None:
+        return None
+    compiler = getattr(shell, 'compile', None)
+    if compiler is None:
+        return None
+    formatter = getattr(compiler, 'format_code_name', None)
+    if formatter is not None:
+        try:
+            formatted = formatter(path)
+        except (AttributeError, TypeError):
+            formatted = None
+        if formatted is not None:
+            return formatted[1]
+    mapping = getattr(compiler, '_filename_map', None)
+    if not mapping:
+        return None
+    number = mapping.get(path)
+    return None if number is None else f'In[{number}]'
+
+
 def format_location(loc: SourceLoc) -> str:
-    return f'{loc.file.path}:{loc.line}:{loc.column}'
+    path = ipython_cell_name(loc.file.path) or loc.file.path
+    return f'{path}:{loc.line}:{loc.column}'
 
 
 def format_diagnostic(

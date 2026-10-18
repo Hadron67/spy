@@ -7,12 +7,17 @@ source ``astgen`` parses back to the original file, the whole-range caret of a
 snippet, and the flat ``called from`` call chain.
 """
 
+import importlib.util
 import inspect
-from unittest import TestCase
+import warnings
+from unittest import TestCase, skipUnless
 
 from ..compiler import CompileError, func, i32, syntax, u8
 from ..compiler.dsl import _GLOBAL_CONTEXT, struct
+from ..compiler.source import SourceFile, SourceLoc, format_location, ipython_cell_name
 from ..std.core import compile_error
+
+_IPYTHON_AVAILABLE = importlib.util.find_spec('IPython') is not None
 
 
 def _line_of(handle, needle: str) -> int:
@@ -184,6 +189,28 @@ class SpyDiagnosticTest(TestCase):
         error = ctx.exception
         assert error.loc is not None
         self.assertEqual(error.loc.line, _line_of(DiagBadStructSource, 'x: str'))
+
+    @skipUnless(_IPYTHON_AVAILABLE, 'IPython is not installed')
+    def test_an_ipython_cell_path_is_rendered_as_in(self) -> None:
+        from IPython.core.interactiveshell import InteractiveShell
+
+        with warnings.catch_warnings():
+            # IPython warns when ~/.ipython is not writable in the test sandbox
+            warnings.simplefilter('ignore', UserWarning)
+            shell = InteractiveShell.instance()
+        shell.run_cell('def _diag_ipython_cell(x):\n    return x\n')
+        fn = shell.user_ns['_diag_ipython_cell']
+        path = inspect.getsourcefile(fn)
+        assert path is not None
+
+        cell = ipython_cell_name(path)
+        self.assertIsNotNone(cell)
+        assert cell is not None
+        self.assertRegex(cell, r'^In\[\d+\]$')
+
+        source_file = SourceFile(path, (), first_line=1)
+        loc = SourceLoc(source_file, 1, 1, 1, 1)
+        self.assertTrue(format_location(loc).startswith(f'{cell}:'))
 
 
 all_tests = [
