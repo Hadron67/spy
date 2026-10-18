@@ -377,29 +377,29 @@ def sw_log_f32(x: f32) -> f32:
 # -- one host context per mode (the option names cover every function) -------
 
 
-def _context_with_mode(mode: bytes | None) -> Context:
+def _context_with_mode(mode: str | None) -> Context:
     ctx = Context(LLVMBackend())
     if mode is not None:
-        ctx.set_compile_option(b'sin_mode', mode)
-        ctx.set_compile_option(b'cos_mode', mode)
-        ctx.set_compile_option(b'tan_mode', mode)
-        ctx.set_compile_option(b'asin_mode', mode)
-        ctx.set_compile_option(b'acos_mode', mode)
-        ctx.set_compile_option(b'atan_mode', mode)
-        ctx.set_compile_option(b'atan2_mode', mode)
-        ctx.set_compile_option(b'sqrt_mode', mode)
-        ctx.set_compile_option(b'cbrt_mode', mode)
-        ctx.set_compile_option(b'pow_mode', mode)
-        ctx.set_compile_option(b'exp_mode', mode)
-        ctx.set_compile_option(b'log_mode', mode)
+        ctx.set_compile_option('sin_mode', mode)
+        ctx.set_compile_option('cos_mode', mode)
+        ctx.set_compile_option('tan_mode', mode)
+        ctx.set_compile_option('asin_mode', mode)
+        ctx.set_compile_option('acos_mode', mode)
+        ctx.set_compile_option('atan_mode', mode)
+        ctx.set_compile_option('atan2_mode', mode)
+        ctx.set_compile_option('sqrt_mode', mode)
+        ctx.set_compile_option('cbrt_mode', mode)
+        ctx.set_compile_option('pow_mode', mode)
+        ctx.set_compile_option('exp_mode', mode)
+        ctx.set_compile_option('log_mode', mode)
     return ctx
 
 
-_CTX_LLVM = _context_with_mode(b'llvm')
-_CTX_LIBC = _context_with_mode(b'libc')
-_CTX_SOFTWARE = _context_with_mode(b'software')
+_CTX_LLVM = _context_with_mode('llvm')
+_CTX_LIBC = _context_with_mode('libc')
+_CTX_SOFTWARE = _context_with_mode('software')
 _CTX_DEFAULT = _context_with_mode(None)
-_CTX_BOGUS = _context_with_mode(b'bogus')
+_CTX_BOGUS = _context_with_mode('bogus')
 
 
 @_CTX_LLVM.func()

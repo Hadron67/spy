@@ -2,12 +2,11 @@
 
 A function that is *not* decorated with ``@func`` is a compile-time helper: a
 call to it is evaluated while the HIR runs, on plain Python objects - an ``int``
-(also ``bool``), ``float``, ``complex`` or ``bytes``, with a ``str`` crossing as
-the UTF-8 byte string it encodes to (spy has no ``str`` type).  Its result is
-one of those plain objects too, and takes the type of the call's result location
-(an inferred one keeping the value's own).  Any other argument or result - a
-runtime value, a spy type, an aggregate, the null value, ... - is a compile
-error, and a ``PyFunction`` never reaches runtime code.
+(also ``bool``), ``float``, ``complex``, ``bytes`` or ``str`` (spy's compile-time
+text string).  Its result is one of those plain objects too, and takes the type of
+the call's result location (an inferred one keeping the value's own).  Any other
+argument or result - a runtime value, a spy type, an aggregate, the null value,
+... - is a compile error, and a ``PyFunction`` never reaches runtime code.
 """
 
 from unittest import TestCase
@@ -40,8 +39,13 @@ def join(a: bytes, b: bytes) -> bytes:
 
 
 def upper(s: bytes) -> str:
-    """Returns a Python ``str``: it crosses as its UTF-8 byte string."""
+    """Returns a Python ``str``: it crosses as spy's compile-time ``str``."""
     return s.decode("utf-8").upper()
+
+
+def shout(s: str) -> str:
+    """Takes and returns a Python ``str`` (spy's compile-time ``str``)."""
+    return s.upper()
 
 
 def is_positive(n: int) -> bool:
@@ -123,6 +127,11 @@ def py_call_bytes():
 @func()
 def py_call_str():
     return upper(b"hey")
+
+
+@func()
+def py_call_str_in():
+    return shout("hey")
 
 
 @func()
@@ -231,8 +240,11 @@ class SpyPyFunctionTest(TestCase):
     def test_a_bytes_result(self) -> None:
         self.assertEqual(py_call_bytes(), b"abcd")
 
-    def test_a_str_result_is_encoded_to_bytes(self) -> None:
-        self.assertEqual(py_call_str(), b"HEY")
+    def test_a_str_result_is_a_text_string(self) -> None:
+        self.assertEqual(py_call_str(), "HEY")
+
+    def test_a_str_argument_and_result_cross_as_str(self) -> None:
+        self.assertEqual(py_call_str_in(), "HEY")
 
     def test_the_none_literal_is_passed_as_none(self) -> None:
         self.assertEqual(py_call_with_none(), True)

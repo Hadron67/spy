@@ -67,12 +67,12 @@ def diag_closure_caller(x: i32) -> i32:
 
 
 @func()
-def diag_bad_param(x: str) -> i32:
+def diag_bad_param(x: list) -> i32:
     return 0
 
 
 @func()
-def diag_bad_return() -> str:
+def diag_bad_return() -> list:
     return 0  # type: ignore[return-value]  # pyright: ignore[reportReturnType]
 
 
@@ -88,7 +88,7 @@ def diag_unused_pragma() -> None:
 
 
 class DiagBadStructSource:
-    x: str
+    x: list
 
 
 DiagBadStruct = struct()(DiagBadStructSource)
@@ -157,16 +157,16 @@ class SpyDiagnosticTest(TestCase):
             diag_bad_param(1)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
         error = ctx.exception
         assert error.loc is not None
-        self.assertEqual(error.loc.line, _line_of(diag_bad_param, 'x: str'))
-        self.assertEqual(error.loc.end_column - error.loc.column, len('str'))
+        self.assertEqual(error.loc.line, _line_of(diag_bad_param, 'x: list'))
+        self.assertEqual(error.loc.end_column - error.loc.column, len('list'))
 
     def test_a_return_annotation_error_points_at_the_annotation(self) -> None:
         with self.assertRaises(CompileError) as ctx:
             diag_bad_return()
         error = ctx.exception
         assert error.loc is not None
-        self.assertEqual(error.loc.line, _line_of(diag_bad_return, '-> str'))
-        self.assertEqual(error.loc.end_column - error.loc.column, len('str'))
+        self.assertEqual(error.loc.line, _line_of(diag_bad_return, '-> list'))
+        self.assertEqual(error.loc.end_column - error.loc.column, len('list'))
 
     def test_compile_error_points_at_its_call(self) -> None:
         with self.assertRaises(CompileError) as ctx:
@@ -188,7 +188,7 @@ class SpyDiagnosticTest(TestCase):
             _GLOBAL_CONTEXT.resolve_global(DiagBadStruct)
         error = ctx.exception
         assert error.loc is not None
-        self.assertEqual(error.loc.line, _line_of(DiagBadStructSource, 'x: str'))
+        self.assertEqual(error.loc.line, _line_of(DiagBadStructSource, 'x: list'))
 
     @skipUnless(_IPYTHON_AVAILABLE, 'IPython is not installed')
     def test_an_ipython_cell_path_is_rendered_as_in(self) -> None:

@@ -257,7 +257,7 @@ def reify_a_struct_keeps_its_field_types() -> spy_bool:
     info: Comptime = type_info(t)
     if isinstance(v := info, StructType):
         field: Comptime = v.fields.ptr[1]
-        return field.name == b'c' and field.type == i32
+        return field.name == 'c' and field.type == i32
     return False
 
 
@@ -293,8 +293,8 @@ class SpyReflectTest(TestCase):
 
     def test_a_struct_type_reflects_its_fields(self) -> None:
         self.assertEqual(reflect_field_count(), 2)
-        # the first field is named ``ab``: its bytes are readable as the
-        # compile-time ``bytes`` value the name is stored as
+        # the first field is named ``ab``: its characters are readable as the
+        # compile-time ``str`` value the name is stored as
         self.assertEqual(reflect_field_name_byte(), ord('a'))
         self.assertEqual(reflect_field_name_arith(), ord('b'))
 

@@ -348,6 +348,11 @@ class _RegisteredClass(StructDecl):
                 except CompileError as e:
                     e.attach_loc(field_loc)
                     raise
+                except Exception as e:
+                    raise CompileError(
+                        f'cannot convert annotation {annotation!r} to a value: {e}',
+                        loc=field_loc,
+                    ) from e
                 if type is None or not isinstance(type, sval.Type):
                     raise CompileError(
                         f'cannot convert annotation {annotation!r} to a value',
@@ -367,6 +372,11 @@ class _RegisteredClass(StructDecl):
                     except CompileError as e:
                         e.attach_loc(field_loc)
                         raise
+                    except Exception as e:
+                        raise CompileError(
+                            f'cannot convert the default of field {name!r} to a value: {e}',
+                            loc=field_loc,
+                        ) from e
                 head.add_field(name, type, default)
             # the ``self`` of every method is the struct *template*: a
             # specialization whose type arguments are the struct's own
@@ -760,7 +770,7 @@ class Context(CompileContext):
         # the compile-time options (``std.core.compile_option``), by name: the
         # host sets them (see ``set_compile_option``) and a spy body reads them
         # back while it is compiled
-        self._compile_options: dict[bytes, sval.AnyValue] = {}
+        self._compile_options: dict[str, sval.AnyValue] = {}
 
     def _local_fn(self, handle: _RegisteredFn) -> _RegisteredFn:
         # this context's handle of the Python function ``handle`` names: a
@@ -913,11 +923,11 @@ class Context(CompileContext):
         return self.mir_lower_cache
 
     @override
-    def get_compile_option(self, name: bytes) -> sval.AnyValue | None:
+    def get_compile_option(self, name: str) -> sval.AnyValue | None:
         return self._compile_options.get(name)
 
     @override
-    def set_compile_option(self, name: bytes, value: sval.AnyValue) -> None:
+    def set_compile_option(self, name: str, value: sval.AnyValue) -> None:
         self._compile_options[name] = value
 
     def _resolve_call(

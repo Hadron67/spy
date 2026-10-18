@@ -76,7 +76,7 @@ flowchart TD
 - `_lookup_within_function`：扫到最内层 `_ClosureScope`（含）为止，不跨越——决定一个赋值是否**声明**新变量。
 - `_gen_body` 会**预先声明一连串连续 `def` 的 slot**（`Alloca`），以便自递归/互递归解析。
 - 全局解析 `_resolve_global`：`fn.__globals__` / 内建表；`range`→`std.range`、`StopIteration`→`std.StopIteration`、
-  `bytes`→`BytesType()`、`str`→报错；`ord`/`len`/`isinstance`/`type` 保留为身份标记。
+  `bytes`→`BytesType()`、`str`→`StrType()`；`ord`/`len`/`isinstance`/`type` 保留为身份标记。
   `_resolve_closure`：先查 `co_freevars`（闭包单元的值作为编译期常量嵌入；未绑定且名字等于函数自身时返回原 `fn`，支持注册期自引用）。
 - `_try_resolve_object`：把一个**全局表达式**折叠成其 Python 对象（名字或属性），是所有标记身份识别的骨干。
 
@@ -171,15 +171,15 @@ flowchart TD
 关键类型：`IntType`（按 range 子类型；整型是浮点的子类型，当其整个范围落在该浮点的精确整数范围内，见 `float_exact_int_range`）、`FloatType`（窄→宽子类型）、`BoolType`、`ComplexType`、
 `PointerType`、`ArrayType`、`OptionType`、`TupleType`、`StrDictType`、`StructType`、`UnionType`、`TaggedUnionType`、
 `ResultType`/`Success`、`FunctionType`/`AnyFunction`/`DeclareFunction`、`IntEnumType`、
-`TypeType`/`AnyType`/`TypeVar`/`BytesType`/`EmptyType`/`VoidType`/`NullType`/`TypedNull`/`UndefinedType`/`ValueType`/`OpaqueType`。
+`TypeType`/`AnyType`/`TypeVar`/`BytesType`/`StrType`/`EmptyType`/`VoidType`/`NullType`/`TypedNull`/`UndefinedType`/`ValueType`/`OpaqueType`。
 
 ### 4.3 值域与 `Box`
 
-- `AnyValue = Value | int | float | complex | bytes | bool`；`ScalarValue` 是能占 `Box` 一个 cell 的子集
+- `AnyValue = Value | int | float | complex | bytes | str | bool`；`ScalarValue` 是能占 `Box` 一个 cell 的子集
   （聚合值形式 `AggregateValue`/`TaggedUnionValue`/`UnionValue`/`OptionValue`/`TypedNull`/`UndefinedAggregate` **不**在其中，`is_scalar_value` 判定）。
 - `Box(name_base, type, is_const, cells)`：身份对象，把值**铺平**为 `list[ScalarValue]`；`reset(type)` 按 `scalar_leaves` 初始化每 cell 为 `UndefinedScalar`。
 - box 读写 helper（均在 `sval`，`interp` 直接读写 `Box.cells`）：`flatten_value`（含 padding；`undefined` → 每叶 `UndefinedScalar`）、
-  `unflatten_cells`（其逆）、`fill_comptime_defaults`（把 `is_comptime` 字段填默认，迭代）、`load_box_cells`（`bytes` box 特判）。
+  `unflatten_cells`（其逆）、`fill_comptime_defaults`（把 `is_comptime` 字段填默认，迭代）、`load_box_cells`（`bytes`/`str` box 特判）。
 
 ### 4.4 结构体布局（`StructType._calculate_mir`）
 
@@ -197,9 +197,9 @@ flowchart TD
 
 - `PointerType(elem, is_const, variant)`：元素相同才可转换；`_points_at_elements_of`（`*[N]T` → `T` 的多指针）；
   只能**加** const；peer 的 const 性用 `_peer_const`。`to_mir_type`：ZST/Opaque pointee → `void*`；无长度数组 pointee → 元素指针。
-- `ComptimePtr(box: Box | bytes, offset: int, type: PointerType)`：结构化 eq/hash → **自身即特化键**（同一 box + offset + 视图类型）。
+- `ComptimePtr(box: Box | bytes | str, offset: int, type: PointerType)`：结构化 eq/hash → **自身即特化键**（同一 box + offset + 视图类型）。
 - `pointer_object_type(ptr)`：指针**所指的对象**——pointee 本身；若它指向的是 `box` 那个数组的元素（`offset` 处、元素类型相同），则是该数组**从该元素起的尾部**（元素下标 = `offset // scalar_count(elem)`，长度 = `length - 下标`）。物化时按它生成存储，才留得住「后面还有多少个元素」（见 §6.5）。
-  `is_writable()` 要求视图非 const、box 非 `bytes`、`Box.is_const` 为假。
+  `is_writable()` 要求视图非 const、box 非 `bytes`/`str`、`Box.is_const` 为假。
 - `CastedPtr(ptr, type)`：`ptr_cast` 重解释后的编译期指针；不能读写透。
 
 ### 4.6 布局缓存与特殊类型（`MirLowerCache` / `SpecialTypes`）
@@ -322,7 +322,7 @@ thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`
   `__getitem__` → `glue.specialized_struct`；`__call__` → `glue.construct`。
 - `_Context`（`sval.CompileContext` 子类）：`resolve_global`（把注册对象/enum 成员解析成本上下文的 spy 值或 `FunctionValue`，把不用 `@func` 装饰的普通 Python 函数包成 `sval.PyFunction`）、
   `special_types`、`mir_lower_cache`、`target_info`、`_resolve_call`、enum 支持（`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`）、
-  编译选项（`get_compile_option`/`set_compile_option`，由 `_compile_options` 存）。
+  编译选项（`get_compile_option`/`set_compile_option`，由 `_compile_options` 以 `str` 名为键存）。
   `_GLOBAL_CONTEXT = _Context(LLVMBackend())` 是顶层默认上下文。
 
 ---
@@ -372,14 +372,14 @@ thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`
 - `exec_field_name_addr`：按名解析字段（**自动解引用**）；`ComplexType` 的 `real`/`imag` 也当字段。
 - `_comptime_field_place`/`_const_box_place`：`is_comptime` 字段的读写指针（编译期 struct 是 box cell；运行时 struct 是只读常量）。
 - `operand`：解析 `Const`（类型参数值 / 全局 / `as_value`）、`Arg(index)`、`Inst`（寄存器表）。
-- `subscript`（大分派）：数组/元组/字典/`$args`/`$kwargs`/字节串/指针/切片/结构体 `__spy_getitemptr__`/结构体模板特化。
+- `subscript`（大分派）：数组/元组/字典/`$args`/`$kwargs`/字符串（`bytes`/`str`）/指针/切片/结构体 `__spy_getitemptr__`/结构体模板特化。
 - `_subscript_pointer`：切片 → `SlicePtr`；多指针 → 元素的 place——**单**指针（地址 `p + i`），编译期则取 `box` 中该元素的 cell。
-- `std.core.ptr_cast`（`_builtin_ptr_cast`/`_ptr_cast_value`）：运行时指针 → `mir.BitCast`；编译期 `ComptimePtr` 是其子类型 → 重定型；否则 `sval.CastedPtr`；字节串指针 → 指向字节 store。
+- `std.core.ptr_cast`（`_builtin_ptr_cast`/`_ptr_cast_value`）：运行时指针 → `mir.BitCast`；编译期 `ComptimePtr` 是其子类型 → 重定型；否则 `sval.CastedPtr`；字符串指针 → 指向字节/文本 store。
 
 ### 6.4 调用
 
 - `call(callee, args, ret, on_return)`：`FunctionValue`/`BoundMethod` → `_call_function_entry`；`BuiltinFn` → `_call_builtin`；
-  `PyFunction` → `_call_py_function`（实参必须是能降为普通 Python 对象的编译期量，`str` 编码成字节串，返回值就是该编译期值本身、写进结果位置）；
+  `PyFunction` → `_call_py_function`（实参必须是能降为普通 Python 对象的编译期量，`str`/`bytes` 原样传递，返回值就是该编译期值本身、写进结果位置）；
   指向含 `__call__` 结构体的指针 → `call_method('__call__')`（闭包）；指向 `FunctionType` → `_call_fn_ptr`。
 - `_call_function_entry`：`substitute_type_vars` + `bind_arg_pos` + `_check_comptime_args`；`force_inline` → `_start_inline`，
   否则 `specialize` 后 `_request_function`（返回 `SUSPEND`，由 `Analyser` 排程）。
@@ -431,7 +431,7 @@ thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`
 ### 6.8 内建与运算符
 
 - `_call_builtin` 按 `fn.name` 分派：`compile_log`、`type_info`、`reify`、`undefined`、`layout_of`、`panic`、`catch_unwind`、
-  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`float_truncate`、`int_to_float_unchecked`、`float_to_int_unchecked`、`coerce`、`compile_error`、`compile_option`、`atomic_load/store/rmw/cmpxchg/fence`；
+  `compile`、`const_array`、`bitcast`、`ptr_cast`、`as_func_ptr`、`truncate`、`float_truncate`、`int_to_float_unchecked`、`float_to_int_unchecked`、`coerce`、`compile_error`、`compile_option`、`encode_length`、`atomic_load/store/rmw/cmpxchg/fence`；
   未知名字报 `cannot call the spy builtin ...`。
 - 运算符：`_eval_binary` 依序判定 `|` 的 union 含义 → struct 重载 → complex → `/` → `//` → `**` → 位运算 → 双常量折叠 → 指针算术 → 数值 peer 类型发 `mir.Arith`；
   `_eval_cmp`（struct 重载/枚举成员/双常量/数值 `mir.Cmp`）、`_eval_not`、`_eval_unary`、`_eval_ord`、`binary_assign`。

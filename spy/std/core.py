@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING, Any, Never, Protocol, Self, cast
 
-from ..compiler import builtin_func, i32, i64, u8, u32, u64, usize
+from ..compiler import builtin_func, i32, i64, typeof, u8, u32, u64, usize
 from ..compiler.dsl import Callable, func, func_type, struct
 from ..compiler.syntax import (
     Array,
@@ -278,14 +278,18 @@ def const_array[T, Len: int](elem: T, length: Len) -> Array[T, Len]: ...
 def compile_log(*args: Any, **kwargs: Any) -> None: ...
 
 @builtin_func
-def compile_error(msg: str | bytes) -> Never: ...
+def compile_error(msg: str) -> Never: ...
 
-# ``sstr(s)``: the compile-time byte string ``s`` as a ``ConstSlicePtr[u8]`` -
-# a pointer to its bytes (lowered into a global constant automatically, see the
-# behaviour doc §4.3) and the number of bytes (no trailing NUL is counted).
+# ``sstr(s)``: the compile-time string ``s`` (a ``bytes`` byte string or a
+# ``str`` text string) as a ``ConstSlicePtr[u8]`` - a pointer to its bytes
+# (lowered into a global constant automatically, see the behaviour doc §4.3)
+# and the number of bytes (no trailing NUL is counted).  A text string is
+# encoded to UTF-8 first, so its length is ``encode_length(s)``.  ``s`` carries
+# no annotation on purpose: it accepts either compile-time string type and the
+# branch picks the length by ``typeof(s)``.
 @func(inline=True)
-def sstr(s: bytes) -> ConstSlicePtr[u8]:
-    return ConstSlicePtr(ptr_cast(s, ConstMultiPtr[u8]), len(s))
+def sstr(s) -> ConstSlicePtr[u8]:
+    return ConstSlicePtr(ptr_cast(s, ConstMultiPtr[u8]), len(s) if typeof(s) == bytes else encode_length(s))
 
 # ``compile(fn)``: manually compile a *non-generic* function value - build its
 # default ``CallSignature`` and request its compilation (see ``interp``), so that
@@ -342,6 +346,12 @@ def catch_unwind[T](fn: Callable[[], T]) -> T: ...
 
 # ``compile_option(name)``: the compile-time option ``name`` as the value the
 # host stored for it (see ``CompileContext.set_compile_option``), or the absent
-# value when it is not set.  A string literal is encoded to bytes at parse time.
+# value when it is not set.
 @builtin_func
-def compile_option(name: str | bytes) -> Any: ...
+def compile_option(name: str) -> Any: ...
+
+# ``encode_length(s)``: the length in bytes of the compile-time text string
+# ``s`` once encoded to UTF-8 - the number of bytes it occupies in memory (the
+# number of characters is ``len(s)``).
+@builtin_func
+def encode_length(s: str) -> usize: ...

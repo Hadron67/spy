@@ -76,7 +76,7 @@ Two layers of "type" run throughout:
 - `_lookup_within_function`: scans up to and including the innermost `_ClosureScope`, never crossing it — this decides whether an assignment **declares** a new variable.
 - `_gen_body` **pre-declares the slots of a run of consecutive `def`s** (`Alloca`), so that self/mutual recursion can be resolved.
 - Global resolution `_resolve_global`: `fn.__globals__` / builtin table; `range` -> `std.range`, `StopIteration` -> `std.StopIteration`,
-  `bytes` -> `BytesType()`, `str` -> error; `ord`/`len`/`isinstance`/`type` are kept as identity markers.
+  `bytes` -> `BytesType()`, `str` -> `StrType()`; `ord`/`len`/`isinstance`/`type` are kept as identity markers.
   `_resolve_closure`: first checks `co_freevars` (the value of a closure cell is embedded as a compile-time constant; if unbound and the name equals the function itself, returns the original `fn`, supporting self-reference at registration time).
 - `_try_resolve_object`: folds a **global expression** down to its Python object (name or attribute); it is the backbone of all marker identity recognition.
 
@@ -171,15 +171,15 @@ Derived: `is_zst()` = `classify()==ZST`; `is_copyable()` = `classify()!=DST` (co
 Key types: `IntType` (subtyped by range; an integer type is a subtype of a float type when its whole range lies within the float's exact integer range, see `float_exact_int_range`), `FloatType` (narrow -> wide subtyping), `BoolType`, `ComplexType`,
 `PointerType`, `ArrayType`, `OptionType`, `TupleType`, `StrDictType`, `StructType`, `UnionType`, `TaggedUnionType`,
 `ResultType`/`Success`, `FunctionType`/`AnyFunction`/`DeclareFunction`, `IntEnumType`,
-`TypeType`/`AnyType`/`TypeVar`/`BytesType`/`EmptyType`/`VoidType`/`NullType`/`TypedNull`/`UndefinedType`/`ValueType`/`OpaqueType`.
+`TypeType`/`AnyType`/`TypeVar`/`BytesType`/`StrType`/`EmptyType`/`VoidType`/`NullType`/`TypedNull`/`UndefinedType`/`ValueType`/`OpaqueType`.
 
 ### 4.3 Value domain and `Box`
 
-- `AnyValue = Value | int | float | complex | bytes | bool`; `ScalarValue` is the subset that can occupy one `Box` cell
+- `AnyValue = Value | int | float | complex | bytes | str | bool`; `ScalarValue` is the subset that can occupy one `Box` cell
   (the aggregate forms `AggregateValue`/`TaggedUnionValue`/`UnionValue`/`OptionValue`/`TypedNull`/`UndefinedAggregate` are **not** among them; `is_scalar_value` decides).
 - `Box(name_base, type, is_const, cells)`: identity object that **flattens** a value into a `list[ScalarValue]`; `reset(type)` initializes each cell to `UndefinedScalar` according to `scalar_leaves`.
 - The box read/write helpers (all in `sval`; `interp` reads and writes `Box.cells` directly): `flatten_value` (including padding; `undefined` -> `UndefinedScalar` per leaf),
-  `unflatten_cells` (its inverse), `fill_comptime_defaults` (fills `is_comptime` fields with defaults, iterative), `load_box_cells` (`bytes` box special case).
+  `unflatten_cells` (its inverse), `fill_comptime_defaults` (fills `is_comptime` fields with defaults, iterative), `load_box_cells` (`bytes`/`str` box special case).
 
 ### 4.4 Struct layout (`StructType._calculate_mir`)
 
@@ -197,9 +197,9 @@ Key types: `IntType` (subtyped by range; an integer type is a subtype of a float
 
 - `PointerType(elem, is_const, variant)`: convertible only when the elements are identical; `_points_at_elements_of` (`*[N]T` -> `T` multi-pointer);
   const can only be **added**; a peer's constness uses `_peer_const`. `to_mir_type`: ZST/Opaque pointee -> `void*`; unsized array pointee -> element pointer.
-- `ComptimePtr(box: Box | bytes, offset: int, type: PointerType)`: structural eq/hash -> **is itself a specialization key** (same box + offset + view type).
+- `ComptimePtr(box: Box | bytes | str, offset: int, type: PointerType)`: structural eq/hash -> **is itself a specialization key** (same box + offset + view type).
 - `pointer_object_type(ptr)`: the object the pointer names - its pointee; when it names an element of the array the `box` holds (at `offset`, same element type), the array's **tail** from that element on (the element's index is `offset // scalar_count(elem)`, the length `length - index`). Materializing that object is what keeps the elements after the first one (see §6.5).
-  `is_writable()` requires the view to be non-const, the box to not be `bytes`, and `Box.is_const` to be false.
+  `is_writable()` requires the view to be non-const, the box to not be `bytes`/`str`, and `Box.is_const` to be false.
 - `CastedPtr(ptr, type)`: the compile-time pointer after a `ptr_cast` reinterpretation; reads/writes cannot see through it.
 
 ### 4.6 Layout cache and special types (`MirLowerCache` / `SpecialTypes`)
@@ -304,7 +304,7 @@ and the thunk returns `bool` (`true` = panic, `false` = normal). `_thunk_call_si
   `__getitem__` -> `glue.specialized_struct`; `__call__` -> `glue.construct`.
 - `_Context` (a subclass of `sval.CompileContext`): `resolve_global` (resolves registered objects / enum members into spy values or `FunctionValue`s of this context, and wraps a plain Python function that is not decorated with `@func` into a `sval.PyFunction`),
   `special_types`, `mir_lower_cache`, `target_info`, `_resolve_call`, enum support (`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`),
-  compile options (`get_compile_option`/`set_compile_option`, stored in `_compile_options`).
+  compile options (`get_compile_option`/`set_compile_option`, stored in `_compile_options` keyed by a `str` name).
   `_GLOBAL_CONTEXT = _Context(LLVMBackend())` is the top-level default context.
 
 ---
@@ -356,7 +356,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - `exec_field_name_addr`: resolves a field by name (**automatic dereference**); `ComplexType`'s `real`/`imag` are also treated as fields.
 - `_comptime_field_place`/`_const_box_place`: the read/write pointer of an `is_comptime` field (a compile-time struct is a box cell; a runtime struct is a read-only constant).
 - `operand`: resolves `Const` (type parameter value / global / `as_value`), `Arg(index)`, `Inst` (the register table).
-- `subscript` (big dispatch): array/tuple/dict/`$args`/`$kwargs`/byte string/pointer/slice/struct `__spy_getitemptr__`/struct template specialization.
+- `subscript` (big dispatch): array/tuple/dict/`$args`/`$kwargs`/strings (`bytes`/`str`)/pointer/slice/struct `__spy_getitemptr__`/struct template specialization.
 - `_subscript_pointer`: a slice -> `SlicePtr`; a multi pointer -> the element's place, a **single** pointer (the address `p + i`); a compile-time one picks the element's cell in the `box`.
 - `std.core.ptr_cast` (`_builtin_ptr_cast`/`_ptr_cast_value`): runtime pointer -> `mir.BitCast`; a compile-time `ComptimePtr` that is a subtype of it -> retype; otherwise `sval.CastedPtr`; byte string pointer -> points at the byte store.
 
@@ -414,7 +414,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 ### 6.8 Builtins and operators
 
 - `_call_builtin` dispatches by `fn.name`: `compile_log`, `type_info`, `reify`, `undefined`, `layout_of`, `panic`, `catch_unwind`,
-  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `float_truncate`, `int_to_float_unchecked`, `float_to_int_unchecked`, `coerce`, `compile_error`, `compile_option`, `atomic_load/store/rmw/cmpxchg/fence`;
+  `compile`, `const_array`, `bitcast`, `ptr_cast`, `as_func_ptr`, `truncate`, `float_truncate`, `int_to_float_unchecked`, `float_to_int_unchecked`, `coerce`, `compile_error`, `compile_option`, `encode_length`, `atomic_load/store/rmw/cmpxchg/fence`;
   an unknown name raises `cannot call the spy builtin ...`.
 - Operators: `_eval_binary` decides in order the union meaning of `|` -> struct overload -> complex -> `/` -> `//` -> `**` -> bitwise -> fold both constants -> pointer arithmetic -> emit `mir.Arith` for numeric peer types;
   `_eval_cmp` (struct overload / enum member / both constants / numeric `mir.Cmp`), `_eval_not`, `_eval_unary`, `_eval_ord`, `binary_assign`.

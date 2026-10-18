@@ -630,9 +630,8 @@ class SpyTypeOfTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# ``std.core.compile_error``: abort the compilation with a compile-time byte
-# string (a string literal is encoded to bytes at parse time), so a spy body can
-# report an error while it is being compiled
+# ``std.core.compile_error``: abort the compilation with a compile-time string,
+# so a spy body can report an error while it is being compiled
 # ---------------------------------------------------------------------------
 
 
@@ -643,14 +642,8 @@ def compile_error_literal() -> i32:
 
 
 @func()
-def compile_error_bytes() -> i32:
-    compile_error(b'boom')
-    return 0
-
-
-@func()
 def compile_error_number() -> i32:
-    # the message must be a compile-time byte string
+    # the message must be a compile-time string
     compile_error(1)  # pyright: ignore[reportArgumentType]
     return 0
 
@@ -677,27 +670,22 @@ def compile_error_in_a_dead_branch() -> i32:
 
 class SpyCompileErrorTest(TestCase):
     """``std.core.compile_error`` aborts the compilation with the message of its
-    (compile-time, byte-string) argument."""
+    (compile-time, string) argument."""
 
     def test_a_string_literal(self) -> None:
         with self.assertRaises(CompileError) as ctx:
             compile_error_literal()
         self.assertEqual(ctx.exception.message, 'boom')
 
-    def test_a_byte_string(self) -> None:
-        with self.assertRaises(CompileError) as ctx:
-            compile_error_bytes()
-        self.assertEqual(ctx.exception.message, 'boom')
-
-    def test_a_non_byte_string_is_rejected(self) -> None:
+    def test_a_non_string_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:
             compile_error_number()
-        self.assertIn('byte string', str(ctx.exception))
+        self.assertIn('string', str(ctx.exception))
 
     def test_a_runtime_message_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:
             compile_error_runtime(1)
-        self.assertIn('byte string', str(ctx.exception))
+        self.assertIn('string', str(ctx.exception))
 
     def test_a_dead_branch_does_not_run_it(self) -> None:
         self.assertEqual(compile_error_in_a_dead_branch(), 1)
@@ -731,11 +719,11 @@ class SpyCompileOptionTest(TestCase):
         self.assertTrue(compile_option_is_absent())
 
     def test_a_set_option_is_read_back(self) -> None:
-        _GLOBAL_CONTEXT.set_compile_option(b'test.answer', 42)
+        _GLOBAL_CONTEXT.set_compile_option('test.answer', 42)
         try:
             self.assertEqual(compile_option_value(), 42)
         finally:
-            _GLOBAL_CONTEXT._compile_options.pop(b'test.answer', None)
+            _GLOBAL_CONTEXT._compile_options.pop('test.answer', None)
 
 
 all_tests = [

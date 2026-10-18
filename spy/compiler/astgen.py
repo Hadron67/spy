@@ -78,6 +78,7 @@ from .sval import (
     CompileContext,
     Null,
     PointerType,
+    StrType,
     StructDecl,
     StructType,
     Type,
@@ -1159,10 +1160,9 @@ class _Builder:
             # the type itself, so ``Comptime[bytes]`` and friends resolve
             return hir.Const(BytesType())
         if builtin is str:
-            raise CompileError(
-                'the str type is not available in spy: use bytes (a string '
-                'literal is encoded to bytes automatically)'
-            )
+            # ``str`` names the compile-time text-string type: its spy value is
+            # the type itself, so ``Comptime[str]`` and friends resolve
+            return hir.Const(StrType())
         if builtin is ord:
             # ``ord(x)`` is lowered to ``hir.Ord`` by the call parser (see
             # ``_gen_call``)
@@ -1276,11 +1276,9 @@ class _Builder:
                 return ArgEntry(self.add(hir.FieldAddr(base.value, node.attr)), True), False
             case ast.Constant():
                 value = node.value
-                if isinstance(value, str):
-                    # spy has no ``str`` type: a string literal is a byte string,
-                    # encoded at parse time (``b'...'`` is already ``bytes``)
-                    value = value.encode()
-                if isinstance(value, (int, float, complex, bytes, bool)) or value is None:
+                if isinstance(value, (int, float, complex, bytes, str, bool)) or value is None:
+                    # ``bytes`` is a byte string, ``str`` a text string (the two
+                    # are different compile-time-only types, see ``sval``)
                     return ArgEntry(hir.Const(value), False), False
                 raise CompileError(f"unsupported constant {node.value!r}")
             case ast.UnaryOp(op=ast.Not()):

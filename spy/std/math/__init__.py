@@ -90,9 +90,6 @@ from .trig import cos as software_cos
 from .trig import sin as software_sin
 from .trig import tan as software_tan
 
-_MODE_LLVM = b'llvm'
-_MODE_LIBC = b'libc'
-_MODE_SOFTWARE = b'software'
 
 @func(inline=True)
 def _dispatch_float(x, f32_fn, f64_fn):
@@ -109,11 +106,11 @@ def _dispatch_float(x, f32_fn, f64_fn):
 def _dispatch(x, opt_name, llvm_f32_fn, llvm_f64_fn, libc_f32_fn, libc_f64_fn, spy_fn):
     comptime()
     mode = compile_option(opt_name)
-    if mode == b'llvm':
+    if mode == 'llvm':
         return _dispatch_float(x, llvm_f32_fn, llvm_f64_fn)
-    elif mode == b'libc':
+    elif mode == 'libc':
         return _dispatch_float(x, libc_f32_fn, libc_f64_fn)
-    elif mode == b'software' or mode is None:
+    elif mode == 'software' or mode is None:
         return spy_fn(x)
     else:
         compile_error('mode must be "llvm", "libc" or "software"')
@@ -133,11 +130,11 @@ def _dispatch_float2(x, y, f32_fn, f64_fn):
 def _dispatch2(x, y, opt_name, llvm_f32_fn, llvm_f64_fn, libc_f32_fn, libc_f64_fn, spy_fn):
     comptime()
     mode = compile_option(opt_name)
-    if mode == b'llvm':
+    if mode == 'llvm':
         return _dispatch_float2(x, y, llvm_f32_fn, llvm_f64_fn)
-    elif mode == b'libc':
+    elif mode == 'libc':
         return _dispatch_float2(x, y, libc_f32_fn, libc_f64_fn)
-    elif mode == b'software' or mode is None:
+    elif mode == 'software' or mode is None:
         return spy_fn(x, y)
     else:
         compile_error('mode must be "llvm", "libc" or "software"')

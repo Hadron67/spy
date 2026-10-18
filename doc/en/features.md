@@ -270,7 +270,7 @@ assert is_absent(None) is True and is_absent(5) is False
 - In a **variable/field/expression value** position it is "a tuple value": `t[i]` is an lvalue of the i-th element (`i` is a compile-time integer; out-of-bounds/negative/runtime subscripts are an error),
   `len(t)` is a compile-time integer, and the whole thing can be copied (`b = a`).
 - In a **parameter/return annotation** position it is interpreted specially: a parameter `tuple[...]` is **flattened passing** (see §6.4), a return `tuple[...]` is **multiple return values** (see §6.5).
-- Elements without a runtime representation (types, byte strings, DST function types) make the whole tuple a compile-time value only.
+- Elements without a runtime representation (types, byte/text strings, DST function types) make the whole tuple a compile-time value only.
 - Tuple `+=` / `+` are **no longer supported** (a tuple is now an ordinary runtime aggregate with a fixed arity).
 
 ```python
@@ -420,7 +420,7 @@ See §7.
   and so on. A ZST takes no runtime space, but a ZST result still delivers a unit value as usual (see `sval.Type.get_unit_value`).
 - **DST (dynamically-sized type)**: DST function types, `Opaque`, unsized arrays; only **a pointer to it** is a value, and it cannot be passed/returned by value or read as a whole.
   The first DST field in a struct is a flexible array member, and later DST fields occupy no slot.
-- **Types with no runtime representation (purely compile time)**: type values (`type`), byte strings (`bytes`), DST function types, the empty type (`Never`).
+- **Types with no runtime representation (purely compile time)**: type values (`type`), byte/text strings (`bytes`/`str`), DST function types, the empty type (`Never`).
 - A pointer to a ZST is non-null (but does not point to actual memory).
 
 ```python
@@ -489,7 +489,7 @@ assert maybe_spin(False) is False
 A value is either a **runtime value** (it has a runtime representation) or a **compile-time value** (it exists only at compile time):
 
 - Compile-time values cover: scalar constants, type values, compile-time aggregate values, compile-time Option/tagged unions, `Null`/`Void`/undefined,
-  compile-time pointers, and ordinary Python `int/float/complex/bytes/bool`; in addition there are compile-time objects such as function values and a Python
+  compile-time pointers, and ordinary Python `int/float/complex/bytes/str/bool`; in addition there are compile-time objects such as function values and a Python
   function that is not decorated with `@func` (a `PyFunction`, see §6.10).
 
 **Key point**: there is no such thing as "a compile-time value in the form of a runtime value". An aggregate any of whose components is a runtime value
@@ -657,8 +657,8 @@ assert infer_runtime(1) == 2
 - Every binary operator has a corresponding compound assignment `a <operator>= b`.
 - Conditional expression `a if c else b`: the condition must be `spy.bool`; a compile-time condition keeps only the selected branch.
 - Short-circuit `and`/`or`: operands are evaluated in order, and the boolean value decides whether to continue.
-- `cast(T, value)`: no-op; `len(x)`: the `__len__` of a tuple/array/slice/struct; `ord(b)`: the encoding of a single-byte byte string.
-- Subscript `expr[i]`: arrays/tuples/multi pointers/slices/byte strings/dicts/`$args`/`$kwargs`; `p[...]` dereferences a single pointer;
+- `cast(T, value)`: no-op; `len(x)`: the `__len__` of a tuple/array/slice/struct, the byte count of a byte string, the character count of a text string; `ord(b)`: the byte encoding of a single-byte byte string, or the code point of a single-character text string.
+- Subscript `expr[i]`: arrays/tuples/multi pointers/slices/byte strings/text strings/dicts/`$args`/`$kwargs`; `p[...]` dereferences a single pointer;
   a struct can overload the subscript via `__spy_getitemptr__` (see §7.8).
 - For operator overloading see §7.2.
 
@@ -912,7 +912,7 @@ assert use_inline(2, 3) == 5
 - Positional parameters, keyword parameters, default parameters, and `*args`/`**kwargs` are supported.
 - **Positional-only/keyword-only parameters are not supported** (Python `posonlyargs`/`kwonlyargs` are an error).
 - Compile-time parameter `x: Comptime` / `x: Comptime[T]`: passed only at compile time, and the argument must be fully known at compile time.
-- **A parameter type with no runtime representation ⇒ an implicit compile-time parameter** (type values, byte strings, DST function types, the empty type, etc.):
+- **A parameter type with no runtime representation ⇒ an implicit compile-time parameter** (type values, byte/text strings, DST function types, the empty type, etc.):
   it automatically becomes a compile-time parameter without an explicit `Comptime` (e.g. `def sstr(s: bytes)`).
 - A `type[X]` parameter: accepts a **type value**.
 - `*args`/`**kwargs`: see §8.3.
@@ -984,7 +984,7 @@ assert sum_nested((1, (2, 3))) == 6        # a Python tuple is flattened too
 - Call side: `a, b = f()` destructures; `return f()` forwards.
 - **Packing**: an all-runtime result can be packed into a **plain tuple variable** `packed = f()` (afterwards it can be destructured again with `x, y = packed`, and `len`, `packed[i]` work);
   the packed tuple keeps the result grouping — one element per result *element*, a nested result being a tuple of its own (so `packed[i][j]` works and `len` is the top-level arity);
-  when it contains compile-time leaves (type values/const pointers/byte strings/function values), the packed tuple has no runtime representation and the target must be a `Comptime` variable.
+  when it contains compile-time leaves (type values/const pointers/byte strings/text strings/function values), the packed tuple has no runtime representation and the target must be a `Comptime` variable.
 - **Compile-time return values**: a return value fully known at compile time occupies no runtime result.
   A non-inline call takes the value of the callee's **last analyzed `return`** (it does not check whether the return paths agree).
 - `tuple[T, ...]` (variadic) is an error at any nesting level.
@@ -1110,8 +1110,8 @@ assert use_func_ptr(2, 3) == 5
 ### 6.10 Compile-time Python functions (`PyFunction`)
 
 - A Python function that is **not decorated with `@func`** is a **compile-time value** (`sval.PyFunction`, with no runtime representation): it can **only be called at compile time**, and its body is **executed by Python as it is** (not compiled into spy code). `@func(inline=True)` is what an "inlined spy function" is spelled as.
-- Its arguments and its result must be **compile-time values**, and only plain Python objects: `int` (including `bool`), `float`, `complex`, `bytes`, `None`.
-  A Python `str` is encoded to the spy byte string at the boundary, the way a string literal in the source is. Like the Python call boundary, `Null`/`TypedNull`/`Void` all cross as `None`, an `Option` is auto-unwrapped to its payload and a tagged union to its variant (an aggregate payload/variant is then rejected, not being a plain object);
+- Its arguments and its result must be **compile-time values**, and only plain Python objects: `int` (including `bool`), `float`, `complex`, `bytes`, `str`, `None`.
+  A Python `str` is spy's compile-time `str` (a text string, see §8.9) and `bytes` a compile-time byte string. Like the Python call boundary, `Null`/`TypedNull`/`Void` all cross as `None`, an `Option` is auto-unwrapped to its payload and a tagged union to its variant (an aggregate payload/variant is then rejected, not being a plain object);
   a `None` result becomes `Null`, the absent value of an option. Any other argument (a runtime value, a spy type, an ordinary aggregate, a pointer, ...) or result is a compile error.
 - The result is written into the call's result location, so it takes that location's type (an inferred location keeps the value's own type). Python does the argument binding (default values and `*args`/`**kwargs` work as usual).
 - A `PyFunction` is an ordinary compile-time value: it can be stored in a `Comptime` variable/parameter and passed as a comptime argument to another spy function.
@@ -1130,10 +1130,10 @@ def use_py_function() -> i32:
 
 @func()
 def use_py_function_str():
-    return shout(b"hey")                   # b'HEY': a str crosses as its UTF-8 bytes
+    return shout(b"hey")                   # 'HEY': a str crosses as a text string
 
 assert use_py_function() == 42
-assert use_py_function_str() == b"HEY"
+assert use_py_function_str() == "HEY"
 ```
 
 ---
@@ -1367,7 +1367,7 @@ assert subscript_use(1) == 1 + 2 + 100
 ### 8.1 Type probes and compile-time logging
 
 - `spy.typeof(x)`: queries the static type (returning a type value); it is a **type probe**: it only types and has no runtime behavior; spy functions referenced in it are triggered to compile. If a probed call throws and leaves the probe, it is an error.
-- `std.core.compile_log(...)`: prints at compile time (no runtime action); bytes are rendered as text and runtime values as `<T>`.
+- `std.core.compile_log(...)`: prints at compile time (no runtime action); bytes/str are rendered as text and runtime values as `<T>`.
 
 ```python
 @func()
@@ -1407,7 +1407,7 @@ assert use_const_ptr() == 99
 ### 8.3 `*args` / `**kwargs`
 
 - In the function body `args` collects positional arguments and `kwargs` collects keyword arguments by name.
-- `len(args)`, `args[i]` (compile-time integer subscript), `kwargs[b'name']` (compile-time byte string name).
+- `len(args)`, `args[i]` (compile-time integer subscript), `kwargs['name']` (compile-time string name).
 - Element/value types may be annotated or inferred; `*args`/`**kwargs` elements do not support `type[X]`; when needed, traverse with `syntax.unroll()`.
 - **Call-site unpacking (`f(*args, **kwargs)`) is not yet implemented**: `**kw` is silently ignored and `*x` is an error (see `doc/issues.md` #1).
 
@@ -1422,7 +1422,7 @@ def sum_all(*args: i32) -> i32:
 
 @func()
 def named_sum(**kwargs: i32) -> i32:
-    return kwargs[b'a'] + kwargs[b'b']
+    return kwargs['a'] + kwargs['b']
 
 assert sum_all(1, 2, 3) == 6
 assert named_sum(a=1, b=2) == 3
@@ -1430,7 +1430,7 @@ assert named_sum(a=1, b=2) == 3
 
 ### 8.4 `dict[str, T]` parameters
 
-- A `**kwargs` parameter / `dict[str, T]` parameter passes arguments flattened by name; access with `len(kwargs)`, `kwargs[b'name']` (compile-time byte string names only, **runtime key lookup is not supported**).
+- A `**kwargs` parameter / `dict[str, T]` parameter passes arguments flattened by name; access with `len(kwargs)`, `kwargs['name']` (compile-time string names only, **runtime key lookup is not supported**).
 - Because it has a runtime representation, a dict value can be stored in ordinary variables/fields and passed by value or by reference.
 - The `dict[str, T]` annotation itself is not yet parsed.
 
@@ -1440,7 +1440,7 @@ assert named_sum(a=1, b=2) == 3
 - A **const pointer** can cross a non-inline boundary (as a `Comptime` argument, captured by a compiled closure, as a non-inline function's return value); it is passed by **identity** and is aliasable.
 - A **non-const compile-time pointer** **materializes a copy** when crossing a non-inline boundary: the callee's writes do not affect the original location.
 - A compile-time pointer obtained through `ptr_cast` cannot be read/written through.
-- A pointer to a compile-time constant and a byte string constant are both automatically materialized as global constants.
+- A pointer to a compile-time constant and a byte/text string constant are both automatically materialized as global constants.
 
 ```python
 @struct()
@@ -1492,10 +1492,10 @@ assert unrolled_sum() == 6
 ### 8.7 Other compile-time builtins
 
 - `std.core.undefined()`: undefined of any type, typed according to its type when written into a target; undefined as a condition is an error.
-- `std.core.compile_error(msg)`: aborts compilation with a compile-time byte string message; a non-byte-string/runtime message is an error; a dead branch does not trigger.
+- `std.core.compile_error(msg)`: aborts compilation with a compile-time string message; a non-string/runtime message is an error; a dead branch does not trigger.
 - `std.core.coerce(value, T)`: concretizes value into type `T` - the **implicit conversion** a store performs, which only allows the same type or a widening one: integers by range coverage (`u32 → u64`, `i32 → i64`), floats `f32 → f64`, a **lossless** integer → float (by type range on a runtime value, by value on a compile-time one, see §1.1), the legal pointer conversions, and a real that converts to the element float **without loss** `→ Complex[T]`; **narrowing and a lossy integer → float are always an error**. A compile-time value is checked by value (`x: i8 = 12` is fine). To narrow, use `std.int.truncate`/`int_cast` or `std.float.float_truncate`, and `std.int.int_to_float` for a lossy integer → float.
 - `std.core.lub_type(t1, t2)`: the least upper bound of two types - the common type both peer to (`t1.resolve_peer_type(t2)`), such as a type with its `Option`, a variant with its tagged union, or an untyped integer with the integer - or the float - that holds it losslessly. The result is a compile-time type value, able to name a declaration's type or feed a `type[X]` parameter; two types with no common type yield `None`.
-- `std.core.compile_option(name)`: reads a compile-time option the host context stores (`CompileContext.get_compile_option`); an option that is not set is the absent value (`None`).
+- `std.core.compile_option(name)`: reads a compile-time option the host context stores (`CompileContext.get_compile_option`, `name` is a compile-time string); an option that is not set is the absent value (`None`).
 - `std.core.compile(fn)`: manually compiles a **non-generic** function value (precompiles its default specialization).
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)` / `std.float.float_truncate(value, T)`: same-bit-width reinterpretation of a scalar / integer narrowing / float narrowing.
 - `std.core.int_to_float_unchecked(value, T)` / `std.core.float_to_int_unchecked(value, T)`: integer↔float conversion (`sitofp`/`uitofp` and `fptosi`/`fptoui`, the latter truncating towards zero), with **no check at all**; a compile-time value that does not fit the target type becomes `undefined`.
@@ -1564,7 +1564,7 @@ assert to_i32(3.9) == 3
 
 - `std.reflect.type_info(type) -> TypeInfo` / `reify(info) -> type`;
   variants `IntType`/`FloatType`/`PointerType`/`ArrayType`/`StructType`/`TaggedUnionType`/`OptionType`/`TupleType`/`StrDictType`/`ComplexType`/`UnionType`.
-- `reflect.StructField` has the `is_comptime` / `is_ref` markers; `reflect.StructType.head` (`None` for non-generic).
+- `reflect.StructField` has a `name` (a compile-time `str`) and the `is_comptime` / `is_ref` markers; `reflect.StructType.head` (`None` for non-generic).
 - `reify`ing a struct **rebuilds** it (not identity-equal to the original struct, but with the same fields/field types).
 - `std.mem.layout_of`/`size_of`/`align_of`: also accept tuple/dict types.
 
@@ -1603,12 +1603,14 @@ assert reified() == 1
 assert int_size() == 4
 ```
 
-### 8.9 Compile-time byte strings
+### 8.9 Compile-time strings (`bytes` / `str`)
 
-- `bytes` exists only at compile time (no runtime representation); a `str` literal is encoded into `bytes` (`str` is not allowed inside a spy function).
-- It can be subscripted `b[i]` and sliced `b[a:c]` (lower bound defaults to 0, upper bound to the length, step must be 1, out of bounds is an error); `ord(b)` takes the encoding of a single-byte byte string.
-- Materialized at runtime: `ptr_cast(s, ConstMultiPtr[u8])` or `std.core.sstr(s) -> ConstSlicePtr[u8]` (the length excludes the NUL).
-- Byte strings with the same content share a global constant; a local holding a byte string must be a compile-time variable.
+- `bytes` (a byte string) and `str` (a text string) both exist only at compile time (no runtime representation) and are both **scalars**; `b'...'` is a byte-string literal and `'...'` a text-string literal (the two are different types).
+- Subscript `s[i]` and slice `s[a:c]`: `bytes` is indexed **by byte** and `str` **by character** (lower bound defaults to 0, upper bound to the length, step must be 1, out of bounds is an error).
+- `len(s)`: the byte count for `bytes`, the **character count** for `str`; the encoded byte length of a `str` is `std.core.encode_length(s)`.
+- Comparison (`==`/`!=`/`<`/…) and concatenation (`+`) fold at compile time; `ord(s)` takes the byte encoding of a single-byte byte string, or the code point of a single-character text string.
+- Materialized at runtime: `ptr_cast(s, ConstMultiPtr[u8])` or `std.core.sstr(s) -> ConstSlicePtr[u8]` (the length excludes the NUL; a `str` is encoded to UTF-8 before it is laid into memory, so its length is the encoded byte count).
+- Strings with the same content share a global constant; a local holding a string must be a compile-time variable.
 
 ```python
 @func()
@@ -1617,8 +1619,13 @@ def byte_at() -> i32:
     return ord(s[1])
 
 @func()
+def text_at() -> i32:
+    s: Comptime = 'ABC'
+    return ord(s[1])
+
+@func()
 def second_byte() -> i32:
-    s: Comptime = b'xy'
+    s: Comptime = 'xy'
     p: ConstMultiPtr[u8] = ptr_cast(s, ConstMultiPtr[u8])
     return coerce(p[1], i32)
 
@@ -1627,9 +1634,16 @@ def str_len() -> i32:
     s = sstr(b'hello')
     return int_cast(s.length, i32)
 
+@func()
+def text_len() -> i32:
+    s = sstr('héllo')                      # encoded to UTF-8: 6 bytes
+    return int_cast(s.length, i32)
+
 assert byte_at() == 66
+assert text_at() == 66
 assert second_byte() == 121
 assert str_len() == 5
+assert text_len() == 6
 ```
 
 ---
@@ -1638,7 +1652,7 @@ assert str_len() == 5
 
 | Module | Contents |
 |---|---|
-| `std.core` | `Numeric`, `StopIteration`, `slice`, `range`, `SlicePtr`/`ConstSlicePtr`, `arr_slice`/`const_arr_slice`/`const_arr_ptr`, `NullException`, `unwrap`/`unwrap_or`, `undefined`, `coerce`/`typed_undefined`/`lub_type`, `const_array`, `compile_error`, `sstr`, `compile`, `bitcast`, `int_to_float_unchecked`/`float_to_int_unchecked`, `DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`, `panic`, `catch_unwind`, `compile_option` |
+| `std.core` | `Numeric`, `StopIteration`, `slice`, `range`, `SlicePtr`/`ConstSlicePtr`, `arr_slice`/`const_arr_slice`/`const_arr_ptr`, `NullException`, `unwrap`/`unwrap_or`, `undefined`, `coerce`/`typed_undefined`/`lub_type`, `const_array`, `compile_error`, `sstr`, `encode_length`, `compile`, `bitcast`, `int_to_float_unchecked`/`float_to_int_unchecked`, `DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`, `panic`, `catch_unwind`, `compile_option` |
 | `std.reflect` | `TypeInfo` and its variants, `StructField`, `type_info`, `reify` |
 | `std.int` | `truncate` (builtin), `IntCastError`, `valid_range`, `try_int_cast`/`int_cast`, `FloatCastError`, `try_int_to_float`/`int_to_float`, `try_float_to_int`/`float_to_int` |
 | `std.float` | `float_truncate` (builtin) |
@@ -1831,7 +1845,7 @@ assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 ## 10. The Python ↔ spy calling boundary
 
 - Mapping from Python values to spy types: `bool`→`bool`, `int`→`i64`, `float`→`f64`, `complex`→`c128`,
-  `bytes`→a compile-time byte string, `None`→`Null`, `syntax.Ptr[T]`→a pointer; use `T(value)` (e.g. `u64(x)`) to specify the type explicitly.
+  `bytes`→a compile-time byte string, `str`→a compile-time text string, `None`→`Null`, `syntax.Ptr[T]`→a pointer; use `T(value)` (e.g. `u64(x)`) to specify the type explicitly.
 - A struct instance supports field reads/writes, method calls, and view semantics; pointers are non-null.
 - `Option[T]` and tagged unions are **unwrapped** when going back to Python: `Option[T]` is a `T` value or `None`, and a union is the value of its concrete variant.
 - Complex numbers ↔ Python `complex`; integer enums ↔ Python enum members.
@@ -1877,10 +1891,10 @@ panic/`catch_unwind`; atomic operations; OpenMP (with reduction); Python-side in
 - Positional-only/keyword-only parameters, chained comparisons, single-pointer subscript `p[i]` (a single pointer only has `p[...]`).
 - Call-site unpacking `f(*args, **kwargs)` (`**kw` is silently ignored, `*x` is an error).
 - The **definition** of C variadic functions (`va_arg`).
-- Tuple `+=` / `+` (removed); float `%`; byte-string operations other than subscript/slice/`ord`/`ptr_cast`/`sstr`.
+- Tuple `+=` / `+` (removed); float `%`; byte/text-string operations other than subscript/slice/`ord`/`ptr_cast`/`sstr`.
 - Arrays: arrays with a runtime length, conversions between arrays, arrays crossing the Python boundary.
 - `dict[str, T]` annotation parsing; pattern matching an option; closure `nonlocal`; mutually recursive closures; a closure referencing the outer type parameters.
-- Declared "compile-time-only" return types (`-> bytes` / `-> type` etc., see `doc/issues.md` #7).
+- Declared "compile-time-only" return types (`-> bytes` / `-> str` / `-> type` etc., see `doc/issues.md` #7).
 - Destructive move semantics (`copyable=False` only means non-copyable; no move checking is done).
 
 > For individual implementation defects and minimal reproductions see `doc/issues.md`.

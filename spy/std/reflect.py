@@ -29,7 +29,7 @@ class ArrayType:
 
 @struct()
 class StructField:
-    name: bytes
+    name: str
     type: type
     default_value: Option[Any]
     # whether the field is compile-time known, and whether it is held by
@@ -70,7 +70,7 @@ class TupleType:
 
 @struct()
 class DictEntry:
-    name: bytes
+    name: str
     type: type
 
 

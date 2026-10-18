@@ -270,7 +270,7 @@ assert is_absent(None) is True and is_absent(5) is False
 - 在**变量/字段/表达式值**位置是「一个元组值」：`t[i]` 是第 i 个元素的左值（`i` 为编译期整数，越界/负/运行时下标报错），
   `len(t)` 是编译期整数，可整体拷贝（`b = a`）。
 - 在**形参/返回注解**位置被特殊解释：形参 `tuple[...]` 是**铺平传参**（见 §6.4），返回 `tuple[...]` 是**多返回值**（见 §6.5）。
-- 无运行时表示的元素（类型、字节串、DST 函数类型）使整个元组只能是编译期值。
+- 无运行时表示的元素（类型、字节串/字符串、DST 函数类型）使整个元组只能是编译期值。
 - **不再支持**元组 `+=` / `+`（元组现在是普通运行时聚合，元数固定）。
 
 ```python
@@ -420,7 +420,7 @@ assert state_is_unknown(TriState.UNKNOWN) is True
   等。ZST 不占运行时空间，但 ZST 结果照常交付单位值（`sval.Type.get_unit_value`）。
 - **DST（动态大小类型）**：DST 函数类型、`Opaque`、无长度数组；只有**指向它的指针**是值，不能按值传递/返回/整体读取。
   结构体里第一个 DST 字段是弹性数组，后续 DST 字段不占位。
-- **无运行时表示的类型（纯编译期）**：类型值（`type`）、字节串（`bytes`）、DST 函数类型、空类型（`Never`）。
+- **无运行时表示的类型（纯编译期）**：类型值（`type`）、字节串/字符串（`bytes`/`str`）、DST 函数类型、空类型（`Never`）。
 - 指向 ZST 的指针是非空的（但不指向实际内存）。
 
 ```python
@@ -489,7 +489,7 @@ assert maybe_spin(False) is False
 一个值要么是**运行时值**（有运行时表示），要么是**编译期值**（只在编译期存在）：
 
 - 编译期值涵盖：标量常量、类型值、编译期聚合值、编译期 Option/tagged union、`Null`/`Void`/undefined、
-  编译期指针，以及普通 Python `int/float/complex/bytes/bool`；此外还有函数值、不用 `@func` 装饰的
+  编译期指针，以及普通 Python `int/float/complex/bytes/str/bool`；此外还有函数值、不用 `@func` 装饰的
   Python 函数（`PyFunction`，见 §6.10）等编译期对象。
 
 **关键点**：不存在「以运行时值形式存在的编译期值」。任何一个组成部分是运行时值的聚合，
@@ -657,8 +657,8 @@ assert infer_runtime(1) == 2
 - 每个二元算符有对应的复合赋值 `a <算符>= b`。
 - 条件表达式 `a if c else b`：条件必须 `spy.bool`；编译期条件只保留选中分支。
 - 短路 `and`/`or`：操作数依次求值，按布尔值决定是否继续。
-- `cast(T, value)`：no-op；`len(x)`：元组/数组/切片/结构体的 `__len__`；`ord(b)`：单字节字节串的编码。
-- 下标 `expr[i]`：数组/元组/多指针/切片/字节串/字典/`$args`/`$kwargs`；`p[...]` 解引用单指针；
+- `cast(T, value)`：no-op；`len(x)`：元组/数组/切片/结构体的 `__len__`，字节串的字节数，字符串的字符数；`ord(b)`：单字节字节串的字节编码，或单字符字符串的码点。
+- 下标 `expr[i]`：数组/元组/多指针/切片/字节串/字符串/字典/`$args`/`$kwargs`；`p[...]` 解引用单指针；
   结构体可通过 `__spy_getitemptr__` 重载下标（见 §7.8）。
 - 运算符重载见 §7.2。
 
@@ -912,7 +912,7 @@ assert use_inline(2, 3) == 5
 - 支持位置参数、关键字参数、默认参数、`*args`/`**kwargs`。
 - **仅位置/仅关键字参数不支持**（Python `posonlyargs`/`kwonlyargs` 报错）。
 - 编译期参数 `x: Comptime` / `x: Comptime[T]`：只在编译期传递，实参必须完全编译时已知。
-- **形参类型无运行时表示 ⇒ 隐式编译期形参**（类型值、字节串、DST 函数类型、空类型等）：
+- **形参类型无运行时表示 ⇒ 隐式编译期形参**（类型值、字节串/字符串、DST 函数类型、空类型等）：
   自动成为编译期形参，无需显式 `Comptime`（如 `def sstr(s: bytes)`）。
 - `type[X]` 形参：接受一个**类型值**。
 - `*args`/`**kwargs`：见 §8.3。
@@ -984,7 +984,7 @@ assert sum_nested((1, (2, 3))) == 6        # a Python tuple is flattened too
 - 调用侧：`a, b = f()` 解构；`return f()` 转发。
 - **打包**：全运行时结果可打包进**普通元组变量** `packed = f()`（之后可 `x, y = packed` 再解构、`len`、`packed[i]`）；
   打包保留结果的分组——每个「结果元素」一个元素，嵌套结果是它自己的元组（故 `packed[i][j]` 可用，`len` 为顶层 arity）；
-  含编译期叶（类型值/const 指针/字节串/函数值）时打包出的元组无运行时表示，目标必须是 `Comptime` 变量。
+  含编译期叶（类型值/const 指针/字节串/字符串/函数值）时打包出的元组无运行时表示，目标必须是 `Comptime` 变量。
 - **编译时返回值**：完全编译时已知的返回值不占运行时结果。
   非 inline 调用取 callee **最后一条被分析的 `return`** 的值（不检查各 return 路径是否一致）。
 - `tuple[T, ...]`（变长）在任意嵌套层级报错。
@@ -1111,8 +1111,8 @@ assert use_func_ptr(2, 3) == 5
 
 - **不用 `@func` 装饰**的普通 Python 函数是一个**编译期值**（`sval.PyFunction`，没有运行时表示）：它**只能在编译期被调用**，
   函数体由 Python **原样执行**（不是编译成 spy 代码）；`@func(inline=True)` 才是「内联 spy 函数」。
-- 实参与返回值都必须是**编译期量**，且只能是普通 Python 对象：`int`（含 `bool`）、`float`、`complex`、`bytes`、`None`；
-  Python `str` 在边界处按 UTF-8 编码成 spy 的字节串（与源码里的字符串字面量一致）。
+- 实参与返回值都必须是**编译期量**，且只能是普通 Python 对象：`int`（含 `bool`）、`float`、`complex`、`bytes`、`str`、`None`；
+  Python `str` 就是 spy 的编译期 `str`（文本字符串，见 §8.9），`bytes` 是编译期字节串。
   和 Python 调用边界一样，`Null`/`TypedNull`/`Void` 都传成 `None`，`Option` 自动解包成载荷值、tagged union 解包成变体值（载荷/变体是聚合时会因不是普通对象而被拒）；
   返回 `None` 则变成 `Null`（option 的缺失值）。
   其它实参（运行期值、spy 类型值、普通聚合、指针等）或其它返回值一律编译报错。
@@ -1133,10 +1133,10 @@ def use_py_function() -> i32:
 
 @func()
 def use_py_function_str():
-    return shout(b"hey")                   # b'HEY': a str crosses as its UTF-8 bytes
+    return shout(b"hey")                   # 'HEY': a str crosses as a text string
 
 assert use_py_function() == 42
-assert use_py_function_str() == b"HEY"
+assert use_py_function_str() == "HEY"
 ```
 
 ---
@@ -1370,7 +1370,7 @@ assert subscript_use(1) == 1 + 2 + 100
 ### 8.1 类型探针与编译期日志
 
 - `spy.typeof(x)`：查询静态类型（返回类型值），是一个**类型探针**：只做类型化、无运行时行为；其中引用的 spy 函数会被触发编译。被探测的调用若抛错离开探针则报错。
-- `std.core.compile_log(...)`：编译期打印（运行时无动作）；bytes 渲染为文本，运行时值渲染为 `<T>`。
+- `std.core.compile_log(...)`：编译期打印（运行时无动作）；bytes/str 渲染为文本，运行时值渲染为 `<T>`。
 
 ```python
 @func()
@@ -1410,7 +1410,7 @@ assert use_const_ptr() == 99
 ### 8.3 `*args` / `**kwargs`
 
 - 函数体里 `args` 收集位置实参、`kwargs` 按名收集关键字实参。
-- `len(args)`、`args[i]`（编译期整数下标）、`kwargs[b'name']`（编译期字节串名）。
+- `len(args)`、`args[i]`（编译期整数下标）、`kwargs['name']`（编译期字符串名）。
 - 元素/值类型可注解也可推断；`*args`/`**kwargs` 元素不支持 `type[X]`；需要时配 `syntax.unroll()` 遍历。
 - **调用点展开（`f(*args, **kwargs)`）尚未实现**：`**kw` 被静默忽略，`*x` 报错（见 `doc/issues.md` #1）。
 
@@ -1425,7 +1425,7 @@ def sum_all(*args: i32) -> i32:
 
 @func()
 def named_sum(**kwargs: i32) -> i32:
-    return kwargs[b'a'] + kwargs[b'b']
+    return kwargs['a'] + kwargs['b']
 
 assert sum_all(1, 2, 3) == 6
 assert named_sum(a=1, b=2) == 3
@@ -1433,7 +1433,7 @@ assert named_sum(a=1, b=2) == 3
 
 ### 8.4 `dict[str, T]` 形参
 
-- `**kwargs` 形参 / `dict[str, T]` 形参按名铺平传参；访问 `len(kwargs)`、`kwargs[b'name']`（仅编译期字节串名，**不支持运行时键查找**）。
+- `**kwargs` 形参 / `dict[str, T]` 形参按名铺平传参；访问 `len(kwargs)`、`kwargs['name']`（仅编译期字符串名，**不支持运行时键查找**）。
 - 由于有运行时表示，字典值可存普通变量/字段、按值或引用传递。
 - `dict[str, T]` 注解本身尚未解析。
 
@@ -1443,7 +1443,7 @@ assert named_sum(a=1, b=2) == 3
 - **const 指针**可以跨非内联边界（作 `Comptime` 实参、被编译闭包捕获、作非内联函数返回值），按**身份**传递、可别名。
 - **非 const 编译期指针**跨非内联边界时会**物化一份拷贝**：callee 的写入影响不到原位置。
 - 经 `ptr_cast` 得到的编译期指针不能读写透。
-- 指向编译期常量的指针、字节串常量都会自动落成全局常量。
+- 指向编译期常量的指针、字节串/字符串常量都会自动落成全局常量。
 
 ```python
 @struct()
@@ -1495,10 +1495,10 @@ assert unrolled_sum() == 6
 ### 8.7 其他编译期内建
 
 - `std.core.undefined()`：任意类型的 undefined，写进目标时按其类型定型；undefined 作条件报错。
-- `std.core.compile_error(msg)`：以编译期字节串为消息中止编译；非字节串/运行时消息报错；死分支不触发。
+- `std.core.compile_error(msg)`：以编译期字符串为消息中止编译；非字符串/运行时消息报错；死分支不触发。
 - `std.core.coerce(value, T)`：把 value 具体化成类型 `T`——与 store 相同的**隐式转换**，只允许同类型或扩宽：整型按范围覆盖（`u32 → u64`、`i32 → i64`），浮点 `f32 → f64`，**无损**的整数 → 浮点（运行期按类型范围、编译期按值，见 §1.1），合法的指针转换，以及（能无损转成元素浮点的）实数 `→ Complex[T]`；**收窄与有损的整数 → 浮点一律报错**。编译期值按值检查（`x: i8 = 12` 可以）。收窄要用 `std.int.truncate`/`int_cast` 或 `std.float.float_truncate`，有损的整数 → 浮点用 `std.int.int_to_float`。
 - `std.core.lub_type(t1, t2)`：两个类型的最小上界——两者共同的 peer 类型（`t1.resolve_peer_type(t2)`），如类型与其 `Option`、变体与其 tagged union、能无损容纳它的整型的无类型整数或浮点。结果是编译期类型值，可用于命名声明类型或喂给 `type[X]` 形参；两者无共同类型时得到 `None`。peer 规则对两个参数是对称的，唯一例外是签名里的 result 类型（返回类型 + 异常集）：此时取 `t1` 的返回类型、`t1` 的异常在前，所以这些情形下结果与参数顺序有关。
-- `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`）；未设置时是缺失值（`None`）。
+- `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`，`name` 是编译期字符串）；未设置时是缺失值（`None`）。
 - `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)` / `std.float.float_truncate(value, T)`：标量的同位宽重解释 / 整数收窄 / 浮点收窄。
 - `std.core.int_to_float_unchecked(value, T)` / `std.core.float_to_int_unchecked(value, T)`：整数↔浮点转换（`sitofp`/`uitofp` 与 `fptosi`/`fptoui`，后者向零取整），**不做任何检查**；编译期值装不进目标类型时得到 `undefined`。
@@ -1567,7 +1567,7 @@ assert to_i32(3.9) == 3
 
 - `std.reflect.type_info(type) -> TypeInfo` / `reify(info) -> type`；
   变体 `IntType`/`FloatType`/`PointerType`/`ArrayType`/`StructType`/`TaggedUnionType`/`OptionType`/`TupleType`/`StrDictType`/`ComplexType`/`UnionType`。
-- `reflect.StructField` 含 `is_comptime` / `is_ref` 标记；`reflect.StructType.head`（非泛型为 `None`）。
+- `reflect.StructField` 含 `name`（编译期 `str`）、`is_comptime` / `is_ref` 标记；`reflect.StructType.head`（非泛型为 `None`）。
 - `reify` 一个 struct 会**重新构建**（与原始 struct 不 identity 相等，但字段/字段类型相同）。
 - `std.mem.layout_of`/`size_of`/`align_of`：也接受元组/字典类型。
 
@@ -1606,12 +1606,14 @@ assert reified() == 1
 assert int_size() == 4
 ```
 
-### 8.9 编译期字节串
+### 8.9 编译期字符串（`bytes` / `str`）
 
-- `bytes` 只在编译期存在（无运行时表示）；`str` 字面量被编码成 `bytes`（spy 函数内不允许 `str`）。
-- 可下标 `b[i]` 与切片 `b[a:c]`（下界缺省 0、上界缺省长度、step 必须 1，越界报错）；`ord(b)` 取单字节字节串的编码。
-- 落成运行时：`ptr_cast(s, ConstMultiPtr[u8])` 或 `std.core.sstr(s) -> ConstSlicePtr[u8]`（长度不含 NUL）。
-- 内容相同的字节串共用一个全局常量；持有字节串的局部量必须是编译期变量。
+- `bytes`（字节串）与 `str`（文本字符串）都只在编译期存在（无运行时表示），都是**标量**；`b'...'` 是字节串字面量，`'...'` 是文本字符串字面量（两者是不同的类型）。
+- 下标 `s[i]` 与切片 `s[a:c]`：`bytes` 按**字节**、`str` 按**字符**（下界缺省 0、上界缺省长度、step 必须 1，越界报错）。
+- `len(s)`：`bytes` 是字节数、`str` 是**字符数**；`str` 编码后的字节长度用 `std.core.encode_length(s)`。
+- 比较（`==`/`!=`/`<`/…）与拼接（`+`）在编译期折叠；`ord(s)` 取单字节字节串的字节编码，或单字符字符串的码点。
+- 落成运行时：`ptr_cast(s, ConstMultiPtr[u8])` 或 `std.core.sstr(s) -> ConstSlicePtr[u8]`（长度不含 NUL；`str` 在落内存前先按 UTF-8 编码，故其长度是编码后字节数）。
+- 内容相同的字符串共用一个全局常量；持有字符串的局部量必须是编译期变量。
 
 ```python
 @func()
@@ -1620,8 +1622,13 @@ def byte_at() -> i32:
     return ord(s[1])
 
 @func()
+def text_at() -> i32:
+    s: Comptime = 'ABC'
+    return ord(s[1])
+
+@func()
 def second_byte() -> i32:
-    s: Comptime = b'xy'
+    s: Comptime = 'xy'
     p: ConstMultiPtr[u8] = ptr_cast(s, ConstMultiPtr[u8])
     return coerce(p[1], i32)
 
@@ -1630,9 +1637,16 @@ def str_len() -> i32:
     s = sstr(b'hello')
     return int_cast(s.length, i32)
 
+@func()
+def text_len() -> i32:
+    s = sstr('héllo')                      # encoded to UTF-8: 6 bytes
+    return int_cast(s.length, i32)
+
 assert byte_at() == 66
+assert text_at() == 66
 assert second_byte() == 121
 assert str_len() == 5
+assert text_len() == 6
 ```
 
 ---
@@ -1641,7 +1655,7 @@ assert str_len() == 5
 
 | 模块 | 内容 |
 |---|---|
-| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`/`lub_type`、`const_array`、`compile_error`、`sstr`、`compile`、`bitcast`、`int_to_float_unchecked`/`float_to_int_unchecked`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option` |
+| `std.core` | `Numeric`、`StopIteration`、`slice`、`range`、`SlicePtr`/`ConstSlicePtr`、`arr_slice`/`const_arr_slice`/`const_arr_ptr`、`NullException`、`unwrap`/`unwrap_or`、`undefined`、`coerce`/`typed_undefined`/`lub_type`、`const_array`、`compile_error`、`sstr`、`encode_length`、`compile`、`bitcast`、`int_to_float_unchecked`/`float_to_int_unchecked`、`DestructorFn`/`OpaqueWithDestructor`/`PanicData`/`deinit_panic_data`/`UnwindException`、`panic`、`catch_unwind`、`compile_option` |
 | `std.reflect` | `TypeInfo` 及变体、`StructField`、`type_info`、`reify` |
 | `std.int` | `truncate`（内建）、`IntCastError`、`valid_range`、`try_int_cast`/`int_cast`、`FloatCastError`、`try_int_to_float`/`int_to_float`、`try_float_to_int`/`float_to_int` |
 | `std.float` | `float_truncate`（内建） |
@@ -1803,7 +1817,7 @@ assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 ## 10. Python ↔ spy 调用边界
 
 - Python 值到 spy 类型的映射：`bool`→`bool`，`int`→`i64`，`float`→`f64`，`complex`→`c128`，
-  `bytes`→编译期字节串，`None`→`Null`，`syntax.Ptr[T]`→指针；用 `T(value)`（如 `u64(x)`）显式指定类型。
+  `bytes`→编译期字节串，`str`→编译期字符串，`None`→`Null`，`syntax.Ptr[T]`→指针；用 `T(value)`（如 `u64(x)`）显式指定类型。
 - 结构体实例支持字段读写、方法调用与视图语义；指针是非空的。
 - `Option[T]` 与 tagged union 回到 Python 时**脱壳**：`Option[T]` 是 `T` 值或 `None`，union 是其具体变体的值。
 - 复数 ↔ Python `complex`；整数枚举 ↔ Python 枚举成员。
@@ -1849,10 +1863,10 @@ panic/`catch_unwind`；原子操作；OpenMP（含归约）；Python 侧互操�
 - 仅位置/仅关键字参数、链式比较、单指针下标 `p[i]`（单指针只有 `p[...]`）。
 - 调用点展开 `f(*args, **kwargs)`（`**kw` 被静默忽略、`*x` 报错）。
 - C 变参函数的**定义**（`va_arg`）。
-- 元组 `+=` / `+`（已移除）；浮点 `%`；字节串除下标/切片/`ord`/`ptr_cast`/`sstr` 外的运算。
+- 元组 `+=` / `+`（已移除）；浮点 `%`；字节串/字符串除下标/切片/`ord`/`ptr_cast`/`sstr` 外的运算。
 - 数组：运行时长度的数组、数组之间的转换、数组跨 Python 边界。
 - `dict[str, T]` 注解解析；option 的模式匹配；闭包 `nonlocal`；互递归闭包；闭包引用外层类型参数。
-- 声明的「编译期专属」返回类型（`-> bytes` / `-> type` 等，见 `doc/issues.md` #7）。
+- 声明的「编译期专属」返回类型（`-> bytes` / `-> str` / `-> type` 等，见 `doc/issues.md` #7）。
 - 破坏性 move 语义（`copyable=False` 只表示不可拷贝，不做 move 检查）。
 
 > 逐条实现缺陷与最小复现见 `doc/issues.md`。

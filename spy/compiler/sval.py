@@ -49,7 +49,7 @@ class Value:
     def get_type(self) -> Type:
         ...
 
-type AnyValue = Value | int | float | complex | bytes | bool
+type AnyValue = Value | int | float | complex | bytes | str | bool
 
 def is_sval(val: Any) -> TypeGuard[AnyValue]:
     """Whether ``val`` is a compile-time spy value - one of the forms of
@@ -57,13 +57,13 @@ def is_sval(val: Any) -> TypeGuard[AnyValue]:
     descriptor or an ``sval.ComptimePtr``, or a plain Python scalar).  The
     interpreter holds such values directly; its own runtime-side values
     (``RuntimeVal``, ``PendingSlot``) are not ``sval`` values."""
-    return isinstance(val, (Value, int, float, complex, bytes, bool))
+    return isinstance(val, (Value, int, float, complex, bytes, str, bool))
 
 type ScalarValue = (
     Type | Void | Null | Int | Float | IntEnumValue | UndefinedScalar
     | UntypedUndefined | DeclareFunction | BoundMethod | BuiltinFn | PyFunction
     | ComptimePtr | CastedPtr | FunctionValue
-    | int | float | complex | bytes | bool
+    | int | float | complex | bytes | str | bool
 )
 """The value union of the scalar types: every compile-time value that may
 occupy one cell of a ``Box`` (see :func:`scalar_leaves`).  The values of the
@@ -1074,6 +1074,31 @@ class BytesType(ScalarType):
         return 'bytes'
 
 @dataclass(frozen=True)
+class StrType(ScalarType):
+    """A compile-time text string: the spy type of a ``str`` literal/value.
+    Like a byte string a text string only exists at compile time - it has no MIR
+    mirror of its own - and lowers into a runtime pointer/slice automatically
+    (``sstr``, or a ``ptr_cast`` to a pointer type; see ``interp``), encoding to
+    UTF-8 on the way into memory.  Its compile-time value is the raw Python
+    ``str`` object; its length is the number of characters (the encoded byte
+    length is ``std.core.encode_length``)."""
+
+    @override
+    def get_type(self) -> Type:
+        return TYPE_TYPE
+
+    @override
+    def classify(self) -> SpecialTypeKind:
+        return SpecialTypeKind.COMPTIME
+
+    @override
+    def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
+        return None
+
+    def __str__(self) -> str:
+        return 'str'
+
+@dataclass(frozen=True)
 class BoolType(ScalarType):
     """The boolean type; values are ``i1`` at the LLVM level."""
 
@@ -1771,9 +1796,11 @@ def fill_comptime_defaults(box: Box, type: Type, offset: int) -> None:
                 stack.append((current.elem, base + index * step))
 
 
-def load_box_cells(box: Box | bytes, offset: int, type: Type) -> AnyValue:
+def load_box_cells(box: Box | bytes | str, offset: int, type: Type) -> AnyValue:
     """Read a compile-time value of ``type`` out of the compile-time storage
-    ``box`` at ``offset`` (a byte-string store holds raw bytes)."""
+    ``box`` at ``offset`` (a byte-string store holds raw bytes, a text-string
+    store a raw ``str``; the offset is a byte index in the former and a
+    character index in the latter)."""
     if isinstance(box, bytes):
         if isinstance(type, BytesType):
             # a byte-string store holds the bytes themselves
@@ -1781,6 +1808,11 @@ def load_box_cells(box: Box | bytes, offset: int, type: Type) -> AnyValue:
         if isinstance(type, IntType):
             return Int(box[offset], type)
         raise CompileError(f'cannot read {type} out of a byte string')
+    if isinstance(box, str):
+        if isinstance(type, StrType):
+            # a text-string store holds the ``str`` itself
+            return box[offset:]
+        raise CompileError(f'cannot read {type} out of a string')
     return unflatten_cells(box.cells, offset, type)
 
 
@@ -2398,14 +2430,14 @@ class Box(IdentityObj):
 @dataclass(frozen=True, slots=True)
 class ComptimePtr(Value):
     """A pointer into compile-time storage: ``box`` (a :class:`Box`, or a raw
-    ``bytes`` byte string - a read-only, cell-less store) together with the
-    ``offset`` of the pointed object's first scalar in ``box.cells`` (``0`` is
-    the object itself), viewed through the pointer type ``type``.  Equality and
-    hashing are structural (``box`` is an identity object, ``bytes`` compares by
-    content), so a ``ComptimePtr`` is its own specialization key: the same box,
-    offset and view type."""
+    ``bytes`` byte string / ``str`` text string - a read-only, cell-less store)
+    together with the ``offset`` of the pointed object's first scalar in
+    ``box.cells`` (``0`` is the object itself), viewed through the pointer type
+    ``type``.  Equality and hashing are structural (``box`` is an identity
+    object, ``bytes``/``str`` compare by content), so a ``ComptimePtr`` is its
+    own specialization key: the same box, offset and view type."""
 
-    box: Box | bytes
+    box: Box | bytes | str
     offset: int
     type: PointerType
 
@@ -2416,10 +2448,10 @@ class ComptimePtr(Value):
     def is_writable(self) -> bool:
         """Whether the pointee may be written through this pointer: both the
         view (``type.is_const``) and the box (``Box.is_const``) have to allow it
-        (a ``bytes`` box is never writable)."""
+        (a ``bytes``/``str`` box is never writable)."""
         if self.type.is_const is not False:
             return False
-        if isinstance(self.box, bytes):
+        if isinstance(self.box, (bytes, str)):
             return False
         return not self.box.is_const
 
@@ -3776,10 +3808,7 @@ def type_of(value: AnyValue, int_literal_bits: int | None = None) -> Type:
         case bytes():
             return BytesType()
         case str():
-            raise CompileError(
-                'the str type is not available in spy: use bytes (a string '
-                'literal is encoded to bytes automatically)'
-            )
+            return StrType()
 
 class StructDecl:
     """A Python-level object that declares a spy struct: the handle a
@@ -3849,15 +3878,8 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         if resolved_enum is None:
             raise CompileError(f'cannot resolve the enum {value!r} to a spy value')
         return resolved_enum
-    if isinstance(value, (Value, int, float, bytes, bool, complex)):
+    if isinstance(value, (Value, int, float, bytes, str, bool, complex)):
         return value
-    if isinstance(value, str) or value is str:
-        # spy has no ``str`` type: a string is a byte string (``bytes``), and a
-        # string literal is encoded at parse time (see ``astgen``)
-        raise CompileError(
-            'the str type is not available in spy: use bytes (a string literal '
-            "is encoded to bytes automatically)"
-        )
     if value is None:
         # ``None`` denotes the null value: the absent value of an option
         return Null()
@@ -3871,6 +3893,8 @@ def as_value(value: Any, ctx: CompileContext, type_vars: dict[typing.TypeVar, Va
         return ComplexType(FloatType(64))
     if value is bytes:
         return BytesType()
+    if value is str:
+        return StrType()
     if value is type:
         return TYPE_TYPE
     if value is typing.Any:
@@ -4561,6 +4585,10 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
             if not isinstance(value, bytes):
                 raise CoerceError(f"cannot use {value!r} as a bytes constant")
             return value
+        case StrType():
+            if not isinstance(value, str):
+                raise CoerceError(f"cannot use {value!r} as a str constant")
+            return value
         case AnyIntType():
             # the type of an untyped integer literal: its values are the plain
             # Python ints the source wrote, so the literal itself is what a
@@ -4673,13 +4701,13 @@ class CompileContext:
         ...
 
     @abstractmethod
-    def get_compile_option(self, name: bytes) -> AnyValue | None:
+    def get_compile_option(self, name: str) -> AnyValue | None:
         """The value the host stored for the compile-time option ``name``, or
         ``None`` when it is not set (the absent value of a spy value read by
         ``std.core.compile_option``)."""
         ...
 
     @abstractmethod
-    def set_compile_option(self, name: bytes, value: AnyValue) -> None:
+    def set_compile_option(self, name: str, value: AnyValue) -> None:
         """Store ``value`` as the compile-time option ``name`` of this host."""
         ...

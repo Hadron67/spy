@@ -946,7 +946,7 @@ def _py_function_arg(ev: InterpVal, fn: sval.PyFunction) -> Any:
         re, im = obj.values[0], obj.values[1]
         if isinstance(re, (sval.Int, sval.Float)) and isinstance(im, (sval.Int, sval.Float)):
             return complex(re.value, im.value)
-    if isinstance(obj, (bool, int, float, complex, bytes)):
+    if isinstance(obj, (bool, int, float, complex, bytes, str)):
         return obj
     raise CompileError(
         f'the argument of the Python function {fn} has to be a plain Python value '
@@ -957,14 +957,13 @@ def _py_function_arg(ev: InterpVal, fn: sval.PyFunction) -> Any:
 def _py_function_result(result: Any, fn: sval.PyFunction) -> sval.AnyValue:
     """The compile-time value a ``PyFunction``'s result becomes: one of the plain
     Python scalars a Python function may return, or ``None`` - spy's ``Null``, the
-    absent value of an option.  A ``str`` is encoded to its UTF-8 byte string, the
-    way a string literal in the source is (spy has no ``str`` type), and a
-    ``complex`` becomes the aggregate of its two parts; nothing else has a spy
-    value."""
+    absent value of an option.  A ``str`` stays the text string it is (spy's
+    compile-time ``str`` type) and a ``complex`` becomes the aggregate of its two
+    parts; nothing else has a spy value."""
     if result is None:
         return sval.Null()
     if isinstance(result, str):
-        return result.encode('utf-8')
+        return result
     if isinstance(result, complex):
         complex_type = sval.type_of(result)
         assert isinstance(complex_type, sval.ComplexType)
@@ -3545,7 +3544,7 @@ class HirRunner:
                 type_var_value = self._type_var_value(obj)
                 if type_var_value is not None:
                     return type_var_value
-                if not isinstance(obj, (int, float, bytes, bool, pytypes.NoneType)):
+                if not isinstance(obj, (int, float, bytes, str, bool, pytypes.NoneType)):
                     resolved = self._analyser._resolver.resolve_global(obj)
                     if resolved is not None:
                         return resolved
@@ -3655,8 +3654,8 @@ class HirRunner:
                     raise CompileError(
                         f'cannot store through the read-only pointer {cptr.type}'
                     )
-                if isinstance(box, bytes):
-                    raise CompileError('cannot write through a byte-string pointer')
+                if isinstance(box, (bytes, str)):
+                    raise CompileError('cannot write through a string pointer')
                 if not _is_comptime_val(value):
                     raise CompileError(
                         f'cannot store a runtime value into a compile-time variable '
@@ -3692,8 +3691,8 @@ class HirRunner:
                     raise CompileError(
                         f'cannot store through the read-only pointer {cptr.type}'
                     )
-                if isinstance(box, bytes):
-                    raise CompileError('cannot write through a byte-string pointer')
+                if isinstance(box, (bytes, str)):
+                    raise CompileError('cannot write through a string pointer')
                 cells = sval.flatten_value(sval.coerce_const(sval.UntypedUndefined(), elem), elem)
                 box.cells[offset:offset + len(cells)] = cells
             case RuntimeVal():
@@ -4295,8 +4294,8 @@ class HirRunner:
                 return sval.UndefinedScalar(field_ptr_type)
             match ptr:
                 case sval.ComptimePtr(box, offset, _):
-                    if isinstance(box, bytes):
-                        raise CompileError('cannot take a field address of a byte string')
+                    if isinstance(box, (bytes, str)):
+                        raise CompileError('cannot take a field address of a string')
                     if index_int is None:
                         # a runtime index into compile-time storage: a read-only
                         # compile-time constant (a ``ConstComptime``, or any const
@@ -4645,7 +4644,7 @@ class HirRunner:
         into the array names - the same address, and the tail is what the storage
         behind it holds.  A narrower view of a wider object is that object's
         address, so the result keeps its address."""
-        if cptr.type.is_const or isinstance(cptr.box, bytes):
+        if cptr.type.is_const or isinstance(cptr.box, (bytes, str)):
             if isinstance(cptr.box, sval.Box) and not cptr.box.is_const:
                 snapshot = sval.Box(cptr.box.name_base, cptr.box.type, is_const=True)
                 snapshot.cells = list(cptr.box.cells)
@@ -4913,9 +4912,9 @@ class HirRunner:
             if inner.type.is_subtype_of(target):
                 return sval.ComptimePtr(inner.box, inner.offset, target)
             return sval.CastedPtr(inner, target)
-        if isinstance(ev, bytes):
-            # a byte string: the pointer points into the byte-string store (see
-            # the byte-string lowering, ``_string_global``)
+        if isinstance(ev, (bytes, str)):
+            # a byte/text string: the pointer points into the string's store (see
+            # the string lowering, ``_string_global``)
             return sval.ComptimePtr(ev, 0, target)
         coerced = self._try_coerce(ev, target)
         if coerced is not None:
@@ -5819,15 +5818,23 @@ class HirRunner:
         raise CompileError(f"unsupported unary operator '{op}'")
 
     def _eval_ord(self, value: InterpVal, ret: InterpVal) -> PollResult:
-        """``ord(x)`` (``hir.Ord``): the encoding of the byte the compile-time
-        byte string ``value`` holds.  The operand has to be a compile-time
-        ``bytes`` of exactly one byte; the result is an *untyped* integer, so the
-        result location gives it its type."""
+        """``ord(x)`` (``hir.Ord``): the encoding of the single character the
+        compile-time string ``value`` holds.  The operand has to be a compile-time
+        ``bytes`` of exactly one byte or a ``str`` of exactly one character (its
+        code point); the result is an *untyped* integer, so the result location
+        gives it its type."""
         obj = _to_comptime(_shallow_normalize(value))
+        if isinstance(obj, str):
+            if len(obj) != 1:
+                raise CompileError(
+                    f'ord expects a string of exactly one character, got {len(obj)}'
+                )
+            self.store(ret, ord(obj))
+            return PollResult.AGAIN
         if not isinstance(obj, bytes):
             type = _type_of(value)
             raise CompileError(
-                f'ord expects a compile-time byte string, got '
+                f'ord expects a compile-time string, got '
                 f'{type if type is not None else value!r}'
             )
         if len(obj) != 1:
@@ -6029,6 +6036,8 @@ class HirRunner:
             return self._builtin_compile_error(binded)
         if fn.name == 'compile_option':
             return self._builtin_compile_option(binded, ret)
+        if fn.name == 'encode_length':
+            return self._builtin_encode_length(binded, ret)
         if fn.name == 'atomic_load':
             return self._builtin_atomic_load(binded, ret)
         if fn.name == 'atomic_store':
@@ -6039,14 +6048,14 @@ class HirRunner:
             return self._builtin_atomic_fence(binded, ret)
         raise CompileError(f"cannot call the spy builtin {fn.name} inside a spy function")
 
-    # -- byte-string builtins ------------------------------------------------
+    # -- string builtins -----------------------------------------------------
 
-    def _bytes_builtin_arg(self, args: ArgList[ArgEntry[InterpVal]], what: str) -> bytes:
-        """The compile-time ``bytes`` value the one argument of a byte-string
-        builtin holds."""
+    def _str_builtin_arg(self, args: ArgList[ArgEntry[InterpVal]], what: str) -> str:
+        """The compile-time ``str`` value the one argument of a string builtin
+        holds."""
         obj = _to_comptime(_shallow_normalize(self._arg_value(args.positional[0])))
-        if not isinstance(obj, bytes):
-            raise CompileError(f'{what} expects a compile-time byte string')
+        if not isinstance(obj, str):
+            raise CompileError(f'{what} expects a compile-time string')
         return obj
 
     def _string_global(self, data: bytes) -> mir.GlobalStringValue:
@@ -6093,10 +6102,10 @@ class HirRunner:
 
     def _builtin_compile_error(self, args: ArgList[ArgEntry[InterpVal]]) -> Never:
         """``std.core.compile_error(msg)``: abort the compilation with ``msg`` -
-        a compile-time byte string (a string literal is encoded to bytes at parse
-        time, see ``astgen``) - as the error message."""
-        data = self._bytes_builtin_arg(args, 'std.core.compile_error')
-        raise CompileError(data.decode(errors='replace'))
+        a compile-time ``str`` (a string literal, see ``astgen``) - as the error
+        message."""
+        msg = self._str_builtin_arg(args, 'std.core.compile_error')
+        raise CompileError(msg)
 
     # -- ``std.core.compile_option`` -----------------------------------------
 
@@ -6106,11 +6115,23 @@ class HirRunner:
         """``std.core.compile_option(name)``: the value the host stored for the
         compile-time option ``name`` (see ``CompileContext.set_compile_option``),
         or the absent value (``sval.Null``) when it is not set.  The name is a
-        compile-time byte string (a string literal is encoded to bytes at parse
-        time, see ``astgen``)."""
-        name = self._bytes_builtin_arg(args, 'std.core.compile_option')
+        compile-time ``str`` (a string literal, see ``astgen``)."""
+        name = self._str_builtin_arg(args, 'std.core.compile_option')
         value = self._analyser._resolver.get_compile_option(name)
         self.store(ret, sval.Null() if value is None else value)
+        return PollResult.AGAIN
+
+    # -- ``std.core.encode_length`` ------------------------------------------
+
+    def _builtin_encode_length(
+        self, args: ArgList[ArgEntry[InterpVal]], ret: InterpVal
+    ) -> PollResult:
+        """``std.core.encode_length(s)``: the length in bytes of the compile-time
+        ``str`` ``s`` once encoded to UTF-8 - the number of bytes the string
+        occupies in memory, which is what ``sstr`` lays out (``len(s)`` is the
+        number of characters)."""
+        s = self._str_builtin_arg(args, 'std.core.encode_length')
+        self.store(ret, sval.Int(len(s.encode('utf-8')), self._usize_type()))
         return PollResult.AGAIN
 
     # -- ``std.core.bitcast`` ------------------------------------------------
@@ -6730,10 +6751,12 @@ class HirRunner:
             # array's tail it points into, not the single element, so that the
             # global keeps the remaining length
             cptr = ev
-            if isinstance(cptr.box, bytes):
-                # a byte-string store: the pointer is a global string constant
-                # (the content plus a trailing NUL, see ``_string_global``)
-                return self._string_global(cptr.box)
+            if isinstance(cptr.box, (bytes, str)):
+                # a byte/text string store: the pointer is a global string
+                # constant (the content plus a trailing NUL, the text encoded to
+                # UTF-8 first, see ``_string_global``)
+                data = cptr.box if isinstance(cptr.box, bytes) else cptr.box.encode('utf-8')
+                return self._string_global(data)
             object_type = sval.pointer_object_type(cptr)
             object_mir = object_type.to_mir_type(self._mir_cache)
             if object_mir is None or object_type.classify() == sval.SpecialTypeKind.DST:
@@ -7081,7 +7104,7 @@ class HirRunner:
 
     def _build_struct_field(self, field: sval.StructField) -> sval.AggregateValue:
         """The ``std.reflect.StructField`` value describing one field of a
-        struct: its name as a compile-time ``bytes`` value, its type, its default
+        struct: its name as a compile-time ``str`` value, its type, its default
         value (absent when the field declares none) and its ``is_comptime``/
         ``is_ref`` markers."""
         default: sval.AnyValue
@@ -7092,7 +7115,7 @@ class HirRunner:
             assert coerced is not None
             default = sval.OptionValue(coerced)
         return sval.AggregateValue((
-            field.name.encode(),
+            field.name,
             field.type,
             default,
             field.is_comptime,
@@ -7101,10 +7124,10 @@ class HirRunner:
 
     def _build_dict_entry(self, name: str, child: sval.Type) -> sval.AggregateValue:
         """The ``std.reflect.DictEntry`` value describing one entry of a
-        ``dict[str, T]`` shape: its name as a compile-time ``bytes`` value and
+        ``dict[str, T]`` shape: its name as a compile-time ``str`` value and
         its type."""
         return sval.AggregateValue((
-            name.encode(),
+            name,
             child,
         ), self._reflect_struct('DictEntry'))
 
@@ -7287,12 +7310,12 @@ class HirRunner:
             if not isinstance(item, sval.AggregateValue):
                 raise CompileError('a reflected struct field is not a struct value')
             name = item.values[0]
-            if not isinstance(name, bytes):
-                raise CompileError('a reflected field name is not a byte string')
+            if not isinstance(name, str):
+                raise CompileError('a reflected field name is not a string')
             is_default_absent, default_value = self._reify_option(item.values[2])
             default = None if is_default_absent else default_value
             new_head.add_field(
-                name.decode(errors='replace'),
+                name,
                 self._reify_type(item.values[1]),
                 default,
                 self._reify_bool(item.values[3]),
@@ -7308,9 +7331,9 @@ class HirRunner:
             if not isinstance(item, sval.AggregateValue):
                 raise CompileError('a reflected dict entry is not a struct value')
             name = item.values[0]
-            if not isinstance(name, bytes):
-                raise CompileError('a reflected entry name is not a byte string')
-            values[name.decode(errors='replace')] = self._reify_type(item.values[1])
+            if not isinstance(name, str):
+                raise CompileError('a reflected entry name is not a string')
+            values[name] = self._reify_type(item.values[1])
         return sval.StrDictType(frozendict(values))
 
     def _call_fn_ptr(
@@ -7905,6 +7928,13 @@ class HirRunner:
             assert isinstance(obj, bytes)
             self._frames[-1].regs[inst] = sval.Int(len(obj), self._usize_type())
             return PollResult.AGAIN
+        if isinstance(type, sval.StrType):
+            # a compile-time text string: its length is the number of characters
+            # (the encoded byte length is ``std.core.encode_length``, see ``sstr``)
+            obj = _to_comptime(self._arg_value(operand))
+            assert isinstance(obj, str)
+            self._frames[-1].regs[inst] = sval.Int(len(obj), self._usize_type())
+            return PollResult.AGAIN
         if isinstance(type, sval.StructType) and self._resolve_method(type, _LEN_METHOD) is not None:
             slot = self.alloca(None)
             regs = self._frames[-1].regs
@@ -7945,16 +7975,16 @@ class HirRunner:
         callback target, since a method call delivers into a result location
         rather than a register (see ``_call_function_entry``).
 
-        ``b[i]`` / ``b[a:c]`` where ``b`` is a compile-time byte string: the
-        substring the subscript names, held as a reference (see
-        ``_subscript_bytes``).
+        ``s[i]`` / ``s[a:c]`` where ``s`` is a compile-time byte/text string:
+        the substring the subscript names, held as a reference (see
+        ``_subscript_string``).
 
         ``t[i]`` where ``t`` is a compile-time tuple place tree (a varargs
         parameter, or a ``Comptime`` variable holding a multi-value result):
         the place of its i-th element (see ``_subscript_comptime_tuple``).
 
         ``d[key]`` where ``d`` is a compile-time ``**kwargs`` dictionary place
-        tree: the place of the argument the byte-string key names (see
+        tree: the place of the argument the string key names (see
         ``_subscript_comptime_dict``)."""
         base_ev = _shallow_normalize(base)
 
@@ -7991,11 +8021,11 @@ class HirRunner:
             self._frames[-1].regs[ret] = self.field_index_addr(base, _index_value(element_index))
             return PollResult.AGAIN
         if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.StrDictType):
-            # a ``dict[str, T]`` place: the entry a compile-time byte-string key names
+            # a ``dict[str, T]`` place: the entry a compile-time string key names
             key_value = _to_comptime(self._arg_value(index))
-            if not isinstance(key_value, bytes):
-                raise CompileError('a dict element key has to be a compile-time byte string')
-            name = key_value.decode()
+            if not isinstance(key_value, str):
+                raise CompileError('a dict element key has to be a compile-time string')
+            name = key_value
             candidates = list(base_type.elem.values.keys())
             if name not in candidates:
                 raise CompileError(f'the dict has no element named {name!r}')
@@ -8024,17 +8054,17 @@ class HirRunner:
             and base_type.elem.head.name_base == '$kwargs'
         ):
             # a synthesized ``**kwargs`` struct (see §8.1): ``kwargs['k']`` is the
-            # entry the compile-time byte-string key names
+            # entry the compile-time string key names
             key_value = _to_comptime(self._arg_value(index))
-            if not isinstance(key_value, bytes):
-                raise CompileError('a dict element key has to be a compile-time byte string')
-            entry_index = base_type.elem.fields().by_key.get(key_value.decode())
+            if not isinstance(key_value, str):
+                raise CompileError('a dict element key has to be a compile-time string')
+            entry_index = base_type.elem.fields().by_key.get(key_value)
             if entry_index is None:
-                raise CompileError(f'the dict has no element named {key_value.decode()!r}')
+                raise CompileError(f'the dict has no element named {key_value!r}')
             self._frames[-1].regs[ret] = self.field_index_addr(base, _index_value(entry_index))
             return PollResult.AGAIN
-        if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.BytesType):
-            return self._subscript_bytes(base, index, ret)
+        if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, (sval.BytesType, sval.StrType)):
+            return self._subscript_string(base, index, ret)
         if isinstance(base_type, sval.PointerType) and isinstance(base_type.elem, sval.PointerType):
             return self._subscript_pointer(base, base_type.elem, index, ret)
 
@@ -8098,38 +8128,43 @@ class HirRunner:
         return PollResult.AGAIN
 
 
-    def _subscript_bytes(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
-        """``b[i]`` / ``b[a:c]`` of the compile-time byte string the place
+    def _subscript_string(self, base: InterpVal, index: ArgEntry[InterpVal], ret: hir.Inst) -> PollResult:
+        """``s[i]`` / ``s[a:c]`` of the compile-time byte/text string the place
         ``base`` holds: the substring the subscript names, held as a reference
         (:class:`sval.ComptimePtr`) - a subscript yields a place.  An integer index
-        picks one byte (checked against the length), a ``std.slice`` object a
-        range (a missing lower bound is 0, a missing upper bound the length, and
-        a step has to be 1); every bound has to be compile-time."""
+        picks one byte of a byte string (one character of a text string; checked
+        against the length), a ``std.slice`` object a range (a missing lower bound
+        is 0, a missing upper bound the length, and a step has to be 1); every
+        bound has to be compile-time."""
         data = _to_comptime(_shallow_normalize(self.load(base)))
-        if not isinstance(data, bytes):
-            raise CompileError('cannot subscript a value that is not a byte string')
+        if isinstance(data, bytes):
+            elem: sval.Type = sval.BytesType()
+        elif isinstance(data, str):
+            elem = sval.StrType()
+        else:
+            raise CompileError('cannot subscript a value that is not a string')
         index_ev = self._arg_value(index)
         index_type = _type_of(index_ev)
         if isinstance(index_type, sval.StructType) and index_type.head is self._special_type.slice_type:
-            start, end = self._bytes_slice_bounds(self.as_comptime_aggregate(index_ev), len(data))
+            start, end = self._string_slice_bounds(self.as_comptime_aggregate(index_ev), len(data))
             piece = data[start:end]
         else:
             index_value = self._coerce(index_ev, self._usize_type())
             index_int = _comptime_int(index_value)
             if index_int is None:
-                raise CompileError('a byte string needs a constant index')
+                raise CompileError('a string needs a constant index')
             if not 0 <= index_int < len(data):
                 raise CompileError(
-                    f'the index {index_int} is out of bounds for a byte string of '
+                    f'the index {index_int} is out of bounds for a string of '
                     f'length {len(data)}'
                 )
             piece = data[index_int:index_int + 1]
-        self._frames[-1].regs[ret] = sval.ComptimePtr(piece, 0, sval.PointerType(sval.BytesType(), is_const=True))
+        self._frames[-1].regs[ret] = sval.ComptimePtr(piece, 0, sval.PointerType(elem, is_const=True))
         return PollResult.AGAIN
 
-    def _bytes_slice_bounds(self, slice_obj: sval.AggregateValue, length: int) -> tuple[int, int]:
-        """The ``(start, end)`` a ``std.slice`` object names over a byte string
-        of ``length`` bytes: a missing lower bound is 0, a missing upper bound
+    def _string_slice_bounds(self, slice_obj: sval.AggregateValue, length: int) -> tuple[int, int]:
+        """The ``(start, end)`` a ``std.slice`` object names over a string of
+        ``length`` elements: a missing lower bound is 0, a missing upper bound
         the length, and a step (if written) has to be 1.  Every bound has to be
         a compile-time integer, and the range is bounds-checked."""
         start_raw, end_raw, step_raw = slice_obj.values
@@ -8139,12 +8174,12 @@ class HirRunner:
         end = length if end_ev is None else _comptime_int(end_ev)
         step_ev = self._slice_bound_value(step_raw, 'the step of a slice')
         if step_ev is not None and _comptime_int(step_ev) != 1:
-            raise CompileError('a slice of a byte string has no step')
+            raise CompileError('a slice of a string has no step')
         if start is None or end is None:
-            raise CompileError('a slice of a byte string needs constant bounds')
+            raise CompileError('a slice of a string needs constant bounds')
         if end < start or end > length:
             raise CompileError(
-                f'the slice {start}:{end} is out of bounds for a byte string of '
+                f'the slice {start}:{end} is out of bounds for a string of '
                 f'length {length}'
             )
         return start, end

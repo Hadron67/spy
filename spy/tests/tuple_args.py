@@ -165,7 +165,7 @@ def is_tuple_shape(v: StructType) -> spy_bool:
     # narrowed ``reflect.StructType``).
     if v.fields.length == 0:
         return False
-    return v.fields.ptr[0].name == b'_0'
+    return v.fields.ptr[0].name == '_0'
 
 
 @func()
