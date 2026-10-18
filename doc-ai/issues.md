@@ -172,3 +172,63 @@ def f() -> i32:
 - **更合理的规则**：pointee 相同的前提下只允许「加 const」（即运行时路径的 `is_subtype_of`）；那样上述 12 处用例需要改写
   （把 `Ptr[T]` 形参改成 `ConstPtr[T]` 等）。因为 `ref(ConstComptime)` 传给 `Ptr[T]` 形参是惯用写法，改动会波及用户代码，本轮不动。
 
+---
+
+## 10. 生成的 LLVM 模块缺 `target datalayout`，优化管线下布局错位（本任务已修，留档根因）
+
+开启 `opt_level >= 1` 后，聚合布局被算错，两个用例群算错：
+
+- `spy.tests.options.SpyPythonSideOptionTest.test_an_aggregate_option_unwraps_to_an_instance`：`maybe_large(7, True)`（返回大聚合
+  `Option[Large]`，经 sret 过 Python 入口）得到 `(2**32, 2**33, 3*2**32, 0)` 而非 `(7, 1, 2, 3)`。
+- `spy.tests.static.StaticPtrTest.test_a_tagged_union` / `test_a_union_field`：读含非存储变体的 union 全局常量得到 0 / 9 而非 5 / 509。
+
+**根因**：`lower.LLVMBackend.compile` 把 `lmod.write()` 的文本 `parse_assembly` 成模块，而该文本**既无 `target datalayout` 也无 `target triple`**：
+LLVM 的 IR pass（优化管线）按模块的**默认布局**算类型/字段偏移（`i64` 对齐 4），而 codegen 用 TargetMachine 的布局（x86-64 上 `i64` 对齐 8）。
+于是 `{i1, {i64, i64}}` 的载荷字段被优化器算成偏移 4（store 变成 `align 4`，偏移 4/12/20/28），而 ctypes 侧按 C 布局读偏移 8/16/24/32 → 错位数据；
+union 常量的 literal 填充与全局字段偏移同样被按错误布局折叠。不开优化时只有 codegen 参与，偏移一致，所以一直没暴露。
+
+**修复**：`compile` 在 `parse_assembly` 后、`verify` 前把模块的布局/目标钉死到后端的目标机：
+
+```python
+llvm_mod.data_layout = str(self._target_machine.target_data)
+llvm_mod.triple = self._target_machine.triple
+```
+
+**验证**：修后上述用例在 `opt_level=2/3` 下通过；配合 #11 的用例修正，整套 1181 个测试现在跑在默认级别（`opt_level=2`）上并通过。
+
+**另（本任务已修）**：`lower._lower_inst` 的 `AsUnion`/`ExtractUnion`/`UnionCast` 原来用「较宽者 alloca + store + 按目标类型 load」重解释，是**跨类型**的 store/load（同一 slot 上类型不一致），属 UB。
+现按 clang 的做法改写：两类型相同便直接取值，否则「源类型槽 store 源值 → `llvm.memcpy`（`min(源, 目标)` 字节）拷进目标类型槽 → 按目标类型 load」
+（clang 对 union 成员访问正是一对 `memcpy`：写入拷成员大小字节，读出拷目标成员大小字节；O2 下同样会被折叠掉，已对照验证）。
+
+**同类隐患（未处理）**：含 union 非存储变体的**全局常量**用 literal 类型 `{<variant>, [pad]}` 声明（与 clang 一致，见上），但读取端是**按规范 union 类型 `load`**，
+而非 clang 的 `memcpy`。二者布局兼容（#10 的 data layout 修复后偏移一致）所以目前能跑，但类型仍不匹配，属 UB；若要彻底一致，可让这类全局的读取也走 `memcpy`。
+
+---
+
+## 11. 两个用例曾断言未定义值 / 悬垂指针（本任务已修）
+
+开启 `opt_level >= 1` 时曾有两个用例失败，二者都是用用例依赖了「未定义/失效」的值（而非编译器布局错误），本任务已改用例修好：
+
+- **错误路径的未初始化结果**：`spy.tests.errors.SpyInferTest.test_an_inferred_set_lowers_to_a_code_and_a_payload` 曾断言
+  `call_with_error(inferred_raise, -3)` 的 result 为 `0`，而 `inferred_raise` 的错误路径是在结果槽 `%4 = alloca i32` 上**没有任何 store** 的 `load`
+  （未优化时栈上恰好是 0，优化后 LLVM 可任取）。错误路径的 result 语义上本就未定义，现只检查 code 与 payload（与同类用例一致）。
+- **悬垂指针**：`spy.tests.options.SpyOptionUnwrapTest.test_a_nested_option` 依赖 `maybe_deep` 的 `y = x; return ref(y)`——返回**局部变量**地址，
+  函数返回后即失效。现把指针改成调用方传入（`maybe_deep(p: Ptr[i32], c)`，`use_maybe_deep`/`unwrap_deep_opt` 传 `ref(y)`），与 `maybe_ptr` 等既有 helper 一致；
+  option 的编码形状（外层 `bool` tag、内层指针）不变。
+
+因此测试套件现在直接跑在默认级别上（无需任何 `opt_level` 规避）；管线本身另有 `spy/tests/optimization.py` 在独立宿主上下文里以 O0/O2/O3 覆盖。
+
+**留意**：`ref` 一个局部变量并把它返回出去（生存期超出函数）目前无任何限制，会得到悬垂指针，只是优化前后「看不看得出来」不同。若要禁止，需要在使用处检测或做生存期延长。
+
+---
+
+## 12. `bytes` → `str` 迁移的剩余候选
+
+`str` 编译期类型加入后，除已迁移的（`compile_error`/`compile_option`、反射字段名、`std` 里本任务改掉的 `sstr(b'...')` panic 消息）外，
+以下仍是「文本却写成 `bytes`」，本任务未处理：
+
+- `std/openmp.py`：`ptr_cast(b'spy', ConstMultiPtr[u8])`（OpenMP ident 的 source，C 侧字节串，保持 `bytes` 也合理）。
+- `std/math/*.py`：大量 `_hex(b'0x1...p-1')`（`_hex(s: bytes) -> float`，内部 `s.decode()`）；十六进制字面量是文本，可改成 `str`。
+- `astgen._gen_literal`：`Literal[...]` 目前只接受 `bool`/`int`/`bytes`，不接受 `str`（`Literal['x']` 会报错）。
+- 测试源码里用于演示 `bytes` 的字面量（`spy/tests/strings.py` 等）按设计保留。
+

@@ -16,8 +16,9 @@ flowchart TD
     NORM --> OPT["opt.simplify (mem2reg)"]
     OPT --> LOWER["lower._Lowerer (MIR -> textual LLVM IR)"]
     LOWER -->|llvm.Module.write| TEXT["LLVM IR text"]
-    TEXT --> VERIFY["llvmlite parse_assembly / verify"]
-    VERIFY --> JIT["ORC / LLJIT (lower.LLVMBackend)"]
+    VERIFY["llvmlite parse_assembly / verify"]
+    VERIFY --> OPTLLVM["LLVM per-module default pipeline (by opt_level/opt_size)"]
+    OPTLLVM --> JIT["ORC / LLJIT (lower.LLVMBackend)"]
     JIT --> NATIVE["native address -> ctypes entry"]
 ```
 
@@ -40,11 +41,11 @@ Two layers of "type" run throughout:
 | `compiler/hir.py` | HIR instruction set and result location types (`ResultLocTree`/`FullResultLoc`/`ReturnLoc`) |
 | `compiler/sval.py` | spy type system, compile-time values, `Box`/`ComptimePtr`, layout cache `MirLowerCache`, return spec, `as_value`/`coerce_const`, `TypeVarSolver` |
 | `compiler/interp.py` | Compile-time interpreter (`HirRunner`) and compile driver (`Analyser`): runs HIR -> emits MIR |
-| `compiler/fn.py` | Signature model (`Signature`/`CallSignature`/`ReturnSignature`), `ArgNode`, `FunctionValue`/`FunctionInstance`/`ClosureFunction`, thunk, `SymbolTable`, `CompileBatch` |
+| `compiler/fn.py` | Signature model (`Signature`/`CallSignature`/`ReturnSignature`), `ArgNode`, `FunctionValue`/`FunctionInstance`/`ClosureFunction`, thunk, `SymbolTable`, `CompileBatch`, `OptimizationOptions` |
 | `compiler/mir.py` | MIR types/values/instructions/basic blocks/terminators; `normalize`, `instantiate_defers` |
 | `compiler/opt.py` | Single optimization: folds a single-access slot back into a register (conservative mem2reg) |
 | `compiler/llvm.py` | Pure-textual LLVM IR builder (no libLLVM calls); `DataLayout`; JIT-agnostic |
-| `compiler/lower.py` | MIR -> LLVM IR; `LLVMBackend` (the only place that uses llvmlite/JIT); exception unwind landing pads |
+| `compiler/lower.py` | MIR -> LLVM IR; `LLVMBackend` (the only place that uses llvmlite/JIT); LLVM optimization pipeline; exception unwind landing pads |
 | `compiler/glue.py` | Python ↔ spy boundary: ctypes read/write, instance wrapping, `invoke`, result unwrapping |
 | `compiler/target.py` | `TargetInfo` (pointer width, C integer widths, `usize` width) |
 | `compiler/util.py` | Shared utilities (`IdentityObj`, `IndexedMap`, `StrBiMap`, `FrozenArraySet`, `TriState`, `frozendict`, etc.) |
@@ -472,7 +473,8 @@ so a single-path body is a pure store/load round trip; this pass folds "a slot s
 Algorithm (iterative): `index_of` records each instruction's position; `roles` records every use of each `Alloca` (`load`/`store`/other, and **an atomic access counts as `use`** so it is not folded);
 `_dominators` (iterative dataflow fixpoint); for each slot: skip if there is a role other than `load`/`store` (address escapes) or more than one `Store` (runtime merge);
 if there is no `Store` (dead) or every load is dominated by the single store (in the same block `store_idx < load_idx`, or `store_block ∈ dominators[load_block]`), replace all loads with the store's value and delete the load/store/alloca.
-No instruction reordering, no general dead code elimination, no constant folding (constant folding happens at construction time in `llvm.BasicBlock.emit`), and no LLVM optimization pipeline is run.
+No instruction reordering, no general dead code elimination, no constant folding (constant folding happens at construction time in `llvm.BasicBlock.emit`).
+Once this pass returns, the JIT runs LLVM's own per-module default pipeline over the lowered LLVM module (see `_optimize` in §9.2).
 
 ---
 
@@ -495,15 +497,20 @@ Construction-time peephole: `BasicBlock.emit` calls `try_evaluate` to fold const
   maps blocks (MIR entry -> llvm entry); **hoists every `Alloca` to the entry block**; first hoists "stable side-effect-free instructions" (operands are `Param`/already-lowered `BitCast`s and constant `Gep`s);
   lowers the rest iteratively in dependency order (a `Phi` is lowered as soon as it has one incoming, the rest are filled in later; the phi is inserted at the head of the block).
 - Global constants: `_lower_global_constant`/`_lower_global_string`/`_lower_constant`; a union constant whose variant is not the storage variant follows clang's `{<variant>, [pad]}` layout (`_needs_literal`/`_lower_literal_struct` propagates).
-- `_lower_inst`: maps instruction by instruction; a `BitCast` between pointers or of the same type is a no-op; `AsUnion`/`ExtractUnion`/`UnionCast` reinterpret via "alloca of the wider one + store + load as the target type";
+- `_lower_inst`: maps instruction by instruction; a `BitCast` between pointers or of the same type is a no-op; `AsUnion`/`ExtractUnion`/`UnionCast` reinterpret the way clang does:
+  the two types lowering the same, the value is used as it is, and otherwise the source value is stored into a source-typed slot, `llvm.memcpy`d (`min(source, target)` bytes) into a target-typed slot and loaded as the target type;
   a `NoReturn` `Call` gets an `unreachable` appended; `Gep` passes the pointee explicitly (because a MIR pointer `BitCast` is a no-op).
 - Exception unwind: `_UnwindCtx` (one `{ptr, i32}` slot per function); `_lower_panic` (`__cxa_allocate_exception` + memcpy + `__cxa_throw(obj, @_ZTIi, null)`,
   using `invoke` when there is an unwind edge); `_lower_call_may_panic` (`invoke` + cleanup landing pad); `_lower_catch_unwind` (catching landing pad, stores the caught object);
   `EndCatch` maps to `__cxa_end_catch`, emitted once the caught payload has been copied out (both in `catch_unwind` and in the Python-entry thunk).
-- `LLVMBackend`: `Target.from_default_triple` + `create_target_machine` + a **process-unique** LLJIT (`create_lljit_compiler`);
-  `compile`: lower the module -> `Module.write()` -> `parse_assembly`/`verify` -> `JITLibraryBuilder().add_ir().add_current_process().add_jit_library(pre-library).export_symbol(...).link(...)`;
-  each function takes its actual name and is `cast` to a `_NativeFn` per a ctypes prototype (the whole IR text is kept for tests' `print_all`).
+- `LLVMBackend`: `Target.from_default_triple` + `create_target_machine` (kept as `_target_machine`) + a **process-unique** LLJIT (`create_lljit_compiler`);
+  `compile`: lower the module -> `Module.write()` -> `parse_assembly` (and pin the module's `data_layout`/`triple` to the target machine: the generated text carries neither, and without them the IR passes and codegen would each use their own layout) / `verify` -> **optimize** -> `JITLibraryBuilder().add_ir().add_current_process().add_jit_library(pre-library).export_symbol(...).link(...)`;
+  each function takes its actual name and is `cast` to a `_NativeFn` per a ctypes prototype (the **pre-optimization** IR text is kept for tests' `print_all`).
   `add_current_process()` makes `ExternSymbol` fall back to the host process.
+- `_optimize(module, options)`: builds a `PassBuilder` with `llvm.create_pass_builder(_target_machine, PipelineTuningOptions(speed_level, size_level))`,
+  takes its per-module default pipeline (`getModulePassManager()`) and runs it over `module` (`run(module, builder)`); the levels come from `fn.OptimizationOptions`.
+  Only the optimized IR (`str(llvm_mod)`) reaches the JIT; with `speed_level == 0` and `size_level == 0` the whole step is skipped and the lowered IR is handed over as is.
+  The levels come from the host's compile-time options `opt_level` (0-3, 2 by default) and `opt_size` (0-2, 0 by default, only usable with `opt_level == 2`): `fn.CompileBatch.compile` reads them through `get_compile_option`, validates them and passes them in (anything else is a `CompileError`).
 
 ### 9.3 Atomic and OpenMP lowering
 

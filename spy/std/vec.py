@@ -40,7 +40,7 @@ class Vec[T, A: Allocator = CAllocator]:
 
     def pop(self):
         if self.size == 0:
-            panic(sstr(b'pop from empty vector'))
+            panic(sstr('pop from empty vector'))
         self.size -= 1
 
     @func(exceptions=AllocError)
@@ -59,7 +59,7 @@ class Vec[T, A: Allocator = CAllocator]:
 
     def __spy_getitemptr__(self, index: usize) -> Ptr[T]:
         if index >= self.size:
-            panic(sstr(b'index out of bounds'))
+            panic(sstr('index out of bounds'))
         return ref(self.ptr[index])
 
     def slice(self, begin: Option[usize], end: Option[usize] = None) -> SlicePtr[T]:

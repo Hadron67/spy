@@ -281,12 +281,13 @@ class TwoPtrs:
 
 
 @func()
-def maybe_deep(x: i32, c: spy_bool) -> Option[Option[Ptr[i32]]]:
+def maybe_deep(p: Ptr[i32], c: spy_bool) -> Option[Option[Ptr[i32]]]:
     # the only pointer of ``Ptr[i32]`` is the inner option's tag, so the outer
-    # option has none left and carries a ``bool`` tag instead
-    y = x
+    # option has none left and carries a ``bool`` tag instead.  The pointer is
+    # the caller's: a ``ref`` of a local this function owns would dangle once it
+    # returns.
     if c:
-        return ref(y)
+        return p
     return None
 
 
@@ -297,7 +298,8 @@ def take_deep(o: Option[Option[Ptr[i32]]]) -> i32:
 
 @func()
 def use_maybe_deep(x: i32, c: spy_bool) -> i32:
-    o = maybe_deep(x, c)
+    y = x
+    o = maybe_deep(ref(y), c)
     return x + take_deep(o)
 
 
@@ -866,7 +868,8 @@ def unwrap_large_opt(x: i64, c: spy_bool) -> i64:
 def unwrap_deep_opt(x: i32, c: spy_bool) -> i32:
     # the outer option carries a ``bool`` tag (the inner one claimed the only
     # pointer): both layers are unwrapped
-    if (p := maybe_deep(x, c)) is not None:
+    y = x
+    if (p := maybe_deep(ref(y), c)) is not None:
         if (q := p) is not None:
             return q[...]
         return -2

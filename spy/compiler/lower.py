@@ -36,7 +36,7 @@ from llvmlite import binding as llvm
 from . import llvm as sllvm
 from . import mir
 from .errors import CompileError
-from .fn import Backend, NativeFn
+from .fn import DEFAULT_OPTIMIZATION_OPTIONS, Backend, NativeFn, OptimizationOptions
 from .target import TargetInfo
 from .util import StrBiMap, sanitize_name
 
@@ -773,19 +773,33 @@ class _Lowerer:
                     result = block.bitcast(value, self._to_llvm(inst.type))
             case mir.AsUnion() | mir.ExtractUnion() | mir.UnionCast():
                 # a union value is laid out as its storage (the largest variant),
-                # and the LLVM pointers are untyped (``ptr``): the conversion is
-                # a store through the largest of the two types and a load of the
-                # target one, which reinterprets the storage
+                # and the LLVM pointers are untyped (``ptr``): the storage bytes
+                # are reinterpreted by copying them into a slot of the target
+                # type - the way clang lowers a union member access.  A store of
+                # one type and a load of another through one slot would be a type
+                # mismatch LLVM may exploit
                 value = self._value(inst.value, arg_values)
                 src = inst.value.get_type()
                 assert isinstance(src, mir.Type), 'a union conversion operand has a type'
                 dst = inst.type
-                src_size = self._layout.size_of(self._to_llvm(src))
-                dst_size = self._layout.size_of(self._to_llvm(dst))
-                wide = dst if dst_size > src_size else src
-                slot = block.alloca(self._to_llvm(wide))
-                block.store(slot, value)
-                result = block.load(slot, self._to_llvm(dst))
+                src_type = self._to_llvm(src)
+                dst_type = self._to_llvm(dst)
+                if src_type == dst_type:
+                    # one representation: there is nothing to reinterpret
+                    result = value
+                else:
+                    src_slot = block.alloca(src_type)
+                    block.store(src_slot, value)
+                    dst_slot = block.alloca(dst_type)
+                    size = min(
+                        self._layout.size_of(src_type),
+                        self._layout.size_of(dst_type),
+                    )
+                    block.call(
+                        sllvm.LLVM_MEMCPY, dst_slot, src_slot,
+                        sllvm.IntValue(size, sllvm.I64), sllvm.BOOL_FALSE,
+                    )
+                    result = block.load(dst_slot, dst_type)
             case mir.Cmp():
                 lhs = self._value(inst.lhs, arg_values)
                 rhs = self._value(inst.rhs, arg_values)
@@ -1012,18 +1026,26 @@ class LLVMBackend(Backend):
     def __init__(self) -> None:
         super().__init__()
         target = llvm.Target.from_default_triple()
-        tm = target.create_target_machine()
+        # the target machine is kept: the JIT compiles with it, and the
+        # optimization pipeline (see ``_optimize``) builds against it
+        self._target_machine = target.create_target_machine()
         # one JIT for the whole process: every module becomes a named JIT
         # library, and a later library lists the earlier ones as prerequisites
         # so that cross-module references resolve by name
-        self._jit = llvm.create_lljit_compiler(tm, use_jit_link=True)
+        self._jit = llvm.create_lljit_compiler(self._target_machine, use_jit_link=True)
         self._libraries: list[str] = []
         # the trackers keep the linked libraries (and their code) alive; the
         # backend lives as long as the process, so the addresses stay valid
         self._trackers: list[llvm.ResourceTracker] = []
         self._module_id = 0
 
-    def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue], target: TargetInfo) -> dict[mir.GlobalValue, NativeFn]:
+    def compile(
+        self,
+        structs: set[mir.StructType],
+        globals: StrBiMap[mir.GlobalValue],
+        target: TargetInfo,
+        options: OptimizationOptions = DEFAULT_OPTIMIZATION_OPTIONS,
+    ) -> dict[mir.GlobalValue, NativeFn]:
         types = _ModuleTypes()
         for struct in structs:
             types.to_llvm(struct)
@@ -1050,13 +1072,30 @@ class LLVMBackend(Backend):
         # reports a clear error
         text = '\n'.join(lines)
         llvm_mod = llvm.parse_assembly(text)
+        # the generated module names neither a target nor a data layout, so LLVM
+        # would fall back to its own default layout for the IR passes (an ``i64``
+        # aligned to 4, say) while codegen uses the target machine's: the two
+        # would disagree about every struct offset.  Pin both to the target
+        # machine before verifying and optimizing
+        llvm_mod.data_layout = str(self._target_machine.target_data)
+        llvm_mod.triple = self._target_machine.triple
         llvm_mod.verify()
+
+        # optimize the IR the JIT compiles: the host selects the levels through
+        # the compile-time options ``opt_level``/``opt_size`` (see
+        # ``fn.OptimizationOptions``).  ``lines`` stays the module as it was
+        # lowered - what ``NativeFn.print_all`` reports -, so only the optimized
+        # form is handed over
+        jit_text = text
+        if options.speed_level != 0 or options.size_level != 0:
+            self._optimize(llvm_mod, options)
+            jit_text = str(llvm_mod)
 
         # link the module as a fresh named library; it may reference any
         # earlier module, so every library linked so far is a prerequisite of
         # the new one (the JIT's link order is not transitive), while
         # unresolved externals fall back to the process
-        builder = llvm.JITLibraryBuilder().add_ir(text).add_current_process()
+        builder = llvm.JITLibraryBuilder().add_ir(jit_text).add_current_process()
         for lib in self._libraries:
             builder.add_jit_library(lib)
         for fn in fns:
@@ -1084,3 +1123,12 @@ class LLVMBackend(Backend):
             )
             rets[fn] = native
         return rets
+
+    def _optimize(self, module: llvm.ModuleRef, options: OptimizationOptions) -> None:
+        """Run LLVM's per-module default optimization pipeline over ``module``
+        in place, at the speed/size levels ``options`` selects.  The pipeline is
+        built against the target machine, so target-dependent transforms (e.g.
+        vectorization) see the real target."""
+        tuning = llvm.PipelineTuningOptions(options.speed_level, options.size_level)
+        builder = llvm.create_pass_builder(self._target_machine, tuning)
+        builder.getModulePassManager().run(module, builder)

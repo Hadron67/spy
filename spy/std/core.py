@@ -76,7 +76,7 @@ class ConstSlicePtr[T]:
         return _ConstSliceRefIterator(self.ptr, self.length)
 
     def _out_of_bounds(self):
-        panic(sstr(b'index out of bounds'))
+        panic(sstr('index out of bounds'))
 
     def __spy_getitemptr__(self, index: usize) -> ConstPtr[T]:
         if index >= self.length:
@@ -127,7 +127,7 @@ class SlicePtr[T]:
         return _SliceRefIterator(self.ptr, self.length)
 
     def _out_of_bounds(self):
-        panic(sstr(b'index out of bounds'))
+        panic(sstr('index out of bounds'))
 
     def __spy_getitemptr__(self, index: usize) -> Ptr[T]:
         if index >= self.length:

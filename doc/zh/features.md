@@ -1499,6 +1499,7 @@ assert unrolled_sum() == 6
 - `std.core.coerce(value, T)`：把 value 具体化成类型 `T`——与 store 相同的**隐式转换**，只允许同类型或扩宽：整型按范围覆盖（`u32 → u64`、`i32 → i64`），浮点 `f32 → f64`，**无损**的整数 → 浮点（运行期按类型范围、编译期按值，见 §1.1），合法的指针转换，以及（能无损转成元素浮点的）实数 `→ Complex[T]`；**收窄与有损的整数 → 浮点一律报错**。编译期值按值检查（`x: i8 = 12` 可以）。收窄要用 `std.int.truncate`/`int_cast` 或 `std.float.float_truncate`，有损的整数 → 浮点用 `std.int.int_to_float`。
 - `std.core.lub_type(t1, t2)`：两个类型的最小上界——两者共同的 peer 类型（`t1.resolve_peer_type(t2)`），如类型与其 `Option`、变体与其 tagged union、能无损容纳它的整型的无类型整数或浮点。结果是编译期类型值，可用于命名声明类型或喂给 `type[X]` 形参；两者无共同类型时得到 `None`。peer 规则对两个参数是对称的，唯一例外是签名里的 result 类型（返回类型 + 异常集）：此时取 `t1` 的返回类型、`t1` 的异常在前，所以这些情形下结果与参数顺序有关。
 - `std.core.compile_option(name)`：读取宿主上下文里存的编译期选项（`CompileContext.get_compile_option`，`name` 是编译期字符串）；未设置时是缺失值（`None`）。
+- JIT 优化级别：宿主用编译期选项 `opt_level`（0–3，速度级别，默认 2；0 关闭 LLVM 优化管线）与 `opt_size`（0–2，尺寸级别，默认 0，仅在 `opt_level == 2` 时可用）选择每个模块跑 LLVM 逐模块默认优化管线；选项值须是指定范围内的整数，否则报编译错误。管线跑在降级后的 LLVM IR 上，`NativeFn.print_all` 报告的仍是未优化的降低结果。
 - `std.core.compile(fn)`：手动编译一个**非泛型**函数值（预编译其默认特化）。
 - `std.core.bitcast(value, T)` / `std.int.truncate(value, T)` / `std.float.float_truncate(value, T)`：标量的同位宽重解释 / 整数收窄 / 浮点收窄。
 - `std.core.int_to_float_unchecked(value, T)` / `std.core.float_to_int_unchecked(value, T)`：整数↔浮点转换（`sitofp`/`uitofp` 与 `fptosi`/`fptoui`，后者向零取整），**不做任何检查**；编译期值装不进目标类型时得到 `undefined`。

@@ -40,6 +40,7 @@ from .ifexpr import all_tests as ifexpr_tests
 from .inline_loops import all_tests as inline_loops_tests
 from .loops import all_tests as loops_tests
 from .operators import all_tests as operators_tests
+from .optimization import all_tests as optimization_tests
 from .options import all_tests as options_tests
 from .panic import all_tests as panic_tests
 from .pointers import all_tests as pointers_tests
@@ -92,6 +93,7 @@ all_tests: list[type[TestCase]] = [
     *func_types_tests,
     *reflect_tests,
     *operators_tests,
+    *optimization_tests,
     *undefined_tests,
     *static_tests,
     *strings_tests,

@@ -16,8 +16,9 @@ flowchart TD
     NORM --> OPT["opt.simplify（mem2reg）"]
     OPT --> LOWER["lower._Lowerer（MIR → 文本 LLVM IR）"]
     LOWER -->|llvm.Module.write| TEXT["LLVM IR 文本"]
-    TEXT --> VERIFY["llvmlite parse_assembly / verify"]
-    VERIFY --> JIT["ORC / LLJIT（lower.LLVMBackend）"]
+    VERIFY["llvmlite parse_assembly / verify"]
+    VERIFY --> OPTLLVM["LLVM 模块默认优化管线（按 opt_level/opt_size）"]
+    OPTLLVM --> JIT["ORC / LLJIT（lower.LLVMBackend）"]
     JIT --> NATIVE["原生地址 → ctypes 入口"]
 ```
 
@@ -40,11 +41,11 @@ flowchart TD
 | `compiler/hir.py` | HIR 指令集与结果位置类型（`ResultLocTree`/`FullResultLoc`/`ReturnLoc`） |
 | `compiler/sval.py` | spy 类型系统、编译期值、`Box`/`ComptimePtr`、布局缓存 `MirLowerCache`、返回规格、`as_value`/`coerce_const`、`TypeVarSolver` |
 | `compiler/interp.py` | 编译期解释器（`HirRunner`）与编译驱动（`Analyser`）：跑 HIR → 发 MIR |
-| `compiler/fn.py` | 签名模型（`Signature`/`CallSignature`/`ReturnSignature`）、`ArgNode`、`FunctionValue`/`FunctionInstance`/`ClosureFunction`、thunk、`SymbolTable`、`CompileBatch` |
+| `compiler/fn.py` | 签名模型（`Signature`/`CallSignature`/`ReturnSignature`）、`ArgNode`、`FunctionValue`/`FunctionInstance`/`ClosureFunction`、thunk、`SymbolTable`、`CompileBatch`、`OptimizationOptions` |
 | `compiler/mir.py` | MIR 类型/值/指令/基本块/终结符；`normalize`、`instantiate_defers` |
 | `compiler/opt.py` | 单一优化：把单次存取的 slot 折回寄存器（保守 mem2reg） |
 | `compiler/llvm.py` | 纯文本 LLVM IR 构造器（无 libLLVM 调用）；`DataLayout`；JIT 无关 |
-| `compiler/lower.py` | MIR → LLVM IR；`LLVMBackend`（唯一使用 llvmlite/JIT 的地方）；异常展开 landing pad |
+| `compiler/lower.py` | MIR → LLVM IR；`LLVMBackend`（唯一使用 llvmlite/JIT 的地方）；LLVM 优化管线；异常展开 landing pad |
 | `compiler/glue.py` | Python ↔ spy 边界：ctypes 读写、实例包装、`invoke`、结果脱壳 |
 | `compiler/target.py` | `TargetInfo`（指针宽度、C 整数宽度、`usize` 宽度） |
 | `compiler/util.py` | 共用工具（`IdentityObj`、`IndexedMap`、`StrBiMap`、`FrozenArraySet`、`TriState`、`frozendict` 等） |
@@ -489,7 +490,8 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
 算法（迭代）：`index_of` 记录每条指令位置；`roles` 记录每个 `Alloca` 的每次使用（`load`/`store`/其它，**原子访问算 `use`** 因此不折）；
 `_dominators`（迭代数据流不动点）；对每个 slot：有非 `load`/`store` 的角色（地址逃逸）或多于一个 `Store`（运行时汇合）则跳过；
 无 `Store`（死）或所有 load 都被单 store 支配（同块 `store_idx < load_idx`，或 `store_block ∈ dominators[load_block]`）则用 store 的值替换所有 load 并删除 load/store/alloca。
-不做指令重排、不做一般死代码消除、不做常量折叠（常量折叠在 `llvm.BasicBlock.emit` 构造期做），也不跑 LLVM 优化管线。
+不做指令重排、不做一般死代码消除、不做常量折叠（常量折叠在 `llvm.BasicBlock.emit` 构造期做）。
+退出本 pass 后，JIT 在降低出的 LLVM 模块上再跑一次 LLVM 自带的逐模块默认优化管线（见 §9.2 `_optimize`）。
 
 ---
 
@@ -512,15 +514,20 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
   块映射（MIR entry → llvm entry）；把每个 `Alloca` **提升到 entry 块**；先提升「稳定的无副作用指令」（操作数为 `Param`/已降低的 `BitCast` 与常量 `Gep`）；
   其余按依赖顺序迭代降低（`Phi` 一旦有一个 incoming 就降低，其余待补；phi 插到块首）。
 - 全局常量：`_lower_global_constant`/`_lower_global_string`/`_lower_constant`；union 常量非存储变体按 clang 的 `{<variant>, [pad]}` 布局（`_needs_literal`/`_lower_literal_struct` 传播）。
-- `_lower_inst`：逐指令映射；`BitCast` 指针↔指针或同类型是无操作；`AsUnion`/`ExtractUnion`/`UnionCast` 用「较宽者 alloca + store + 按目标类型 load」重解释；
+- `_lower_inst`：逐指令映射；`BitCast` 指针↔指针或同类型是无操作；`AsUnion`/`ExtractUnion`/`UnionCast` 按 clang 的做法重解释：
+  两类型相同便直接用该值，否则把源值 store 进源类型槽，用 `llvm.memcpy`（`min(源, 目标)` 字节）拷进目标类型槽，再按目标类型 load；
   `Call` 的 `NoReturn` 后补 `unreachable`；`Gep` 显式传 pointee（因 MIR 指针 `BitCast` 是 no-op）。
 - 异常展开：`_UnwindCtx`（每函数一个 `{ptr, i32}` slot）；`_lower_panic`（`__cxa_allocate_exception` + memcpy + `__cxa_throw(obj, @_ZTIi, null)`，
   有 unwind 边则用 `invoke`）；`_lower_call_may_panic`（`invoke` + cleanup landing pad）；`_lower_catch_unwind`（catching landing pad，存下被捕获对象）；
   `EndCatch` 降成 `__cxa_end_catch`，在捕获的 payload 拷出之后发射（`catch_unwind` 与 Python 入口 thunk 都如此）。
-- `LLVMBackend`：`Target.from_default_triple` + `create_target_machine` + **进程唯一** LLJIT（`create_lljit_compiler`）；
-  `compile`：降模块 → `Module.write()` → `parse_assembly`/`verify` → `JITLibraryBuilder().add_ir().add_current_process().add_jit_library(前置库).export_symbol(...).link(...)`；
-  每个函数取实际名字、按 ctypes 原型 `cast` 成 `_NativeFn`（保留整段 IR 文本供测试 `print_all`）。
+- `LLVMBackend`：`Target.from_default_triple` + `create_target_machine`（保留为 `_target_machine`）+ **进程唯一** LLJIT（`create_lljit_compiler`）；
+  `compile`：降模块 → `Module.write()` → `parse_assembly`（并把模块的 `data_layout`/`triple` 钉到目标机：生成的文本不带这两项，否则 IR pass 与 codegen 会各用一套布局）/`verify` → **优化** → `JITLibraryBuilder().add_ir().add_current_process().add_jit_library(前置库).export_symbol(...).link(...)`；
+  每个函数取实际名字、按 ctypes 原型 `cast` 成 `_NativeFn`（保留**优化前**的整段 IR 文本供测试 `print_all`）。
   `add_current_process()` 让 `ExternSymbol` 回退到宿主进程。
+- `_optimize(module, options)`：用 `llvm.create_pass_builder(_target_machine, PipelineTuningOptions(speed_level, size_level))` 建
+  `PassBuilder`，取其逐模块默认管线（`getModulePassManager()`）跑在 `module` 上（`run(module, builder)`），`speed_level`/`size_level` 由 `fn.OptimizationOptions` 给出。
+  优化后的 IR（`str(llvm_mod)`）才交给 JIT；`speed_level == 0` 且 `size_level == 0` 时整段跳过、原样交 IR。
+  级别来自宿主的编译期选项 `opt_level`（0–3，默认 2）与 `opt_size`（0–2，默认 0，仅当 `opt_level == 2` 可用），在 `fn.CompileBatch.compile` 里经 `get_compile_option` 读出、校验后传入（非法值报 `CompileError`）。
 
 ### 9.3 原子与 OpenMP 降级
 

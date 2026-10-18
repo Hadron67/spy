@@ -761,8 +761,10 @@ class SpyInferTest(TestCase):
     def test_an_inferred_set_lowers_to_a_code_and_a_payload(self) -> None:
         result, code, _ = call_with_error(inferred_raise, 5)
         self.assertEqual((result, code), (6, 0))
-        result, code, payload = call_with_error(inferred_raise, -3)
-        self.assertEqual((result, code, payload), (0, 1, 7))
+        # a raising path leaves the result undefined, so only the error code and
+        # the payload are checked
+        _, code, payload = call_with_error(inferred_raise, -3)
+        self.assertEqual((code, payload), (1, 7))
         entry = inferred_raise.get_entry()  # pyright: ignore
         instance = next(iter(entry.specs.values()))
         assert instance.ret_sig is not None

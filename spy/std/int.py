@@ -111,7 +111,7 @@ def int_cast[T](value, typ: type[T]) -> T:
     try:
         return try_int_cast(value, typ)
     except IntCastError:
-        panic(sstr(b'integer cast out of range'))
+        panic(sstr('integer cast out of range'))
 
 
 @struct()
@@ -184,7 +184,7 @@ def int_to_float[T: float](value, typ: type[T]) -> T:
     try:
         return try_int_to_float(value, typ)
     except FloatCastError:
-        panic(sstr(b'integer is not exactly representable as a float'))
+        panic(sstr('integer is not exactly representable as a float'))
 
 
 @func(exceptions=FloatCastError)
@@ -236,4 +236,4 @@ def float_to_int[T: int](value, typ: type[T]) -> T:
     try:
         return try_float_to_int(value, typ)
     except FloatCastError:
-        panic(sstr(b'float is out of range for the integer type'))
+        panic(sstr('float is out of range for the integer type'))

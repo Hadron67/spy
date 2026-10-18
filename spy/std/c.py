@@ -5,17 +5,18 @@ from spy.std.io import Readable, Writable
 from ..compiler import (
     ConstMultiPtr,
     MultiPtr,
+    Opaque,
     Option,
     Ptr,
     decl_func,
     f32,
     f64,
     i32,
+    ref,
     struct,
     u8,
     usize,
 )
-from ..compiler.syntax import Opaque, ref
 from .core import ConstSlicePtr, SlicePtr
 
 

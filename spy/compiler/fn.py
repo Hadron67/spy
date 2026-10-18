@@ -1241,7 +1241,8 @@ class CompileBatch:
             elif isinstance(sym, mir.GlobalValue):
                 globals.add(names[sym], sym)
 
-        native_fns = backend.compile(structs, globals, target) if self.newly_compiled else {}
+        options = _optimization_options(resolver)
+        native_fns = backend.compile(structs, globals, target, options) if self.newly_compiled else {}
         for instance in self.newly_compiled:
             native_fn = native_fns[instance.mir]
             instance.native_fn = native_fn
@@ -1249,7 +1250,72 @@ class CompileBatch:
             instance.wrapper_fn = native_fns[thunks[instance.mir]]
 
 
+# the compile-time option names (see ``CompileContext.get_compile_option``)
+# the host sets to select the LLVM optimization levels of the modules it
+# compiles
+_OPT_LEVEL_OPTION = 'opt_level'
+_OPT_SIZE_OPTION = 'opt_size'
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizationOptions:
+    """The LLVM optimization levels a compiled module is optimized at: the
+    *speed* level (``0``-``3``; ``0`` leaves the pipeline off, so the module
+    reaches the JIT exactly as it was lowered) and the *size* level (``0``-``2``).
+    A size level other than ``0`` is only valid with a speed level of ``2`` - the
+    constraint of LLVM's per-module default pipeline."""
+
+    speed_level: int = 2
+    size_level: int = 0
+
+
+#: the optimization levels a backend compiles at when the host selected none
+DEFAULT_OPTIMIZATION_OPTIONS = OptimizationOptions()
+
+
 class Backend:
     @abstractmethod
-    def compile(self, structs: set[mir.StructType], globals: StrBiMap[mir.GlobalValue], target: TargetInfo) -> dict[mir.GlobalValue, NativeFn]:
+    def compile(
+        self,
+        structs: set[mir.StructType],
+        globals: StrBiMap[mir.GlobalValue],
+        target: TargetInfo,
+        options: OptimizationOptions = DEFAULT_OPTIMIZATION_OPTIONS,
+    ) -> dict[mir.GlobalValue, NativeFn]:
         ...
+
+
+def _optimization_options(resolver: sval.CompileContext) -> OptimizationOptions:
+    """The LLVM optimization levels of one compile round, read from the host's
+    compile-time options ``opt_level`` (the speed level; ``2`` when unset) and
+    ``opt_size`` (the size level; ``0`` when unset).  An option set to anything
+    but the documented integer is a compile error."""
+    speed = _int_compile_option(resolver, _OPT_LEVEL_OPTION, 0, 3, 2)
+    size = _int_compile_option(resolver, _OPT_SIZE_OPTION, 0, 2, 0)
+    if size != 0 and speed != 2:
+        raise CompileError(
+            f"the compile-time option {_OPT_SIZE_OPTION!r} other than 0 needs "
+            f"{_OPT_LEVEL_OPTION!r} to be 2, got {speed}"
+        )
+    return OptimizationOptions(speed, size)
+
+
+def _int_compile_option(
+    resolver: sval.CompileContext, name: str, lo: int, hi: int, default: int
+) -> int:
+    """The integer the host stored for the compile-time option ``name``, or
+    ``default`` when it is unset; a value outside ``[lo, hi]`` or of any other
+    type is a compile error."""
+    value = resolver.get_compile_option(name)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CompileError(
+            f"the compile-time option {name!r} must be an integer, got {value!r}"
+        )
+    if not lo <= value <= hi:
+        raise CompileError(
+            f"the compile-time option {name!r} must be between {lo} and {hi}, "
+            f"got {value}"
+        )
+    return value
