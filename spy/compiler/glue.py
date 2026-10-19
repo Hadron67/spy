@@ -397,7 +397,9 @@ def _write(type: Type, value: Any, owner: Any, offset: int, context: CompileCont
             if pointer:
                 _scalar_ctype(type, cache).from_address(address).value = _as_address(value)
             else:
-                _scalar_ctype(type, cache).from_address(address).value = _py(value)
+                _scalar_ctype(type, cache).from_address(address).value = _py(
+                    sval.coerce_const(value, type)
+                )
 
 
 def _as_address(value: Any) -> int | None:

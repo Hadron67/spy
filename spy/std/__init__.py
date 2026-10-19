@@ -5,59 +5,13 @@
 T`` names any of them.
 """
 
-from ..compiler import syntax, usize
-from ..compiler.dsl import struct
-from ..compiler.syntax import (
-    Array,
-    ConstMultiPtr,
-    ConstPtr,
-    MultiPtr,
-    Option,
-    Ptr,
-    comptime,
-)
-from .core import (
-    ConstSlicePtr,
-    Numeric,
-    SlicePtr,
-    StopIteration,
-    arr_slice,
-    as_func_ptr,
-    compile,
-    const_arr_slice,
-    const_array,
-    encode_length,
-    ptr_cast,
-    range,
-    slice,
-    sstr,
-    undefined,
-)
-
-__all__ = [
-    'Array',
-    'ConstMultiPtr',
-    'ConstPtr',
-    'ConstSlicePtr',
-    'MultiPtr',
-    'Numeric',
-    'Option',
-    'Ptr',
-    'SlicePtr',
-    'StopIteration',
-    'arr_slice',
-    'as_func_ptr',
-    'compile',
-    'comptime',
-    'const_arr_slice',
-    'const_array',
-    'encode_length',
-    'ptr_cast',
-    'range',
-    'slice',
-    'sstr',
-    'struct',
-    'syntax',
-    'undefined',
-    'usize',
-]
+from . import c as c
+from . import io as io
+from . import llvm as llvm
+from . import math as math
+from . import mem as mem
+from . import openmp as openmp
+from . import python as python
+from . import reflect as reflect
+from . import vec as vec
+from .core import *

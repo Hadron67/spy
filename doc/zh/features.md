@@ -1848,6 +1848,7 @@ assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 
 - Python 值到 spy 类型的映射：`bool`→`bool`，`int`→`i64`，`float`→`f64`，`complex`→`c128`，
   `bytes`→编译期字节串，`str`→编译期字符串，`None`→`Null`，`syntax.Ptr[T]`→指针；用 `T(value)`（如 `u64(x)`）显式指定类型。
+  超出目标整型范围的 `int` 会报 `CoerceError`，不会被静默截断。
 - 结构体实例支持字段读写、方法调用与视图语义；指针是非空的。
 - `Option[T]` 与 tagged union 回到 Python 时**脱壳**：`Option[T]` 是 `T` 值或 `None`，union 是其具体变体的值。
 - 复数 ↔ Python `complex`；整数枚举 ↔ Python 枚举成员。

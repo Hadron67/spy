@@ -1879,6 +1879,7 @@ assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 
 - Mapping from Python values to spy types: `bool`→`bool`, `int`→`i64`, `float`→`f64`, `complex`→`c128`,
   `bytes`→a compile-time byte string, `str`→a compile-time text string, `None`→`Null`, `syntax.Ptr[T]`→a pointer; use `T(value)` (e.g. `u64(x)`) to specify the type explicitly.
+  An `int` outside the target integer type's range raises `CoerceError` instead of being silently truncated.
 - A struct instance supports field reads/writes, method calls, and view semantics; pointers are non-null.
 - `Option[T]` and tagged unions are **unwrapped** when going back to Python: `Option[T]` is a `T` value or `None`, and a union is the value of its concrete variant.
 - Complex numbers ↔ Python `complex`; integer enums ↔ Python enum members.

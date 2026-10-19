@@ -2,8 +2,11 @@ from unittest import TestCase
 
 from ...compiler import (
     CompileError,
+    closure,
+    comptime,
     f32,
     f64,
+    func,
     i8,
     i16,
     i32,
@@ -14,8 +17,6 @@ from ...compiler import (
     u64,
 )
 from ...compiler import bool as spy_bool
-from ...compiler.dsl import func
-from ...compiler.syntax import closure, comptime
 from ...std.core import (
     UnwindException,
     catch_unwind,

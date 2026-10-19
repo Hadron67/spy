@@ -8,6 +8,7 @@ from llvmlite.binding import llvm_version_info
 from ...compiler import CompileError, f32, f64, i8, i32, i64, u8, u32, u64
 from ...compiler import bool as spy_bool
 from ...compiler.dsl import Context, func
+from ...compiler.errors import CoerceError
 from ...compiler.lower import LLVMBackend
 from ...std.math import abs as spy_abs
 from ...std.math import (
@@ -875,6 +876,13 @@ class SpyAbsTest(TestCase):
         ]
         for fn, arg, want in cases:
             self.assertEqual(fn(arg), want, msg=repr(arg))
+
+    def test_abs_of_an_out_of_range_integer_is_rejected(self) -> None:
+        # a plain Python int is marshaled as i64: one that does not fit must
+        # not be silently truncated (``9...9`` used to wrap to ``-1i64`` and
+        # return 1)
+        with self.assertRaises(CoerceError):
+            spy_abs(int('9' * 79))
 
     def test_abs_of_a_non_numeric_type_is_rejected(self) -> None:
         with self.assertRaises(CompileError):

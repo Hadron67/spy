@@ -1,10 +1,15 @@
 from typing import Protocol
 
-from spy.compiler.syntax import ref
-from spy.std import MultiPtr, ptr_cast
-
-from ..compiler import Array, comptime, func, struct, typeof, u8, usize
-from .core import ConstSlicePtr, SlicePtr, const_arr_slice, panic, sstr, typed_undefined
+from ..compiler import Array, MultiPtr, comptime, func, ref, struct, typeof, u8, usize
+from .core import (
+    ConstSlicePtr,
+    SlicePtr,
+    const_arr_slice,
+    panic,
+    ptr_cast,
+    sstr,
+    typed_undefined,
+)
 from .int import int_cast
 from .reflect import IntType, reify, type_info
 
