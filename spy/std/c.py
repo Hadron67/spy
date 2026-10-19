@@ -11,13 +11,14 @@ from ..compiler import (
     decl_func,
     f32,
     f64,
+    func,
     i32,
     ref,
     struct,
     u8,
     usize,
 )
-from .core import ConstSlicePtr, SlicePtr
+from .core import ConstSlicePtr, SlicePtr, ptr_cast
 
 
 @decl_func()
@@ -116,25 +117,29 @@ class FILE(Readable, Writable):
     inner: Opaque
 
     @staticmethod
-    def open(path: MultiPtr[u8], mode: MultiPtr[u8]) -> Ptr[FILE]:
-        ptr = fopen(path, mode)
+    @func(inline=True)
+    def open(path, mode) -> Ptr[FILE]:
+        ptr = fopen(ptr_cast(path, ConstMultiPtr[u8]), ptr_cast(mode, ConstMultiPtr[u8]))
         if ptr is None:
             raise CError(0)
         return ptr
 
+    @func(inline=True)
     def close(self):
         fclose(ref(self))
 
+    @func(inline=True)
     @override
     def read(self, data: SlicePtr[u8]) -> usize:
         return fread(data.ptr, 1, data.length, ref(self))
 
+    @func(inline=True)
     @override
     def write(self, data: ConstSlicePtr[u8]) -> usize:
         return fwrite(data.ptr, 1, data.length, ref(self))
 
 @decl_func()
-def fopen(path: MultiPtr[u8], mode: MultiPtr[u8]) -> Option[Ptr[FILE]]: ...
+def fopen(path: ConstMultiPtr[u8], mode: ConstMultiPtr[u8]) -> Option[Ptr[FILE]]: ...
 
 @decl_func()
 def fclose(ptr: Ptr[FILE]) -> None: ...
