@@ -96,6 +96,41 @@ def coerce_comptime_int_to_float_lossy() -> f64:
 
 
 @func()
+def coerce_comptime_int_to_float_exact_power_of_two() -> f64:
+    # a compile-time value is checked for its own exactness, not against the
+    # ``[-2**53, 2**53]`` range: ``2**63`` is a power of two and exact
+    x: f64 = 9223372036854775808
+    return x
+
+
+@func()
+def coerce_comptime_int_to_float_exact_negative_power_of_two() -> f64:
+    x: f64 = -9223372036854775808
+    return x
+
+
+@func()
+def coerce_comptime_int_to_float_lossy_power_of_two() -> f64:
+    # ``2**63 + 1`` rounds to ``2**63``, so this is a compile error
+    x: f64 = 9223372036854775809
+    return x
+
+
+@func()
+def coerce_comptime_int_to_f32_exact_power_of_two() -> f32:
+    # ``2**40`` is exact in ``f32`` although it is outside ``[-2**24, 2**24]``
+    x: f32 = 1099511627776
+    return x
+
+
+@func()
+def coerce_comptime_int_to_f32_lossy_power_of_two() -> f32:
+    # ``2**40 + 1`` is not representable in ``f32``
+    x: f32 = 1099511627777
+    return x
+
+
+@func()
 def truncate_narrow(x: i32) -> i8:
     # the explicit narrowing: ``truncate`` to the same-signedness type
     return truncate(x, i8)
@@ -347,6 +382,29 @@ class SpyCoerceTest(TestCase):
         self.assertEqual(coerce_comptime_int_to_float_exact(), 9007199254740992.0)
         with self.assertRaises(CompileError):
             coerce_comptime_int_to_float_lossy()
+
+    def test_a_comptime_integer_outside_the_exact_range_may_still_be_exact(
+        self,
+    ) -> None:
+        # unlike a runtime integer (whose whole type range is checked), a
+        # compile-time value is checked for its own exact representability:
+        # ``2**63`` is a power of two, hence exact in ``f64``, and ``2**40`` is
+        # exact in ``f32`` - both lie outside the ranges of all integers the
+        # two float types represent exactly
+        self.assertEqual(
+            coerce_comptime_int_to_float_exact_power_of_two(), 9223372036854775808.0
+        )
+        self.assertEqual(
+            coerce_comptime_int_to_float_exact_negative_power_of_two(),
+            -9223372036854775808.0,
+        )
+        with self.assertRaises(CompileError):
+            coerce_comptime_int_to_float_lossy_power_of_two()
+        self.assertEqual(
+            coerce_comptime_int_to_f32_exact_power_of_two(), 1099511627776.0
+        )
+        with self.assertRaises(CompileError):
+            coerce_comptime_int_to_f32_lossy_power_of_two()
 
     def test_a_runtime_integer_to_a_float_is_checked_by_its_type_range(self) -> None:
         # the whole source range has to fit the exact integer range of the float

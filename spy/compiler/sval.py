@@ -20,6 +20,8 @@ the compile-time comparisons in ``spy.typeof(a) == spy.u64`` work.
 from __future__ import annotations
 
 import functools
+import math
+import struct
 import typing
 from abc import abstractmethod
 from collections.abc import Callable, Iterator, Mapping
@@ -3493,11 +3495,38 @@ def float_exact_int_range(type: FloatType) -> tuple[int, int]:
     Every integer in the range converts to the float without loss, and one
     outside it may round to a neighbour.  It is the range an integer has to
     stay within for the float conversion to be lossless: an integer *type*
-    checks its whole range against it (see ``IntType.is_subtype_of``), an
-    integer *value* its value (see ``coerce_const``), and
-    ``std.int.try_int_to_float`` the same range."""
+    checks its whole range against it (see ``IntType.is_subtype_of``), and
+    ``std.int.try_int_to_float`` uses it to decide whether the whole source
+    range is exact.  A single compile-time value is checked for its own exact
+    representability instead, which may be exact outside the range (see
+    ``int_to_float_is_exact``)."""
     p = 53 if type.bits == 64 else 24
     return (-(1 << p), 1 << p)
+
+
+def int_to_float_is_exact(value: int, type: FloatType) -> bool:
+    """Whether the integer constant ``value`` converts to ``type`` without loss.
+
+    Unlike :func:`float_exact_int_range`, which bounds the integers a float type
+    represents exactly as a whole, this tests the value itself: a power of two
+    far outside that range is still exact (``2**63`` in ``f64``, say).  The
+    value is exact when its Python ``float`` (an ``f64``) round-trips to it and,
+    for ``f32``, it also survives the rounding to the target precision."""
+    try:
+        as_float = float(value)
+    except OverflowError:
+        # beyond the largest finite ``f64`` value
+        return False
+    if not math.isfinite(as_float) or int(as_float) != value:
+        return False
+    if type.bits == 64:
+        return True
+    try:
+        rounded = struct.unpack('<f', struct.pack('<f', as_float))[0]
+    except OverflowError:
+        # beyond the largest finite ``f32`` value
+        return False
+    return rounded == as_float
 
 def min_int_type(lower: int, upper: int) -> IntType:
     """The smallest integer type whose range contains ``[lower, upper]``."""
@@ -4645,17 +4674,18 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
         case FloatType():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise CoerceError(f"cannot use {value} as a float constant")
-            if isinstance(value, int):
-                # an integer converts to a float only when it is exactly
-                # representable: a value outside the exact range would round
-                # (the conversion has to be spelled out, see
-                # ``std.int.int_to_float``)
-                lo, hi = float_exact_int_range(type)
-                if not lo <= value <= hi:
-                    raise CoerceError(
-                        f"integer constant {value} is not exactly representable "
-                        f"as {type}"
-                    )
+            # an integer converts to a float only when it is exactly
+            # representable.  Unlike a runtime integer, whose whole *type*
+            # range is checked (see ``IntType.is_subtype_of``), a compile-time
+            # value is checked by *value*: a power of two outside
+            # ``float_exact_int_range`` is still exact (``2**63`` in ``f64``,
+            # say).  A lossy conversion has to be spelled out (see
+            # ``std.int.int_to_float``)
+            if isinstance(value, int) and not int_to_float_is_exact(value, type):
+                raise CoerceError(
+                    f"integer constant {value} is not exactly representable "
+                    f"as {type}"
+                )
             return Float(float(value), type)
         case TypeType():
             if not isinstance(value, Type):

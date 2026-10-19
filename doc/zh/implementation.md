@@ -232,7 +232,7 @@ flowchart TD
 - `coerce_const(value, type)`：把**任意**编译期量具体化成类型常量，失败抛 `CoerceError`。覆盖：
   `UntypedUndefined`/typed undefined（`_typed_undefined`，是 option/union 的成员时包成 present）、`Any`（任意值原样）、
   `ComptimePtr`（一个指针值：pointee 相同即可作指针常量；指向数组的指针还可转成**元素的多指针** `*[N]T -> mptr T`，`_points_at_elements_of`，此时视图按目标重定型（地址相同、按元素看））、`AggregateValue`（只能是自身类型）
-  与各种聚合/union/complex/option 值形式、函数值（作函数指针）、枚举成员、整数 range 检查，以及「自身类型即目标且该类型是编译期专属」的值；
+  与各种聚合/union/complex/option 值形式、函数值（作函数指针）、枚举成员、整数 range 检查，整数→浮点常量按**值**（而非按类型范围）的精确性检查（`int_to_float_is_exact`，见 §6.1），以及「自身类型即目标且该类型是编译期专属」的值；
   `coerce_const_tagged_union` 负责变体选择与 tag 重映射。
 - `TypeVarSolver`：约束求解（相等/子类型、结构分解 `StructType`/`OptionType`/`PointerType`/`ArrayType`、`finish` 折叠子类型界）。
 - `replace_type_var(s)`：结构替换（含 `StructType` 经 head 重新特化以保 identity）。
@@ -343,7 +343,7 @@ thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`
 - `ComptimeResultPtr(value, code, payload)`：函数结果位置的指针形态（value/code/payload 三个位置），**不是** `InterpVal`。
 - 判定：`_is_comptime_val`（`RuntimeVal` 一律不是；旧的「不引用寄存器」放宽已删除）、`_place_is_comptime`、`_references_register`。
 - `_coerce(ev, target)`：store、实参、返回与 `std.core.coerce` 共用的**隐式转换**。**编译期量一律交给 `sval.coerce_const`**（一个 `sval` 编译期值，含 `ComptimePtr` 这种指针值），所以编译期量是按**值**收窄的；
-  运行期量只有 `src.is_subtype_of(target)`（同类型或拓宽）才放行，否则抛 `CoerceError`——即整数收窄、**有损**的整数→浮点、`f64 -> f32` 都是运行期编译错误；整数→浮点在其**无损**时才隐式（运行期由 `IntType.is_subtype_of` 判断整型范围是否落在 `float_exact_int_range` 内，编译期由 `coerce_const` 按值判断）
+  运行期量只有 `src.is_subtype_of(target)`（同类型或拓宽）才放行，否则抛 `CoerceError`——即整数收窄、**有损**的整数→浮点、`f64 -> f32` 都是运行期编译错误；整数→浮点在其**无损**时才隐式（运行期由 `IntType.is_subtype_of` 判断整个类型范围是否落在 `float_exact_int_range` 内；编译期由 `coerce_const` 按值的**实际精确性**判断，见 `int_to_float_is_exact`，所以 `±2**53` 之外的 2 的幂也合法——运行期与编译期的规则并不相同）
   （显式形式 `std.int.truncate`、`std.int.int_cast`、`std.float.float_truncate`、有损的 `std.int.int_to_float` 各自经 `_convert_inst` 构造 `mir.Convert`，收窄与有损转换仍在那里发生）。`CoerceError` 由 `_try_coerce` 吞掉。
   `Option`/`TaggedUnion`/`Tuple`/`StrDict`/`Complex` 的目标分支只处理运行期值。
 

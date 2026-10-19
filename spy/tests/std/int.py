@@ -436,6 +436,16 @@ def to_int_i32(x: f64) -> i32:
 
 
 @func()
+def to_int_i64(x: f64) -> i64:
+    return float_to_int(x, i64)
+
+
+@func()
+def to_int_u64(x: f64) -> u64:
+    return float_to_int(x, u64)
+
+
+@func()
 def to_int_u8(x: f64) -> u8:
     return float_to_int(x, u8)
 
@@ -526,6 +536,14 @@ class SpyFloatToIntTest(TestCase):
         self.assertEqual(to_int_i32(3.9), 3)
         self.assertEqual(to_int_i32(-3.9), -3)
         self.assertEqual(to_int_u8(200.7), 200)
+
+    def test_64_bit_targets(self) -> None:
+        # the target bounds ``-2**63``/``2**63`` (and ``2**64``) are exact in
+        # ``f64`` although they are outside its exact integer range
+        self.assertEqual(to_int_i64(3.9), 3)
+        self.assertEqual(to_int_i64(-3.9), -3)
+        self.assertEqual(to_int_i64(-9223372036854775808.0), -(2**63))
+        self.assertEqual(to_int_u64(42.9), 42)
 
     def test_range(self) -> None:
         self.assertTrue(fits_int_i32(2147483647.0))  # 2**31 - 1
