@@ -11,6 +11,7 @@
 * Feature docs are located in `doc/zh/`
 * Local variables should be assigned first, i.e., write
 * When a feature changes, update `doc/` accordingly.
+* `ruff` is located at `$HOME/Library/Application Support/Zed/languages/ruff/`
 ```python
 a: Foo | None = None
 if foo():

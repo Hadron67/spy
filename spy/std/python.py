@@ -43,12 +43,14 @@ from ..compiler import (
     Ptr,
     c_int,
     c_long,
+    c_longlong,
+    c_uint,
+    c_ulonglong,
     comptime,
     decl_func,
     enum,
     f64,
     func,
-    i32,
     i64,
     isize,
     ref,
@@ -96,7 +98,7 @@ class GILState(Enum):
         PyGILState_Release(self)
 
 
-@enum(c_int)
+@enum(c_uint)
 class PyConstant(Enum):
     """The constant ids ``Py_GetConstant``/``Py_GetConstantBorrowed`` take
     (``Py_CONSTANT_*`` in ``object.h``)."""
@@ -385,7 +387,7 @@ class PyObject:
     @staticmethod
     @func(inline=True)
     def from_bool(value: bool) -> Ptr[PyObject]:
-        flag: i32 = 0
+        flag: c_long = 0
         if value:
             flag = 1
         if (p := PyBool_FromLong(flag)) is not None:
@@ -710,27 +712,27 @@ def PyObject_GetAttr(obj: Ptr[PyObject], name: Ptr[PyObject]) -> Option[Ptr[PyOb
 
 
 @decl_func()
-def PyObject_SetAttrString(obj: Ptr[PyObject], name: ConstMultiPtr[u8], value: Ptr[PyObject]) -> i32: ...
+def PyObject_SetAttrString(obj: Ptr[PyObject], name: ConstMultiPtr[u8], value: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyObject_SetAttr(obj: Ptr[PyObject], name: Ptr[PyObject], value: Ptr[PyObject]) -> i32: ...
+def PyObject_SetAttr(obj: Ptr[PyObject], name: Ptr[PyObject], value: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyObject_HasAttrString(obj: Ptr[PyObject], name: ConstMultiPtr[u8]) -> i32: ...
+def PyObject_HasAttrString(obj: Ptr[PyObject], name: ConstMultiPtr[u8]) -> c_int: ...
 
 
 @decl_func()
-def PyObject_HasAttr(obj: Ptr[PyObject], name: Ptr[PyObject]) -> i32: ...
+def PyObject_HasAttr(obj: Ptr[PyObject], name: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyObject_DelAttrString(obj: Ptr[PyObject], name: ConstMultiPtr[u8]) -> i32: ...
+def PyObject_DelAttrString(obj: Ptr[PyObject], name: ConstMultiPtr[u8]) -> c_int: ...
 
 
 @decl_func()
-def PyObject_DelAttr(obj: Ptr[PyObject], name: Ptr[PyObject]) -> i32: ...
+def PyObject_DelAttr(obj: Ptr[PyObject], name: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
@@ -754,11 +756,11 @@ def PyObject_GetItem(obj: Ptr[PyObject], key: Ptr[PyObject]) -> Option[Ptr[PyObj
 
 
 @decl_func()
-def PyObject_SetItem(obj: Ptr[PyObject], key: Ptr[PyObject], value: Ptr[PyObject]) -> i32: ...
+def PyObject_SetItem(obj: Ptr[PyObject], key: Ptr[PyObject], value: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyObject_DelItem(obj: Ptr[PyObject], key: Ptr[PyObject]) -> i32: ...
+def PyObject_DelItem(obj: Ptr[PyObject], key: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
@@ -766,7 +768,7 @@ def PyObject_Length(obj: Ptr[PyObject]) -> isize: ...
 
 
 @decl_func()
-def PyObject_IsTrue(obj: Ptr[PyObject]) -> i32: ...
+def PyObject_IsTrue(obj: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
@@ -786,7 +788,7 @@ def PyIter_Next(iter: Ptr[PyObject]) -> Option[Ptr[PyObject]]: ...
 
 
 @decl_func()
-def PyObject_IsInstance(obj: Ptr[PyObject], cls: Ptr[PyObject]) -> i32: ...
+def PyObject_IsInstance(obj: Ptr[PyObject], cls: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
@@ -794,11 +796,11 @@ def PyObject_RichCompare(obj1: Ptr[PyObject], obj2: Ptr[PyObject], op: PyCompare
 
 
 @decl_func()
-def PyObject_RichCompareBool(obj1: Ptr[PyObject], obj2: Ptr[PyObject], op: PyCompareOp) -> i32: ...
+def PyObject_RichCompareBool(obj1: Ptr[PyObject], obj2: Ptr[PyObject], op: PyCompareOp) -> c_int: ...
 
 
 @decl_func()
-def PyCallable_Check(obj: Ptr[PyObject]) -> i32: ...
+def PyCallable_Check(obj: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
@@ -806,19 +808,19 @@ def PyObject_Type(obj: Ptr[PyObject]) -> Option[Ptr[PyObject]]: ...
 
 
 @decl_func()
-def PyLong_FromLongLong(value: i64) -> Option[Ptr[PyObject]]: ...
+def PyLong_FromLongLong(value: c_longlong) -> Option[Ptr[PyObject]]: ...
 
 
 @decl_func()
-def PyLong_FromUnsignedLongLong(value: u64) -> Option[Ptr[PyObject]]: ...
+def PyLong_FromUnsignedLongLong(value: c_ulonglong) -> Option[Ptr[PyObject]]: ...
 
 
 @decl_func()
-def PyLong_AsLongLong(obj: Ptr[PyObject]) -> i64: ...
+def PyLong_AsLongLong(obj: Ptr[PyObject]) -> c_longlong: ...
 
 
 @decl_func()
-def PyLong_AsUnsignedLongLong(obj: Ptr[PyObject]) -> u64: ...
+def PyLong_AsUnsignedLongLong(obj: Ptr[PyObject]) -> c_ulonglong: ...
 
 
 @decl_func()
@@ -834,7 +836,7 @@ def PyFloat_AsDouble(obj: Ptr[PyObject]) -> f64: ...
 
 
 @decl_func()
-def PyBool_FromLong(value: i32) -> Option[Ptr[PyObject]]: ...
+def PyBool_FromLong(value: c_long) -> Option[Ptr[PyObject]]: ...
 
 
 @decl_func()
@@ -882,7 +884,7 @@ def PyTuple_GetItem(obj: Ptr[PyObject], index: isize) -> Option[Ptr[PyObject]]: 
 
 
 @decl_func()
-def PyTuple_SetItem(obj: Ptr[PyObject], index: isize, item: Ptr[PyObject]) -> i32: ...
+def PyTuple_SetItem(obj: Ptr[PyObject], index: isize, item: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
@@ -898,15 +900,15 @@ def PyList_GetItem(obj: Ptr[PyObject], index: isize) -> Option[Ptr[PyObject]]: .
 
 
 @decl_func()
-def PyList_SetItem(obj: Ptr[PyObject], index: isize, item: Ptr[PyObject]) -> i32: ...
+def PyList_SetItem(obj: Ptr[PyObject], index: isize, item: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyList_Append(obj: Ptr[PyObject], item: Ptr[PyObject]) -> i32: ...
+def PyList_Append(obj: Ptr[PyObject], item: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyList_Insert(obj: Ptr[PyObject], index: isize, item: Ptr[PyObject]) -> i32: ...
+def PyList_Insert(obj: Ptr[PyObject], index: isize, item: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
@@ -926,19 +928,19 @@ def PyDict_GetItemString(obj: Ptr[PyObject], key: ConstMultiPtr[u8]) -> Option[P
 
 
 @decl_func()
-def PyDict_SetItem(obj: Ptr[PyObject], key: Ptr[PyObject], value: Ptr[PyObject]) -> i32: ...
+def PyDict_SetItem(obj: Ptr[PyObject], key: Ptr[PyObject], value: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyDict_SetItemString(obj: Ptr[PyObject], key: ConstMultiPtr[u8], value: Ptr[PyObject]) -> i32: ...
+def PyDict_SetItemString(obj: Ptr[PyObject], key: ConstMultiPtr[u8], value: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyDict_DelItem(obj: Ptr[PyObject], key: Ptr[PyObject]) -> i32: ...
+def PyDict_DelItem(obj: Ptr[PyObject], key: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyDict_DelItemString(obj: Ptr[PyObject], key: ConstMultiPtr[u8]) -> i32: ...
+def PyDict_DelItemString(obj: Ptr[PyObject], key: ConstMultiPtr[u8]) -> c_int: ...
 
 
 @decl_func()
@@ -962,12 +964,12 @@ def PyModule_GetDict(module: Ptr[PyObject]) -> Option[Ptr[PyObject]]: ...
 
 
 @decl_func()
-def PyModule_AddObjectRef(module: Ptr[PyObject], name: ConstMultiPtr[u8], value: Ptr[PyObject]) -> i32: ...
+def PyModule_AddObjectRef(module: Ptr[PyObject], name: ConstMultiPtr[u8], value: Ptr[PyObject]) -> c_int: ...
 
 
 @decl_func()
-def PyModule_AddIntConstant(module: Ptr[PyObject], name: ConstMultiPtr[u8], value: c_long) -> i32: ...
+def PyModule_AddIntConstant(module: Ptr[PyObject], name: ConstMultiPtr[u8], value: c_long) -> c_int: ...
 
 
 @decl_func()
-def PyModule_AddStringConstant(module: Ptr[PyObject], name: ConstMultiPtr[u8], value: ConstMultiPtr[u8]) -> i32: ...
+def PyModule_AddStringConstant(module: Ptr[PyObject], name: ConstMultiPtr[u8], value: ConstMultiPtr[u8]) -> c_int: ...
