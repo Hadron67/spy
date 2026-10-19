@@ -793,7 +793,14 @@ def _read_result(
         else:
             index = code - 1
         if index >= 0 and index < len(exceptions):
-            payload = _read_error_payload(exceptions[index], buffers[consumed], context)
+            exception = exceptions[index]
+            if exception.is_zst():
+                # a zero-sized exception has no payload storage, so the thunk
+                # allocated no result buffer for the payload union; every value
+                # of it equals its unit value
+                payload = _read_error_payload(exception, None, context)
+            else:
+                payload = _read_error_payload(exception, buffers[consumed], context)
             raise payload
     return value
 
@@ -802,9 +809,13 @@ def _value_is_empty(spec: RetSpec | None) -> bool:
     return isinstance(spec, RetValue) and isinstance(spec.type, sval.EmptyType)
 
 
-def _read_error_payload(exception: Type, buffer: Any, context: CompileContext) -> _ExceptionInstance:
+def _read_error_payload(
+    exception: Type, buffer: Any | None, context: CompileContext,
+) -> _ExceptionInstance:
     assert isinstance(exception, StructType), 'an exception is a spy struct'
-    return _ExceptionInstance(exception, buffer, 0, context)
+    # a zero-sized exception has no storage at all (``buffer`` is None): it is
+    # the unit value of its type, so any address (none) is as good as another
+    return _ExceptionInstance(exception, 0 if buffer is None else buffer, 0, context)
 
 
 # ---------------------------------------------------------------------------

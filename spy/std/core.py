@@ -290,7 +290,11 @@ def compile_error(msg: str) -> Never: ...
 # branch picks the length by ``typeof(s)``.
 @func(inline=True)
 def sstr(s) -> ConstSlicePtr[u8]:
-    return ConstSlicePtr(ptr_cast(s, ConstMultiPtr[u8]), len(s) if typeof(s) == bytes else encode_length(s))
+    return ConstSlicePtr(gstr(s), len(s) if typeof(s) == bytes else encode_length(s))
+
+@func(inline=True)
+def gstr(s) -> ConstMultiPtr[u8]:
+    return ptr_cast(s, ConstMultiPtr[u8])
 
 # ``compile(fn)``: manually compile a *non-generic* function value - build its
 # default ``CallSignature`` and request its compilation (see ``interp``), so that

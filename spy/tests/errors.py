@@ -206,11 +206,39 @@ class ErrorB(Exception):
     n: i32
 
 
+@struct()
+class EmptyError(Exception):
+    # a zero-sized exception: its payload union is zero-sized too, so a call
+    # allocates no payload buffer for it (see ``glue._read_result``)
+    pass
+
+
 @func(exceptions=ErrorA)
 def raise_a(n: i32) -> i32:
     if n < 0:
         raise ErrorA(7)
     return n + 1
+
+
+@func(exceptions=EmptyError)
+def raise_empty(n: i32) -> i32:
+    if n < 0:
+        raise EmptyError()
+    return n + 3
+
+
+@func(exceptions=EmptyError)
+def raise_empty_never(n: i32) -> Never:
+    raise EmptyError()
+
+
+@func(exceptions=(EmptyError, ErrorA))
+def raise_empty_or_a(n: i32) -> i32:
+    if n < 0:
+        raise EmptyError()
+    if n == 0:
+        raise ErrorA(7)
+    return n
 
 
 @func(exceptions=ErrorB)
@@ -620,6 +648,30 @@ class SpyErrorUnionTest(TestCase):
         # Python ``Exception`` too)
         with self.assertRaises(Exception) as ctx:
             raise_a(-1)
+        self.assertEqual(ctx.exception.code, 7)  # pyright: ignore
+
+    def test_calling_a_function_raising_a_zst_exception_from_python(self) -> None:
+        # a zero-sized exception has no payload storage, so the thunk allocates
+        # no result buffer for the payload union: the boundary must not read one
+        with self.assertRaises(Exception) as ctx:
+            raise_empty(-1)
+        self.assertIs(ctx.exception._data.type, struct_type(EmptyError))  # pyright: ignore
+
+    def test_a_value_less_function_raising_a_zst_exception(self) -> None:
+        # the value-less result type leaves only the (zero-sized) payload: no
+        # buffer is allocated at all
+        with self.assertRaises(Exception) as ctx:
+            raise_empty_never(1)
+        self.assertIs(ctx.exception._data.type, struct_type(EmptyError))  # pyright: ignore
+
+    def test_a_zst_exception_in_a_mixed_payload_union(self) -> None:
+        # the union has storage for the other variant, but the raised exception
+        # is still zero-sized
+        with self.assertRaises(Exception) as ctx:
+            raise_empty_or_a(-1)
+        self.assertIs(ctx.exception._data.type, struct_type(EmptyError))  # pyright: ignore
+        with self.assertRaises(Exception) as ctx:
+            raise_empty_or_a(0)
         self.assertEqual(ctx.exception.code, 7)  # pyright: ignore
 
     def _compile(self, handle: Any, arg: int) -> None:

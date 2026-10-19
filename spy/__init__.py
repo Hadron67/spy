@@ -18,4 +18,5 @@ concrete argument types (comptime semantics: ``spy.typeof``, compile-time
 typed MIR, which ``lower`` turns into native code via LLVM.
 """
 
+from . import std as std
 from .compiler import *

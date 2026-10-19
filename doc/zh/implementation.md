@@ -556,7 +556,8 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
   调 `wrapper_fn.call`；thunk 返回 `true` 时把占位对象作为 Python 异常抛出（`data` 已被 thunk 覆盖），否则 `_read_result` 脱壳结果。
   `UnwindException` 类型在本次调用的 context 里 lazy 解析（绝不用全局 context）。
 - `_read_result`：走 `ret_sig.ret_type_spec`（`RetValue`/`RetTuple`/`RetComptime`）；`RetComptime` 读 `instance.ret_comptime_values[leaf.index]` 经 `_comptime_to_python`；
-  错误码非 0 时 `_read_error_payload` 抛 `_ExceptionInstance`。
+  错误码非 0 时 `_read_error_payload` 抛 `_ExceptionInstance`。ZST 异常没有 payload 存储，thunk 也不为它分配出缓冲，
+  此时 `_read_error_payload` 用一个空 owner 构造实例（不读 `buffers`）。
 - `construct`/`_resolve_struct`/`specialized_struct`：Python 侧构造实例（显式特化 / 非泛型 / 从字段值推断特化）、
   `Foo[i32]` 可调用、`Foo[i32].m` 不隐式传 `self`；`construct(..., exception=True)` 把结果包成 `_ExceptionInstance`
   （占位 `UnwindException` 用）。

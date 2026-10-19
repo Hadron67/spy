@@ -539,7 +539,8 @@ The only place that turns Python values into spy values (and back); it does **no
   It calls `wrapper_fn.call`; when the thunk returns `true` the placeholder is raised as the Python exception (`data` has been overwritten by the thunk), otherwise `_read_result` unwraps the result.
   The `UnwindException` type is resolved lazily in the call's context (never in a global context).
 - `_read_result`: walks `ret_sig.ret_type_spec` (`RetValue`/`RetTuple`/`RetComptime`); for `RetComptime` it reads `instance.ret_comptime_values[leaf.index]` through `_comptime_to_python`;
-  when the error code is non-zero, `_read_error_payload` raises an `_ExceptionInstance`.
+  when the error code is non-zero, `_read_error_payload` raises an `_ExceptionInstance`. A zero-sized exception has no payload storage and the thunk allocates no out-buffer for it,
+  so `_read_error_payload` constructs the instance with an empty owner (it reads no `buffers` entry).
 - `construct`/`_resolve_struct`/`specialized_struct`: Python-side instance construction (explicit specialization / non-generic / specialization inferred from field values),
   `Foo[i32]` is callable, and `Foo[i32].m` does not implicitly pass `self`; `construct(..., exception=True)` wraps the result as an `_ExceptionInstance`
   (used for the placeholder `UnwindException`).
