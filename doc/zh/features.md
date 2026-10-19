@@ -1665,6 +1665,7 @@ assert text_len() == 6
 | `std.vec` | `Vec[T, A]` 动态数组 |
 | `std.atomic` | `MemoryOrder`/`RmwOp`、`atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`、便捷包装 |
 | `std.openmp` | `load_openmp_runtime`、`parallel_loop` |
+| `std.python` | CPython C API 绑定：`GILState`、`PyError`、`PyObject`（属性/调用/下标/转换/tuple/list/dict/模块操作），以及同名的原始 extern 声明 |
 
 ### 9.1 原子操作
 
@@ -1837,6 +1838,7 @@ assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 - 多返回值打包成 Python `tuple`（嵌套结果嵌套 `tuple`），按值返回的聚合解包成实例。
 - 编译期结果：有自然 Python 镜像的标量转成 `int`/`float`，其余原样交出编译器对象。
 - **数组目前不能跨 Python 边界**（读取/写入时直接报错）。
+- 从编译后的 spy 代码调用 CPython C API 用 `std.python`：JIT 入口在调用原生代码时会释放 GIL，因此调用方用 `GILState.acquire()` / `release()` 包住一段操作；引用计数按 C 语义手动 `decref()`/`incref()`（新引用创建后立即 `with defer(): obj.decref()`，借用引用不要 `decref`，`tuple_set`/`list_set` 会偷引用）。
 
 ```python
 @struct()

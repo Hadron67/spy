@@ -1662,6 +1662,7 @@ assert text_len() == 6
 | `std.vec` | `Vec[T, A]` dynamic array |
 | `std.atomic` | `MemoryOrder`/`RmwOp`, `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`, convenience wrappers |
 | `std.openmp` | `load_openmp_runtime`, `parallel_loop` |
+| `std.python` | CPython C API bindings: `GILState`, `PyError`, `PyObject` (attributes/calls/subscripts/conversions/tuple/list/dict/module operations), plus the raw extern declarations under the C names |
 
 ### 9.1 Atomic operations
 
@@ -1868,6 +1869,7 @@ assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
 - Multiple return values are packed into a Python `tuple` (nested results nest `tuple`s), and an aggregate returned by value is unpacked into an instance.
 - Compile-time results: a scalar with a natural Python mirror is converted to `int`/`float`, and the rest are handed over as compiler objects as-is.
 - **Arrays currently cannot cross the Python boundary** (reading/writing them is an error directly).
+- Compiled spy code reaches the CPython C API through `std.python`: the JIT entry point calls native code with the GIL released, so the caller wraps a group of operations in `GILState.acquire()` / `release()`.  Reference counting follows the C rules and is manual (`decref()`/`incref()`): register `with defer(): obj.decref()` right after a new reference is created, never decref a borrowed reference, and note that `tuple_set`/`list_set` steal their reference.
 
 ```python
 @struct()
