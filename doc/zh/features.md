@@ -31,8 +31,6 @@ from spy import (
     c_long, c_ulong, c_longlong, c_ulonglong,
     Ptr, ConstPtr, MultiPtr, ConstMultiPtr, Option,
     typeof,
-)
-from spy.compiler.syntax import (
     Array, Opaque, array,
     Comptime, ConstComptime, InferComptime,
     comptime, const_comptime, infer_comptime, unroll,
@@ -49,7 +47,7 @@ from spy.std.core import (
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
-from spy.std.math import sin, cos, tan, asin, acos, atan, atan2, sqrt, cbrt, pow, exp, log
+from spy.std.math import abs, sin, cos, tan, asin, acos, atan, atan2, sqrt, cbrt, pow, exp, log
 from spy.std.mem import Layout, layout_of, size_of, align_of
 from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
@@ -1663,7 +1661,7 @@ assert text_len() == 6
 | `std.mem` | `Layout`、`layout_of`/`size_of`/`align_of`、`AllocError`、`Allocator`（协议）、`AllocatorVtable`、`DynamicAllocator`、`CAllocator` |
 | `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf`（extern 声明）、`sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`atan`/`atanf`/`atan2`/`atan2f`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`/`pow`/`powf`/`exp`/`expf`/`log`/`logf`/`asin`/`asinf`/`acos`/`acosf`（libm）、`CError`、`FILE`、`fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`、`Writable`/`Readable`（协议） |
-| `std.math` | `sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sqrt`/`cbrt`/`pow`/`exp`/`log`（实现由编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode` 在编译期选定：`llvm`/`libc`/`software`） |
+| `std.math` | `abs`、`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sqrt`/`cbrt`/`pow`/`exp`/`log`（后十二者的实现由编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode` 在编译期选定：`llvm`/`libc`/`software`） |
 | `std.vec` | `Vec[T, A]` 动态数组 |
 | `std.atomic` | `MemoryOrder`/`RmwOp`、`atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`、便捷包装 |
 | `std.openmp` | `load_openmp_runtime`、`parallel_loop` |
@@ -1729,7 +1727,7 @@ def parallel_sum_count(n: i32) -> i64:
 
 ### 9.3 数学
 
-`std.math.sin(x)` / `std.math.cos(x)` / `std.math.tan(x)` 返回 `f32` 或 `f64` 的 `x` 的正弦/余弦/正切（结果类型与 `x` 相同），`std.math.asin(x)` / `std.math.acos(x)` 返回其反正弦（值域 `[-pi/2, pi/2]`）/反余弦（值域 `[0, pi]`）（`|x| > 1` 为 NaN），`std.math.atan(x)` 返回其反正切（值域 `(-pi/2, pi/2)`），`std.math.atan2(y, x)` 返回 `y/x` 的反正切（值域 `[-pi, pi]`，两个参数是相容的浮点类型，结果取它们的共同类型，并按两者的符号选择象限），`std.math.sqrt(x)` 返回其平方根（非负 `x`），`std.math.cbrt(x)` 返回其立方根（可为负 `x`），`std.math.pow(x, y)` 返回 `x` 的 `y` 次幂（两个参数是相容的浮点类型，结果取它们的共同类型），`std.math.exp(x)` 返回 `e**x`，`std.math.log(x)` 返回自然对数 `ln(x)`（`x` 为 `f32` 或 `f64`）。具体用哪个实现在**编译期**由宿主的编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode` 选定：
+`std.math.sin(x)` / `std.math.cos(x)` / `std.math.tan(x)` 返回 `f32` 或 `f64` 的 `x` 的正弦/余弦/正切（结果类型与 `x` 相同），`std.math.asin(x)` / `std.math.acos(x)` 返回其反正弦（值域 `[-pi/2, pi/2]`）/反余弦（值域 `[0, pi]`）（`|x| > 1` 为 NaN），`std.math.atan(x)` 返回其反正切（值域 `(-pi/2, pi/2)`），`std.math.atan2(y, x)` 返回 `y/x` 的反正切（值域 `[-pi, pi]`，两个参数是相容的浮点类型，结果取它们的共同类型，并按两者的符号选择象限），`std.math.sqrt(x)` 返回其平方根（非负 `x`），`std.math.cbrt(x)` 返回其立方根（可为负 `x`），`std.math.pow(x, y)` 返回 `x` 的 `y` 次幂（两个参数是相容的浮点类型，结果取它们的共同类型），`std.math.exp(x)` 返回 `e**x`，`std.math.log(x)` 返回自然对数 `ln(x)`（`x` 为 `f32` 或 `f64`）。`std.math.abs(x)` 返回整数 `x` 的绝对值（非负时为 `x`，否则为 `-x`），或 `f32`/`f64` `x` 的绝对值（清掉符号位，即 C 的 `fabs`：`abs(±0)` 是 `+0`，NaN 保留其 payload）；它对数值类型泛型，且与上面十二个不同，**不**由编译期选项选定实现。具体用哪个实现在**编译期**由宿主的编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode` 选定：
 
 - `llvm`：LLVM 内建（`llvm.sin.*`/`llvm.cos.*`/`llvm.tan.*`/`llvm.asin.*`/`llvm.acos.*`/`llvm.atan.*`/`llvm.atan2.*`/`llvm.sqrt.*`/`llvm.cbrt.*`/`llvm.pow.*`/`llvm.exp.*`/`llvm.log.*`；其中 `llvm.cbrt.*` 是 LLVM 21 才引入的内建，更早的 LLVM 上不可用）；
 - `libc`：C 标准库的 `sinf`/`sin`/`cosf`/`cos`/`tanf`/`tan`/`asinf`/`asin`/`acosf`/`acos`/`atanf`/`atan`/`atan2f`/`atan2`/`sqrtf`/`sqrt`/`cbrtf`/`cbrt`/`powf`/`pow`/`expf`/`exp`/`logf`/`log`（即 `std.c` 中的 extern 声明）；
@@ -1786,6 +1784,19 @@ def my_atan(x: f64) -> f64:
 @func()
 def my_atan2(y: f64, x: f64) -> f64:
     return atan2(y, x)
+
+@func()
+def my_abs(x: f64) -> f64:
+    return abs(x)
+
+@func()
+def my_abs_i(i: i64) -> i64:
+    return abs(i)
+
+assert my_abs(-2.5) == 2.5
+assert my_abs(2.5) == 2.5
+assert my_abs(-0.0) == 0.0
+assert my_abs_i(-5) == 5
 
 assert abs(my_sin(0.5) - 0.479425538604203) < 1e-15
 assert abs(my_sin(1.0) - 0.8414709848078965) < 1e-15

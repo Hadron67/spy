@@ -31,8 +31,6 @@ from spy import (
     c_long, c_ulong, c_longlong, c_ulonglong,
     Ptr, ConstPtr, MultiPtr, ConstMultiPtr, Option,
     typeof,
-)
-from spy.compiler.syntax import (
     Array, Opaque, array,
     Comptime, ConstComptime, InferComptime,
     comptime, const_comptime, infer_comptime, unroll,
@@ -49,7 +47,7 @@ from spy.std.core import (
     int_to_float_unchecked, float_to_int_unchecked,
 )
 from spy.std.c import snprintf
-from spy.std.math import sin, cos, tan, asin, acos, atan, atan2, sqrt, cbrt, pow, exp, log
+from spy.std.math import abs, sin, cos, tan, asin, acos, atan, atan2, sqrt, cbrt, pow, exp, log
 from spy.std.mem import Layout, layout_of, size_of, align_of
 from spy.std.int import (
     IntCastError, FloatCastError, int_cast, try_int_cast, truncate, valid_range,
@@ -1660,7 +1658,7 @@ assert text_len() == 6
 | `std.mem` | `Layout`, `layout_of`/`size_of`/`align_of`, `AllocError`, `Allocator` (protocol), `AllocatorVtable`, `DynamicAllocator`, `CAllocator` |
 | `std.c` | `malloc`/`free`/`realloc`/`puts`/`snprintf` (extern declarations), `sin`/`sinf`/`cos`/`cosf`/`tan`/`tanf`/`atan`/`atanf`/`atan2`/`atan2f`/`sqrt`/`sqrtf`/`cbrt`/`cbrtf`/`pow`/`powf`/`exp`/`expf`/`log`/`logf`/`asin`/`asinf`/`acos`/`acosf` (libm), `CError`, `FILE`, `fopen`/`fclose`/`fread`/`fwrite` |
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`, `Writable`/`Readable` (protocols) |
-| `std.math` | `sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sqrt`/`cbrt`/`pow`/`exp`/`log` (the implementation is chosen at compile time by the option `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode`: `llvm`/`libc`/`software`) |
+| `std.math` | `abs`, `sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sqrt`/`cbrt`/`pow`/`exp`/`log` (the implementation of the last twelve is chosen at compile time by the option `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode`: `llvm`/`libc`/`software`) |
 | `std.vec` | `Vec[T, A]` dynamic array |
 | `std.atomic` | `MemoryOrder`/`RmwOp`, `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`, convenience wrappers |
 | `std.openmp` | `load_openmp_runtime`, `parallel_loop` |
@@ -1734,6 +1732,9 @@ arc tangent of `y/x` (in `[-pi, pi]`; the two arguments take a common float type
 select the quadrant), `std.math.sqrt(x)` returns its square root (a non-negative `x`), `std.math.cbrt(x)` its cube root (a
 negative `x` is fine), `std.math.pow(x, y)` raises `x` to the `y`-th power (the two arguments take a common float type,
 which the result has too), `std.math.exp(x)` returns `e**x`, and `std.math.log(x)` returns the natural logarithm `ln(x)`.
+`std.math.abs(x)` returns the absolute value of an integer `x` (`x` when it is non-negative, `-x` otherwise) or of an
+`f32`/`f64` `x` (its sign bit cleared, C's `fabs`: `abs(+-0)` is `+0` and a NaN keeps its payload). It is generic over the
+numeric types and, unlike the twelve above, is **not** dispatched by a compile-time mode.
 Which implementation runs is picked **at compile time** by the host's compile-time option
 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`pow_mode`/`exp_mode`/`log_mode`:
 
@@ -1814,6 +1815,19 @@ def my_atan(x: f64) -> f64:
 @func()
 def my_atan2(y: f64, x: f64) -> f64:
     return atan2(y, x)
+
+@func()
+def my_abs(x: f64) -> f64:
+    return abs(x)
+
+@func()
+def my_abs_i(i: i64) -> i64:
+    return abs(i)
+
+assert my_abs(-2.5) == 2.5
+assert my_abs(2.5) == 2.5
+assert my_abs(-0.0) == 0.0
+assert my_abs_i(-5) == 5
 
 assert abs(my_sin(0.5) - 0.479425538604203) < 1e-15
 assert abs(my_sin(1.0) - 0.8414709848078965) < 1e-15

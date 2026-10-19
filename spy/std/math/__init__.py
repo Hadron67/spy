@@ -23,6 +23,10 @@ compile time, chosen by the host's compile-time option
 The mode is read while the function is compiled (``compile_option``) and only the
 selected implementation is typed and lowered, so the choice costs nothing at run
 time.
+
+:func:`abs` is the exception: it is generic over the numeric types (an
+``f32``/``f64`` with its sign bit cleared, or an integer's absolute value) and is
+not dispatched by a mode.
 """
 
 from ...compiler import f32, f64, typeof
@@ -77,6 +81,7 @@ from ..llvm import sqrt_f32 as llvm_sqrt_f32
 from ..llvm import sqrt_f64 as llvm_sqrt_f64
 from ..llvm import tan_f32 as llvm_tan_f32
 from ..llvm import tan_f64 as llvm_tan_f64
+from .abs import abs as abs
 from .cbrt import cbrt as software_cbrt
 from .exp import exp as software_exp
 from .invtrig import acos as software_acos

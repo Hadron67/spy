@@ -5,9 +5,11 @@ from unittest import TestCase, skipUnless
 
 from llvmlite.binding import llvm_version_info
 
-from ...compiler import CompileError, f32, f64
+from ...compiler import CompileError, f32, f64, i8, i32, i64, u8, u32, u64
+from ...compiler import bool as spy_bool
 from ...compiler.dsl import Context, func
 from ...compiler.lower import LLVMBackend
+from ...std.math import abs as spy_abs
 from ...std.math import (
     acos,
     asin,
@@ -372,6 +374,54 @@ def sw_log_f64(x: f64) -> f64:
 @func()
 def sw_log_f32(x: f32) -> f32:
     return software_log(x)
+
+
+# -- ``abs``: generic over the numeric types, not dispatched by a mode -------
+
+
+@func()
+def abs_f64(x: f64) -> f64:
+    return spy_abs(x)
+
+
+@func()
+def abs_f32(x: f32) -> f32:
+    return spy_abs(x)
+
+
+@func()
+def abs_i8(x: i8) -> i8:
+    return spy_abs(x)
+
+
+@func()
+def abs_i32(x: i32) -> i32:
+    return spy_abs(x)
+
+
+@func()
+def abs_i64(x: i64) -> i64:
+    return spy_abs(x)
+
+
+@func()
+def abs_u8(x: u8) -> u8:
+    return spy_abs(x)
+
+
+@func()
+def abs_u32(x: u32) -> u32:
+    return spy_abs(x)
+
+
+@func()
+def abs_u64(x: u64) -> u64:
+    return spy_abs(x)
+
+
+@func()
+def abs_bool(x: spy_bool) -> spy_bool:
+    return spy_abs(x)  # pyright: ignore[reportArgumentType]
 
 
 # -- one host context per mode (the option names cover every function) -------
@@ -780,6 +830,55 @@ class _TrigUlpTest(TestCase):
             want = _to_f32(math.pow(_to_f32(x), _to_f32(y)))
             got = float(fn(f32(x), f32(y)))
             self.assertLessEqual(_f32_ulp(got, want), tol, msg=repr((x, y)))
+
+
+class SpyAbsTest(TestCase):
+    """``std.math.abs``: the sign bit of an ``f32``/``f64`` is cleared (C's
+    ``fabs``) and the absolute value of any integer type is returned; any other
+    argument type is a compile error."""
+
+    def test_abs_f64(self) -> None:
+        for v in _F64_VALUES:
+            self.assertEqual(abs_f64(v), abs(v), msg=repr(v))
+
+    def test_abs_f32(self) -> None:
+        for v in _F32_VALUES:
+            self.assertEqual(float(abs_f32(f32(v))), abs(_to_f32(v)), msg=repr(v))
+
+    def test_abs_f64_of_the_special_values(self) -> None:
+        self.assertTrue(math.isnan(abs_f64(math.nan)))
+        self.assertTrue(math.isnan(abs_f64(-math.nan)))
+        self.assertEqual(abs_f64(math.inf), math.inf)
+        self.assertEqual(abs_f64(-math.inf), math.inf)
+
+    def test_abs_f32_of_the_special_values(self) -> None:
+        self.assertTrue(math.isnan(float(abs_f32(f32(math.nan)))))
+        self.assertEqual(float(abs_f32(f32(math.inf))), math.inf)
+        self.assertEqual(float(abs_f32(f32(-math.inf))), math.inf)
+
+    def test_abs_clears_only_the_sign_bit(self) -> None:
+        # the result is the masked bit pattern, so a negative zero becomes a
+        # positive one, and a NaN keeps its payload
+        self.assertEqual(math.copysign(1.0, abs_f64(-0.0)), 1.0)
+        self.assertEqual(math.copysign(1.0, abs_f32(f32(-0.0))), 1.0)
+        quiet = struct.unpack('<Q', struct.pack('<d', math.nan))[0]
+        got = struct.unpack('<Q', struct.pack('<d', abs_f64(math.nan)))[0]
+        self.assertEqual(got, quiet & 0x7FFFFFFFFFFFFFFF)
+
+    def test_abs_integers(self) -> None:
+        cases = [
+            (abs_i8, -5, 5), (abs_i8, 5, 5), (abs_i8, 0, 0),
+            (abs_i32, -100000, 100000), (abs_i32, 100000, 100000),
+            (abs_i64, -2 ** 40, 2 ** 40), (abs_i64, 2 ** 40, 2 ** 40),
+            (abs_u8, 200, 200), (abs_u32, 4000000000, 4000000000),
+            (abs_u64, 2 ** 63, 2 ** 63),
+        ]
+        for fn, arg, want in cases:
+            self.assertEqual(fn(arg), want, msg=repr(arg))
+
+    def test_abs_of_a_non_numeric_type_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            abs_bool(True)
 
 
 class SpySoftwareTrigTest(_TrigUlpTest):
@@ -1397,6 +1496,7 @@ class SpyLogModeTest(_TrigUlpTest):
 
 
 all_tests = [
+    SpyAbsTest,
     SpySoftwareTrigTest,
     SpyTrigModeTest,
     SpySoftwareAsinAcosTest,

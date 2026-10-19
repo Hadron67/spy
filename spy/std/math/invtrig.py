@@ -45,6 +45,7 @@ from ...compiler.syntax import comptime
 from ..core import Numeric, bitcast, coerce, compile_error
 from ..float import float_truncate
 from ..int import truncate
+from .abs import abs as _abs
 from .sqrt import _invalid_f32, _invalid_f64
 from .sqrt import sqrt as _sqrt
 
@@ -126,14 +127,6 @@ _PI_LO_F32 = -8.7422776573e-08
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-
-@func(inline=True)
-def _fabs64(x: f64) -> f64:
-    """``fabs(x)``: spy has no ``fabs`` builtin, so the sign bit is masked off by
-    hand (``fabsf`` of an ``f32`` is the same, on the value promoted to
-    ``f64``)."""
-    return bitcast(bitcast(x, u64) & 0x7FFFFFFFFFFFFFFF, f64)
 
 
 @func(inline=True)
@@ -272,7 +265,7 @@ def asin[T: Numeric](x: T) -> T:
             return float_truncate(xd + xd * _r32(xd * xd), typ)
         # 1 > |x| >= 0.5
         xd = coerce(x, f64)
-        z = float_truncate((1.0 - _fabs64(xd)) * 0.5, f32)
+        z = float_truncate((1.0 - _abs(xd)) * 0.5, f32)
         zf = coerce(z, f64)
         s = _sqrt(zf)
         res = _PIO2_HI - 2.0 * (s + s * _r32(zf))
@@ -297,7 +290,7 @@ def asin[T: Numeric](x: T) -> T:
             return coerce(xd + xd * _r64(xd * xd), typ)
         # 1 > |x| >= 0.5
         xd = coerce(x, f64)
-        z = (1.0 - _fabs64(xd)) * 0.5
+        z = (1.0 - _abs(xd)) * 0.5
         s = _sqrt(z)
         r = _r64(z)
         res: f64 = 0.0
@@ -420,7 +413,7 @@ def atan[T: Numeric](x: T) -> T:
                 # |x| < 2**-12
                 return x
         else:
-            xa = _fabs64(xa)
+            xa = _abs(xa)
             if ix < 0x3F980000:
                 # |x| < 1.1875
                 if ix < 0x3F300000:
@@ -472,7 +465,7 @@ def atan[T: Numeric](x: T) -> T:
                 # |x| < 2**-27
                 return x
         else:
-            xa = _fabs64(xa)
+            xa = _abs(xa)
             if ix < 0x3FF30000:
                 # |x| < 1.1875
                 if ix < 0x3FE60000:
@@ -572,7 +565,7 @@ def atan2[T: Numeric](y: T, x: T) -> T:
             # |y/x| < 2**-26, x < 0: the result is pi, so no underflow
             zf = coerce(0.0, f32)
         else:
-            ratio = float_truncate(_fabs64(yd / xd), f32)
+            ratio = float_truncate(_abs(yd / xd), f32)
             zf = atan(ratio)
         if m == 0:
             return coerce(zf, typ)
@@ -644,7 +637,7 @@ def atan2[T: Numeric](y: T, x: T) -> T:
             # |y/x| < 2**-64, x < 0: the result is pi, so no underflow
             z64 = 0.0
         else:
-            z64 = atan(_fabs64(yd / xd))
+            z64 = atan(_abs(yd / xd))
         if m == 0:
             return coerce(z64, typ)
         elif m == 1:

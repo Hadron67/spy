@@ -35,6 +35,7 @@ from ...compiler.syntax import array, comptime, const_comptime
 from ..core import Numeric, bitcast, coerce, compile_error, int_to_float_unchecked
 from ..float import float_truncate
 from ..int import int_cast, truncate
+from .abs import abs as _abs
 
 
 def _hex(s: bytes) -> float:
@@ -344,12 +345,6 @@ def _exp2f_tab(index: usize) -> u64:
 
 
 @func()
-def _fabs(x: f64) -> f64:
-    """``fabs(x)``: the sign bit cleared (spy has no ``fenv``)."""
-    return bitcast(bitcast(x, u64) & 0x7FFFFFFFFFFFFFFF, f64)
-
-
-@func()
 def _neg(x: f64) -> f64:
     """``-x`` with the sign of a zero kept: spy lowers a unary ``-`` on a float
     as a subtraction from zero, which would turn ``-0.0`` into ``+0.0``, but
@@ -442,7 +437,7 @@ def _specialcase(tmp: f64, sbits: u64, ki: u64) -> f64:
     sbits = sbits + (1022 << 52)
     scale = bitcast(sbits, f64)
     y = scale + scale * tmp
-    if _fabs(y) < 1.0:
+    if _abs(y) < 1.0:
         one = 1.0
         if y < 0.0:
             one = -1.0
