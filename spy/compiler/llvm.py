@@ -90,6 +90,9 @@ class IntType(Type):
 
     @staticmethod
     def get_range_from_data(bits: int, signed: bool):
+        if bits == 0:
+            # a zero-width integer (a ZST) holds only ``0``
+            return (0, 0)
         if signed:
             return (-2**(bits - 1), 2**(bits - 1) - 1)
         else:

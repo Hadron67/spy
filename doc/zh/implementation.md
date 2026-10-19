@@ -245,7 +245,7 @@ flowchart TD
   借用式表示下，若 `T` 自身把该指针位置表示成空值，会被误读为外层缺席。
 - **tagged union**：单变体 → 该变体自身的镜像；多变体 → `tag + payload union`（`tagged_union_mir`），
   payload 存最大变体，ZST 变体不占 payload。
-- **整数枚举**：能容纳所有成员值的最小整数类型（有负值改有符号），如 `{0,1,2}` → `u2`、`{-1,0,1}` → `i2`。
+- **整数枚举**：默认取能容纳所有成员值的最小整数类型（有负值改有符号），如 `{0,1,2}` → `u2`、`{-1,0,1}` → `i2`；`@enum(...)` 可手动指定（如 `c_int` 对齐 C ABI，`i0`/`u0` 为 ZST）。空枚举报错。
 - **复数**：`{real, imag}` 两个元素浮点（`complex_mir`）。
 - **无标签 union**：存储即最大变体，各变体都在偏移 0（见 §7.1）。
 
@@ -322,7 +322,7 @@ thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`
 - `_RegisteredClass`：`get_entry` 建 `StructTypeHead`（先绑 head 再读 body，支持自引用）、字段、方法（走 `reversed(MRO)`，子类覆盖优先）；
   `__getitem__` → `glue.specialized_struct`；`__call__` → `glue.construct`。
 - `_Context`（`sval.CompileContext` 子类）：`resolve_global`（把注册对象/enum 成员解析成本上下文的 spy 值或 `FunctionValue`，把不用 `@func` 装饰的普通 Python 函数包成 `sval.PyFunction`）、
-  `special_types`、`mir_lower_cache`、`target_info`、`_resolve_call`、enum 支持（`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`）、
+  `special_types`、`mir_lower_cache`、`target_info`、`_resolve_call`、enum 支持（`enum` 装饰器/`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`）、
   编译选项（`get_compile_option`/`set_compile_option`，由 `_compile_options` 以 `str` 名为键存）。
   `_GLOBAL_CONTEXT = _Context(LLVMBackend())` 是顶层默认上下文。
 

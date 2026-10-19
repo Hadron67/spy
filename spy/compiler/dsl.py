@@ -696,6 +696,32 @@ def _build_fn_type(
         has_varargs,
     )
 
+_ENUM_INT_TYPE_ATTR = '__spy_enum_int_type__'
+"""The class attribute ``@enum(...)`` stores its integer-type argument in: the
+raw ``sval`` type (a fixed-width ``IntType`` such as ``i32``) or a target-
+dependent marker such as ``c_int``, which each context resolves against its
+own target (see ``enum_int_type``)."""
+
+def _enum_int_type(cls: type, ctx: CompileContext) -> sval.IntType | None:
+    """The integer type ``@enum(...)`` declared for the enumeration class
+    ``cls``, resolved in ``ctx`` (a target-dependent marker such as ``c_int``
+    takes the target's width), or ``None`` when the class declares none."""
+    spec = getattr(cls, _ENUM_INT_TYPE_ATTR, None)
+    if spec is None:
+        return None
+    try:
+        resolved = sval.as_value(spec, ctx)
+    except TypeError as e:
+        raise CompileError(
+            f'the enum {cls.__name__} integer type must be an integer type, '
+            f'got {spec!r}'
+        ) from e
+    if not isinstance(resolved, sval.IntType):
+        raise CompileError(
+            f'the enum {cls.__name__} integer type must be an integer type, '
+            f'got {spec!r}'
+        )
+    return resolved
 
 @dataclass(frozen=True, slots=True)
 class DeclFuncMetadata:
@@ -857,7 +883,13 @@ class Context(CompileContext):
         # mapping for the Python boundary (see ``enum_class_of``)
         existing = self._enum_cache.get(cls)
         if existing is None:
-            existing = sval.int_enum_type(cls.__name__, cls)
+            class_loc, _ = _class_declaration_locs(cls)
+            try:
+                int_type = _enum_int_type(cls, self)
+                existing = sval.int_enum_type(cls.__name__, cls, int_type)
+            except CompileError as e:
+                e.attach_loc(class_loc)
+                raise
             self._enum_cache[cls] = existing
             self._enum_class_of[existing] = cls
             self._collect_enum_methods(cls, existing)
@@ -994,6 +1026,48 @@ class Context(CompileContext):
             return cast(T, result)
         return wrapper
 
+    def enum(self, int_type: type | sval.IntType):
+        """Declare the integer type an ``enum.Enum`` class is represented by.
+        The argument is a fixed-width ``IntType`` (``i32``, ``u8``, ...) or a
+        target-dependent marker (``c_int``, ``usize``, ...), resolved in the
+        context that builds the enumeration.  A zero-width type (``i0``/``u0``)
+        makes the enumeration a ZST; a class without one keeps the smallest
+        integer type that holds every member value."""
+        # resolve the argument now: it catches both a non-integer type and the
+        # bare ``@enum`` spelling, which passes the decorated class as the
+        # argument (``@enum`` must be ``@enum(c_int)``)
+        try:
+            resolved = sval.as_value(int_type, self)
+        except (TypeError, CompileError) as e:
+            raise CompileError(
+                f'@enum requires an integer type (for example @enum(c_int)), '
+                f'got {int_type!r}'
+            ) from e
+        if not isinstance(resolved, sval.IntType):
+            raise CompileError(
+                f'@enum requires an integer type (for example @enum(c_int)), '
+                f'got {int_type!r}'
+            )
+
+        def wrapper[T](cls: type[T]) -> type[T]:
+            class_loc, _ = _class_declaration_locs(cls)
+            if not sval.is_int_enum_class(cls):
+                raise CompileError(
+                    f'@enum can only decorate an enum.Enum class, got {cls!r}',
+                    loc=class_loc,
+                )
+            # store the raw specification: a target-dependent marker must be
+            # resolved against each context's own target (see
+            # ``_int_enum_type``), and resolve it here once for an early error
+            setattr(cls, _ENUM_INT_TYPE_ATTR, int_type)
+            try:
+                _enum_int_type(cls, self)
+            except CompileError as e:
+                e.attach_loc(class_loc)
+                raise
+            return cls
+        return wrapper
+
     @dataclass_transform()
     def struct(self, extern_c: bool = False, copyable: bool | Literal["inherit"] = "inherit"):
         """Declare a spy struct.  ``extern_c`` keeps the C layout; ``copyable``
@@ -1019,3 +1093,4 @@ func = _GLOBAL_CONTEXT.func
 struct = _GLOBAL_CONTEXT.struct
 func_type = _GLOBAL_CONTEXT.func_type
 decl_func = _GLOBAL_CONTEXT.decl_func
+enum = _GLOBAL_CONTEXT.enum

@@ -24,7 +24,7 @@ the examples below import the common names directly to keep their bodies short:
 
 ```python
 from spy import (
-    func, struct, decl_func, func_type, Enum,
+    func, struct, decl_func, func_type, enum, Enum,
     i8, i16, i32, i64, u8, u16, u32, u64, u0, usize, isize,
     f32, f64, c64, c128,
     c_char, c_uchar, c_short, c_ushort, c_int, c_uint,
@@ -383,6 +383,7 @@ A class that inherits `spy.Enum` (the standard `enum.Enum`) with integer member 
 - It can be used directly as a parameter/return value/field annotation; its members are compile-time values.
 - **It is not an integer**: it takes part in no arithmetic/bit operations, and is not compared/converted with `int` or another enum; only `==`/`!=` between members of the same enum are supported (comparing member identity).
 - Methods are supported (`@func()`-compiled, undecorated inlined, `@staticmethod`); a method's `self` is **by value** by default (use `@func(self_arg="ptr"/"const ptr")` to switch to by reference).
+- By default the representation is the smallest integer type that holds every member value; `@enum(...)` names one explicitly (e.g. `@enum(c_int)` matches a C API's `int`). `i0`/`u0` makes the enumeration a ZST (its only member value can be `0`); an empty enum is rejected.
 - At the Python boundary: a member passed in is recognized as an enum value, and an enum return value/field is restored to a Python member.
 
 ```python
@@ -408,13 +409,29 @@ assert negate_state(TriState.UNKNOWN) is TriState.UNKNOWN
 assert state_is_unknown(TriState.UNKNOWN) is True
 ```
 
+An explicit representation:
+
+```python
+@enum(c_int)
+class PyConstant(Enum):
+    NONE = 0
+    ONE = 6
+
+@func()
+def is_py_none(c: PyConstant) -> bool:
+    return c == PyConstant.NONE
+
+assert is_py_none(PyConstant.NONE) is True
+assert is_py_none(PyConstant.ONE) is False
+```
+
 ### 1.11 Structs
 
 See §7.
 
 ### 1.12 ZST (zero-sized type) and DST
 
-- **ZST**: the `void` of `-> None`, `u0`, structs whose fields are all ZST, tuples and `dict[str, T]`s whose elements are all ZST, arrays whose elements are ZST or whose length is 0, `Null`, `undefined`,
+- **ZST**: the `void` of `-> None`, `u0`, integer enums represented by `i0`/`u0`, structs whose fields are all ZST, tuples and `dict[str, T]`s whose elements are all ZST, arrays whose elements are ZST or whose length is 0, `Null`, `undefined`,
   and so on. A ZST takes no runtime space, but a ZST result still delivers a unit value as usual (see `sval.Type.get_unit_value`).
 - **DST (dynamically-sized type)**: DST function types, `Opaque`, unsized arrays; only **a pointer to it** is a value, and it cannot be passed/returned by value or read as a whole.
   The first DST field in a struct is a flexible array member, and later DST fields occupy no slot.

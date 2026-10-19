@@ -246,7 +246,7 @@ Struct helpers (mostly iterative): `alignment_of`, `aggregate_type_length`, `sca
   Under the borrowing representation, if `T` itself represents that pointer position as null, it is misread as an outer absence.
 - **tagged union**: single variant -> that variant's own mirror; multiple variants -> `tag + payload union` (`tagged_union_mir`),
   the payload holds the largest variant, and ZST variants take no payload.
-- **Integer enum**: the smallest integer type able to hold all member values (with negative values it becomes signed), e.g. `{0,1,2}` -> `u2`, `{-1,0,1}` -> `i2`.
+- **Integer enum**: by default the smallest integer type able to hold all member values (with negative values it becomes signed), e.g. `{0,1,2}` -> `u2`, `{-1,0,1}` -> `i2`; `@enum(...)` names it explicitly (e.g. `c_int` matches the C ABI, `i0`/`u0` makes it a ZST). An empty enum is rejected.
 - **Complex**: `{real, imag}` as two-element float (`complex_mir`).
 - **Untagged union**: the storage is just the largest variant, with every variant at offset 0 (see §7.1).
 
@@ -304,7 +304,7 @@ and the thunk returns `bool` (`true` = panic, `false` = normal). `_thunk_call_si
 - `_RegisteredClass`: `get_entry` builds the `StructTypeHead` (binds the head before reading the body, supporting self-reference), the fields, and the methods (walking `reversed(MRO)`, subclass overrides first);
   `__getitem__` -> `glue.specialized_struct`; `__call__` -> `glue.construct`.
 - `_Context` (a subclass of `sval.CompileContext`): `resolve_global` (resolves registered objects / enum members into spy values or `FunctionValue`s of this context, and wraps a plain Python function that is not decorated with `@func` into a `sval.PyFunction`),
-  `special_types`, `mir_lower_cache`, `target_info`, `_resolve_call`, enum support (`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`),
+  `special_types`, `mir_lower_cache`, `target_info`, `_resolve_call`, enum support (the `enum` decorator/`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`),
   compile options (`get_compile_option`/`set_compile_option`, stored in `_compile_options` keyed by a `str` name).
   `_GLOBAL_CONTEXT = _Context(LLVMBackend())` is the top-level default context.
 

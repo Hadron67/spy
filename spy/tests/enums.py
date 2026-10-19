@@ -4,9 +4,16 @@ from unittest import TestCase
 from ..compiler import (
     CompileError,
     SpyError,
+    c_int,
+    enum,
+    f32,
+    i0,
     i32,
+    i64,
     mir,
     sval,
+    u0,
+    u8,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
@@ -18,7 +25,9 @@ from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
 # an integer: it never takes part in arithmetic, implicit conversion or
 # comparison with an ``int``, and only its own members compare equal.  It is
 # represented at runtime as the smallest integer type that holds every member
-# value (unsigned, or signed when a value is negative).
+# value (unsigned, or signed when a value is negative), unless ``@enum(...)``
+# names the representation explicitly.  A zero-width representation (``i0``/
+# ``u0``) makes the enumeration a ZST.
 # ---------------------------------------------------------------------------
 
 
@@ -56,6 +65,47 @@ class Sign(Enum):
     NEG = -1
     ZERO = 0
     POS = 1
+
+
+@enum(c_int)
+class CIntState(Enum):
+    ZERO = 0
+    ONE = 1
+
+
+@enum(u8)
+class ByteValue(Enum):
+    ZERO = 0
+    MAX = 255
+
+
+@enum(i64)
+class WideSigned(Enum):
+    NEG = -1
+    ZERO = 0
+
+
+@enum(u0)
+class ZeroSized(Enum):
+    ZERO = 0
+
+
+# the declarations the type builder rejects: a value that does not fit the
+# named representation, and an enumeration with no members at all
+
+
+@enum(u8)
+class OutOfRange(Enum):
+    TOO_BIG = 256
+
+
+@enum(i0)
+class NonZeroZeroWidth(Enum):
+    ONE = 1
+
+
+class Empty(Enum):
+    pass
 
 
 @func()
@@ -120,6 +170,29 @@ def sign_negate(s: Sign) -> Sign:
 @func()
 def sign_is_neg(s: Sign) -> spy_bool:
     return s == Sign.NEG
+
+
+@func()
+def wide_pick(which: i32) -> WideSigned:
+    if which == 0:
+        return WideSigned.NEG
+    return WideSigned.ZERO
+
+
+@struct()
+class WideMachine:
+    state: WideSigned
+    count: i32
+
+
+@func()
+def wide_machine_make(state: WideSigned, count: i32) -> WideMachine:
+    return WideMachine(state, count)
+
+
+@func()
+def zero_sized_roundtrip(x: ZeroSized) -> ZeroSized:
+    return x
 
 
 @func()
@@ -333,6 +406,84 @@ class SpyEnumTest(TestCase):
         self.assertEqual(tri_state_mir, mir.IntType(2, False))
         sign_mir = self.enum_type(Sign).to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache)
         self.assertEqual(sign_mir, mir.IntType(2, True))
+
+    def test_a_manual_c_int_representation(self) -> None:
+        target = _GLOBAL_CONTEXT.target_info()
+        enum_type = self.enum_type(CIntState)
+        self.assertEqual(enum_type.int_type, sval.IntType(target.c_int_bits, True))
+        self.assertEqual(
+            enum_type.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache),
+            mir.IntType(target.c_int_bits, True),
+        )
+
+    def test_a_manual_unsigned_representation(self) -> None:
+        enum_type = self.enum_type(ByteValue)
+        self.assertEqual(enum_type.int_type, sval.IntType(8, False))
+        self.assertEqual(
+            enum_type.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache), mir.IntType(8, False),
+        )
+
+    def test_a_representation_wider_than_needed(self) -> None:
+        enum_type = self.enum_type(WideSigned)
+        self.assertEqual(enum_type.int_type, sval.IntType(64, True))
+        self.assertEqual(
+            enum_type.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache), mir.IntType(64, True),
+        )
+
+    def test_a_zero_width_representation_is_a_zst(self) -> None:
+        enum_type = self.enum_type(ZeroSized)
+        self.assertIsNone(enum_type.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache))
+        self.assertEqual(enum_type.classify(), sval.SpecialTypeKind.ZST)
+        unit = enum_type.get_unit_value()
+        self.assertIsInstance(unit, sval.IntEnumValue)
+        assert isinstance(unit, sval.IntEnumValue)
+        self.assertIs(unit.type, enum_type)
+        self.assertEqual(enum_type.value_of(unit.index), 0)
+
+    def test_zero_width_int_range_is_zero(self) -> None:
+        i0 = sval.IntType(0, True)
+        u0 = sval.IntType(0, False)
+        self.assertEqual(sval.int_range(i0), (0, 0))
+        self.assertEqual(sval.int_range(u0), (0, 0))
+        self.assertEqual(sval.coerce_const(0, i0), sval.Int(0, i0))
+        self.assertRaises(CompileError, sval.coerce_const, 1, i0)
+
+    def test_a_manual_representation_crosses_the_boundary(self) -> None:
+        self.assertIs(wide_pick(0), WideSigned.NEG)
+        self.assertIs(wide_pick(1), WideSigned.ZERO)
+        machine = wide_machine_make(WideSigned.NEG, 3)
+        self.assertIs(machine.state, WideSigned.NEG)
+        self.assertEqual(machine.count, 3)
+
+    def test_a_zero_width_enumeration_crosses_the_boundary(self) -> None:
+        self.assertIsNone(zero_sized_roundtrip(ZeroSized.ZERO))
+
+    def test_a_member_out_of_range_is_rejected(self) -> None:
+        self.assertRaises(CompileError, sval.as_value, OutOfRange, _GLOBAL_CONTEXT)
+
+    def test_a_nonzero_member_of_a_zero_width_enum_is_rejected(self) -> None:
+        self.assertRaises(CompileError, sval.as_value, NonZeroZeroWidth, _GLOBAL_CONTEXT)
+
+    def test_an_empty_enum_is_rejected(self) -> None:
+        self.assertRaises(CompileError, sval.as_value, Empty, _GLOBAL_CONTEXT)
+
+    def test_a_non_integer_representation_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            @enum(f32)
+            class Bad(Enum):
+                ZERO = 0
+
+    def test_the_bare_decorator_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            @enum  # type: ignore[arg-type]
+            class Bad(Enum):
+                ZERO = 0
+
+    def test_decorating_a_non_enum_class_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            @enum(c_int)
+            class Bad:
+                pass
 
     def test_comparing_an_enumeration_to_an_integer_is_rejected(self) -> None:
         self.assertRaises(CompileError, enum_bad_int_compare, TriState.TRUE)

@@ -5,6 +5,7 @@ from enum import Enum as Enum
 from .dsl import Context as Context
 from .dsl import builtin_func as builtin_func
 from .dsl import decl_func as decl_func
+from .dsl import enum as enum
 from .dsl import func as func
 from .dsl import func_type as func_type
 from .dsl import struct as struct

@@ -2020,7 +2020,9 @@ class IntEnumType(ScalarType, IdentityObj):
     member values declares.  It is *not* an integer - it never takes part in
     arithmetic, implicit conversion or comparison with an ``int`` - and its
     runtime representation is the smallest integer type that holds every member
-    value (unsigned when all the values are non-negative, signed otherwise).
+    value (unsigned when all the values are non-negative, signed otherwise),
+    unless ``@enum(...)`` names one explicitly.  A zero-width representation
+    (``i0``/``u0``) makes the enumeration a ZST.
 
     Like a struct type it is compared by identity, so a Python enum class has
     exactly one ``IntEnumType`` in each host context (see
@@ -2028,14 +2030,29 @@ class IntEnumType(ScalarType, IdentityObj):
     ``CompileContext.enum_class_of``.  ``members`` holds the members in
     declaration order, as ``name -> (name, value)``."""
 
-    def __init__(self, name: str, members: IndexedMap[str, tuple[str, int]]) -> None:
+    def __init__(self, name: str, members: IndexedMap[str, tuple[str, int]], int_type: IntType | None = None) -> None:
         self.name = name
         self.members = members
         values = [value for _, value in members.by_id]
-        # the smallest integer type that holds every member value: unsigned for
-        # non-negative values, signed as soon as one is negative (see
-        # ``min_int_type``, which always reserves at least one bit)
-        self.int_type = IntType(1, False) if len(values) == 0 else min_int_type(min(values), max(values))
+        if len(values) == 0:
+            # an empty enumeration has no value at all, like ``EmptyType``
+            raise CompileError(f'the enum {name} must have at least one member')
+        if int_type is None:
+            # the smallest integer type that holds every member value: unsigned
+            # for non-negative values, signed as soon as one is negative (see
+            # ``min_int_type``, which always reserves at least one bit)
+            self.int_type = min_int_type(min(values), max(values))
+        else:
+            # a representation named explicitly (``@enum(...)``): every member
+            # value has to fit in it
+            lower, upper = int_range(int_type)
+            for member_name, value in members.by_id:
+                if not lower <= value <= upper:
+                    raise CompileError(
+                        f'the enum {name} member {member_name!r} has the value '
+                        f'{value}, which does not fit in {int_type}'
+                    )
+            self.int_type = int_type
         # the methods of the enum class body, by name (see
         # ``dsl._Context._collect_enum_methods``): a struct-like set, except an
         # enum method's ``self`` is the value itself
@@ -2067,12 +2084,23 @@ class IntEnumType(ScalarType, IdentityObj):
         return TYPE_TYPE
 
     @override
+    def get_unit_value(self) -> Value | None:
+        if self.int_type.bits != 0:
+            return None
+        # a zero-width enumeration holds the single value ``0`` (the range check
+        # leaves no other member value), so its unit value is that member
+        for index, (_name, value) in enumerate(self.members.by_id):
+            if value == 0:
+                return IntEnumValue(self, index)
+        raise AssertionError(f'the zero-width enum {self.name} has no zero member')
+
+    @override
     def classify(self) -> SpecialTypeKind:
-        return SpecialTypeKind.NONE
+        return self.int_type.classify()
 
     @override
     def to_mir_type(self, cache: MirLowerCache) -> mir.Type | None:
-        return mir.IntType(self.int_type.bits, self.int_type.signed)
+        return self.int_type.to_mir_type(cache)
 
     @override
     def is_subtype_of(self, other: Type) -> bool:
@@ -2115,16 +2143,16 @@ def is_int_enum_class(value: Any) -> TypeGuard[type]:
     ``enum.Enum``)."""
     return isinstance(value, type) and issubclass(value, _INT_ENUM_BASE)
 
-
 def is_int_enum_member(value: Any) -> TypeGuard[Enum]:
     """Whether ``value`` is a member of a spy enumeration."""
     return isinstance(value, _INT_ENUM_BASE)
 
 
-def int_enum_type(name: str, cls: type) -> IntEnumType:
+def int_enum_type(name: str, cls: type, int_type: IntType | None = None) -> IntEnumType:
     """The :class:`IntEnumType` the ``enum.Enum`` class ``cls`` declares: its
     members in declaration order, each with an integer value (aliases are
-    skipped, as Python does)."""
+    skipped, as Python does).  ``int_type`` is the representation ``@enum(...)``
+    named, or ``None`` for the smallest integer type that holds every value."""
     members: IndexedMap[str, tuple[str, int]] = IndexedMap()
     # iterating an ``Enum`` class yields its canonical members, in declaration
     # order (aliases are skipped, as Python does); the checker does not know
@@ -2137,7 +2165,7 @@ def int_enum_type(name: str, cls: type) -> IntEnumType:
                 f'value, got {value!r}'
             )
         members.add(member.name, (member.name, value))
-    return IntEnumType(name, members)
+    return IntEnumType(name, members, int_type)
 
 @dataclass(frozen=True)
 class FloatType(ScalarType):
@@ -3450,6 +3478,10 @@ class PyFunction(Value):
 
 
 def int_range(type: IntType) -> tuple[int, int]:
+    if type.bits == 0:
+        # a zero-width integer (a ZST) holds only ``0``; the signed formula would
+        # produce ``(-0.5, -0.5)`` here
+        return (0, 0)
     if type.signed:
         return (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
     return (0, 2 ** type.bits - 1)
@@ -4604,10 +4636,7 @@ def coerce_const(value: AnyValue, type: Type) -> AnyValue:
         case IntType():
             if isinstance(value, bool) or not isinstance(value, int):
                 raise CoerceError(f"cannot use {value!r} as an integer constant")
-            if type.signed:
-                lo, hi = (-(2 ** (type.bits - 1)), 2 ** (type.bits - 1) - 1)
-            else:
-                lo, hi = (0, 2 ** type.bits - 1)
+            lo, hi = int_range(type)
             if not lo <= value <= hi:
                 raise CoerceError(
                     f"integer constant {value} is out of range for {type}"

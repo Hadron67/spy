@@ -41,9 +41,11 @@ from ..compiler import (
     Opaque,
     Option,
     Ptr,
+    c_int,
     c_long,
     comptime,
     decl_func,
+    enum,
     f64,
     func,
     i32,
@@ -75,6 +77,7 @@ class PyError(Exception):
     """
 
 
+@enum(c_int)
 class GILState(Enum):
     """The state ``PyGILState_Ensure`` returns, passed back to
     ``PyGILState_Release``.  ``acquire``/``release`` are the short spelling of
@@ -93,6 +96,7 @@ class GILState(Enum):
         PyGILState_Release(self)
 
 
+@enum(c_int)
 class PyConstant(Enum):
     """The constant ids ``Py_GetConstant``/``Py_GetConstantBorrowed`` take
     (``Py_CONSTANT_*`` in ``object.h``)."""
@@ -109,6 +113,7 @@ class PyConstant(Enum):
     EMPTY_TUPLE = 9
 
 
+@enum(c_int)
 class PyCompareOp(Enum):
     """The comparison operators ``PyObject_RichCompare*`` take
     (``Py_LT``..``Py_GE`` in ``object.h``)."""

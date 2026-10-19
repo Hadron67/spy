@@ -24,7 +24,7 @@
 
 ```python
 from spy import (
-    func, struct, decl_func, func_type, Enum,
+    func, struct, decl_func, func_type, enum, Enum,
     i8, i16, i32, i64, u8, u16, u32, u64, u0, usize, isize,
     f32, f64, c64, c128,
     c_char, c_uchar, c_short, c_ushort, c_int, c_uint,
@@ -383,6 +383,7 @@ assert widen_int(3) == complex(3, 0.0)
 - 可直接作形参/返回值/字段注解；成员是编译期值。
 - **不是一个整数**：不参与算术/位运算、不与 `int` 或另一个枚举比较/转换；只支持同枚举之间的 `==`/`!=`（比较成员身份）。
 - 支持方法（`@func()` 编译、未装饰内联、`@staticmethod`）；方法的 `self` **默认按值**（可用 `@func(self_arg="ptr"/"const ptr")` 改按引用）。
+- 默认取能容纳所有成员值的最小整数类型；可用 `@enum(...)` 手动指定表示类型（如 `@enum(c_int)` 与 C API 的 `int` 对齐）。`i0`/`u0` 使枚举成为 ZST（只能有取值为 0 的成员）；空枚举报错。
 - Python 边界：成员入参识别为枚举值，枚举返回值/字段还原为 Python 成员。
 
 ```python
@@ -408,13 +409,29 @@ assert negate_state(TriState.UNKNOWN) is TriState.UNKNOWN
 assert state_is_unknown(TriState.UNKNOWN) is True
 ```
 
+手动指定表示类型：
+
+```python
+@enum(c_int)
+class PyConstant(Enum):
+    NONE = 0
+    ONE = 6
+
+@func()
+def is_py_none(c: PyConstant) -> bool:
+    return c == PyConstant.NONE
+
+assert is_py_none(PyConstant.NONE) is True
+assert is_py_none(PyConstant.ONE) is False
+```
+
 ### 1.11 结构体（struct）
 
 见 §7。
 
 ### 1.12 ZST（零大小类型）与 DST
 
-- **ZST**：`-> None` 的 `void`、`u0`、字段全为 ZST 的结构体、元素全为 ZST 的元组/`dict[str, T]`、元素为 ZST 或长度为 0 的数组、`Null`、`undefined`
+- **ZST**：`-> None` 的 `void`、`u0`、以 `i0`/`u0` 表示的整数枚举、字段全为 ZST 的结构体、元素全为 ZST 的元组/`dict[str, T]`、元素为 ZST 或长度为 0 的数组、`Null`、`undefined`
   等。ZST 不占运行时空间，但 ZST 结果照常交付单位值（`sval.Type.get_unit_value`）。
 - **DST（动态大小类型）**：DST 函数类型、`Opaque`、无长度数组；只有**指向它的指针**是值，不能按值传递/返回/整体读取。
   结构体里第一个 DST 字段是弹性数组，后续 DST 字段不占位。
