@@ -1,24 +1,24 @@
 """Math functions (``std.math``).
 
 :func:`sin`, :func:`cos`, :func:`tan`, :func:`asin`, :func:`acos`,
-:func:`atan`, :func:`atan2`, :func:`sqrt`, :func:`cbrt`, :func:`pow`,
-:func:`exp` and :func:`log` each dispatch to one of three implementations at
-compile time, chosen by the host's compile-time option
+:func:`atan`, :func:`atan2`, :func:`sqrt`, :func:`cbrt`, :func:`ceil`,
+:func:`pow`, :func:`exp` and :func:`log` each dispatch to one of three
+implementations at compile time, chosen by the host's compile-time option
 ``sin_mode``/``cos_mode``/``tan_mode``/``asin_mode``/``acos_mode``/
-``atan_mode``/``atan2_mode``/``sqrt_mode``/``cbrt_mode``/``pow_mode``/
-``exp_mode``/``log_mode``:
+``atan_mode``/``atan2_mode``/``sqrt_mode``/``cbrt_mode``/``ceil_mode``/
+``pow_mode``/``exp_mode``/``log_mode``:
 
 * ``llvm`` - the LLVM intrinsic (``llvm.sin.*``/``llvm.cos.*``/``llvm.tan.*``/
   ``llvm.asin.*``/``llvm.acos.*``/``llvm.atan.*``/``llvm.atan2.*``/
-  ``llvm.sqrt.*``/``llvm.cbrt.*``/``llvm.pow.*``/``llvm.exp.*``/
-  ``llvm.log.*``),
+  ``llvm.sqrt.*``/``llvm.cbrt.*``/``llvm.ceil.*``/``llvm.pow.*``/
+  ``llvm.exp.*``/``llvm.log.*``),
 * ``libc`` - the C library ``sinf``/``sin``/``cosf``/``cos``/``tanf``/``tan``/
   ``asinf``/``asin``/``acosf``/``acos``/``atanf``/``atan``/``atan2f``/
-  ``atan2``/``sqrtf``/``sqrt``/``cbrtf``/``cbrt``/``powf``/``pow``/
-  ``expf``/``exp``/``logf``/``log`` (see ``std.c``),
+  ``atan2``/``sqrtf``/``sqrt``/``cbrtf``/``cbrt``/``ceilf``/``ceil``/
+  ``powf``/``pow``/``expf``/``exp``/``logf``/``log`` (see ``std.c``),
 * ``software`` (the default, also when the option is unset) - the pure spy port
   in ``std.math.trig``/``std.math.invtrig``/``std.math.sqrt``/``std.math.cbrt``/
-  ``std.math.pow``/``std.math.exp``/``std.math.log``.
+  ``std.math.ceil``/``std.math.pow``/``std.math.exp``/``std.math.log``.
 
 The mode is read while the function is compiled (``compile_option``) and only the
 selected implementation is typed and lowered, so the choice costs nothing at run
@@ -42,6 +42,8 @@ from ..c import atan2f as c_atan2f
 from ..c import atanf as c_atanf
 from ..c import cbrt as c_cbrt
 from ..c import cbrtf as c_cbrtf
+from ..c import ceil as c_ceil
+from ..c import ceilf as c_ceilf
 from ..c import cos as c_cos
 from ..c import cosf as c_cosf
 from ..c import exp as c_exp
@@ -67,6 +69,8 @@ from ..llvm import atan_f32 as llvm_atan_f32
 from ..llvm import atan_f64 as llvm_atan_f64
 from ..llvm import cbrt_f32 as llvm_cbrt_f32
 from ..llvm import cbrt_f64 as llvm_cbrt_f64
+from ..llvm import ceil_f32 as llvm_ceil_f32
+from ..llvm import ceil_f64 as llvm_ceil_f64
 from ..llvm import cos_f32 as llvm_cos_f32
 from ..llvm import cos_f64 as llvm_cos_f64
 from ..llvm import exp_f32 as llvm_exp_f32
@@ -83,6 +87,7 @@ from ..llvm import tan_f32 as llvm_tan_f32
 from ..llvm import tan_f64 as llvm_tan_f64
 from .abs import abs as abs
 from .cbrt import cbrt as software_cbrt
+from .ceil import ceil as software_ceil
 from .exp import exp as software_exp
 from .invtrig import acos as software_acos
 from .invtrig import asin as software_asin
@@ -221,6 +226,15 @@ def cbrt[T](x: T) -> T:
     option ``cbrt_mode`` (``llvm``/``libc``/``software``) selects.  An unknown
     mode is a compile error."""
     return _dispatch(x, "cbrt_mode", llvm_cbrt_f32, llvm_cbrt_f64, c_cbrtf, c_cbrt, software_cbrt)
+
+@func(inline=True)
+def ceil[T](x: T) -> T:
+    """The smallest integer not less than ``x`` (``f32`` or ``f64``):
+    ``llvm.ceil.*``, the libc ``ceilf``/``ceil``, or the pure spy
+    implementation, as the compile-time option ``ceil_mode``
+    (``llvm``/``libc``/``software``) selects.  An unknown mode is a compile
+    error."""
+    return _dispatch(x, "ceil_mode", llvm_ceil_f32, llvm_ceil_f64, c_ceilf, c_ceil, software_ceil)
 
 @func(inline=True)
 def pow[T](x: T, y: T) -> T:

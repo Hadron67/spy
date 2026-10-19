@@ -17,6 +17,7 @@ from ...std.math import (
     atan,
     atan2,
     cbrt,
+    ceil,
     cos,
     exp,
     log,
@@ -26,6 +27,7 @@ from ...std.math import (
     tan,
 )
 from ...std.math.cbrt import cbrt as software_cbrt
+from ...std.math.ceil import ceil as software_ceil
 from ...std.math.exp import exp as software_exp
 from ...std.math.invtrig import acos as software_acos
 from ...std.math.invtrig import asin as software_asin
@@ -143,6 +145,40 @@ _CBRT_F32_VALUES = [
     2.0, -2.0, 3.0, -3.0, 0.7853982, 1e-4, -1e-4, 1e-30, 1.4e-45,
     1.1754944e-38, 2.0**12, 2.0**23, 2.0**24, 1e7, -1e7, 1e8, 1e30, 3.4e38,
 ]
+
+# ``ceil`` is exact, so the values cover the two zeros, the fractions on either
+# side of zero (a negative one yields ``-0.0``), the integers, the ``2**52``
+# (``f64``) and ``2**23`` (``f32``) boundaries where every value is already an
+# integer, the subnormals and the special values.
+_CEIL_F64_VALUES = [
+    math.nan, math.inf, -math.inf,
+    0.0, -0.0, 0.1, -0.1, 0.5, -0.5, 0.9, -0.9, 1.0, -1.0,
+    1.1, -1.1, 1.5, -1.5, 1.9, -1.9, 2.0, -2.0, 2.5, -2.5,
+    3.0, -3.0, 100.0, -100.0, 123456789.123, -123456789.123,
+    5e-324, -5e-324, 2.2250738585072014e-308, -2.2250738585072014e-308,
+    2.0**52 - 1.5, 2.0**52 - 1.0, 2.0**52 - 0.5, 2.0**52,
+    -(2.0**52 - 0.5), -2.0**52, 2.0**53, -2.0**53, 1e16, -1e16,
+    1e300, -1e300,
+]
+
+_CEIL_F32_VALUES = [
+    math.nan, math.inf, -math.inf,
+    0.0, -0.0, 0.1, -0.1, 0.5, -0.5, 0.9, -0.9, 1.0, -1.0,
+    1.1, -1.1, 1.5, -1.5, 2.0, -2.0, 2.5, -2.5, 3.0, -3.0,
+    100.0, -100.0, 1234.5678, -1234.5678,
+    1.4e-45, -1.4e-45, 1.1754944e-38, -1.1754944e-38,
+    2.0**23 - 1.5, 2.0**23 - 1.0, 2.0**23 - 0.5, 2.0**23, 2.0**24,
+    -2.0**23, 1e7, -1e7, 1e30, -1e30,
+]
+
+
+def _ceil_ref(x: float) -> float:
+    """The exact ceiling of ``x`` as a float, keeping ``-0.0`` for ``(-1, 0)``."""
+    if math.isnan(x) or math.isinf(x) or x == 0.0:
+        return x
+    if -1.0 < x < 0.0:
+        return -0.0
+    return float(math.ceil(x))
 
 # ``pow`` takes two arguments; the values stay where the result neither
 # overflows nor underflows and a negative base always has an integer exponent
@@ -348,6 +384,16 @@ def sw_cbrt_f32(x: f32) -> f32:
 
 
 @func()
+def sw_ceil_f64(x: f64) -> f64:
+    return software_ceil(x)
+
+
+@func()
+def sw_ceil_f32(x: f32) -> f32:
+    return software_ceil(x)
+
+
+@func()
 def sw_pow_f64(x: f64, y: f64) -> f64:
     return software_pow(x, y)
 
@@ -440,6 +486,7 @@ def _context_with_mode(mode: str | None) -> Context:
         ctx.set_compile_option('atan2_mode', mode)
         ctx.set_compile_option('sqrt_mode', mode)
         ctx.set_compile_option('cbrt_mode', mode)
+        ctx.set_compile_option('ceil_mode', mode)
         ctx.set_compile_option('pow_mode', mode)
         ctx.set_compile_option('exp_mode', mode)
         ctx.set_compile_option('log_mode', mode)
@@ -478,6 +525,11 @@ def libm_cbrt_llvm[T](x: T) -> T:
     return cbrt(x)
 
 
+@_CTX_LLVM.func()
+def libm_ceil_llvm[T](x: T) -> T:
+    return ceil(x)
+
+
 @_CTX_LIBC.func()
 def libm_sin_libc[T](x: T) -> T:
     return sin(x)
@@ -501,6 +553,11 @@ def libm_sqrt_libc[T](x: T) -> T:
 @_CTX_LIBC.func()
 def libm_cbrt_libc[T](x: T) -> T:
     return cbrt(x)
+
+
+@_CTX_LIBC.func()
+def libm_ceil_libc[T](x: T) -> T:
+    return ceil(x)
 
 
 @_CTX_SOFTWARE.func()
@@ -528,6 +585,11 @@ def libm_cbrt_software[T](x: T) -> T:
     return cbrt(x)
 
 
+@_CTX_SOFTWARE.func()
+def libm_ceil_software[T](x: T) -> T:
+    return ceil(x)
+
+
 @_CTX_DEFAULT.func()
 def libm_sin_default[T](x: T) -> T:
     return sin(x)
@@ -553,6 +615,11 @@ def libm_cbrt_default[T](x: T) -> T:
     return cbrt(x)
 
 
+@_CTX_DEFAULT.func()
+def libm_ceil_default[T](x: T) -> T:
+    return ceil(x)
+
+
 @_CTX_BOGUS.func()
 def libm_sin_bogus(x: f64) -> f64:
     return sin(x)
@@ -576,6 +643,11 @@ def libm_sqrt_bogus(x: f64) -> f64:
 @_CTX_BOGUS.func()
 def libm_cbrt_bogus(x: f64) -> f64:
     return cbrt(x)
+
+
+@_CTX_BOGUS.func()
+def libm_ceil_bogus(x: f64) -> f64:
+    return ceil(x)
 
 
 @_CTX_LLVM.func()
@@ -1289,6 +1361,72 @@ class SpyCbrtModeTest(_TrigUlpTest):
             self.assertEqual(fn(-8.0), -2.0)
 
 
+class SpySoftwareCeilTest(_TrigUlpTest):
+    """The pure spy ``ceil`` (the musl port): both ``f32`` and ``f64`` are exact
+    (0 ULP), ``+-0`` and ``+-inf`` keep their sign, a ``NaN`` stays a ``NaN`` and
+    a negative fraction in ``(-1, 0)`` yields ``-0.0``."""
+
+    def test_ceil_f64(self) -> None:
+        self.check_f64(sw_ceil_f64, _ceil_ref, 0, _CEIL_F64_VALUES)
+
+    def test_ceil_f32(self) -> None:
+        self.check_f32(sw_ceil_f32, _ceil_ref, 0, _CEIL_F32_VALUES)
+
+    def test_ceil_of_a_fraction_rounds_up(self) -> None:
+        cases = [
+            (0.1, 1.0), (-0.1, -0.0), (0.9, 1.0), (-0.9, -0.0),
+            (1.1, 2.0), (-1.1, -1.0), (1.5, 2.0), (-1.5, -1.0),
+            (2.5, 3.0), (-2.5, -2.0), (123456789.123, 123456790.0),
+            (-123456789.123, -123456789.0),
+        ]
+        for v, want in cases:
+            self.assertEqual(_f64_ulp(sw_ceil_f64(v), want), 0, msg=repr(v))
+
+    def test_ceil_of_an_integer_is_unchanged(self) -> None:
+        values = (0.0, -0.0, 1.0, -1.0, 2.0**52, -2.0**52, 1e300, -1e300)
+        for v in values:
+            self.assertEqual(_f64_ulp(sw_ceil_f64(v), v), 0, msg=repr(v))
+
+    def test_ceil_of_a_negative_fraction_is_negative_zero(self) -> None:
+        self.assertEqual(math.copysign(1.0, sw_ceil_f64(-0.3)), -1.0)
+        self.assertEqual(math.copysign(1.0, float(sw_ceil_f32(f32(-0.3)))), -1.0)
+
+    def test_ceil_of_the_special_values(self) -> None:
+        self.assertEqual(sw_ceil_f64(math.inf), math.inf)
+        self.assertEqual(sw_ceil_f64(-math.inf), -math.inf)
+        self.assertTrue(math.isnan(sw_ceil_f64(math.nan)))
+        self.assertEqual(float(sw_ceil_f32(f32(math.inf))), math.inf)
+        self.assertEqual(float(sw_ceil_f32(f32(-math.inf))), -math.inf)
+        self.assertTrue(math.isnan(float(sw_ceil_f32(f32(math.nan)))))
+
+
+class SpyCeilModeTest(_TrigUlpTest):
+    """``ceil_mode`` selects the ``llvm``/``libc``/``software`` implementation at
+    compile time; an unset option defaults to ``software``."""
+
+    def test_llvm(self) -> None:
+        self.check_f64(libm_ceil_llvm, _ceil_ref, 0, _CEIL_F64_VALUES)
+        self.check_f32(libm_ceil_llvm, _ceil_ref, 0, _CEIL_F32_VALUES)
+
+    def test_libc(self) -> None:
+        self.check_f64(libm_ceil_libc, _ceil_ref, 0, _CEIL_F64_VALUES)
+        self.check_f32(libm_ceil_libc, _ceil_ref, 0, _CEIL_F32_VALUES)
+
+    def test_software(self) -> None:
+        self.check_f64(libm_ceil_software, _ceil_ref, 0, _CEIL_F64_VALUES)
+        self.check_f32(libm_ceil_software, _ceil_ref, 0, _CEIL_F32_VALUES)
+
+    def test_default_is_software(self) -> None:
+        # ``ceil`` is exact, so the default (an unset option) has to match the
+        # software implementation bit for bit
+        for v in _CEIL_F64_VALUES:
+            self.assertEqual(_f64_ulp(libm_ceil_default(v), sw_ceil_f64(v)), 0, msg=repr(v))
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(CompileError):
+            libm_ceil_bogus(0.5)
+
+
 class SpySoftwarePowTest(_TrigUlpTest):
     """The pure spy ``pow`` (the musl port): both ``f32`` and ``f64`` are within
     1 ULP of the correctly rounded result (musl bounds the error at < 0.54 ULP),
@@ -1513,6 +1651,8 @@ all_tests = [
     SpySqrtModeTest,
     SpySoftwareCbrtTest,
     SpyCbrtModeTest,
+    SpySoftwareCeilTest,
+    SpyCeilModeTest,
     SpySoftwarePowTest,
     SpyPowModeTest,
     SpySoftwareExpTest,
