@@ -71,6 +71,28 @@ def scale(a: f64, b: f64) -> f64:
 
 
 @func()
+def tiny_float_literal() -> f64:
+    # Python spells these without a decimal point (``1e-20``, ``1e+20``,
+    # ``5e-324``); the emitted LLVM literal must still carry one
+    return 1e-20
+
+
+@func()
+def huge_float_literal() -> f64:
+    return 1e20
+
+
+@func()
+def subnormal_float_literal() -> f64:
+    return 5e-324
+
+
+@func()
+def negative_tiny_float_literal() -> f64:
+    return -1e-20
+
+
+@func()
 def add_default[T: Numeric](a: T, b: T = 0) -> T:
     return a + b
 
@@ -343,6 +365,12 @@ class SpyFunctionCallTest(TestCase):
 
     def test_float_promotion(self) -> None:
         self.assertAlmostEqual(scale(3.0, 0.5), 2.5)
+
+    def test_float_literals_in_scientific_notation(self) -> None:
+        self.assertEqual(tiny_float_literal(), 1e-20)
+        self.assertEqual(huge_float_literal(), 1e20)
+        self.assertEqual(subnormal_float_literal(), 5e-324)
+        self.assertEqual(negative_tiny_float_literal(), -1e-20)
 
     def test_non_default_integer_type(self) -> None:
         # calling the type binds an argument to an explicit spy type

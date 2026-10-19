@@ -9,6 +9,7 @@ from ..compiler import (
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
 from ..compiler.dsl import func, struct
+from ..std.core import Numeric
 
 # ---------------------------------------------------------------------------
 # generic structs: ``class Foo[T]`` declares a struct *template*, and
@@ -21,16 +22,16 @@ from ..compiler.dsl import func, struct
 
 
 @struct()
-class Pair[T]:
+class Pair[T: Numeric]:
     a: T
     b: T
 
     @func()
     def total(self) -> T:
-        return self.a + self.b  # pyright: ignore[reportOperatorIssue]
+        return self.a + self.b
 
     def doubled_a(self) -> T:
-        return self.a + self.a  # pyright: ignore[reportOperatorIssue]
+        return self.a + self.a
 
 
 @struct()
@@ -72,7 +73,7 @@ class Shadow[T]:
 
 
 @struct()
-class NestedGeneric[T]:
+class NestedGeneric[T: Numeric]:
     """A generic struct with a generic field: the field's type is
     substituted recursively."""
 
@@ -81,7 +82,7 @@ class NestedGeneric[T]:
 
 
 @struct()
-class Maker[T]:
+class Maker[T: Numeric]:
     """A generic struct whose method builds and returns a specialization of
     another generic struct from its own type parameter."""
 
@@ -108,12 +109,12 @@ class StructHolder:
 
 
 @func()
-def make_pair[T](a: T, b: T) -> Pair[T]:
+def make_pair[T: Numeric](a: T, b: T) -> Pair[T]:
     return Pair[T](a, b)
 
 
 @func()
-def first[T](p: Pair[T]) -> T:
+def first[T: Numeric](p: Pair[T]) -> T:
     return p.a
 
 
@@ -214,7 +215,7 @@ class Phantom[T]:
 # taken from the type of the location it is built into - here the result
 # location of ``make_pair_inferred``, whose declared return type is known
 @func()
-def make_pair_inferred[T](a: T, b: T) -> Pair[T]:
+def make_pair_inferred[T: Numeric](a: T, b: T) -> Pair[T]:
     return Pair(a, b)
 
 

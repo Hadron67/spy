@@ -374,7 +374,16 @@ class FloatValue(Value):
             raw = struct.unpack('>Q', struct.pack('>d', value))[0]
             return f'0x{raw:016x}'
         if math.isfinite(self.value):
-            return str(self.value)
+            # LLVM's decimal float literal needs a decimal point, while Python's
+            # ``str`` drops it in scientific notation (``1e-20``): add it back
+            # before the exponent so the literal is not lexed as an integer.
+            text = str(self.value)
+            if 'e' in text:
+                mantissa, exponent = text.split('e')
+                if '.' not in mantissa:
+                    mantissa += '.0'
+                text = f'{mantissa}e{exponent}'
+            return text
         raw = struct.unpack('>Q', struct.pack('>d', self.value))[0]
         return f'0x{raw:016x}'
 
