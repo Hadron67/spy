@@ -5,13 +5,15 @@ calling the runtime entry points itself - ``__kmpc_fork_call`` to form the
 parallel region, and the ``__kmpc_for_static_init_*``/``__kmpc_for_static_fini``
 pair to hand each thread its slice of the static schedule.
 
-The host must load the OpenMP runtime (``libomp``) before anything using
-``parallel_loop`` is compiled: the JIT resolves the ``__kmpc_*`` symbols from
-the process, and they become visible only once the library is loaded with
-``RTLD_GLOBAL``.  Call :func:`load_openmp_runtime` first (it is idempotent):
+The JIT resolves the ``__kmpc_*`` symbols from the process, and they become
+visible only once ``libomp`` is loaded with ``RTLD_GLOBAL``.  This is handled
+for you: :func:`parallel_loop` calls :func:`load_openmp_runtime` at compile
+time, so **there is no need to call it manually**:
 
-    load_openmp_runtime()
     parallel_loop(1000, kernel)
+
+Calling it yourself is still allowed (it is idempotent), but it is never
+required.
 """
 
 import ctypes
@@ -66,7 +68,10 @@ def load_openmp_runtime() -> None:
     so the JIT can resolve the ``__kmpc_*`` entry points :func:`parallel_loop`
     calls.  Idempotent.  The library is looked up at ``SPY_LIBOMP`` first, then at
     the paths it is usually installed at; a ``RuntimeError`` names every
-    candidate that failed."""
+    candidate that failed.
+
+    You do not normally need to call this: :func:`parallel_loop` invokes it at
+    compile time, before the ``__kmpc_*`` symbols are needed."""
     global _LOADED
     if _LOADED:
         return
@@ -241,6 +246,10 @@ def parallel_loop[R](length: int, kernel: Callable[[int], R], reduce_op: Callabl
     ``i32``/``u32``/``i64``/``u64``), which selects the matching runtime entry
     point.  The exit of the last ``__kmpc_fork_call`` joins the team, so no
     barrier is needed after the loop.
+
+    The OpenMP runtime is loaded automatically: this function calls
+    :func:`load_openmp_runtime` at compile time, so there is no need to call
+    it manually.
 
     When ``kernel`` returns a value (a single one, or several for a
     ``tuple[...]`` annotation) and ``reduce_op`` is given, the results are

@@ -538,6 +538,8 @@ defer body 只挂在 `Jmp`/`Br`（普通转移）、`Ret`、`EndDefer`、`Panic`
 - `std.openmp.parallel_loop` 用 `__kmpc_fork_call` 组建并行域，用 `__kmpc_for_static_init_*`/`__kmpc_for_static_fini`
   分发每线程的切片（static 调度）。带返回值 kernel 的归约时，每线程先在本地折叠出 partial，再在
   `__kmpc_critical`/`__kmpc_end_critical` 临界区内并入被指针传入的共享累加器。
+- `parallel_loop` 是内联函数，其函数体在编译期执行，因此它在编译时会先调用 `load_openmp_runtime()` 以
+  `RTLD_GLOBAL` 载入 `libomp`，用户无需在源码里手动调用——否则 JIT 解析不到 `__kmpc_*` 符号。
 
 ---
 

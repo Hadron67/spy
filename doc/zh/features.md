@@ -1709,7 +1709,8 @@ assert use_bump(5) == 56
 ### 9.2 OpenMP
 
 `std.openmp.parallel_loop(length, kernel, reduce_op=None)` 实现 `#pragma omp parallel for`（static 调度）。
-使用前须 `load_openmp_runtime()`（幂等，加载 `libomp`）。
+**无需手动调用 `load_openmp_runtime()`**：`parallel_loop` 会在编译时自动调用它加载 `libomp`，
+让 JIT 能解析 `__kmpc_*` 符号（该函数本身幂等，手动调用也无害）。
 
 - `kernel` 是接收下标 `i`（类型 `typeof(length)`，`i32`/`u32`/`i64`/`u64` 之一）的闭包；每个线程拿到 `[0, length)` 的一个切片。
 - 若 `kernel` 有返回值（单个，或用 `tuple[...]` 注解的多返回值）且给出 `reduce_op`，则把各次迭代的返回值归约，

@@ -521,6 +521,9 @@ Construction-time peephole: `BasicBlock.emit` calls `try_evaluate` to fold const
   to distribute each thread's slice (static schedule).  When a value-returning kernel is reduced, each thread first folds its own slice
   into a partial locally, then combines the partials under the `__kmpc_critical`/`__kmpc_end_critical` critical section into the shared
   accumulator the call passed by pointer.
+- `parallel_loop` is an inline function whose body runs at compile time, so it calls `load_openmp_runtime()` while compiling,
+  loading `libomp` with `RTLD_GLOBAL`; users need not call it manually - otherwise the JIT cannot resolve the
+  `__kmpc_*` symbols.
 
 ---
 

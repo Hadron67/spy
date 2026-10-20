@@ -1706,7 +1706,8 @@ assert use_bump(5) == 56
 ### 9.2 OpenMP
 
 `std.openmp.parallel_loop(length, kernel, reduce_op=None)` implements `#pragma omp parallel for` (static schedule).
-Before use, `load_openmp_runtime()` is required (idempotent, loads `libomp`).
+**No manual call to `load_openmp_runtime()` is needed**: `parallel_loop` calls it at compile time to load `libomp`,
+which is what lets the JIT resolve the `__kmpc_*` symbols (the function is idempotent, so calling it yourself is harmless).
 
 - `kernel` is a closure taking the index `i` (typed `typeof(length)`, one of `i32`/`u32`/`i64`/`u64`); every thread gets a slice of `[0, length)`.
 - When `kernel` returns a value (a single one, or several for a `tuple[...]` annotation) and `reduce_op` is given, the per-iteration
