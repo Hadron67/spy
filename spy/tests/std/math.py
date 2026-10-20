@@ -9,7 +9,6 @@ from ...compiler import (
     CoerceError,
     CompileError,
     Context,
-    LLVMBackend,
     f32,
     f64,
     func,
@@ -21,6 +20,7 @@ from ...compiler import (
     u64,
 )
 from ...compiler import bool as spy_bool
+from ...compiler.lower import LLVMBackend
 from ...std.math import abs as spy_abs
 from ...std.math import (
     acos,

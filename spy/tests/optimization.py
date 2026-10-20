@@ -21,11 +21,10 @@ from llvmlite import binding as llvm
 from ..compiler import (
     CompileError,
     Context,
-    LLVMBackend,
-    OptimizationOptions,
-    _optimization_options,
     i32,
 )
+from ..compiler.fn import _optimization_options
+from ..compiler.lower import LLVMBackend, OptimizationOptions
 
 
 def _context_with_options(**options: int) -> Context:

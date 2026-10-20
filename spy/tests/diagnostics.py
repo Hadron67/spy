@@ -15,16 +15,14 @@ from unittest import TestCase, skipUnless
 from ..compiler import (
     GLOBAL_CONTEXT,
     CompileError,
-    SourceFile,
-    SourceLoc,
-    format_location,
     func,
     i32,
-    ipython_cell_name,
     struct,
     u8,
     unroll,
 )
+from ..compiler.errors import SourceLoc
+from ..compiler.source import SourceFile, format_location, ipython_cell_name
 from ..std.core import compile_error
 
 _IPYTHON_AVAILABLE = importlib.util.find_spec('IPython') is not None

@@ -6,8 +6,6 @@ from unittest import TestCase
 from ..compiler import (
     GLOBAL_CONTEXT,
     CompileError,
-    LLVMBackend,
-    StrBiMap,
     func,
     i32,
     i64,
@@ -15,6 +13,8 @@ from ..compiler import (
     struct,
     sval,
 )
+from ..compiler.lower import LLVMBackend
+from ..compiler.util import StrBiMap
 from ..std.int import truncate
 from .returns import mir_signature
 from .structs import MIR_CACHE, ExternMixed, Large, Small, struct_type
