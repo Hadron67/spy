@@ -1,4 +1,4 @@
-from spy.compiler import decl_func, f32, f64
+from ..compiler import decl_func, f32, f64
 
 
 @decl_func("llvm.sin.f32")

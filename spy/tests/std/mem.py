@@ -12,13 +12,14 @@ cross the Python boundary.
 from unittest import TestCase
 
 from ...compiler import (
+    defer,
     func,
+    ref,
     u8,
     u32,
     u64,
     usize,
 )
-from ...compiler.syntax import defer, ref
 from ...std.mem import (
     AllocError,
     CAllocator,

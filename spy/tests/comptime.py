@@ -1,28 +1,30 @@
 from unittest import TestCase
 
 from ..compiler import (
+    GLOBAL_CONTEXT,
     CompileError,
-    i32,
-    syntax,
-    u64,
-)
-from ..compiler import bool as spy_bool
-from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
-from ..compiler.syntax import (
     Comptime,
     InferComptime,
     Ptr,
+    comptime,
+    func,
+    i32,
+    infer_comptime,
     ref,
+    struct,
+    u64,
+    unroll,
 )
+from ..compiler import bool as spy_bool
+from ..compiler import typeof as spy_typeof
 from ..std.core import compile_error, compile_option
 from .basics import inc
 from .errors import ErrorA
 
 # ---------------------------------------------------------------------------
-# ``syntax.comptime()``: the statement marker that declares the variable of the
+# ``comptime()``: the statement marker that declares the variable of the
 # declaration immediately after it as a compile-time one, the way
-# ``syntax.unroll()`` marks the loop that follows it - ``syntax.comptime()``
+# ``unroll()`` marks the loop that follows it - ``comptime()``
 # followed by ``a: T = e`` is ``a: Comptime[T] = e``, and followed by ``a = e``
 # (no annotation) it is ``a: Comptime = e`` (see ``astgen._gen_stmt``)
 # ---------------------------------------------------------------------------
@@ -38,10 +40,10 @@ class MarkerState:
 def comptime_marker_typed() -> i32:
     # the marker plus a typed declaration is ``i: Comptime[i32] = 0``: the loop
     # condition is a compile-time value, so the loop unrolls
-    syntax.comptime()
+    comptime()
     i: i32 = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 4:
         total = total + i
         i = i + 1
@@ -52,10 +54,10 @@ def comptime_marker_typed() -> i32:
 def comptime_marker_untyped() -> i32:
     # no annotation: the value determines the type (a bare ``Comptime``), and an
     # untyped literal has no runtime representation at all
-    syntax.comptime()
+    comptime()
     n = 4
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while n > 0:
         total = total + n
         n = n - 1
@@ -65,7 +67,7 @@ def comptime_marker_untyped() -> i32:
 @func()
 def comptime_marker_holds_a_type(x: i32) -> spy_bool:
     # a compile-time variable is what holds a type (a plain local cannot)
-    syntax.comptime()
+    comptime()
     t = spy_typeof(x)
     return t == i32
 
@@ -74,10 +76,10 @@ def comptime_marker_holds_a_type(x: i32) -> spy_bool:
 def comptime_marker_struct(x: i32) -> i32:
     # a compile-time struct declared with the marker: its field conditions a
     # compile-time loop
-    syntax.comptime()
+    comptime()
     s: MarkerState = MarkerState(True, 0)
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while s.on:
         s.on = False
         total = total + x
@@ -128,7 +130,7 @@ def comptime_place_assigned_a_runtime_value(x: i32) -> i32:
 @func()
 def comptime_marker_without_a_value() -> i32:
     # the marker also marks a declaration that writes no value
-    syntax.comptime()
+    comptime()
     n: i32
     n = 5
     return n + 1
@@ -137,10 +139,10 @@ def comptime_marker_without_a_value() -> i32:
 @func()
 def comptime_marker_destructuring() -> i32:
     # the marker marks every name a destructuring declaration declares
-    syntax.comptime()
+    comptime()
     a, b = 1, 2
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while a > 0:
         total = total + a * 10 + b
         a = a - 1
@@ -152,7 +154,7 @@ def comptime_marker_in_a_branch(c: spy_bool) -> i32:
     # the marker marks a declaration of the block it sits in
     total: i32 = 0
     if c:
-        syntax.comptime()
+        comptime()
         k = 3
         total = total + k
     return total
@@ -183,9 +185,9 @@ def comptime_marker_unpack_after_an_inline_call() -> i32:
     # call's continuation - not at the sub-block's head, which would put their
     # ``Alloca`` in a runtime block the store no longer dominates (see
     # pending-problems.md #3)
-    syntax.comptime()
+    comptime()
     a, b = pair(5)
-    syntax.comptime()
+    comptime()
     c = 9
     return a * 100 + b * 10 + c
 
@@ -193,28 +195,28 @@ def comptime_marker_unpack_after_an_inline_call() -> i32:
 @func()
 def comptime_marker_unpack_before_an_inline_call() -> i32:
     # the other order: the marker precedes the one after the call
-    syntax.comptime()
+    comptime()
     c = 9
-    syntax.comptime()
+    comptime()
     a, b = pair(5)
     return a * 100 + b * 10 + c
 
 
 @func()
 def comptime_marker_before_a_non_declaration() -> i32:
-    syntax.comptime()
+    comptime()
     return 1
 
 
 @func()
 def comptime_marker_at_the_end():
-    syntax.comptime()
+    comptime()
 
 
 @func()
 def comptime_marker_redundant() -> i32:
     # the annotation already declares the variable compile-time
-    syntax.comptime()
+    comptime()
     a: Comptime = 1
     return a
 
@@ -224,21 +226,21 @@ def comptime_marker_on_an_assignment() -> i32:
     # the marker marks a *declaration*: this statement assigns to a variable
     # that is bound already
     a: i32 = 1
-    syntax.comptime()
+    comptime()
     a = 2
     return a
 
 
 @func()
 def comptime_marker_as_a_value() -> i32:
-    return syntax.comptime()  # pyright: ignore[reportReturnType]
+    return comptime()  # pyright: ignore[reportReturnType]
 
 
 @func()
 def comptime_marker_before_a_loop() -> i32:
     # the marker must come immediately before the declaration it marks
-    syntax.comptime()
-    syntax.unroll()
+    comptime()
+    unroll()
     while False:
         pass
     return 1
@@ -290,14 +292,14 @@ class Slice[T]:
 
 
 class SpyComptimeMarkerTest(TestCase):
-    """``syntax.comptime()``: the statement marker that declares the variable
+    """``comptime()``: the statement marker that declares the variable
     of the declaration right after it as a compile-time one, the way
-    ``syntax.unroll()`` marks the loop that follows it.  It stands for the
-    ``Comptime`` annotation: ``syntax.comptime()`` + ``a: T = e`` is
+    ``unroll()`` marks the loop that follows it.  It stands for the
+    ``Comptime`` annotation: ``comptime()`` + ``a: T = e`` is
     ``a: Comptime[T] = e``, and with no annotation ``a: Comptime = e``."""
 
     def test_a_typed_declaration(self) -> None:
-        # ``syntax.comptime()`` + ``i: i32 = 0`` is ``i: Comptime[i32] = 0``
+        # ``comptime()`` + ``i: i32 = 0`` is ``i: Comptime[i32] = 0``
         self.assertEqual(comptime_marker_typed(), 0 + 1 + 2 + 3)
 
     def test_an_unannotated_declaration(self) -> None:
@@ -375,7 +377,7 @@ class SpyComptimeMarkerTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# ``InferComptime`` / ``syntax.infer_comptime()``: the storage decision is left
+# ``InferComptime`` / ``infer_comptime()``: the storage decision is left
 # to the stores - a compile-time value stays in a box, a runtime one lands in
 # memory - so a declaration may hold a compile-time-only value (an untyped
 # integer literal, a type) without saying which storage it wants.  Only a
@@ -390,7 +392,7 @@ def infer_comptime_holds_an_untyped_literal() -> i32:
     # condition is a compile-time value
     n: InferComptime = 4
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while n > 0:
         total = total + n
         n = n - 1
@@ -400,7 +402,7 @@ def infer_comptime_holds_an_untyped_literal() -> i32:
 @func()
 def infer_comptime_marker_holds_a_type(x: i32) -> spy_bool:
     # the statement marker form decides the storage the same way
-    syntax.infer_comptime()
+    infer_comptime()
     t = spy_typeof(x)
     return t == i32
 
@@ -431,10 +433,10 @@ def infer_comptime_declares_the_type(x: i32) -> i32:
 @func()
 def infer_comptime_marker_destructuring() -> i32:
     # the marker marks every name a destructuring declaration declares
-    syntax.infer_comptime()
+    infer_comptime()
     a, b = 1, 2
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while a > 0:
         total = total + a * 10 + b
         a = a - 1
@@ -444,14 +446,14 @@ def infer_comptime_marker_destructuring() -> i32:
 @func()
 def infer_comptime_marker_redundant() -> i32:
     # the annotation already declares the storage
-    syntax.infer_comptime()
+    infer_comptime()
     a: InferComptime = 1
     return a
 
 
 @func()
 def infer_comptime_marker_before_a_non_declaration() -> i32:
-    syntax.infer_comptime()
+    infer_comptime()
     return 1
 
 
@@ -481,7 +483,7 @@ def infer_comptime_closure_varargs() -> i32:
 
 
 class SpyInferComptimeTest(TestCase):
-    """``InferComptime``/``syntax.infer_comptime()``: a local declaration whose
+    """``InferComptime``/``infer_comptime()``: a local declaration whose
     storage is inferred from the values written into it - a compile-time value
     stays in a box (so a compile-time-only value is allowed), a runtime one
     lands in memory.  Only a local may infer; a parameter may not."""
@@ -547,7 +549,7 @@ class SpyTupleTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# ``syntax.typeof``: the *type probe*.  Its argument is only *typed* - its
+# ``typeof``: the *type probe*.  Its argument is only *typed* - its
 # instructions run into a detached block that is never lowered, which compiles
 # whatever spy functions the expression names - so ``typeof(f(x))`` yields the
 # type of the call without emitting (or ever running) it.
@@ -612,7 +614,7 @@ def typeof_a_raising_call() -> i32:
 
 
 class SpyTypeOfTest(TestCase):
-    """``syntax.typeof`` is a type probe: it types its argument (compiling the
+    """``typeof`` is a type probe: it types its argument (compiling the
     functions it names) without emitting any code, so the argument has no
     runtime effect."""
 
@@ -659,7 +661,7 @@ def compile_error_runtime(x: i32) -> i32:
 def compile_error_in_a_dead_branch() -> i32:
     # a compile-time condition makes one branch dead: its ``compile_error``
     # never runs
-    syntax.comptime()
+    comptime()
     x: i32 = 1
     if x == 1:
         return 1
@@ -719,11 +721,11 @@ class SpyCompileOptionTest(TestCase):
         self.assertTrue(compile_option_is_absent())
 
     def test_a_set_option_is_read_back(self) -> None:
-        _GLOBAL_CONTEXT.set_compile_option('test.answer', 42)
+        GLOBAL_CONTEXT.set_compile_option('test.answer', 42)
         try:
             self.assertEqual(compile_option_value(), 42)
         finally:
-            _GLOBAL_CONTEXT._compile_options.pop('test.answer', None)
+            GLOBAL_CONTEXT._compile_options.pop('test.answer', None)
 
 
 all_tests = [

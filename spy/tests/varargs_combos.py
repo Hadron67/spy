@@ -1,15 +1,13 @@
 from unittest import TestCase
 
 from ..compiler import (
+    Comptime,
     f64,
+    func,
     i32,
-    syntax,
+    unroll,
 )
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func
-from ..compiler.syntax import (
-    Comptime,
-)
 from ..std.int import int_to_float
 
 # ---------------------------------------------------------------------------
@@ -65,7 +63,7 @@ def c_d(d: i32 = 7) -> f64:
 def c_v(*args) -> f64:
     total: f64 = 0.0
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         elem: f64 = to_f64(args[i])
         total = total + elem
@@ -99,7 +97,7 @@ def c_pv(p: i32, *args) -> f64:
     tp: f64 = int_to_float(p, f64)
     total = total + tp
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         elem: f64 = to_f64(args[i])
         total = total + elem
@@ -125,7 +123,7 @@ def c_dv(d: i32 = 7, *args) -> f64:
     td: f64 = int_to_float(d, f64)
     total = total + td
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         elem: f64 = to_f64(args[i])
         total = total + elem
@@ -149,7 +147,7 @@ def c_dk(d: i32 = 7, **kwargs) -> f64:
 def c_vk(*args, **kwargs) -> f64:
     total: f64 = 0.0
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         elem: f64 = to_f64(args[i])
         total = total + elem
@@ -169,7 +167,7 @@ def c_pdv(p: i32, d: i32 = 7, *args) -> f64:
     total = total + tp
     total = total + td
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         elem: f64 = to_f64(args[i])
         total = total + elem
@@ -197,7 +195,7 @@ def c_pvk(p: i32, *args, **kwargs) -> f64:
     tp: f64 = int_to_float(p, f64)
     total = total + tp
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         elem: f64 = to_f64(args[i])
         total = total + elem
@@ -215,7 +213,7 @@ def c_dvk(d: i32 = 7, *args, **kwargs) -> f64:
     td: f64 = int_to_float(d, f64)
     total = total + td
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         elem: f64 = to_f64(args[i])
         total = total + elem
@@ -235,7 +233,7 @@ def c_pdvk(p: i32, d: i32 = 7, *args, **kwargs) -> f64:
     total = total + tp
     total = total + td
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         elem: f64 = to_f64(args[i])
         total = total + elem

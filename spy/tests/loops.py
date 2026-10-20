@@ -2,12 +2,11 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
-    i32,
-)
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
     Ptr,
+    func,
+    i32,
     ref,
+    struct,
 )
 from .basics import inc
 from .errors import ErrorA, raise_a

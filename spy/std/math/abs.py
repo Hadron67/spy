@@ -1,7 +1,6 @@
 from typing import cast
 
-from spy.compiler import comptime, f32, f64, func, typeof, u32, u64
-
+from ...compiler import comptime, f32, f64, func, typeof, u32, u64
 from ..core import Numeric, bitcast, compile_error
 from ..reflect import IntType, type_info
 

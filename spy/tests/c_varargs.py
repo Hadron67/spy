@@ -2,17 +2,21 @@ from typing import Literal, Protocol
 from unittest import TestCase
 
 from ..compiler import (
+    GLOBAL_CONTEXT,
     CompileError,
     ConstMultiPtr,
+    closure,
+    decl_func,
     f32,
+    func,
+    func_type,
     i8,
     i32,
     mir,
+    ref,
     sval,
     u8,
 )
-from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type
-from ..compiler.syntax import closure, ref
 from ..std import Array, ptr_cast
 from ..std.c import snprintf
 from ..std.core import const_arr_ptr, undefined
@@ -124,7 +128,7 @@ class SpyCVariadicTypeTest(TestCase):
     C-variadic *definition* are all rejected."""
 
     def test_a_c_declaration_is_variadic(self) -> None:
-        decl = _GLOBAL_CONTEXT.resolve_global(c_variadic)
+        decl = GLOBAL_CONTEXT.resolve_global(c_variadic)
         assert isinstance(decl, sval.DeclareFunction)
         self.assertTrue(decl.type.varargs)
         self.assertEqual(decl.type.callconv, 'c')
@@ -136,17 +140,17 @@ class SpyCVariadicTypeTest(TestCase):
 
     def test_an_annotated_varargs_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:
-            _GLOBAL_CONTEXT.resolve_global(c_variadic_annotated)
+            GLOBAL_CONTEXT.resolve_global(c_variadic_annotated)
         self.assertIn('may not be annotated', str(ctx.exception))
 
     def test_kwargs_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:
-            _GLOBAL_CONTEXT.resolve_global(c_variadic_kwargs)
+            GLOBAL_CONTEXT.resolve_global(c_variadic_kwargs)
         self.assertIn('**kwargs', str(ctx.exception))
 
     def test_a_default_callconv_varargs_is_rejected(self) -> None:
         with self.assertRaises(CompileError) as ctx:
-            _GLOBAL_CONTEXT.resolve_global(SpyVariadic)
+            GLOBAL_CONTEXT.resolve_global(SpyVariadic)
         self.assertIn('may not declare *args', str(ctx.exception))
 
     def test_defining_a_c_variadic_function_is_rejected(self) -> None:

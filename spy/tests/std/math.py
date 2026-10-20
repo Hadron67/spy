@@ -5,11 +5,22 @@ from unittest import TestCase, skipUnless
 
 from llvmlite.binding import llvm_version_info
 
-from ...compiler import CompileError, f32, f64, i8, i32, i64, u8, u32, u64
+from ...compiler import (
+    CoerceError,
+    CompileError,
+    Context,
+    LLVMBackend,
+    f32,
+    f64,
+    func,
+    i8,
+    i32,
+    i64,
+    u8,
+    u32,
+    u64,
+)
 from ...compiler import bool as spy_bool
-from ...compiler.dsl import Context, func
-from ...compiler.errors import CoerceError
-from ...compiler.lower import LLVMBackend
 from ...std.math import abs as spy_abs
 from ...std.math import (
     acos,

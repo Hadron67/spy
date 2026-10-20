@@ -14,9 +14,7 @@ instead, and ``t = t + u`` was never supported (there is no tuple ``+``).
 
 from unittest import TestCase
 
-from ..compiler import CompileError, i32, syntax
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import InferComptime
+from ..compiler import CompileError, InferComptime, func, i32, struct, unroll
 
 # ---------------------------------------------------------------------------
 # building a tuple value element by element
@@ -28,7 +26,7 @@ def sum_accumulated() -> i32:
     # the ``reduce`` shape: a compile-time loop filling one element per
     # iteration.  The tuple is built first (its arity is fixed), then filled
     t: InferComptime = (0, 0, 0)
-    syntax.unroll()
+    unroll()
     for i in range(3):
         t[i] = i * 10  # pyright: ignore
     return t[0] + t[1] + t[2]

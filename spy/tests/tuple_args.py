@@ -2,12 +2,14 @@ from unittest import TestCase
 
 from ..compiler import bool as spy_bool
 from ..compiler import (
+    comptime,
+    func,
     i32,
     i64,
-    syntax,
+    struct,
+    unroll,
 )
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
 from ..std import Numeric
 from ..std.core import coerce
 from ..std.reflect import (
@@ -170,7 +172,7 @@ def is_tuple_shape(v: StructType) -> spy_bool:
 
 @func()
 def classify(x) -> i32:
-    syntax.comptime()
+    comptime()
     info = type_info(spy_typeof(x))
     if isinstance(v := info, StructType):
         if is_tuple_shape(v):
@@ -181,32 +183,32 @@ def classify(x) -> i32:
 
 @func()
 def reflect_sum(x) -> i64:
-    syntax.comptime()
+    comptime()
     info = type_info(spy_typeof(x))
     if isinstance(v := info, StructType):
         if is_tuple_shape(v):
             if v.fields.length == 2:
                 # the second element is a tuple itself: read its elements too
-                syntax.comptime()
+                comptime()
                 second = type_info(v.fields.ptr[1].type)
                 if isinstance(s := second, StructType) and is_tuple_shape(s):
                         return 20 + x[0] + x[1][0] + x[1][1]
             # a flat tuple: walk it by the length the reflection gives
             total: i64 = 0
-            syntax.comptime()
+            comptime()
             i: i32 = 0
-            syntax.unroll()
+            unroll()
             while i < v.fields.length:
                 total = total + x[i]
                 i = i + 1
             return total
         # a dictionary: walk its entries and read each by its reflected name
         dict_total: i64 = 0
-        syntax.comptime()
+        comptime()
         j: i32 = 0
-        syntax.unroll()
+        unroll()
         while j < v.fields.length:
-            syntax.comptime()
+            comptime()
             entry = v.fields.ptr[j]
             dict_total = dict_total + x[entry.name]
             j = j + 1
@@ -221,10 +223,10 @@ def call_reflect_sum() -> i64:
 
 @func()
 def first_dict_entry_name(x) -> i32:
-    syntax.comptime()
+    comptime()
     info = type_info(spy_typeof(x))
     if isinstance(v := info, StructType):
-        syntax.comptime()
+        comptime()
         entry = v.fields.ptr[0]
         return ord(entry.name[0:1])
     return -1
@@ -232,10 +234,10 @@ def first_dict_entry_name(x) -> i32:
 
 @func()
 def first_dict_entry_is_i64(x) -> spy_bool:
-    syntax.comptime()
+    comptime()
     info = type_info(spy_typeof(x))
     if isinstance(v := info, StructType):
-        syntax.comptime()
+        comptime()
         entry = v.fields.ptr[0]
         return entry.type == i64
     return False
@@ -243,12 +245,12 @@ def first_dict_entry_is_i64(x) -> spy_bool:
 
 @func()
 def dict_value_is_tuple(x) -> spy_bool:
-    syntax.comptime()
+    comptime()
     info = type_info(spy_typeof(x))
     if isinstance(v := info, StructType):
-        syntax.comptime()
+        comptime()
         entry = v.fields.ptr[0]
-        syntax.comptime()
+        comptime()
         child = type_info(entry.type)
         if isinstance(c := child, StructType) and is_tuple_shape(c):
                 # the entry's value is read out of the runtime ``$args`` struct:

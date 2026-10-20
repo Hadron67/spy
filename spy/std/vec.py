@@ -1,8 +1,6 @@
 from typing import TYPE_CHECKING, cast
 
-from ..compiler import Option, Ptr, struct, usize
-from ..compiler.dsl import func
-from ..compiler.syntax import ref
+from ..compiler import Option, Ptr, func, ref, struct, usize
 from .core import SlicePtr, panic, sstr, undefined
 from .mem import Allocator, AllocError, CAllocator
 

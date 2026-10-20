@@ -324,7 +324,7 @@ thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`
 - `_Context`（`sval.CompileContext` 子类）：`resolve_global`（把注册对象/enum 成员解析成本上下文的 spy 值或 `FunctionValue`，把不用 `@func` 装饰的普通 Python 函数包成 `sval.PyFunction`）、
   `special_types`、`mir_lower_cache`、`target_info`、`_resolve_call`、enum 支持（`enum` 装饰器/`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`）、
   编译选项（`get_compile_option`/`set_compile_option`，由 `_compile_options` 以 `str` 名为键存）。
-  `_GLOBAL_CONTEXT = _Context(LLVMBackend())` 是顶层默认上下文。
+  `GLOBAL_CONTEXT = _Context(LLVMBackend())` 是顶层默认上下文。
 
 ---
 

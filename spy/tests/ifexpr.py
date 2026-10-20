@@ -2,15 +2,13 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    func,
     i32,
     i64,
+    ref,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func
-from ..compiler.syntax import (
-    ref,
-)
 from .basics import inc, le
 from .structs import Large, Small
 

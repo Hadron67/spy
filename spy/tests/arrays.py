@@ -2,19 +2,18 @@ from typing import Any, Literal, cast
 from unittest import TestCase
 
 from ..compiler import (
+    Array,
     CompileError,
+    Comptime,
+    array,
+    func,
     i32,
     i64,
+    ref,
+    struct,
     usize,
 )
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
-    Array,
-    Comptime,
-    array,
-    ref,
-)
 from ..std.core import const_array
 from ..std.int import int_cast
 from .comptime_structs import runtime_struct_unroll

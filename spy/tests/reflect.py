@@ -1,22 +1,21 @@
 from unittest import TestCase
 
-from ..compiler import bool as spy_bool
 from ..compiler import (
-    f32,
-    f64,
-    i32,
-    i64,
-    u32,
-    u64,
-)
-from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
     Array,
     Comptime,
     Option,
     Ptr,
+    f32,
+    f64,
+    func,
+    i32,
+    i64,
+    struct,
+    u32,
+    u64,
 )
+from ..compiler import bool as spy_bool
+from ..compiler import typeof as spy_typeof
 from ..std.core import coerce
 from ..std.reflect import (
     ArrayType,

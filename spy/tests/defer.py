@@ -3,17 +3,15 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
-    i32,
-)
-from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func
-from ..compiler.syntax import (
     Ptr,
     defer,
     errdefer,
+    func,
+    i32,
     okdefer,
     ref,
 )
+from ..compiler import typeof as spy_typeof
 from .errors import ErrorA
 
 # ---------------------------------------------------------------------------

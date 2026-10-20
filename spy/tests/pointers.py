@@ -1,20 +1,18 @@
 from unittest import TestCase
 
 from ..compiler import (
-    i32,
-    syntax,
-    void,
-)
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
     ConstPtr,
     Ptr,
+    func,
+    i32,
     ref,
+    struct,
+    void,
 )
 from .structs import Small
 
 # ---------------------------------------------------------------------------
-# pointers: ``syntax.Ptr`` is C's pointer type - ``ref(a)`` takes the address
+# pointers: ``Ptr`` is C's pointer type - ``ref(a)`` takes the address
 # of ``a`` (C's ``&a``) and ``p[...]`` denotes the place the pointer value
 # ``p`` points at (C's ``*p``)
 # ---------------------------------------------------------------------------
@@ -42,8 +40,8 @@ def add_through_ptr(x: i32) -> i32:
 
 @func()
 def deref_module_qualified(x: i32) -> i32:
-    # ``syntax.ref`` names the same function as a plain import of ``ref``
-    p = syntax.ref(x)
+    # ``ref`` names the same function as a plain import of ``ref``
+    p = ref(x)
     return p[...]
 
 
@@ -138,7 +136,7 @@ def ptr_to_void_field(h: HasVoid) -> Ptr[void]:
 
 
 class SpyPointerTest(TestCase):
-    """Pointers: ``syntax.Ptr`` annotates a pointer type, ``ref`` takes the
+    """Pointers: ``Ptr`` annotates a pointer type, ``ref`` takes the
     address of a value and ``p[...]`` dereferences a pointer value."""
 
     def test_deref_a_local(self) -> None:

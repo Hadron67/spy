@@ -18,10 +18,14 @@ from unittest import TestCase
 
 from llvmlite import binding as llvm
 
-from ..compiler import CompileError, i32
-from ..compiler.dsl import Context
-from ..compiler.fn import OptimizationOptions, _optimization_options
-from ..compiler.lower import LLVMBackend
+from ..compiler import (
+    CompileError,
+    Context,
+    LLVMBackend,
+    OptimizationOptions,
+    _optimization_options,
+    i32,
+)
 
 
 def _context_with_options(**options: int) -> Context:

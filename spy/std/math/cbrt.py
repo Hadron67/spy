@@ -26,9 +26,7 @@ is odd (``cbrt(-x) == -cbrt(x)``, so negative arguments are computed, not a
 NaN), ``NaN``/``+-inf`` come out unchanged and ``cbrt(+-0)`` is ``+-0``.
 """
 
-from ...compiler import f32, f64, typeof, u32, u64
-from ...compiler.dsl import func
-from ...compiler.syntax import comptime
+from ...compiler import comptime, f32, f64, func, typeof, u32, u64
 from ..core import Numeric, bitcast, coerce, compile_error
 from ..float import float_truncate
 from ..int import truncate

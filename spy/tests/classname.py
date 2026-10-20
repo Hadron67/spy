@@ -2,9 +2,10 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    func,
     i32,
+    struct,
 )
-from ..compiler.dsl import func, struct
 from ..std.mem import DynamicAllocator
 from .structs import struct_type
 

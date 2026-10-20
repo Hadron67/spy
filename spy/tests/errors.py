@@ -4,15 +4,17 @@ from typing import Any, Never
 from unittest import TestCase
 
 from ..compiler import (
+    GLOBAL_CONTEXT,
     CompileError,
+    LLVMBackend,
+    StrBiMap,
+    func,
     i32,
     i64,
     mir,
+    struct,
     sval,
 )
-from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
-from ..compiler.lower import LLVMBackend
-from ..compiler.util import StrBiMap
 from ..std.int import truncate
 from .returns import mir_signature
 from .structs import MIR_CACHE, ExternMixed, Large, Small, struct_type
@@ -178,7 +180,7 @@ class SpyErrorUnionPrimitiveTest(TestCase):
         globals: StrBiMap[mir.GlobalValue] = StrBiMap()
         globals.add('union_lowering_test', fn)
         backend = LLVMBackend()
-        native = backend.compile(set(), globals, _GLOBAL_CONTEXT.target_info())[fn]
+        native = backend.compile(set(), globals, GLOBAL_CONTEXT.target_info())[fn]
         self.assertEqual(native.call(ctypes.c_int32(0)), 10)
         self.assertEqual(native.call(ctypes.c_int32(1)), 20)
         self.assertEqual(native.call(ctypes.c_int32(7)), 30)

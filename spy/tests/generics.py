@@ -3,12 +3,13 @@ from unittest import TestCase
 from ..compiler import (
     CompileError,
     f64,
+    func,
     i32,
     i64,
+    struct,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
 from ..std.core import Numeric
 
 # ---------------------------------------------------------------------------

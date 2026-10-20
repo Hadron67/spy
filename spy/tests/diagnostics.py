@@ -12,9 +12,19 @@ import inspect
 import warnings
 from unittest import TestCase, skipUnless
 
-from ..compiler import CompileError, func, i32, syntax, u8
-from ..compiler.dsl import _GLOBAL_CONTEXT, struct
-from ..compiler.source import SourceFile, SourceLoc, format_location, ipython_cell_name
+from ..compiler import (
+    GLOBAL_CONTEXT,
+    CompileError,
+    SourceFile,
+    SourceLoc,
+    format_location,
+    func,
+    i32,
+    ipython_cell_name,
+    struct,
+    u8,
+    unroll,
+)
 from ..std.core import compile_error
 
 _IPYTHON_AVAILABLE = importlib.util.find_spec('IPython') is not None
@@ -84,7 +94,7 @@ def diag_compile_error() -> i32:
 
 @func()
 def diag_unused_pragma() -> None:
-    syntax.unroll()
+    unroll()
 
 
 class DiagBadStructSource:
@@ -181,11 +191,11 @@ class SpyDiagnosticTest(TestCase):
             diag_unused_pragma()
         error = ctx.exception
         assert error.loc is not None
-        self.assertEqual(error.loc.line, _line_of(diag_unused_pragma, 'syntax.unroll()'))
+        self.assertEqual(error.loc.line, _line_of(diag_unused_pragma, 'unroll()'))
 
     def test_a_struct_field_error_points_at_the_annotation(self) -> None:
         with self.assertRaises(CompileError) as ctx:
-            _GLOBAL_CONTEXT.resolve_global(DiagBadStruct)
+            GLOBAL_CONTEXT.resolve_global(DiagBadStruct)
         error = ctx.exception
         assert error.loc is not None
         self.assertEqual(error.loc.line, _line_of(DiagBadStructSource, 'x: list'))

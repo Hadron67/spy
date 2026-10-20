@@ -1,10 +1,9 @@
 # This file is imported by the compiler, make sure to avoid circular imports.
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Never, Protocol, Self, cast
 
-from ..compiler import builtin_func, i32, i64, typeof, u8, u32, u64, usize
-from ..compiler.dsl import Callable, func, func_type, struct
-from ..compiler.syntax import (
+from ..compiler import (
     Array,
     ConstMultiPtr,
     ConstPtr,
@@ -12,7 +11,18 @@ from ..compiler.syntax import (
     Opaque,
     Option,
     Ptr,
+    builtin_func,
+    func,
+    func_type,
+    i32,
+    i64,
     infer_comptime,
+    struct,
+    typeof,
+    u8,
+    u32,
+    u64,
+    usize,
 )
 
 

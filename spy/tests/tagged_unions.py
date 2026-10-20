@@ -3,18 +3,17 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
-    i32,
-    i64,
-)
-from ..compiler import bool as spy_bool
-from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
     Comptime,
     Option,
     Ptr,
+    func,
+    i32,
+    i64,
     ref,
+    struct,
 )
+from ..compiler import bool as spy_bool
+from ..compiler import typeof as spy_typeof
 from .structs import Large
 
 # ---------------------------------------------------------------------------

@@ -2,21 +2,21 @@ from typing import Any, cast
 from unittest import TestCase
 
 from ..compiler import (
+    GLOBAL_CONTEXT,
     CompileError,
+    Comptime,
+    func,
     i8,
     i32,
     i64,
     mir,
+    struct,
     sval,
     u0,
     void,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
-from ..compiler.syntax import (
-    Comptime,
-)
 from .basics import nothing
 from .generics import OuterTwo, nested_struct_field
 
@@ -45,14 +45,14 @@ def struct_type(handle: Any) -> sval.StructType:
 
 def spy_type(annotation: Any) -> sval.Type:
     """The spy type a Python annotation evaluates to (see ``sval.as_value``)."""
-    type = sval.as_value(annotation, _GLOBAL_CONTEXT)
+    type = sval.as_value(annotation, GLOBAL_CONTEXT)
     assert isinstance(type, sval.Type)
     return type
 
 
 # the MIR-mirror interning table of the global host context: the MIR types the
 # tests compare against are the ones it created (see ``sval.MirLowerCache``)
-MIR_CACHE = _GLOBAL_CONTEXT.mir_lower_cache
+MIR_CACHE = GLOBAL_CONTEXT.mir_lower_cache
 
 
 def struct_mirror(handle: Any) -> mir.Type:

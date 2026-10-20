@@ -26,9 +26,7 @@ at about 0.51 ULP, which the arithmetic below reproduces (it is the non-FMA
 path).
 """
 
-from ...compiler import f32, f64, typeof, u32, u64, usize
-from ...compiler.dsl import func
-from ...compiler.syntax import comptime
+from ...compiler import comptime, f32, f64, func, typeof, u32, u64, usize
 from ..core import Numeric, bitcast, coerce, compile_error
 from ..float import float_truncate
 from .pow import (

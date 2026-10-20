@@ -2,18 +2,19 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    comptime,
     f32,
     f64,
+    func,
     i1,
     i32,
+    ref,
     u1,
     u8,
     u32,
     u64,
 )
 from ..compiler import bool as spy_bool
-from ..compiler.dsl import func
-from ..compiler.syntax import comptime, ref
 from ..std.core import bitcast
 
 # ---------------------------------------------------------------------------

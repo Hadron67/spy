@@ -29,9 +29,20 @@ sign-bit mask.  musl bounds the error of both ``pow`` and ``powf`` at well under
 1 ULP, which the arithmetic below reproduces exactly (it is the non-FMA path).
 """
 
-from ...compiler import f32, f64, i32, i64, typeof, u32, u64, usize
-from ...compiler.dsl import func
-from ...compiler.syntax import array, comptime, const_comptime
+from ...compiler import (
+    array,
+    comptime,
+    const_comptime,
+    f32,
+    f64,
+    func,
+    i32,
+    i64,
+    typeof,
+    u32,
+    u64,
+    usize,
+)
 from ..core import Numeric, bitcast, coerce, compile_error, int_to_float_unchecked
 from ..float import float_truncate
 from ..int import int_cast, truncate

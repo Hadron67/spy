@@ -4,19 +4,21 @@ from typing import Any, Protocol
 from unittest import TestCase
 
 from ..compiler import (
+    GLOBAL_CONTEXT,
     CompileError,
-    i32,
-    i64,
-    mir,
-    sval,
-    syntax,
-)
-from ..compiler.dsl import _GLOBAL_CONTEXT, decl_func, func, func_type, struct
-from ..compiler.syntax import (
     ConstPtr,
     MultiPtr,
     array,
+    comptime,
+    decl_func,
+    func,
+    func_type,
+    i32,
+    i64,
+    mir,
     ref,
+    struct,
+    sval,
 )
 from ..compiler.util import FrozenArraySet
 from ..std import compile as spy_compile
@@ -190,7 +192,7 @@ def call_any_decl(x: i32) -> i32:
     # a declared function held in a compile-time ``Any`` variable: ``Any`` holds
     # the pointer as it is, and the call dereferences the box to reach it (see
     # ``HirRunner._auto_deref``)
-    syntax.comptime()
+    comptime()
     fn: Any = c_abs
     return fn(x)
 
@@ -199,9 +201,9 @@ def call_any_decl(x: i32) -> i32:
 def call_any_decl_reassigned(x: i32) -> i32:
     # the variable is reassigned in a compile-time branch: only the chosen
     # branch is walked, so the callee is the one written there
-    syntax.comptime()
+    comptime()
     pick_upper = 1
-    syntax.comptime()
+    comptime()
     fn: Any = c_abs
     if pick_upper == 1:
         fn = c_toupper
@@ -256,7 +258,7 @@ class SpyFuncTypeTest(TestCase):
     that names the declaration."""
 
     def test_a_function_type_resolves_from_the_call_signature(self) -> None:
-        t = _GLOBAL_CONTEXT.resolve_global(Fallible)
+        t = GLOBAL_CONTEXT.resolve_global(Fallible)
         assert isinstance(t, sval.FunctionType)
         self.assertEqual([a.name for a in t.args], ['n'])
         self.assertEqual(t.args[0].type, sval.IntType(32, True))
@@ -265,18 +267,18 @@ class SpyFuncTypeTest(TestCase):
         self.assertEqual(t.callconv, 'default')
 
     def test_a_default_of_a_function_type_parameter_is_carried(self) -> None:
-        t = _GLOBAL_CONTEXT.resolve_global(CWithDefault)
+        t = GLOBAL_CONTEXT.resolve_global(CWithDefault)
         assert isinstance(t, sval.FunctionType)
         self.assertEqual(t.args[1].default_value, 10)
 
     def test_a_pointer_to_a_function_type_is_a_pointer(self) -> None:
-        t = sval.as_value(ConstPtr[CBinary], _GLOBAL_CONTEXT)
+        t = sval.as_value(ConstPtr[CBinary], GLOBAL_CONTEXT)
         assert isinstance(t, sval.PointerType)
         self.assertIsInstance(t.elem, sval.FunctionType)
         self.assertIs(t.is_const, True)
 
     def test_a_c_function_type_forces_every_argument_by_value(self) -> None:
-        t = _GLOBAL_CONTEXT.resolve_global(CBinary)
+        t = GLOBAL_CONTEXT.resolve_global(CBinary)
         assert isinstance(t, sval.FunctionType)
         i32_mir = mir.IntType(32, True)
         # no by-ref argument and no result pointer: ``fn(i32, i32) -> i32``
@@ -285,7 +287,7 @@ class SpyFuncTypeTest(TestCase):
         )
 
     def test_a_c_function_type_returns_an_aggregate_by_value(self) -> None:
-        t = _GLOBAL_CONTEXT.resolve_global(CGetWide)
+        t = GLOBAL_CONTEXT.resolve_global(CGetWide)
         assert isinstance(t, sval.FunctionType)
         mirror = t.to_mir_type(MIR_CACHE)
         assert isinstance(mirror, mir.FunctionType)
@@ -296,7 +298,7 @@ class SpyFuncTypeTest(TestCase):
 
     def test_a_c_function_type_may_not_declare_exceptions(self) -> None:
         with self.assertRaises(CompileError) as ctx:
-            _GLOBAL_CONTEXT.resolve_global(CBad)
+            GLOBAL_CONTEXT.resolve_global(CBad)
         self.assertIn('may not declare exceptions', str(ctx.exception))
 
 
@@ -310,14 +312,14 @@ class SpyFnPtrCallTest(TestCase):
         self.assertEqual(call_an_array_element_function_pointer(5), 6)
 
     def test_calling_a_c_function_pointer(self) -> None:
-        ptr_type = sval.as_value(ConstPtr[CBinary], _GLOBAL_CONTEXT)
+        ptr_type = sval.as_value(ConstPtr[CBinary], GLOBAL_CONTEXT)
         proto = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32, ctypes.c_int32)
         callback = proto(lambda a, b: a + b)
         pointer = ctypes.cast(callback, ctypes.c_void_p)
         self.assertEqual(call_c_binary(ptr_type(pointer), 2, 3), 5)  # pyright: ignore
 
     def test_the_default_of_a_function_pointer_is_filled_in(self) -> None:
-        ptr_type = sval.as_value(ConstPtr[CWithDefault], _GLOBAL_CONTEXT)
+        ptr_type = sval.as_value(ConstPtr[CWithDefault], GLOBAL_CONTEXT)
         proto = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32, ctypes.c_int32)
         callback = proto(lambda a, b: a + b)
         pointer = ctypes.cast(callback, ctypes.c_void_p)
@@ -326,7 +328,7 @@ class SpyFnPtrCallTest(TestCase):
     def test_calling_a_spy_function_pointer(self) -> None:
         # the default convention: the callee carries the error code and payload
         # through trailing pointers
-        ptr_type = _GLOBAL_CONTEXT.resolve_global(Fallible)
+        ptr_type = GLOBAL_CONTEXT.resolve_global(Fallible)
         proto = ctypes.CFUNCTYPE(
             ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p,
         )
@@ -340,7 +342,7 @@ class SpyFnPtrCallTest(TestCase):
         self.assertEqual(call_fallible(ptr_type(pointer), 5), 6)  # pyright: ignore
 
     def test_the_error_of_a_spy_function_pointer_is_routed(self) -> None:
-        ptr_type = _GLOBAL_CONTEXT.resolve_global(Fallible)
+        ptr_type = GLOBAL_CONTEXT.resolve_global(Fallible)
         proto = ctypes.CFUNCTYPE(
             ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p,
         )
@@ -370,14 +372,14 @@ class SpyCallconvTest(TestCase):
         self.assertIn('only one value', str(ctx.exception))
 
     def test_a_c_function_type_may_not_take_a_non_copyable(self) -> None:
-        t = _GLOBAL_CONTEXT.resolve_global(CTakeHandle)
+        t = GLOBAL_CONTEXT.resolve_global(CTakeHandle)
         assert isinstance(t, sval.FunctionType)
         with self.assertRaises(CompileError) as ctx:
             t.to_mir_type(MIR_CACHE)
         self.assertIn('non-copyable', str(ctx.exception))
 
     def test_a_c_function_type_may_not_return_a_non_copyable(self) -> None:
-        t = _GLOBAL_CONTEXT.resolve_global(CReturnHandle)
+        t = GLOBAL_CONTEXT.resolve_global(CReturnHandle)
         assert isinstance(t, sval.FunctionType)
         with self.assertRaises(CompileError) as ctx:
             t.to_mir_type(MIR_CACHE)
@@ -428,7 +430,7 @@ class SpyExceptionsArgumentTest(TestCase):
     exception type (``exceptions=ErrorA`` means ``exceptions=(ErrorA,)``)."""
 
     def test_a_func_type_accepts_a_single_exception(self) -> None:
-        t = _GLOBAL_CONTEXT.resolve_global(FallibleSingle)
+        t = GLOBAL_CONTEXT.resolve_global(FallibleSingle)
         assert isinstance(t, sval.FunctionType)
         self.assertEqual(tuple(t.exceptions), (struct_type(FnError),))
 
@@ -449,7 +451,7 @@ class SpyDeclFuncTest(TestCase):
     decorated name resolves to a function pointer (``sval.DeclareFunction``)."""
 
     def test_a_declared_function_is_a_c_function_pointer(self) -> None:
-        decl = _GLOBAL_CONTEXT.resolve_global(c_abs)
+        decl = GLOBAL_CONTEXT.resolve_global(c_abs)
         assert isinstance(decl, sval.DeclareFunction)
         self.assertEqual(decl.linkname, 'abs')
         self.assertEqual(decl.type.callconv, 'c')
@@ -480,7 +482,7 @@ class SpyDeclFuncTest(TestCase):
 
     def test_a_c_declaration_may_not_declare_exceptions(self) -> None:
         with self.assertRaises(CompileError) as ctx:
-            _GLOBAL_CONTEXT.resolve_global(c_bad_decl)
+            GLOBAL_CONTEXT.resolve_global(c_bad_decl)
         self.assertIn('may not declare exceptions', str(ctx.exception))
 
 

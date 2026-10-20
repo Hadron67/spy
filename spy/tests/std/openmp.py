@@ -12,8 +12,20 @@ cannot be found the tests are skipped, since the JIT would not resolve the
 from typing import Literal, cast
 from unittest import TestCase
 
-from ...compiler import CompileError, c64, c128, f32, f64, func, i32, i64, u8, usize
-from ...compiler.syntax import Array, ref
+from ...compiler import (
+    Array,
+    CompileError,
+    c64,
+    c128,
+    f32,
+    f64,
+    func,
+    i32,
+    i64,
+    ref,
+    u8,
+    usize,
+)
 from ...std.core import arr_slice, coerce, undefined
 from ...std.int import int_cast, int_to_float
 from ...std.openmp import parallel_loop

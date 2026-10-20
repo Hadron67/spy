@@ -3,14 +3,15 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    Comptime,
+    Option,
     c128,
+    func,
     i32,
     i64,
     mir,
     void,
 )
-from ..compiler.dsl import func
-from ..compiler.syntax import Comptime, Option
 from ..std.int import truncate
 from .structs import Large, Small, struct_mirror
 

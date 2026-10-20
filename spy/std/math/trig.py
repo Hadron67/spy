@@ -16,9 +16,22 @@ The public entry points are :func:`sin`, :func:`cos` and :func:`tan`, generic ov
 
 from typing import Literal
 
-from ...compiler import bool, f32, f64, i32, typeof, u32, u64, usize
-from ...compiler.dsl import func
-from ...compiler.syntax import Array, Comptime, array, comptime, const_comptime
+from ...compiler import (
+    Array,
+    Comptime,
+    array,
+    bool,
+    comptime,
+    const_comptime,
+    f32,
+    f64,
+    func,
+    i32,
+    typeof,
+    u32,
+    u64,
+    usize,
+)
 from ..core import (
     bitcast,
     coerce,

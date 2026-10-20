@@ -29,9 +29,7 @@ time.
 not dispatched by a mode.
 """
 
-from ...compiler import f32, f64, typeof
-from ...compiler.dsl import func
-from ...compiler.syntax import comptime
+from ...compiler import comptime, f32, f64, func, typeof
 from ..c import acos as c_acos
 from ..c import acosf as c_acosf
 from ..c import asin as c_asin

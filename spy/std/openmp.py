@@ -25,28 +25,26 @@ from typing import Any, Protocol
 from spy.std.int import int_cast
 
 from ..compiler import (
+    ConstComptime,
     ConstMultiPtr,
     ConstPtr,
+    Opaque,
     Ptr,
     bool,
+    closure,
+    comptime,
     decl_func,
     func,
     func_type,
     i32,
     i64,
+    ref,
     struct,
     typeof,
     u8,
     u32,
     u64,
     void,
-)
-from ..compiler.syntax import (
-    ConstComptime,
-    Opaque,
-    closure,
-    comptime,
-    ref,
 )
 from .core import (
     as_func_ptr,

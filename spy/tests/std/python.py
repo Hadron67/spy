@@ -2,8 +2,7 @@ import sys
 from typing import Never
 from unittest import TestCase
 
-from ...compiler import f64, func, i8, i32, i64, u8, u64, usize
-from ...compiler.syntax import defer
+from ...compiler import defer, f64, func, i8, i32, i64, u8, u64, usize
 from ...std.core import sstr
 from ...std.python import GILState, PyCompareOp, PyError, PyObject
 from ..structs import struct_type

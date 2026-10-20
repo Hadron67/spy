@@ -2,18 +2,8 @@ from typing import TYPE_CHECKING, Literal
 from unittest import TestCase
 
 from ..compiler import (
-    CompileError,
-    i32,
-    i64,
-    syntax,
-    u8,
-    u64,
-    usize,
-)
-from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
     Array,
+    CompileError,
     Comptime,
     ConstMultiPtr,
     ConstPtr,
@@ -22,9 +12,18 @@ from ..compiler.syntax import (
     Ptr,
     array,
     closure,
+    comptime,
     defer,
+    func,
+    i32,
+    i64,
     ref,
+    struct,
+    u8,
+    u64,
+    usize,
 )
+from ..compiler import typeof as spy_typeof
 from ..std import (
     ConstSlicePtr,
     SlicePtr,
@@ -555,7 +554,7 @@ def call_iterate_const_slice_refs_sum(x: i32) -> i32:
 def comptime_slice_element() -> i32:
     # the array *is* compile-time: its elements are their own places, the slice
     # names them, and indexing it is folded in Python
-    syntax.comptime()
+    comptime()
     v = array(Small(1, 2), Small(3, 4))
     s: Comptime[SlicePtr[Small]] = arr_slice(ref(v))
     return s.ptr[1].b
@@ -563,7 +562,7 @@ def comptime_slice_element() -> i32:
 
 @func()
 def comptime_slice_length() -> u64:
-    syntax.comptime()
+    comptime()
     v = array(Small(1, 2), Small(3, 4))
     s: Comptime[SlicePtr[Small]] = arr_slice(ref(v))
     return s.length
@@ -572,9 +571,9 @@ def comptime_slice_length() -> u64:
 @func()
 def runtime_index_into_comptime_storage(x: usize) -> i32:
     # a runtime index cannot pick a compile-time place
-    syntax.comptime()
+    comptime()
     v = array(Small(1, 2), Small(3, 4))
-    syntax.comptime()
+    comptime()
     s = arr_slice(ref(v))
     return s.ptr[x].a
 

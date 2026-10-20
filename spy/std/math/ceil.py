@@ -21,9 +21,7 @@ come out unchanged, ``ceil(+-0)`` is ``+-0``, and a negative argument in
 ``(-1, 0)`` yields ``-0``.
 """
 
-from ...compiler import f32, f64, typeof, u32, u64
-from ...compiler.dsl import func
-from ...compiler.syntax import comptime
+from ...compiler import comptime, f32, f64, func, typeof, u32, u64
 from ..core import Numeric, bitcast, coerce, compile_error
 
 # ``ceil.c``: ``toint = 1/DBL_EPSILON``.  Adding and subtracting it rounds an

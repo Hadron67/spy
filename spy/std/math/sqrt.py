@@ -19,9 +19,19 @@ round-to-nearest mode that value is far below the result's ulp, so it never
 changes the returned number.
 """
 
-from ...compiler import f32, f64, typeof, u16, u32, u64, usize
-from ...compiler.dsl import func
-from ...compiler.syntax import array, comptime, const_comptime
+from ...compiler import (
+    array,
+    comptime,
+    const_comptime,
+    f32,
+    f64,
+    func,
+    typeof,
+    u16,
+    u32,
+    u64,
+    usize,
+)
 from ..core import Numeric, bitcast, coerce, compile_error
 from ..int import truncate
 

@@ -2,29 +2,28 @@ from typing import Literal
 from unittest import TestCase
 
 from ..compiler import (
+    Array,
     CompileError,
+    Comptime,
+    ConstComptime,
+    InferComptime,
+    Option,
+    Ptr,
     TypeMismatchError,
+    array,
+    func,
     i8,
     i32,
     i64,
     mir,
+    ref,
+    struct,
     sval,
     u0,
     void,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
-    Array,
-    Comptime,
-    ConstComptime,
-    InferComptime,
-    Option,
-    Ptr,
-    array,
-    ref,
-)
 from .structs import MIR_CACHE, Large, Small, spy_type, struct_type
 
 # ---------------------------------------------------------------------------

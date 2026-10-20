@@ -4,12 +4,13 @@ from ..compiler import (
     CompileError,
     f32,
     f64,
+    func,
     i32,
     i64,
+    struct,
     u64,
 )
 from ..compiler import bool as spy_bool
-from ..compiler.dsl import func, struct
 from ..std.int import int_to_float
 
 # ---------------------------------------------------------------------------

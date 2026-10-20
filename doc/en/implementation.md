@@ -306,7 +306,7 @@ and the thunk returns `bool` (`true` = panic, `false` = normal). `_thunk_call_si
 - `_Context` (a subclass of `sval.CompileContext`): `resolve_global` (resolves registered objects / enum members into spy values or `FunctionValue`s of this context, and wraps a plain Python function that is not decorated with `@func` into a `sval.PyFunction`),
   `special_types`, `mir_lower_cache`, `target_info`, `_resolve_call`, enum support (the `enum` decorator/`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`),
   compile options (`get_compile_option`/`set_compile_option`, stored in `_compile_options` keyed by a `str` name).
-  `_GLOBAL_CONTEXT = _Context(LLVMBackend())` is the top-level default context.
+  `GLOBAL_CONTEXT = _Context(LLVMBackend())` is the top-level default context.
 
 ---
 

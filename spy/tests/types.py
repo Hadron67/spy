@@ -1,7 +1,14 @@
 from unittest import TestCase
 
 from ..compiler import (
+    GLOBAL_CONTEXT,
+    Array,
     CompileError,
+    MultiPtr,
+    Opaque,
+    Option,
+    Ptr,
+    array,
     c_char,
     c_int,
     c_long,
@@ -9,27 +16,20 @@ from ..compiler import (
     c_uchar,
     c_uint,
     c_ulonglong,
+    comptime,
     f32,
     f64,
+    func,
     i32,
     i64,
     mir,
+    ref,
+    struct,
     sval,
     usize,
     void,
 )
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
-from ..compiler.syntax import (
-    Array,
-    MultiPtr,
-    Opaque,
-    Option,
-    Ptr,
-    array,
-    comptime,
-    ref,
-)
 from ..compiler.util import TriState
 from ..std import compile
 from ..std.core import coerce, lub_type, ptr_cast
@@ -472,11 +472,11 @@ class SpyTypeClassifyTest(TestCase):
     def test_the_mir_cache_is_the_contexts_own(self) -> None:
         # the interning table belongs to a host context, so two contexts do not
         # share the MIR types they intern
-        self.assertIsNot(_GLOBAL_CONTEXT.mir_lower_cache, _CROSS_CONTEXT.mir_lower_cache)
+        self.assertIsNot(GLOBAL_CONTEXT.mir_lower_cache, _CROSS_CONTEXT.mir_lower_cache)
         union = sval.UnionType(frozenset((sval.IntType(32, True),)))
-        global_mir = union.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache)
+        global_mir = union.to_mir_type(GLOBAL_CONTEXT.mir_lower_cache)
         # ... while one context reuses the one it made
-        self.assertIs(union.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache), global_mir)
+        self.assertIs(union.to_mir_type(GLOBAL_CONTEXT.mir_lower_cache), global_mir)
         self.assertIsNot(union.to_mir_type(_CROSS_CONTEXT.mir_lower_cache), global_mir)
 
 
@@ -829,15 +829,15 @@ class SpyCTypeTest(TestCase):
     for ``c_char``, signedness - is read off the compile target (``TargetInfo``)."""
 
     def test_c_types_resolve_to_target_ints(self) -> None:
-        target = _GLOBAL_CONTEXT.target_info()
-        self.assertEqual(sval.as_value(c_char, _GLOBAL_CONTEXT), sval.IntType(target.c_char_bits, True))
-        self.assertEqual(sval.as_value(c_uchar, _GLOBAL_CONTEXT), sval.IntType(target.c_char_bits, False))
-        self.assertEqual(sval.as_value(c_short, _GLOBAL_CONTEXT), sval.IntType(target.c_short_bits, True))
-        self.assertEqual(sval.as_value(c_int, _GLOBAL_CONTEXT), sval.IntType(target.c_int_bits, True))
-        self.assertEqual(sval.as_value(c_uint, _GLOBAL_CONTEXT), sval.IntType(target.c_int_bits, False))
-        self.assertEqual(sval.as_value(c_long, _GLOBAL_CONTEXT), sval.IntType(target.c_long_bits, True))
+        target = GLOBAL_CONTEXT.target_info()
+        self.assertEqual(sval.as_value(c_char, GLOBAL_CONTEXT), sval.IntType(target.c_char_bits, True))
+        self.assertEqual(sval.as_value(c_uchar, GLOBAL_CONTEXT), sval.IntType(target.c_char_bits, False))
+        self.assertEqual(sval.as_value(c_short, GLOBAL_CONTEXT), sval.IntType(target.c_short_bits, True))
+        self.assertEqual(sval.as_value(c_int, GLOBAL_CONTEXT), sval.IntType(target.c_int_bits, True))
+        self.assertEqual(sval.as_value(c_uint, GLOBAL_CONTEXT), sval.IntType(target.c_int_bits, False))
+        self.assertEqual(sval.as_value(c_long, GLOBAL_CONTEXT), sval.IntType(target.c_long_bits, True))
         self.assertEqual(
-            sval.as_value(c_ulonglong, _GLOBAL_CONTEXT),
+            sval.as_value(c_ulonglong, GLOBAL_CONTEXT),
             sval.IntType(target.c_longlong_bits, False),
         )
 

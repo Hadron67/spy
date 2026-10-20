@@ -1,10 +1,12 @@
 from unittest import TestCase
 
 from ..compiler import (
+    Context,
+    func,
     i32,
+    struct,
     sval,
 )
-from ..compiler.dsl import Context, func, struct
 from ..compiler.lower import LLVMBackend
 from .basics import smoke_test
 from .structs import struct_type

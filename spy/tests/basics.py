@@ -4,16 +4,16 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    Comptime,
     f32,
     f64,
+    func,
     i32,
     sval,
     u64,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func
-from ..compiler.syntax import Comptime
 from ..std import (
     Numeric,
 )

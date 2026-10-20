@@ -2,16 +2,14 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    Comptime,
+    Option,
+    Ptr,
+    func,
     i32,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func
-from ..compiler.syntax import (
-    Comptime,
-    Option,
-    Ptr,
-)
 from ..std import (
     undefined,
 )

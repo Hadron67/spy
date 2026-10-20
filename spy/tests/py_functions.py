@@ -13,13 +13,14 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    Comptime,
+    Option,
     c128,
     f64,
     func,
     i32,
 )
 from ..compiler import bool as spy_bool
-from ..compiler.syntax import Comptime, Option
 
 
 def double(n: int) -> int:

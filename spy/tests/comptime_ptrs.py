@@ -1,17 +1,23 @@
 from typing import Literal, Protocol
 from unittest import TestCase
 
-from ..compiler import CompileError, i32, sval, syntax, usize
-from ..compiler.dsl import func, func_type, struct
-from ..compiler.syntax import (
+from ..compiler import (
     Array,
+    CompileError,
     Comptime,
     ConstComptime,
     Option,
     Ptr,
     array,
+    closure,
     const_comptime,
+    func,
+    func_type,
+    i32,
     ref,
+    struct,
+    sval,
+    usize,
 )
 from ..std.core import as_func_ptr, coerce
 
@@ -278,7 +284,7 @@ def comptime_var_to_comptime_param() -> i32:
 def compiled_closure_captures_a_comptime_aggregate() -> i32:
     s: Comptime = Little(1, 2)
 
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def f() -> i32:
         return s.a + s.b
 
@@ -291,7 +297,7 @@ def compiled_closure_captures_a_comptime_tuple() -> i32:
     # baked into the closure's struct type (see the behaviour doc §9.3)
     t: Comptime = (coerce(3, i32), coerce(4, i32))
 
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def f() -> i32:
         return t[0] + t[1]
 
@@ -310,7 +316,7 @@ def compiled_closure_captures_a_tuple_with_a_runtime_element(x: i32) -> i32:
     # it like any other runtime variable
     t = (x, x + 5)
 
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def f() -> i32:
         return t[0] + t[1]
 
@@ -321,7 +327,7 @@ def compiled_closure_captures_a_tuple_with_a_runtime_element(x: i32) -> i32:
 def compiled_closure_captures_an_aggregate_with_a_runtime_element(x: i32) -> i32:
     s = Little(x, 2)
 
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def f() -> i32:
         return s.a + s.b
 
@@ -342,7 +348,7 @@ def comptime_capture_as_func_ptr() -> i32:
     # specialization and the closure is an ordinary runtime function
     n: Comptime = 5
 
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def f(x: i32) -> i32:
         return x + n
 

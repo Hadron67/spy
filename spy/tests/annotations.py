@@ -3,16 +3,14 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    Comptime,
+    func,
     i32,
     i64,
     void,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func
-from ..compiler.syntax import (
-    Comptime,
-)
 from .generics import Pair
 from .structs import Small
 

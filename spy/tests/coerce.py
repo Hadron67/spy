@@ -2,21 +2,8 @@ from typing import Any, Literal
 from unittest import TestCase
 
 from ..compiler import (
-    CompileError,
-    f32,
-    f64,
-    i8,
-    i16,
-    i32,
-    i64,
-    u8,
-    u32,
-    u64,
-)
-from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
     Array,
+    CompileError,
     Comptime,
     ConstComptime,
     ConstMultiPtr,
@@ -27,8 +14,20 @@ from ..compiler.syntax import (
     Ptr,
     array,
     comptime,
+    f32,
+    f64,
+    func,
+    i8,
+    i16,
+    i32,
+    i64,
     ref,
+    struct,
+    u8,
+    u32,
+    u64,
 )
+from ..compiler import typeof as spy_typeof
 from ..std.core import coerce, const_array, typed_undefined
 from ..std.float import float_truncate
 from ..std.int import int_to_float, truncate

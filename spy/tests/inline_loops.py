@@ -2,21 +2,19 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
-    i32,
-    syntax,
-)
-from ..compiler.dsl import func
-from ..compiler.syntax import (
     Comptime,
     Ptr,
     defer,
     errdefer,
+    func,
+    i32,
     ref,
+    unroll,
 )
 from .errors import ErrorA
 
 # ---------------------------------------------------------------------------
-# compile-time loops: a loop preceded by the statement ``syntax.unroll()``
+# compile-time loops: a loop preceded by the statement ``unroll()``
 # unrolls its body once per compile-time iteration (the condition is a
 # compile-time value that the body advances); ``break`` leaves the whole
 # unrolled sequence and ``continue`` jumps to the next unrolled body.
@@ -27,7 +25,7 @@ from .errors import ErrorA
 def inline_sum() -> i32:
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 4:
         total = total + i
         i = i + 1
@@ -38,7 +36,7 @@ def inline_sum() -> i32:
 def inline_false() -> i32:
     # a compile-time false condition unrolls no body and runs the else clause
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while False:
         total = total + 1
     else:  # noqa: PLW0120 - the else clause is the point of the fixture
@@ -51,7 +49,7 @@ def inline_break(n: i32) -> i32:
     # a runtime-conditional break leaves all the remaining unrolled bodies
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 10:
         i = i + 1
         if i == n:
@@ -65,7 +63,7 @@ def inline_continue(n: i32) -> i32:
     # a runtime-conditional continue jumps to the next unrolled body
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 6:
         i = i + 1
         if i == n:
@@ -78,7 +76,7 @@ def inline_continue(n: i32) -> i32:
 def inline_else() -> i32:
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 3:
         total = total + i
         i = i + 1
@@ -91,10 +89,10 @@ def inline_else() -> i32:
 def inline_nested() -> i32:
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 3:
         j: Comptime = 0
-        syntax.unroll()
+        unroll()
         while j < 2:
             total = total + 1
             j = j + 1
@@ -107,7 +105,7 @@ def inline_continue_always() -> i32:
     # an unconditional continue: the body has no falling end, so the next body
     # is unrolled from the block the continue jumped to
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < 4:
         i = i + 1
         continue
@@ -121,7 +119,7 @@ def runtime_loop_with_inline(n: i32) -> i32:
     total: i32 = 0
     while k < n:
         i: Comptime = 0
-        syntax.unroll()
+        unroll()
         while i < 3:
             total = total + 1
             i = i + 1
@@ -136,7 +134,7 @@ def inline_continue_or_return(n: i32) -> i32:
     # through
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 5:
         i = i + 1
         if i == n:
@@ -150,7 +148,7 @@ def inline_continue_or_return(n: i32) -> i32:
 @func()
 def inline_bad_cond(n: i32) -> i32:
     # a runtime condition cannot be unrolled: the cap is what reports it
-    syntax.unroll()
+    unroll()
     while n > 0:
         n = n - 1
     return n
@@ -159,13 +157,13 @@ def inline_bad_cond(n: i32) -> i32:
 @func()
 def inline_loop_misuse(n: i32) -> i32:
     # the marker must be followed by a loop
-    syntax.unroll()
+    unroll()
     return n
 
 
 # ---------------------------------------------------------------------------
 # compile-time ``for`` loops: the iterable (and so the loop variable) of a loop
-# marked with ``syntax.unroll()`` is a compile-time value, so the desugared
+# marked with ``unroll()`` is a compile-time value, so the desugared
 # iterator loop unrolls at compile time - ``__next__`` raises ``StopIteration``
 # while the interpreter runs, and the ``break`` its ``except`` clause runs ends
 # the unrolled sequence (see ``astgen._gen_for``)
@@ -177,7 +175,7 @@ def unroll_for_sum() -> i32:
     # the literals have no runtime type of their own: the whole loop is
     # compile-time
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in range(4, 0, 1):
         total = total + i
     return total
@@ -187,7 +185,7 @@ def unroll_for_sum() -> i32:
 def unroll_for_defaults() -> i32:
     # ``start``/``step`` are left out: the field defaults fill them
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in range(4):
         total = total + i
     return total
@@ -196,7 +194,7 @@ def unroll_for_defaults() -> i32:
 @func()
 def unroll_for_else() -> i32:
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in range(3, 0, 1):
         total = total + i
     else:  # noqa: PLW0120 - the else clause is the point of the fixture
@@ -209,7 +207,7 @@ def unroll_for_break(n: i32) -> i32:
     # a runtime-conditional break leaves every remaining unrolled body (and the
     # else clause, like Python)
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in range(10, 0, 1):
         if i == n:
             break
@@ -222,7 +220,7 @@ def unroll_for_break(n: i32) -> i32:
 @func()
 def unroll_for_continue() -> i32:
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in range(5, 0, 1):
         if i == 2:
             continue
@@ -233,9 +231,9 @@ def unroll_for_continue() -> i32:
 @func()
 def unroll_for_nested() -> i32:
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in range(3, 0, 1):
-        syntax.unroll()
+        unroll()
         for j in range(2, 0, 1):
             total = total + i * 10 + j
     return total
@@ -248,7 +246,7 @@ def unroll_for_typed_var() -> i32:
     # subscriptable in spy but not in the Python type system)
     r: Comptime[range[i32]] = range(3, 0, 1)  # pyright: ignore
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in r:
         total = total + i
     return total
@@ -258,14 +256,14 @@ def unroll_for_typed_var() -> i32:
 def unroll_for_runtime_iter(n: i32) -> i32:
     # a runtime iterator cannot be unrolled: the unroll cap reports it
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in range(n, 0, 1):
         total = total + i
     return total
 
 
 # ---------------------------------------------------------------------------
-# deferred bodies inside compile-time loops: a ``with syntax.defer():`` in the
+# deferred bodies inside compile-time loops: a ``with defer():`` in the
 # body of an unrolled loop is registered in the region that wraps that body
 # (the compile-time ``if`` a ``while`` lowers to, the ``try`` a ``for`` lowers
 # to), so it runs at the end of every unrolled iteration - not once per loop.
@@ -277,7 +275,7 @@ def unroll_defer_body(p: Ptr[i32]) -> i32:
     # the defer runs once per unrolled iteration
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 3:
         with defer():
             p[...] = p[...] + 1
@@ -298,7 +296,7 @@ def unroll_defer_for(p: Ptr[i32]) -> i32:
     # the desugared ``for`` wraps its body in a ``try``: the defer runs when
     # each iteration's body falls through to the ``StopIteration`` clause
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     for i in range(3, 0, 1):
         with defer():
             p[...] = p[...] + 1
@@ -318,7 +316,7 @@ def unroll_defer_break(p: Ptr[i32], n: i32) -> i32:
     # a runtime-conditional break runs the defer of the iteration it leaves
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 10:
         with defer():
             p[...] = p[...] + 1
@@ -342,7 +340,7 @@ def unroll_defer_continue(p: Ptr[i32], n: i32) -> i32:
     # defer runs on it too
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < 5:
         with defer():
             p[...] = p[...] + 1
@@ -364,7 +362,7 @@ def call_unroll_defer_continue(x: i32, n: i32) -> i32:
 def unroll_defer_else(p: Ptr[i32]) -> i32:
     # a defer in the ``else`` clause runs once, when the loop ends normally
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < 2:
         i = i + 1
     else:  # noqa: PLW0120 - the else clause is the point of the fixture
@@ -384,7 +382,7 @@ def call_unroll_defer_else(x: i32) -> i32:
 def unroll_defer_order(p: Ptr[i32]) -> i32:
     # two defers of one iteration run in reverse declaration order
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < 2:
         with defer():
             p[...] = p[...] * 10 + 1
@@ -405,7 +403,7 @@ def call_unroll_defer_order(x: i32) -> i32:
 def unroll_errdefer(p: Ptr[i32], n: i32) -> i32:
     # an ``errdefer`` runs only on the raise, which ends the whole loop
     i: Comptime = 0
-    syntax.unroll()
+    unroll()
     while i < 5:
         with errdefer():
             p[...] = p[...] + 1
@@ -427,7 +425,7 @@ def call_unroll_errdefer(x: i32, n: i32) -> i32:
 
 
 class SpyInlineLoopTest(TestCase):
-    """Compile-time loops: a loop preceded by ``syntax.unroll()`` unrolls its
+    """Compile-time loops: a loop preceded by ``unroll()`` unrolls its
     body once per compile-time iteration, ``break`` leaves the whole unrolled
     sequence and ``continue`` jumps to the next unrolled body."""
 
@@ -484,7 +482,7 @@ class SpyInlineLoopTest(TestCase):
 
 class SpyUnrollForTest(TestCase):
     """Compile-time ``for`` loops: the iterable of a loop marked with
-    ``syntax.unroll()`` is a compile-time value (the loop variable may have no
+    ``unroll()`` is a compile-time value (the loop variable may have no
     runtime representation at all), so the desugared iterator loop unrolls at
     compile time; ``break`` leaves the whole unrolled sequence and ``continue``
     jumps to the next unrolled body."""

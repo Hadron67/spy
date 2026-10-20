@@ -5,21 +5,19 @@ from typing import Any, Protocol, override
 from ..compiler import (
     ConstPtr,
     MultiPtr,
+    Opaque,
     Ptr,
     builtin_func,
+    closure,
+    comptime,
+    const_comptime,
     func,
     func_type,
+    ref,
     struct,
     typeof,
     u8,
     usize,
-)
-from ..compiler.syntax import (
-    Opaque,
-    closure,
-    comptime,
-    const_comptime,
-    ref,
 )
 from .c import free, malloc, realloc
 from .core import SlicePtr, as_func_ptr, panic, ptr_cast, sstr, undefined

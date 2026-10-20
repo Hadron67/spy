@@ -3,12 +3,16 @@ from unittest import TestCase
 from unittest.case import skip
 
 from ..compiler import (
+    GLOBAL_CONTEXT,
     CompileError,
+    Comptime,
+    closure,
+    func,
+    func_type,
     i32,
-    syntax,
+    struct,
 )
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, func, func_type, struct
 from ..std.core import as_func_ptr
 
 # ---------------------------------------------------------------------------
@@ -69,13 +73,13 @@ def closures_mutually_recursive(n: i32) -> i32:
     if n > 100:
         return -1
 
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def even(x: i32) -> i32:
         if x == 0:
             return 1
         return odd(x - 1)
 
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def odd(x: i32) -> i32:
         if x == 0:
             return 0
@@ -113,7 +117,7 @@ def closure_mutates_captured_field(a: i32) -> i32:
 def closure_compiled(n: i32) -> i32:
     # a non-inlined closure is compiled into a runtime function that takes the
     # address of ``n`` as a hidden parameter
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def add(x: i32) -> i32:
         return x + n
     return add(20)
@@ -121,7 +125,7 @@ def closure_compiled(n: i32) -> i32:
 
 @func()
 def closure_compiled_calls(n: i32) -> i32:
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def double(x: i32) -> i32:
         return twice(x)
     return double(n)
@@ -135,7 +139,7 @@ def twice(x: i32) -> i32:
 @func()
 def closure_comptime() -> i32:
     # an inlined closure captures a compile-time variable directly
-    n: syntax.Comptime = 5
+    n: Comptime = 5
     def f() -> i32:
         return n + 1
     return f()
@@ -145,8 +149,8 @@ def closure_comptime() -> i32:
 def closure_compiled_comptime() -> i32:
     # a compile-time capture is used when the closure is compiled and does not
     # reach the runtime signature
-    n: syntax.Comptime = 5
-    @syntax.closure(inline=False)
+    n: Comptime = 5
+    @closure(inline=False)
     def f() -> i32:
         return n + 1
     return f()
@@ -168,7 +172,7 @@ def raise_closure_error(n: i32) -> i32:
 def closure_compiled_raises(n: i32) -> i32:
     # a compiled closure declares the exceptions it may raise; the error it
     # propagates is dispatched to the caller's ``try``
-    @syntax.closure(inline=False, exceptions=ClosureError)
+    @closure(inline=False, exceptions=ClosureError)
     def f(x: i32) -> i32:
         return raise_closure_error(x)
     try:
@@ -188,7 +192,7 @@ class PlusOneFn(Protocol):
 @func()
 def closure_as_func_ptr() -> i32:
     # a capture-free, non-inlined closure is an ordinary runtime function
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def inc(x: i32) -> i32:
         return x + 1
     p = as_func_ptr(PlusOneFn, inc)
@@ -218,9 +222,9 @@ def closure_in_a_loop(n: i32) -> i32:
 def closure_naming(n: i32) -> i32:
     # a compiled closure's native name is prefixed with the function it is
     # created in (the enclosing specialization, its signature included)
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def mid(x: i32) -> i32:
-        @syntax.closure(inline=False)
+        @closure(inline=False)
         def inner(y: i32) -> i32:
             return y + 1
         return inner(x) + n
@@ -234,7 +238,7 @@ def closure_naming(n: i32) -> i32:
 
 @func()
 def closure_capturing_as_func_ptr(n: i32) -> i32:
-    @syntax.closure(inline=False)
+    @closure(inline=False)
     def f(x: i32) -> i32:
         return x + n
     p = as_func_ptr(PlusOneFn, f)
@@ -330,7 +334,7 @@ class SpyClosureTest(TestCase):
 
     def test_a_compiled_closures_name_is_qualified(self) -> None:
         self.assertEqual(closure_naming(10), 13)
-        names = list(_GLOBAL_CONTEXT._symbol_table._symbols.keys())
+        names = list(GLOBAL_CONTEXT._symbol_table._symbols.keys())
         nested = [n for n in names if 'mid' in n and 'inner' in n]
         self.assertTrue(
             any('closure_naming' in n and n.index('mid') < n.index('inner') for n in nested),

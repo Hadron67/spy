@@ -1,14 +1,14 @@
 from unittest import TestCase
 
-from ..compiler import i32
-from ..compiler.dsl import func
-from ..compiler.syntax import (
+from ..compiler import (
     OK,
     UNWIND,
     Ptr,
     closure,
     defer,
     errdefer,
+    func,
+    i32,
     okdefer,
     ref,
 )

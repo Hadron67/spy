@@ -1087,10 +1087,10 @@ class Context(CompileContext):
             return cast(type[T], result)
         return wrapper
 
-_GLOBAL_CONTEXT = Context(LLVMBackend())
+GLOBAL_CONTEXT = Context(LLVMBackend())
 
-func = _GLOBAL_CONTEXT.func
-struct = _GLOBAL_CONTEXT.struct
-func_type = _GLOBAL_CONTEXT.func_type
-decl_func = _GLOBAL_CONTEXT.decl_func
-enum = _GLOBAL_CONTEXT.enum
+func = GLOBAL_CONTEXT.func
+struct = GLOBAL_CONTEXT.struct
+func_type = GLOBAL_CONTEXT.func_type
+decl_func = GLOBAL_CONTEXT.decl_func
+enum = GLOBAL_CONTEXT.enum

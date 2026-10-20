@@ -2,22 +2,24 @@ from enum import Enum
 from unittest import TestCase
 
 from ..compiler import (
+    GLOBAL_CONTEXT,
     CompileError,
     SpyError,
     c_int,
     enum,
     f32,
+    func,
     i0,
     i32,
     i64,
     mir,
+    struct,
     sval,
     u0,
     u8,
 )
 from ..compiler import bool as spy_bool
 from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import _GLOBAL_CONTEXT, func, struct
 
 # ---------------------------------------------------------------------------
 # integer enumerations: a class inheriting ``enum.Enum`` whose members have
@@ -287,7 +289,7 @@ class SpyEnumTest(TestCase):
     """Integer enumerations: definition, comparison, marshaling and layout."""
 
     def enum_type(self, cls: type) -> sval.IntEnumType:
-        type = sval.as_value(cls, _GLOBAL_CONTEXT)
+        type = sval.as_value(cls, GLOBAL_CONTEXT)
         assert isinstance(type, sval.IntEnumType)
         return type
 
@@ -402,17 +404,17 @@ class SpyEnumTest(TestCase):
         self.assertFalse(tri_state_self_arg_const_ref(TriState.FALSE))
 
     def test_the_representation_is_the_smallest_integer_type(self) -> None:
-        tri_state_mir = self.enum_type(TriState).to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache)
+        tri_state_mir = self.enum_type(TriState).to_mir_type(GLOBAL_CONTEXT.mir_lower_cache)
         self.assertEqual(tri_state_mir, mir.IntType(2, False))
-        sign_mir = self.enum_type(Sign).to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache)
+        sign_mir = self.enum_type(Sign).to_mir_type(GLOBAL_CONTEXT.mir_lower_cache)
         self.assertEqual(sign_mir, mir.IntType(2, True))
 
     def test_a_manual_c_int_representation(self) -> None:
-        target = _GLOBAL_CONTEXT.target_info()
+        target = GLOBAL_CONTEXT.target_info()
         enum_type = self.enum_type(CIntState)
         self.assertEqual(enum_type.int_type, sval.IntType(target.c_int_bits, True))
         self.assertEqual(
-            enum_type.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache),
+            enum_type.to_mir_type(GLOBAL_CONTEXT.mir_lower_cache),
             mir.IntType(target.c_int_bits, True),
         )
 
@@ -420,19 +422,19 @@ class SpyEnumTest(TestCase):
         enum_type = self.enum_type(ByteValue)
         self.assertEqual(enum_type.int_type, sval.IntType(8, False))
         self.assertEqual(
-            enum_type.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache), mir.IntType(8, False),
+            enum_type.to_mir_type(GLOBAL_CONTEXT.mir_lower_cache), mir.IntType(8, False),
         )
 
     def test_a_representation_wider_than_needed(self) -> None:
         enum_type = self.enum_type(WideSigned)
         self.assertEqual(enum_type.int_type, sval.IntType(64, True))
         self.assertEqual(
-            enum_type.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache), mir.IntType(64, True),
+            enum_type.to_mir_type(GLOBAL_CONTEXT.mir_lower_cache), mir.IntType(64, True),
         )
 
     def test_a_zero_width_representation_is_a_zst(self) -> None:
         enum_type = self.enum_type(ZeroSized)
-        self.assertIsNone(enum_type.to_mir_type(_GLOBAL_CONTEXT.mir_lower_cache))
+        self.assertIsNone(enum_type.to_mir_type(GLOBAL_CONTEXT.mir_lower_cache))
         self.assertEqual(enum_type.classify(), sval.SpecialTypeKind.ZST)
         unit = enum_type.get_unit_value()
         self.assertIsInstance(unit, sval.IntEnumValue)
@@ -459,13 +461,13 @@ class SpyEnumTest(TestCase):
         self.assertIsNone(zero_sized_roundtrip(ZeroSized.ZERO))
 
     def test_a_member_out_of_range_is_rejected(self) -> None:
-        self.assertRaises(CompileError, sval.as_value, OutOfRange, _GLOBAL_CONTEXT)
+        self.assertRaises(CompileError, sval.as_value, OutOfRange, GLOBAL_CONTEXT)
 
     def test_a_nonzero_member_of_a_zero_width_enum_is_rejected(self) -> None:
-        self.assertRaises(CompileError, sval.as_value, NonZeroZeroWidth, _GLOBAL_CONTEXT)
+        self.assertRaises(CompileError, sval.as_value, NonZeroZeroWidth, GLOBAL_CONTEXT)
 
     def test_an_empty_enum_is_rejected(self) -> None:
-        self.assertRaises(CompileError, sval.as_value, Empty, _GLOBAL_CONTEXT)
+        self.assertRaises(CompileError, sval.as_value, Empty, GLOBAL_CONTEXT)
 
     def test_a_non_integer_representation_is_rejected(self) -> None:
         with self.assertRaises(CompileError):

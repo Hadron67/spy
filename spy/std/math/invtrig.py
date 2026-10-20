@@ -39,9 +39,7 @@ no ``fenv``, so the ``0x1p-120`` tail that flags an inexact ``asin(+-1)`` /
 the result's ulp -- are dropped.
 """
 
-from ...compiler import f32, f64, i32, typeof, u32, u64
-from ...compiler.dsl import func
-from ...compiler.syntax import comptime
+from ...compiler import comptime, f32, f64, func, i32, typeof, u32, u64
 from ..core import Numeric, bitcast, coerce, compile_error
 from ..float import float_truncate
 from ..int import truncate

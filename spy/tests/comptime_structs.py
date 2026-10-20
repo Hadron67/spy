@@ -1,17 +1,16 @@
 from unittest import TestCase
 
-from ..compiler import bool as spy_bool
 from ..compiler import (
+    Comptime,
+    func,
     i32,
     i64,
-    syntax,
-)
-from ..compiler import typeof as spy_typeof
-from ..compiler.dsl import func, struct
-from ..compiler.syntax import (
-    Comptime,
     ref,
+    struct,
+    unroll,
 )
+from ..compiler import bool as spy_bool
+from ..compiler import typeof as spy_typeof
 from .generics import OuterTwo, Pair, StructHolder, TwoI64
 from .pointers import incr_ptr
 from .structs import Blank, Holder, Small, sum_small
@@ -21,7 +20,7 @@ from .structs import Blank, Holder, Small, sum_small
 # temporary or a ``Comptime`` variable - is an aggregate whose fields are their
 # own compile-time places, so a field is read and written at compile time: a
 # field assignment is folded in Python, a field read may condition a
-# compile-time loop marked with ``syntax.unroll()``, and a whole aggregate is
+# compile-time loop marked with ``unroll()``, and a whole aggregate is
 # copied field by field (see ``sval.Box``).
 #
 # A struct with *any* runtime part is a whole runtime value now: a ``Comptime``
@@ -134,7 +133,7 @@ def comptime_struct_unroll() -> i32:
     # loop: the body runs once, then the condition turns false
     s: Comptime = Toggle(True, 0)
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while s.on:
         s.on = False
         total = total + 1
@@ -149,7 +148,7 @@ def runtime_struct_unroll() -> i32:
     # of compile-time values would be inferred compile-time)
     s: Toggle = Toggle(True, 0)
 
-    syntax.unroll()
+    unroll()
     while s.on:
         s.on = False
     return s.n
@@ -293,7 +292,7 @@ class SpyComptimeStructTest(TestCase):
     temporary or a ``Comptime`` variable - is an aggregate whose fields are
     their own compile-time places, so a field read or write is folded in
     Python (a field value may condition a compile-time loop marked with
-    ``syntax.unroll()``).  A struct with a runtime part is a whole runtime
+    ``unroll()``).  A struct with a runtime part is a whole runtime
     value and lives in a plain variable instead."""
 
     def test_field_read(self) -> None:

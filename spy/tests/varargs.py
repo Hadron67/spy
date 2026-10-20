@@ -2,12 +2,10 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
-    i32,
-    syntax,
-)
-from ..compiler.dsl import func
-from ..compiler.syntax import (
     Comptime,
+    func,
+    i32,
+    unroll,
 )
 from ..std.int import truncate
 
@@ -29,7 +27,7 @@ def sum_args(*args: i32) -> i32:
     # integer and ``args[i]`` the i-th element place
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         total = total + args[i]
         i = i + 1
@@ -59,7 +57,7 @@ def sum_inline(*args: i32) -> i32:
     # an inlined spy function: it declares ``*args`` like any other
     i: Comptime = 0
     total: i32 = 0
-    syntax.unroll()
+    unroll()
     while i < len(args):
         total = total + args[i]
         i = i + 1
@@ -76,7 +74,7 @@ def call_closure(a: i32) -> i32:
     def add(*args: i32) -> i32:
         i: Comptime = 0
         total: i32 = 0
-        syntax.unroll()
+        unroll()
         while i < len(args):
             total = total + args[i]
             i = i + 1

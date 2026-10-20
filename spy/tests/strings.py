@@ -2,16 +2,14 @@ from unittest import TestCase
 
 from ..compiler import (
     CompileError,
+    Comptime,
+    ConstMultiPtr,
+    func,
     i32,
     u8,
     usize,
 )
 from ..compiler import bool as spy_bool
-from ..compiler.dsl import func
-from ..compiler.syntax import (
-    Comptime,
-    ConstMultiPtr,
-)
 from ..std import (
     ConstSlicePtr,
     encode_length,

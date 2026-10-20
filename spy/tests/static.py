@@ -2,16 +2,8 @@ from typing import Any, Literal
 from unittest import TestCase
 
 from ..compiler import (
-    CompileError,
-    f64,
-    i32,
-    i64,
-    usize,
-)
-from ..compiler import bool as spy_bool
-from ..compiler.dsl import decl_func, func, struct
-from ..compiler.syntax import (
     Array,
+    CompileError,
     ConstComptime,
     ConstPtr,
     Option,
@@ -19,8 +11,16 @@ from ..compiler.syntax import (
     array,
     comptime,
     const_comptime,
+    decl_func,
+    f64,
+    func,
+    i32,
+    i64,
     ref,
+    struct,
+    usize,
 )
+from ..compiler import bool as spy_bool
 from ..std.core import coerce
 
 

@@ -9,10 +9,8 @@ no address to operate on); the address forces the local into memory.
 
 from unittest import TestCase
 
-from ...compiler import CompileError, c128, f64, i32
+from ...compiler import CompileError, c128, f64, func, i32, ref, struct
 from ...compiler import bool as spy_bool
-from ...compiler.dsl import func, struct
-from ...compiler.syntax import ref
 from ...std.atomic import (
     MemoryOrder,
     RmwOp,

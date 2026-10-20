@@ -8,8 +8,7 @@ functions are ordinary spy functions built on top of compile-time reflection
 ``core``, so a ``core``-side import would be circular).
 """
 
-from ..compiler import builtin_func, f32, f64, func, struct, typeof
-from ..compiler.syntax import Comptime, comptime
+from ..compiler import Comptime, builtin_func, comptime, f32, f64, func, struct, typeof
 from .core import (
     bitcast,
     coerce,
