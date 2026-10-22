@@ -1830,11 +1830,11 @@ class _Builder:
         if isinstance(node.func, ast.Attribute) and isinstance(fn_global, types.FunctionType):
             # a *plain* Python function reached as an attribute of a global
             # object - a plain class used as a namespace of functions
-            # (``Foo.bar()``): it is not a spy method, so the call is emitted
-            # directly, the way the attribute folds as an expression (see
-            # ``_gen_expr``).  An ``enum.Enum`` class is left to the method
-            # dispatch below: its undecorated functions are spy methods, and a
-            # ``Foo.m(x)`` on a registered struct resolves to a spy declaration
+            # (``Foo.bar()``), or an undecorated method of a registered struct
+            # (``Foo.m(...)``, which is a ``PyFunction`` too): the call is
+            # emitted directly, the way the attribute folds as an expression
+            # (see ``_gen_expr``).  An ``enum.Enum`` class is left to the method
+            # dispatch below, and a decorated method is a registered function
             # (never a plain function), so neither reaches this branch.
             base_obj = self._try_resolve_object(node.func.value)
             if not (isinstance(base_obj, type) and issubclass(base_obj, Enum)):

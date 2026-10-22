@@ -25,6 +25,7 @@ class _ClassNamePlain:
 
 class _ClassNameBase:
     # a plain base class: a struct that derives from it inherits its methods
+    @func(inline=True)
     def total(self, x: i32) -> i32:
         return self.a + x  # pyright: ignore
 
@@ -34,9 +35,11 @@ class ClassNameLib:
     x: i32
 
     @staticmethod
+    @func(inline=True)
     def foo() -> i32:
         return 5
 
+    @func(inline=True)
     def add(self, y: i32) -> i32:
         return self.x + y
 
@@ -50,6 +53,7 @@ class ClassNameChild(_ClassNameBase):
 class ClassNameGeneric[T]:
     v: T
 
+    @func(inline=True)
     def get(self) -> T:
         return self.v
 

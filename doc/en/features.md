@@ -382,7 +382,7 @@ A class that inherits `spy.Enum` (the standard `enum.Enum`) with integer member 
 
 - It can be used directly as a parameter/return value/field annotation; its members are compile-time values.
 - **It is not an integer**: it takes part in no arithmetic/bit operations, and is not compared/converted with `int` or another enum; only `==`/`!=` between members of the same enum are supported (comparing member identity).
-- Methods are supported (`@func()`-compiled, undecorated inlined, `@staticmethod`); a method's `self` is **by value** by default (use `@func(self_arg="ptr"/"const ptr")` to switch to by reference).
+- Methods are supported (`@func()`-compiled, `@func(inline=True)`-inlined, `@staticmethod`; an undecorated method is a compile-time Python function, a `PyFunction`, see §6.10); a method's `self` is **by value** by default (use `@func(self_arg="ptr"/"const ptr")` to switch to by reference).
 - By default the representation is the smallest integer type that holds every member value; `@enum(...)` names one explicitly (e.g. `@enum(c_int)` matches a C API's `int`). `i0`/`u0` makes the enumeration a ZST (its only member value can be `0`); an empty enum is rejected.
 - At the Python boundary: a member passed in is recognized as an enum value, and an enum return value/field is restored to a Python member.
 
@@ -900,7 +900,7 @@ Case guards and subpatterns are not supported (`case A(x):` is an error). (For a
 
 - Register with `@spy.func()`; the first call compiles a **specialization** for the argument types, and a function may have multiple specializations.
 - **A function that is not decorated with `@func` is a compile-time Python helper** (a `PyFunction`, see §6.10): it can only be called at compile time, and its body is executed by Python as it is.
-- `@func(inline=True)` marks a registered function as **inlined**: its body is expanded into the call site, and it may take runtime arguments. An undecorated struct method is inlined too.
+- `@func(inline=True)` marks a registered function as **inlined**: its body is expanded into the call site, and it may take runtime arguments. An undecorated method, like an undecorated free function, is a compile-time `PyFunction`; a method usable at runtime has to be decorated explicitly.
 - A parameter's type is determined by: the annotation (after substituting solved generic parameters) > the type inferred from the argument > the type of the default value.
 - `@func(ignore_signature=True)` ignores the parameter and return **type** annotations (they are read by the Python type checker only): every parameter's type is inferred from the argument and the return type from the body.  `Comptime`/`Comptime[T]` is not a type, so its marker is kept (the parameter stays a compile-time one).
 
@@ -1125,7 +1125,8 @@ assert use_func_ptr(2, 3) == 5
 ### 6.10 Compile-time Python functions (`PyFunction`)
 
 - A Python function that is **not decorated with `@func`** is a **compile-time value** (`sval.PyFunction`, with no runtime representation): it can **only be called at compile time**, and its body is **executed by Python as it is** (not compiled into spy code). `@func(inline=True)` is what an "inlined spy function" is spelled as.
-- Its arguments and its result must be **compile-time values**, and only plain Python objects: `int` (including `bool`), `float`, `complex`, `bytes`, `str`, `None`.
+  The same rule covers **methods**: an undecorated method of a `@struct()`/`Enum` class is a `PyFunction` too, so it cannot take a runtime `self`; a runtime method must be decorated with `@func(inline=True)` or `@func()`.
+- Its arguments and its result must be **compile-time values**, and only plain Python objects: `int` (including `bool`), `float`, `complex`, `bytes`, `str`, `None`; an enumeration value crosses as its Python member.
   A Python `str` is spy's compile-time `str` (a text string, see §8.9) and `bytes` a compile-time byte string. Like the Python call boundary, `Null`/`TypedNull`/`Void` all cross as `None`, an `Option` is auto-unwrapped to its payload and a tagged union to its variant (an aggregate payload/variant is then rejected, not being a plain object);
   a `None` result becomes `Null`, the absent value of an option. Any other argument (a runtime value, a spy type, an ordinary aggregate, a pointer, ...) or result is a compile error.
 - The result is written into the call's result location, so it takes that location's type (an inferred location keeps the value's own type). Python does the argument binding (default values and `*args`/`**kwargs` work as usual).
@@ -1194,7 +1195,8 @@ assert use_cfg(1) == 8
 
 ### 7.2 Methods
 
-- A method decorated with `@spy.func()` in a class is a spy method compiled into a native call; an undecorated method is **inlined** at the call site.
+- A method decorated with `@spy.func()` in a class is a spy method compiled into a native call; a method with `@func(inline=True)` is **inlined** at the call site;
+  an undecorated method, like an undecorated free function, is a compile-time `PyFunction` and cannot take a runtime `self` (an instance call is an error; decorate it explicitly).
 - A method's `self` is by default a writable pointer to itself (`Ptr[Self]`); `@func(self_arg="const ptr")` gives a read-only pointer, `"value"` passes by value.
 - Methods are inherited (taken from the whole MRO, with subclass overrides taking precedence).
 - Calling through the class name `Foo.m(...)` (including `Foo[i32].m(x)`) does **not pass `self` implicitly**; `@staticmethod` has no receiver.
@@ -1208,7 +1210,8 @@ class Point:
     x: i32
     y: i32
 
-    def total(self) -> i32:          # undecorated: inlined
+    @func(inline=True)
+    def total(self) -> i32:          # decorated: inlined at the call site
         return self.x + self.y
 
     @func()
@@ -1218,7 +1221,8 @@ class Point:
 @struct()
 class Math:
     @staticmethod
-    def double(x: i32) -> i32:
+    @func(inline=True)
+    def double(x: i32) -> i32:      # inlined static method
         return x * 2
 
 @func()
@@ -1316,7 +1320,7 @@ assert handle_id(make_handle(7)) == 7
 ### 7.7 Use from the Python side
 
 - `Point(1, 2)` constructs an instance (omitted fields take their default values; a generic specialization is inferred from the field values or given explicitly as `Foo[i32](...)`).
-- Instance fields are readable and writable; methods can be called (`p.m()` passes `self` implicitly; `Foo.m(p, ...)` does not).
+- Instance fields are readable and writable; methods can be called (`p.m()` passes `self` implicitly; `Foo.m(p, ...)` does not). A runtime method needs an explicit `@func()` or `@func(inline=True)`; an undecorated method is a compile-time `PyFunction`.
 - An instance can be an argument or a return value across the boundary; the layout is handled by the boundary layer.
 - A nested field is a **view** into the parent instance (writing the child field writes the parent instance).
 
@@ -1326,6 +1330,7 @@ class Pt:
     x: i32
     y: i32
 
+    @func()
     def total(self) -> i32:
         return self.x + self.y
 
@@ -1347,7 +1352,7 @@ A struct value can be subscripted like an array (`expr[i]`): define the method `
 (or `ConstPtr[T]` / `MultiPtr[T]` / `ConstMultiPtr[T]`), which **returns a pointer to the element** — that is, the address of the `i`-th element.
 
 - `expr[i]` is exactly **the element the method's return value points to** (the compiler dereferences where a value is needed): readable, assignable, `+=`-able, and you can keep taking fields/subscripts.
-- The method may be undecorated (inlined at the call site) or compiled into a runtime method with `@func()`; it must return a **pointer**, and returning a value is an error.
+- The method must be explicitly `@func(inline=True)` (inlined at the call site) or `@func()` (compiled into a runtime method); an undecorated `PyFunction` cannot take a runtime `self`, so it cannot implement subscript overloading. It must return a **pointer**, and returning a value is an error.
 - The class usually also defines a pair of `__getitem__`/`__setitem__` (placed in `if TYPE_CHECKING:`) **only so that a Python type checker** accepts
   the `expr[i]` form — the compiler does not call them (at compile time a subscript goes through `__spy_getitemptr__`).
 - `std.SlicePtr`/`std.ConstSlicePtr`/`std.vec.Vec` use it to implement subscripts.
@@ -1357,6 +1362,7 @@ A struct value can be subscripted like an array (`expr[i]`): define the method `
 class IntArray:
     ptr: MultiPtr[i32]
 
+    @func(inline=True)
     def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
         return self.ptr + index          # the address of the i-th element
 

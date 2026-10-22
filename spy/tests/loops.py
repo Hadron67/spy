@@ -355,6 +355,7 @@ def for_iter_is_a_copy(n: i32) -> i32:
 class Addressable:
     x: i32
 
+    @func(inline=True)
     def addr(self) -> Ptr[Addressable]:
         # ``self`` is bound directly to the incoming pointer, so ``ref(self)``
         # is a ``Ptr[Self]``

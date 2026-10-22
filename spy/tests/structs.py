@@ -69,6 +69,7 @@ class Small:
     a: i32
     b: i32
 
+    @func(inline=True)
     def total(self) -> i32:
         return self.a + self.b
 
@@ -84,7 +85,7 @@ class Large:
 @struct()
 class Counter:
     """A struct with both kinds of method (a registered ``bump``, compiled
-    into a native call, and a plain ``double``, inlined)."""
+    into a native call, and an inlined ``double``)."""
 
     n: i32
 
@@ -93,6 +94,7 @@ class Counter:
         self.n = self.n + k
         return self.n
 
+    @func(inline=True)
     def double(self) -> i32:
         return self.n * 2
 
@@ -104,6 +106,7 @@ class Counter:
 class One:
     a: i32
 
+    @func(inline=True)
     def get(self) -> i32:
         return self.a
 
@@ -180,8 +183,8 @@ class GenericDefault[T]:
 
 
 # a struct whose void methods are called for their effect alone, one
-# registered (``reset``, compiled into a native call) and one plain
-# (``clear``, inlined)
+# registered (``reset``, compiled into a native call) and one inlined
+# (``clear``)
 @struct()
 class Sink:
     n: i32
@@ -190,6 +193,7 @@ class Sink:
     def reset(self) -> None:
         self.n = 0
 
+    @func(inline=True)
     def clear(self) -> None:
         self.n = 0
 

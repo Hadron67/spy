@@ -32,6 +32,7 @@ class Layout:
     size: usize
     align: usize
 
+    @func(inline=True)
     def repeat(self, count: usize) -> Layout:
         return Layout(self.size * count, self.align)
 
@@ -50,13 +51,16 @@ class Allocator(Protocol):
     def alloc(self, layout: Layout) -> SlicePtr[u8]: ...
     def resize(self, ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]: ...
 
+    @func(inline=True)
     def _free_failed(self):
         panic(sstr('failed to free memory'))
 
+    @func(inline=True)
     def new[T](self, typ: type[T]) -> Ptr[T]:
         layout = layout_of(typ)
         return ptr_cast(self.alloc(layout).ptr, Ptr[T])
 
+    @func(inline=True)
     def free[T](self, ptr: Ptr[T]):
         layout = layout_of(T)
         try:
@@ -64,14 +68,17 @@ class Allocator(Protocol):
         except AllocError:
             self._free_failed()
 
+    @func(inline=True)
     def new_array[T](self, typ: type[T], count: usize) -> SlicePtr[T]:
         layout = layout_of(typ).repeat(count)
         return SlicePtr(ptr_cast(self.alloc(layout).ptr, MultiPtr[T]), count)
 
+    @func(inline=True)
     def resize_array[T](self, ptr: SlicePtr[T], count: usize) -> SlicePtr[T]:
         layout = layout_of(T).repeat(count)
         return SlicePtr(ptr_cast(self.resize(ptr_cast(ptr.ptr, MultiPtr[u8]), layout_of(T).repeat(ptr.length), layout).ptr, MultiPtr[T]), count)
 
+    @func(inline=True)
     def free_array[T](self, ptr: SlicePtr[T]):
         try:
             self.resize_array(ptr, 0)
@@ -117,9 +124,11 @@ class DynamicAllocator(Allocator):
         )
         return DynamicAllocator(ptr_cast(allocator, Ptr[Opaque]), ref(vtable))
 
+    @func(inline=True)
     def alloc(self, layout: Layout) -> SlicePtr[u8]:
         return self.vtable[...].alloc[...](self.data, layout)
 
+    @func(inline=True)
     def resize(self, ptr: MultiPtr[u8], layout: Layout, new_layout: Layout) -> SlicePtr[u8]:
         return self.vtable[...].resize[...](self.data, ptr, layout, new_layout)
 

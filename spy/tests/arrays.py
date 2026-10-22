@@ -37,6 +37,7 @@ class Vec2:
 
     data: Array[i32, Literal[2]]
 
+    @func(inline=True)
     def total(self) -> i32:
         return self.data[0] + self.data[1]
 

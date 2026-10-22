@@ -19,8 +19,9 @@ goes through the handle, which at call time
 A *class* decorated with ``struct`` declares a spy struct type of the same
 name: the annotated attributes of its body are the fields, in declaration
 order, and the functions of its body are its methods (a decorated one is a
-registered function, compiled into a native call, and a plain one is inlined
-at its call sites).  The decorated name stands for that struct: a spy body
+registered function, compiled into a native call or inlined, and a plain one
+is a compile-time Python function - a ``sval.PyFunction``, like an undecorated
+module-level function).  The decorated name stands for that struct: a spy body
 annotates with it, constructs it (``Foo(a, b)`` - the arguments fill the
 fields in place, positional ones in declaration order and keyword ones by
 name; a custom ``__init__`` is not supported) and calls its methods on a
@@ -134,7 +135,7 @@ class FnMetadata:
     extern: bool
     linkname: str | None
     # a method inlined at its call sites instead of being compiled into a
-    # native call: ``@func(inline=True)``, and every undecorated struct method
+    # native call: ``@func(inline=True)``
     inline: bool = False
     # the exceptions the function may raise: ``None`` (the default) means it
     # raises nothing, ``"infer"`` that they are inferred from the body, and a
@@ -170,11 +171,6 @@ class FuncTypeMetadata:
 class StructMetadata:
     extern_c: bool
     copyable: bool | Literal["inherit"]
-
-
-# the metadata of an undecorated method (see ``_RegisteredClass.get_entry``);
-# ``self_arg=None`` takes the context default (by value for an enum method)
-_INLINE_META = FnMetadata(self_arg=None, extern=False, linkname=None, inline=True)
 
 
 def _normalize_exceptions(
@@ -413,15 +409,12 @@ class _RegisteredClass(StructDecl):
                         value.context_type_vars = self.class_type_vars
                         head.methods[name] = value
                     elif isinstance(value, pytypes.FunctionType):
-                        # an undecorated method: inlined at its call sites.  It is
-                        # wrapped like a registered one so that it is parsed lazily
-                        # with the struct as its ``self`` type and the struct's
-                        # type parameters in scope (a static one takes no ``self``)
-                        method = _RegisteredFn(
-                            value, None if is_static else template, _INLINE_META, self.context,
-                        )
-                        method.context_type_vars = self.class_type_vars
-                        head.methods[name] = method
+                        # an undecorated method: a plain Python function used at
+                        # compile time (a ``sval.PyFunction``), like a module-level
+                        # one.  It is stored as it is; a call on a runtime value is
+                        # rejected by ``interp.call_method``, and a class-name call
+                        # passes every argument explicitly
+                        head.methods[name] = value
                     else:
                         continue
                     if is_static:
@@ -459,7 +452,9 @@ class _RegisteredClass(StructDecl):
     def __getattr__(self, name: str) -> Any:
         """``Foo.m``: the method ``m`` of this struct, called from Python with
         no implicit ``self`` (``Foo.m(x, ...)`` passes every argument, ``self``
-        included)."""
+        included).  An undecorated method is the plain Python function of the
+        class body, so Python runs it directly; a decorated one is a registered
+        handle and compiles a spy call."""
         method = self.get_entry().methods.get(name)
         if method is None:
             raise AttributeError(f'{self.cls.__name__} has no method {name!r}')
@@ -854,10 +849,11 @@ class Context(CompileContext):
                 handle = value if value.context is self else self._local_decl_func(value)
                 return handle.as_spy_value()
             case pytypes.FunctionType():
-                # a plain Python function - one *not* decorated with ``@func``:
-                # a compile-time helper (``sval.PyFunction``) that is only ever
-                # called while the HIR runs.  The function object is wrapped as it
-                # is; nothing about its signature is read (see ``interp``)
+                # a plain Python function - one *not* decorated with ``@func``,
+                # including an undecorated struct/enum method: a compile-time
+                # helper (``sval.PyFunction``) that is only ever called while the
+                # HIR runs.  The function object is wrapped as it is; nothing about
+                # its signature is read (see ``interp``)
                 return sval.PyFunction(value)
             case _:
                 if sval.is_int_enum_member(value):
@@ -898,10 +894,11 @@ class Context(CompileContext):
     def _collect_enum_methods(self, cls: type, enum_type: sval.IntEnumType) -> None:
         """Collect the methods of the Python enum class ``cls`` into
         ``enum_type`` (like ``_RegisteredClass.get_entry`` does for a struct):
-        every function of the class body (a ``@func()`` handle or an
-        undecorated Python function) becomes a method whose ``self`` is the
-        enumeration - by value, see ``_RegisteredFn.get_entry`` - resolved
-        through this context.  A ``@staticmethod`` takes no receiver.  Names
+        every function of the class body becomes a method.  A ``@func()``
+        handle is compiled with the enumeration as its ``self`` - by value, see
+        ``_RegisteredFn.get_entry`` - and resolved through this context; an
+        undecorated one is a compile-time Python function (a
+        ``sval.PyFunction``).  A ``@staticmethod`` takes no receiver.  Names
         starting with an underscore are skipped (they are the enum machinery's
         own, or convention-private)."""
         for base in reversed(cls.__mro__):
@@ -913,15 +910,15 @@ class Context(CompileContext):
                     value = value.__func__
                 if isinstance(value, _RegisteredFn):
                     method = value if value.context is self else value.with_context(self)
+                    method.cls = None if is_static else enum_type
+                    method.context_type_vars = {}
+                    enum_type.methods[name] = method
                 elif isinstance(value, pytypes.FunctionType):
-                    # an undecorated method: inlined at its call sites (see
-                    # ``_INLINE_META``)
-                    method = _RegisteredFn(value, None, _INLINE_META, self)
+                    # an undecorated method: a plain Python function used at
+                    # compile time (a ``sval.PyFunction``), stored as it is
+                    enum_type.methods[name] = value
                 else:
                     continue
-                method.cls = None if is_static else enum_type
-                method.context_type_vars = {}
-                enum_type.methods[name] = method
                 if is_static:
                     enum_type.static_methods.add(name)
                 else:

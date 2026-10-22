@@ -26,6 +26,7 @@ class CrossPair:
     a: i32
     b: i32
 
+    @func(inline=True)
     def total(self) -> i32:
         return self.a + self.b
 
@@ -34,6 +35,7 @@ class CrossPair:
 class CrossBox[T]:
     v: T
 
+    @func(inline=True)
     def get(self) -> T:
         return self.v
 

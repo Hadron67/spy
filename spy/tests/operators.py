@@ -166,35 +166,44 @@ def augmented_ops(a: i32, b: i32) -> f64:
 @struct()
 class OpVec:
     """A struct that overloads the arithmetic, comparison, unary and bitwise
-    operators through magic methods (undecorated, so each is inlined)."""
+    operators through magic methods (each inlined with ``@func(inline=True)``)."""
 
     v: i32
 
+    @func(inline=True)
     def __add__(self, other: OpVec) -> OpVec:
         return OpVec(self.v + other.v)
 
+    @func(inline=True)
     def __radd__(self, k: i32) -> OpVec:
         return OpVec(self.v + k)
 
+    @func(inline=True)
     def __iadd__(self, other: OpVec) -> OpVec:  # pyright: ignore  # noqa: PYI034
         self.v = self.v + other.v
         return self
 
+    @func(inline=True)
     def __eq__(self, other: OpVec) -> spy_bool:  # pyright: ignore
         return self.v == other.v
 
+    @func(inline=True)
     def __lt__(self, other: OpVec) -> spy_bool:
         return self.v < other.v
 
+    @func(inline=True)
     def __neg__(self) -> OpVec:
         return OpVec(-self.v)
 
+    @func(inline=True)
     def __bool__(self) -> spy_bool:
         return self.v != 0
 
+    @func(inline=True)
     def __len__(self) -> i32:
         return self.v * 2
 
+    @func(inline=True)
     def __and__(self, other: OpVec) -> OpVec:
         return OpVec(self.v & other.v)
 
@@ -242,8 +251,7 @@ def overload_bool(a: i32) -> spy_bool:
 
 @func()
 def overload_len(a: i32) -> i32:
-    # ``len`` of a struct answers through its own ``__len__`` (undecorated, so
-    # the method is inlined)
+    # ``len`` of a struct answers through its own inlined ``__len__``
     return len(OpVec(a))
 
 

@@ -382,7 +382,7 @@ assert widen_int(3) == complex(3, 0.0)
 
 - 可直接作形参/返回值/字段注解；成员是编译期值。
 - **不是一个整数**：不参与算术/位运算、不与 `int` 或另一个枚举比较/转换；只支持同枚举之间的 `==`/`!=`（比较成员身份）。
-- 支持方法（`@func()` 编译、未装饰内联、`@staticmethod`）；方法的 `self` **默认按值**（可用 `@func(self_arg="ptr"/"const ptr")` 改按引用）。
+- 支持方法（`@func()` 编译、`@func(inline=True)` 内联、`@staticmethod`；未装饰的方法是编译期 Python 函数 `PyFunction`，见 §6.10）；方法的 `self` **默认按值**（可用 `@func(self_arg="ptr"/"const ptr")` 改按引用）。
 - 默认取能容纳所有成员值的最小整数类型；可用 `@enum(...)` 手动指定表示类型（如 `@enum(c_int)` 与 C API 的 `int` 对齐）。`i0`/`u0` 使枚举成为 ZST（只能有取值为 0 的成员）；空枚举报错。
 - Python 边界：成员入参识别为枚举值，枚举返回值/字段还原为 Python 成员。
 
@@ -900,7 +900,7 @@ assert caught() == 42
 
 - `@spy.func()` 注册；首次调用按实参类型编译出一个**特化**，同函数可有多个特化。
 - **不用 `@func` 装饰的函数是编译期 Python 辅助函数**（`PyFunction`，见 §6.10）：只能在编译期调用，函数体由 Python 原样执行。
-- `@func(inline=True)` 把注册的函数标成**内联**：函数体展开到调用处，可以接收运行期实参。未装饰的结构体方法也是内联的。
+- `@func(inline=True)` 把注册的函数标成**内联**：函数体展开到调用处，可以接收运行期实参。未装饰的方法和普通函数一样是编译期 `PyFunction`；要让方法在运行期可用，必须显式标注。
 - 形参类型由：注解（替换已求解的泛型参数后）> 实参推断出的类型 > 默认值的类型决定。
 - `@func(ignore_signature=True)` 忽略形参与返回**类型**注解（它们只供 Python 类型检查器阅读）：形参类型一律由实参推断、返回类型由函数体推断。`Comptime`/`Comptime[T]` 不是类型，其标记仍保留（参数仍是编译期参数）。
 
@@ -1126,7 +1126,9 @@ assert use_func_ptr(2, 3) == 5
 
 - **不用 `@func` 装饰**的普通 Python 函数是一个**编译期值**（`sval.PyFunction`，没有运行时表示）：它**只能在编译期被调用**，
   函数体由 Python **原样执行**（不是编译成 spy 代码）；`@func(inline=True)` 才是「内联 spy 函数」。
-- 实参与返回值都必须是**编译期量**，且只能是普通 Python 对象：`int`（含 `bool`）、`float`、`complex`、`bytes`、`str`、`None`；
+  这条规则对**方法**同样成立：`@struct()`/`Enum` 里未装饰的方法也是 `PyFunction`，不能接收运行期 `self`；
+  运行时方法必须写 `@func(inline=True)` 或 `@func()`。
+- 实参与返回值都必须是**编译期量**，且只能是普通 Python 对象：`int`（含 `bool`）、`float`、`complex`、`bytes`、`str`、`None`；枚举值以对应的 Python 枚举成员传入；
   Python `str` 就是 spy 的编译期 `str`（文本字符串，见 §8.9），`bytes` 是编译期字节串。
   和 Python 调用边界一样，`Null`/`TypedNull`/`Void` 都传成 `None`，`Option` 自动解包成载荷值、tagged union 解包成变体值（载荷/变体是聚合时会因不是普通对象而被拒）；
   返回 `None` 则变成 `Null`（option 的缺失值）。
@@ -1197,7 +1199,8 @@ assert use_cfg(1) == 8
 
 ### 7.2 方法
 
-- 类里 `@spy.func()` 装饰的方法是编译成原生调用的 spy 方法；未装饰的方法在调用处**内联**。
+- 类里 `@spy.func()` 装饰的方法是编译成原生调用的 spy 方法；`@func(inline=True)` 的方法在调用处**内联**；
+  未装饰的方法和普通 Python 函数一样是编译期 `PyFunction`，不能接收运行期 `self`（实例调用会报错，需显式标注）。
 - 方法 `self` 默认是指向自身的可写指针（`Ptr[Self]`）；`@func(self_arg="const ptr")` 得只读指针，`"value"` 按值传。
 - 方法可继承（取自整个 MRO，子类覆盖优先）。
 - 通过类名调用 `Foo.m(...)`（含 `Foo[i32].m(x)`）**不隐式传 `self`**；`@staticmethod` 不带接收者。
@@ -1211,7 +1214,8 @@ class Point:
     x: i32
     y: i32
 
-    def total(self) -> i32:          # undecorated: inlined
+    @func(inline=True)
+    def total(self) -> i32:          # decorated: inlined at the call site
         return self.x + self.y
 
     @func()
@@ -1221,7 +1225,8 @@ class Point:
 @struct()
 class Math:
     @staticmethod
-    def double(x: i32) -> i32:
+    @func(inline=True)
+    def double(x: i32) -> i32:      # inlined static method
         return x * 2
 
 @func()
@@ -1319,7 +1324,7 @@ assert handle_id(make_handle(7)) == 7
 ### 7.7 Python 侧使用
 
 - `Point(1, 2)` 构造一个实例（省略字段取默认值；泛型特化由字段值推断或显式 `Foo[i32](...)`）。
-- 实例字段可读可写；方法可调用（`p.m()` 隐式传 `self`；`Foo.m(p, ...)` 不隐式传）。
+- 实例字段可读可写；方法可调用（`p.m()` 隐式传 `self`；`Foo.m(p, ...)` 不隐式传）。运行时方法需显式 `@func()` 或 `@func(inline=True)`；未装饰的方法是编译期 `PyFunction`。
 - 实例可作实参、返回值跨边界；布局由边界层处理。
 - 嵌套字段是父实例的**视图**（写入子字段即写入父实例）。
 
@@ -1329,6 +1334,7 @@ class Pt:
     x: i32
     y: i32
 
+    @func()
     def total(self) -> i32:
         return self.x + self.y
 
@@ -1350,7 +1356,7 @@ assert q.x == 2 and q.y == 1
 （或 `ConstPtr[T]` / `MultiPtr[T]` / `ConstMultiPtr[T]`），它**返回元素的指针**——即第 `i` 个元素的地址。
 
 - `expr[i]` 就是该方法返回值**指向的那个元素**（编译器在需要值的地方自动解引用）：可读、可赋值、可 `+=`，也可继续取字段/下标。
-- 方法可以未装饰（调用处内联）或用 `@func()` 编译成运行时方法；返回的必须是**指针**，返回一个值会报错。
+- 方法必须显式 `@func(inline=True)`（调用处内联）或 `@func()`（编译成运行时方法）；未装饰的 `PyFunction` 不能接收运行期 `self`，因此不能用于下标重载。返回的必须是**指针**，返回一个值会报错。
 - 类里通常再写一对 `__getitem__`/`__setitem__`（放在 `if TYPE_CHECKING:` 里）**只为 Python 类型检查器**接受
   `expr[i]` 的写法——编译器不调用它们（下标编译时走 `__spy_getitemptr__`）。
 - `std.SlicePtr`/`std.ConstSlicePtr`/`std.vec.Vec` 就用它实现下标。
@@ -1360,6 +1366,7 @@ assert q.x == 2 and q.y == 1
 class IntArray:
     ptr: MultiPtr[i32]
 
+    @func(inline=True)
     def __spy_getitemptr__(self, index: i64) -> MultiPtr[i32]:
         return self.ptr + index          # the address of the i-th element
 

@@ -917,15 +917,16 @@ def _to_comptime(value: InterpVal) -> sval.AnyValue | None:
     return None
 
 
-def _py_function_arg(ev: InterpVal, fn: sval.PyFunction) -> Any:
+def _py_function_arg(ev: InterpVal, fn: sval.PyFunction, context: CompileContext) -> Any:
     """The plain Python object one argument of a ``PyFunction`` call denotes.
     Like the Python boundary, an option and a tagged union hand their payload /
     variant over (an option's absent value included) and the null, typed-null and
     void values are the Python ``None``; anything else has to be a plain Python
     scalar, a typed ``sval.Int``/``sval.Float`` unwrapped to the Python scalar it
-    holds and a compile-time complex number rebuilt from its two parts.  A runtime
-    value, or a compile-time value that is none of these (a spy type, an
-    aggregate, a pointer, ...), is rejected."""
+    holds, a compile-time enumeration member delivered as its Python member and a
+    compile-time complex number rebuilt from its two parts.  A runtime value, or a
+    compile-time value that is none of these (a spy type, an aggregate, a pointer,
+    ...), is rejected."""
     obj = _to_comptime(_shallow_normalize(ev))
     if obj is None:
         raise CompileError(
@@ -941,6 +942,11 @@ def _py_function_arg(ev: InterpVal, fn: sval.PyFunction) -> Any:
     if isinstance(obj, (sval.Int, sval.Float)):
         # a typed scalar constant: the Python scalar it holds
         return obj.value
+    if isinstance(obj, sval.IntEnumValue):
+        # an enumeration member crosses as its Python member, like a value read
+        # back at the Python boundary (see ``glue._read``)
+        enum_type = obj.type
+        return context.enum_class_of(enum_type)(enum_type.value_of(obj.index))
     if isinstance(obj, sval.AggregateValue) and isinstance(obj.type, sval.ComplexType):
         # a compile-time complex number is an aggregate of its two parts
         re, im = obj.values[0], obj.values[1]
@@ -5886,8 +5892,15 @@ class HirRunner:
             if isinstance(target, sval.BoundMethod):
                 # a method of a generic struct resolved from a value: the
                 # struct's type-argument values are substituted into the
-                # method's signature (see ``_call_function_entry``)
+                # method's signature (see ``_call_function_entry``).  A
+                # ``PyFunction`` is never bound (Python binds its arguments),
+                # but handling it here keeps the two method kinds interchangeable.
                 fn = target.fn
+                if isinstance(fn, sval.PyFunction):
+                    self._call_py_function(fn, args, ret)
+                    if on_return is not None:
+                        on_return()
+                    return PollResult.AGAIN
                 assert isinstance(fn, FunctionValue), 'a bound method holds a function value'
                 return self._call_function_entry(fn, args, ret, target.generic_var_values, on_return=on_return)
             if isinstance(target, sval.BuiltinFn):
@@ -5928,15 +5941,16 @@ class HirRunner:
         """Evaluate one call of a plain Python function (a ``sval.PyFunction``,
         see ``dsl``) while the HIR runs.  Every argument has to be a
         compile-time value that denotes a plain Python scalar (an
-        ``int``/``bool``/``float``/``complex``/``bytes``), the function is called
-        with them, and the plain Python value it returns is written into the
-        call's result location, where it takes that location's type (an inferred
-        location keeps the value's own).  The function's signature is never read:
+        ``int``/``bool``/``float``/``complex``/``bytes``, or an enumeration
+        member), the function is called with them, and the plain Python value it
+        returns is written into the call's result location, where it takes that
+        location's type (an inferred location keeps the value's own).  The function's signature is never read:
         Python binds the arguments itself (default values, ``*args``/``**kwargs``,
         and a binding error is reported as a compile error)."""
-        py_args = [_py_function_arg(self._arg_value(arg), fn) for arg in args.positional]
+        context = self._analyser._resolver
+        py_args = [_py_function_arg(self._arg_value(arg), fn, context) for arg in args.positional]
         py_kwargs = {
-            name: _py_function_arg(self._arg_value(arg), fn)
+            name: _py_function_arg(self._arg_value(arg), fn, context)
             for name, arg in args.kwargs.items()
         }
         try:
@@ -8736,6 +8750,10 @@ class HirRunner:
             resolved = self._analyser._resolver.resolve_global(method)
             if resolved is None:
                 return None
+        if isinstance(resolved, sval.PyFunction):
+            # an undecorated method: Python binds its arguments itself, so it
+            # needs none of the struct's type-argument values (see ``BoundMethod``)
+            return resolved
         generic_var_values = frozendict(zip(struct.head.generic_args, struct.generic_args))
         if len(generic_var_values) == 0:
             return resolved
@@ -8848,11 +8866,22 @@ class HirRunner:
         if isinstance(struct_type, (sval.StructType, sval.IntEnumType)) and struct_type.is_static_method(method_name):
             return self.call(method, args, ret, on_return)
 
+        fn = method.fn if isinstance(method, sval.BoundMethod) else method
+        if isinstance(fn, sval.PyFunction):
+            # an undecorated method is a compile-time Python function: the
+            # receiver an instance call passes is a runtime value, which cannot
+            # cross into Python
+            raise CompileError(
+                f"the method {method_name!r} of {struct_type} is not decorated "
+                f"with @func: an undecorated method is a compile-time Python "
+                f"function (a PyFunction) and cannot take a runtime receiver; "
+                f"add @func(inline=True) or @func() to compile it as a spy method"
+            )
+
         # a method's first parameter is the struct itself: it is passed by
         # reference (the base's address) unless the method declares
         # ``self`` as a pointer type, in which case the base's address is
         # already the pointer value the parameter expects
-        fn = method.fn if isinstance(method, sval.BoundMethod) else method
         self_is_ref = True
         if isinstance(fn, FunctionValue):
             first = fn.hir.signature.positional.by_id[0]

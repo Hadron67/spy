@@ -420,10 +420,11 @@ def catch_const_slice_method_out_of_bounds(x: i32) -> i32:
 
 @struct()
 class Indexable:
-    """A struct that overloads the subscript with an inlined plain method."""
+    """A struct that overloads the subscript with an inlined method."""
 
     ptr: MultiPtr[i32]
 
+    @func(inline=True)
     def __spy_getitemptr__(self, index: usize) -> MultiPtr[i32]:
         return self.ptr + index
 
@@ -457,6 +458,7 @@ class BadIndexable:
 
     ptr: MultiPtr[i32]
 
+    @func(inline=True)
     def __spy_getitemptr__(self, index: usize) -> i32:
         return self.ptr[index]
 

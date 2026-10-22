@@ -109,8 +109,8 @@ Expression highlights:
   statement-level markers (`unroll`/`comptime`/`const_comptime`/`infer_comptime`) are buffered as a pragma by `_as_marker` and consumed by the next statement (a dangling pragma is an error).
 - Subscript dispatch for `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` is in `astgen._gen_expr`, `_gen_type_ctor`, `_gen_literal`.
 - `is None`/`is not None` (`_gen_is_none`), walrus `_gen_walrus`/`_gen_unwrap`, `isinstance` (`_gen_isinstance`).
-- Call `_gen_call`: `cast` (no-op) -> `array` -> `isinstance` -> `ord` -> `len` -> if the attribute is an ordinary Python function, `CallInplace` (its callee resolves to a `sval.PyFunction`, evaluated by Python at compile time) ->
-  if the attribute is a method, `CallMethodInplace` -> struct construction `FinishStruct` -> ordinary `CallInplace`.
+- Call `_gen_call`: `cast` (no-op) -> `array` -> `isinstance` -> `ord` -> `len` -> if the attribute is an ordinary Python function, `CallInplace` (its callee resolves to a `sval.PyFunction`, evaluated by Python at compile time; an undecorated method of a `@struct()` class uses this path too) ->
+  if the attribute is a registered method, `CallMethodInplace` -> struct construction `FinishStruct` -> ordinary `CallInplace`.
   `_gen_arglist` currently **silently ignores `**kw` and errors on `*x`** (`hir.Spread` exists but astgen does not emit it, see `doc/issues.md` #1).
 
 ### 2.4 Closure capture (`_gen_closure`)
@@ -301,9 +301,9 @@ and the thunk returns `bool` (`true` = panic, `false` = normal). `_thunk_call_si
 - `_RegisteredFn`: `__call__` is the Python-side call (resolve -> bind -> `specialize` -> `Analyser` -> `CompileBatch` -> `glue.invoke`);
   `__get__` implements the descriptor protocol (class access yields the handle, instance access yields `partial(self, instance)`, so that `Foo.m(x,…)` does not implicitly pass `self` while `x.m()` does).
   `get_entry` resolves lazily: `self_arg` defaults to a decision by type (enum -> `"value"`, struct -> `"ptr"`).
-- `_RegisteredClass`: `get_entry` builds the `StructTypeHead` (binds the head before reading the body, supporting self-reference), the fields, and the methods (walking `reversed(MRO)`, subclass overrides first);
+- `_RegisteredClass`: `get_entry` builds the `StructTypeHead` (binds the head before reading the body, supporting self-reference), the fields, and the methods (walking `reversed(MRO)`, subclass overrides first; a `@func` method is a `_RegisteredFn`, an undecorated one is the raw Python function, i.e. a `PyFunction`);
   `__getitem__` -> `glue.specialized_struct`; `__call__` -> `glue.construct`.
-- `_Context` (a subclass of `sval.CompileContext`): `resolve_global` (resolves registered objects / enum members into spy values or `FunctionValue`s of this context, and wraps a plain Python function that is not decorated with `@func` into a `sval.PyFunction`),
+- `_Context` (a subclass of `sval.CompileContext`): `resolve_global` (resolves registered objects / enum members into spy values or `FunctionValue`s of this context, and wraps a plain Python function that is not decorated with `@func` - including an undecorated struct/enum method - into a `sval.PyFunction`),
   `special_types`, `mir_lower_cache`, `target_info`, `_resolve_call`, enum support (the `enum` decorator/`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`),
   compile options (`get_compile_option`/`set_compile_option`, stored in `_compile_options` keyed by a `str` name).
   `GLOBAL_CONTEXT = _Context(LLVMBackend())` is the top-level default context.
@@ -366,6 +366,7 @@ This is the heart of the compiler: it **runs HIR instruction by instruction** wi
 - `call(callee, args, ret, on_return)`: `FunctionValue`/`BoundMethod` -> `_call_function_entry`; `BuiltinFn` -> `_call_builtin`;
   `PyFunction` -> `_call_py_function` (every argument must be a compile-time value that lowers to a plain Python object, a `str` is encoded to its byte string, and the result is written into the result location as the compile-time value itself);
   a pointer to a struct containing `__call__` -> `call_method('__call__')` (closure); a pointer to `FunctionType` -> `_call_fn_ptr`.
+  `call_method` rejects a non-static `PyFunction` method outright: an undecorated method cannot take a runtime `self`, so it has to be decorated with `@func(inline=True)`/`@func()`.
 - `_call_function_entry`: `substitute_type_vars` + `bind_arg_pos` + `_check_comptime_args`; `force_inline` -> `_start_inline`,
   otherwise `_request_function` after `specialize` (returns `SUSPEND`, scheduled by `Analyser`).
 - `_start_inline`: inline depth limit 64; binds the parameters (`_inline_arg_place`, declaring slots with the callee's annotations), appends a synthetic struct for `$args`/`$kwargs`;

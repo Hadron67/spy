@@ -12,9 +12,11 @@ class Vec[T, A: Allocator = CAllocator]:
     allocator: A = cast(A, CAllocator())
 
     @staticmethod
+    @func(inline=True)
     def new(allocator: A) -> Vec[T, A]:
         return Vec(SlicePtr(undefined(), 0), 0, allocator)
 
+    @func(inline=True)
     def deinit(self):
         self.allocator.free_array(self.ptr)
 
@@ -33,9 +35,11 @@ class Vec[T, A: Allocator = CAllocator]:
         self.size += count
         return ret
 
+    @func(inline=True)
     def push(self, value: T):
         self.reserve(1)[0] = value
 
+    @func(inline=True)
     def pop(self):
         if self.size == 0:
             panic(sstr('pop from empty vector'))
@@ -46,20 +50,25 @@ class Vec[T, A: Allocator = CAllocator]:
         if self.size < self.ptr.length:
             self.ptr = self.allocator.resize_array(self.ptr, self.size)
 
+    @func(inline=True)
     def __iter__(self):
         return iter(self.ptr)
 
+    @func(inline=True)
     def __bool__(self):
         return self.size > 0
 
+    @func(inline=True)
     def refs(self):
         return self.ptr.refs()
 
+    @func(inline=True)
     def __spy_getitemptr__(self, index: usize) -> Ptr[T]:
         if index >= self.size:
             panic(sstr('index out of bounds'))
         return ref(self.ptr[index])
 
+    @func(inline=True)
     def slice(self, begin: Option[usize], end: Option[usize] = None) -> SlicePtr[T]:
         return self.ptr.slice(begin, end)
 

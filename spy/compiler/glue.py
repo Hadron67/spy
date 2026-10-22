@@ -117,12 +117,19 @@ class _StructInstanceData:
 
     def get_attr(self, name: str, instance: _StructInstance) -> Any:
         """The value of the field ``name``, or the method ``name`` bound to
-        ``instance``."""
+        ``instance`` (a ``@staticmethod`` is left unbound).  A method that is not
+        decorated with ``@func`` is a plain Python function; it is returned
+        through :class:`_BoundMethod` too, so a Python caller runs it as the
+        ordinary Python function it is."""
         index = self.type.field_index(name)
         if index is not None:
             return _read_field(self, self.type, index, self._context)
         method = self.type.get_method(name)
         if method is not None:
+            if self.type.is_static_method(name):
+                # a static method takes no receiver: leave it unbound, exactly
+                # as normal Python attribute lookup would
+                return method
             return _BoundMethod(instance, method)
         raise AttributeError(f'{self.type} has no field or method {name!r}')
 
@@ -203,7 +210,9 @@ class _ExceptionInstance(Exception, _StructInstance):
 
 class _BoundMethod:
     """A method of a struct instance: calling it passes the instance as the
-    method's ``self`` (its first parameter, a ``Ptr[Self]``)."""
+    method's ``self``.  A registered method takes a pointer to the spy value (its
+    first parameter is a ``Ptr[Self]``); an undecorated one is a plain Python
+    function and receives the Python-side :class:`_StructInstance`."""
 
     __slots__ = ('_handle', '_self')
 

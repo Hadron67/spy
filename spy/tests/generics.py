@@ -31,6 +31,7 @@ class Pair[T: Numeric]:
     def total(self) -> T:
         return self.a + self.b
 
+    @func(inline=True)
     def doubled_a(self) -> T:
         return self.a + self.a
 
@@ -49,10 +50,11 @@ class Box[T]:
 
 @struct()
 class PlainBox[T]:
-    """A generic struct whose method is an inlined plain method."""
+    """A generic struct whose method is an inlined spy method."""
 
     v: T
 
+    @func(inline=True)
     def get(self) -> T:
         return self.v
 
@@ -97,6 +99,7 @@ class Maker[T: Numeric]:
     def is_own_type(self) -> spy_bool:
         return spy_typeof(self.a) == T
 
+    @func(inline=True)
     def plain_is_own_type(self) -> spy_bool:
         return spy_typeof(self.a) == T
 
@@ -208,6 +211,7 @@ def generic_field_of_nongeneric(x: i32) -> i32:
 class Phantom[T]:
     v: i32
 
+    @func(inline=True)
     def get(self) -> i32:
         return self.v
 

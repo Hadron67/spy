@@ -90,6 +90,7 @@ class Pair:
     a: i32
     b: i32
 
+    @func(inline=True)
     def total(self) -> i32:
         return self.a + self.b
 
@@ -101,6 +102,7 @@ class Big:
     b: i64
     c: i64
 
+    @func(inline=True)
     def total(self) -> i64:
         return self.a + self.b + self.c
 

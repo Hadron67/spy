@@ -3443,7 +3443,8 @@ class BoundMethod(Value):
 
 class PyFunction(Value):
     """A plain Python function - one *not* decorated with ``@func`` - used as a
-    compile-time helper.  It is only ever called while the HIR runs (see
+    compile-time helper.  This includes an undecorated method of a ``@struct()``
+    or ``Enum`` class.  It is only ever called while the HIR runs (see
     ``interp``), so it has no runtime representation at all: its arguments and
     result are plain Python scalars (an ``int``/``bool``/``float``/``complex``/
     ``bytes``, and a ``str`` which crosses as its UTF-8 byte string).

@@ -48,6 +48,7 @@ class NDArray[T, N: int]:
     size: Array[usize, N]
     stride: Array[usize, N]
 
+    @func(inline=True)
     def __spy_getitemptr__(self, indices) -> Ptr[T]:
         """``a[i, j, ...]``: the place of one element.
 
@@ -73,6 +74,7 @@ class NDArray[T, N: int]:
                 offset += index * self.stride[i]
             return self.ptr + offset
 
+    @func(inline=True)
     def slice(self, *slices) -> NDArray[T, N]:
         """A view of the elements the per-dimension ``slices`` name.
 

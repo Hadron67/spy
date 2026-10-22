@@ -57,9 +57,11 @@ class range[T: Numeric]:
     start: T = cast(T, 0)
     step: T = cast(T, 1)
 
+    @func(inline=True)
     def __iter__(self) -> range[T]:
         return self
 
+    @func(inline=True)
     def __next__(self) -> T:
         if self.start >= self.end:
             raise StopIteration()
@@ -80,20 +82,25 @@ class ConstSlicePtr[T]:
     ptr: ConstMultiPtr[T]
     length: usize
 
+    @func(inline=True)
     def __iter__(self) -> _SliceValueIterator[T]:
         return _SliceValueIterator(self.ptr, self.length)
 
+    @func(inline=True)
     def refs(self) -> _ConstSliceRefIterator[T]:
         return _ConstSliceRefIterator(self.ptr, self.length)
 
+    @func(inline=True)
     def _out_of_bounds(self):
         panic(sstr('index out of bounds'))
 
+    @func(inline=True)
     def __spy_getitemptr__(self, index: usize) -> ConstPtr[T]:
         if index >= self.length:
             self._out_of_bounds()
         return self.ptr + index
 
+    @func(inline=True)
     def __bool__(self) -> bool:
         return self.length != 0
 
@@ -125,21 +132,27 @@ class SlicePtr[T]:
     ptr: MultiPtr[T]
     length: usize
 
+    @func(inline=True)
     def as_const(self) -> ConstSlicePtr[T]:
         return ConstSlicePtr(self.ptr, self.length)
 
+    @func(inline=True)
     def __iter__(self) -> _SliceValueIterator[T]:
         return _SliceValueIterator(self.ptr, self.length)
 
+    @func(inline=True)
     def __bool__(self) -> bool:
         return self.length != 0
 
+    @func(inline=True)
     def refs(self) -> _SliceRefIterator[T]:
         return _SliceRefIterator(self.ptr, self.length)
 
+    @func(inline=True)
     def _out_of_bounds(self):
         panic(sstr('index out of bounds'))
 
+    @func(inline=True)
     def __spy_getitemptr__(self, index: usize) -> Ptr[T]:
         if index >= self.length:
             self._out_of_bounds()
@@ -167,9 +180,11 @@ class _SliceValueIterator[T]:
     cursor: ConstMultiPtr[T]
     remaining: usize
 
+    @func(inline=True)
     def __iter__(self) -> _SliceValueIterator[T]:
         return self
 
+    @func(inline=True)
     def __next__(self) -> T:
         if self.remaining == 0:
             raise StopIteration()
@@ -183,9 +198,11 @@ class _ConstSliceRefIterator[T]:
     cursor: ConstMultiPtr[T]
     remaining: usize
 
+    @func(inline=True)
     def __iter__(self) -> _ConstSliceRefIterator[T]:
         return self
 
+    @func(inline=True)
     def __next__(self) -> ConstPtr[T]:
         if self.remaining == 0:
             raise StopIteration()
@@ -199,9 +216,11 @@ class _SliceRefIterator[T]:
     cursor: MultiPtr[T]
     remaining: usize
 
+    @func(inline=True)
     def __iter__(self) -> _SliceRefIterator[T]:
         return self
 
+    @func(inline=True)
     def __next__(self) -> Ptr[T]:
         if self.remaining == 0:
             raise StopIteration()
@@ -339,6 +358,7 @@ class OpaqueWithDestructor:
     ptr: Ptr[Opaque]
     destructor: ConstPtr[DestructorFn]
 
+    @func(inline=True)
     def deinit(self):
         self.destructor[...](self.ptr)
 

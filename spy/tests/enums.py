@@ -42,6 +42,7 @@ class TriState(Enum):
     def is_true(self) -> spy_bool:
         return self == TriState.TRUE
 
+    @func(inline=True)
     def is_false(self) -> spy_bool:
         return self == TriState.FALSE
 
@@ -242,6 +243,7 @@ class Machine:
     state: TriState
     count: i32
 
+    @func(inline=True)
     def is_on(self) -> spy_bool:
         return self.state == TriState.TRUE
 
@@ -346,7 +348,7 @@ class SpyEnumTest(TestCase):
         self.assertTrue(tri_state_method_true(TriState.TRUE))
         self.assertFalse(tri_state_method_true(TriState.FALSE))
 
-    def test_an_undecorated_method_is_inlined_from_spy_code(self) -> None:
+    def test_an_inline_method_from_spy_code(self) -> None:
         self.assertTrue(tri_state_method_false(TriState.FALSE))
         self.assertFalse(tri_state_method_false(TriState.TRUE))
 
@@ -367,8 +369,9 @@ class SpyEnumTest(TestCase):
         self.assertIs(TriState.TRUE.unknown(), TriState.UNKNOWN)
 
     def test_python_side_method_calls(self) -> None:
-        # a decorated method goes through the handle (compiled), an undecorated
-        # one is the plain Python function of the class body
+        # a decorated method goes through the handle (compiled), an inlined one
+        # is expanded into the caller, and an undecorated one is the plain
+        # Python function of the class body
         self.assertTrue(TriState.TRUE.is_true())
         self.assertFalse(TriState.TRUE.is_false())
         self.assertIs(TriState.TRUE.and_with(TriState.FALSE), TriState.FALSE)

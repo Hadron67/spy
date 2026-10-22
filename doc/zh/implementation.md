@@ -109,8 +109,8 @@ flowchart TD
   语句级标记（`unroll`/`comptime`/`const_comptime`/`infer_comptime`）由 `_as_marker` 缓冲为 pragma，由下一条语句消费（悬空 pragma 报错）。
 - 下标 `a[...]`/`a[Literal[X]]`/`Ptr[T]`/`Array[T,N]`/`Option[T]`/`a[b:c]`/`a[i]` 分派见 `astgen._gen_expr`、`_gen_type_ctor`、`_gen_literal`。
 - `is None`/`is not None`（`_gen_is_none`）、海牙 `_gen_walrus`/`_gen_unwrap`、`isinstance`（`_gen_isinstance`）。
-- 调用 `_gen_call`：`cast`（no-op）→ `array` → `isinstance` → `ord` → `len` → 属性为普通 Python 函数则 `CallInplace`（其 callee 解析成 `sval.PyFunction`，编译期由 Python 求值）→
-  属性为方法则 `CallMethodInplace` → 结构体构造 `FinishStruct` → 普通 `CallInplace`。
+- 调用 `_gen_call`：`cast`（no-op）→ `array` → `isinstance` → `ord` → `len` → 属性为普通 Python 函数则 `CallInplace`（其 callee 解析成 `sval.PyFunction`，编译期由 Python 求值；`@struct()` 的未装饰方法也走这里）→
+  属性为已注册方法则 `CallMethodInplace` → 结构体构造 `FinishStruct` → 普通 `CallInplace`。
   `_gen_arglist` 目前**静默忽略 `**kw`、对 `*x` 报错**（`hir.Spread` 已存在但 astgen 未发射，见 `doc/issues.md` #1）。
 
 ### 2.4 闭包捕获（`_gen_closure`）
@@ -319,9 +319,9 @@ thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`
 - `_RegisteredFn`：`__call__` 是 Python 侧调用（解析→绑定→`specialize`→`Analyser`→`CompileBatch`→`glue.invoke`）；
   `__get__` 实现描述符协议（类访问得到句柄、实例访问得到 `partial(self, instance)`，从而 `Foo.m(x,…)` 不隐式传 `self`、`x.m()` 传）。
   `get_entry` 惰性解析：`self_arg` 默认按类型决定（枚举 → `"value"`，struct → `"ptr"`）。
-- `_RegisteredClass`：`get_entry` 建 `StructTypeHead`（先绑 head 再读 body，支持自引用）、字段、方法（走 `reversed(MRO)`，子类覆盖优先）；
+- `_RegisteredClass`：`get_entry` 建 `StructTypeHead`（先绑 head 再读 body，支持自引用）、字段、方法（走 `reversed(MRO)`，子类覆盖优先；`@func` 方法是 `_RegisteredFn`，未装饰方法是原始 Python 函数，即 `PyFunction`）；
   `__getitem__` → `glue.specialized_struct`；`__call__` → `glue.construct`。
-- `_Context`（`sval.CompileContext` 子类）：`resolve_global`（把注册对象/enum 成员解析成本上下文的 spy 值或 `FunctionValue`，把不用 `@func` 装饰的普通 Python 函数包成 `sval.PyFunction`）、
+- `_Context`（`sval.CompileContext` 子类）：`resolve_global`（把注册对象/enum 成员解析成本上下文的 spy 值或 `FunctionValue`，把不用 `@func` 装饰的普通 Python 函数——包括结构体/枚举的未装饰方法——包成 `sval.PyFunction`）、
   `special_types`、`mir_lower_cache`、`target_info`、`_resolve_call`、enum 支持（`enum` 装饰器/`_int_enum_type`/`_collect_enum_methods`/`enum_class_of`）、
   编译选项（`get_compile_option`/`set_compile_option`，由 `_compile_options` 以 `str` 名为键存）。
   `GLOBAL_CONTEXT = _Context(LLVMBackend())` 是顶层默认上下文。
@@ -382,6 +382,7 @@ thunk 返回 `bool`（`true` = panic，`false` = 正常）。`_thunk_call_sig`/`
 - `call(callee, args, ret, on_return)`：`FunctionValue`/`BoundMethod` → `_call_function_entry`；`BuiltinFn` → `_call_builtin`；
   `PyFunction` → `_call_py_function`（实参必须是能降为普通 Python 对象的编译期量，`str`/`bytes` 原样传递，返回值就是该编译期值本身、写进结果位置）；
   指向含 `__call__` 结构体的指针 → `call_method('__call__')`（闭包）；指向 `FunctionType` → `_call_fn_ptr`。
+  `call_method` 对非静态的 `PyFunction` 方法直接报错：未装饰方法不能接收运行期 `self`，须显式 `@func(inline=True)`/`@func()`。
 - `_call_function_entry`：`substitute_type_vars` + `bind_arg_pos` + `_check_comptime_args`；`force_inline` → `_start_inline`，
   否则 `specialize` 后 `_request_function`（返回 `SUSPEND`，由 `Analyser` 排程）。
 - `_start_inline`：内联深度上限 64；绑定形参（`_inline_arg_place`，用 callee 注解声明 slot）、附加 `$args`/`$kwargs` 合成 struct；
