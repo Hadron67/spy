@@ -1336,7 +1336,7 @@ def _infer_struct_generic_args(
             solver.add_constraint(place_type, declared.get_by_id(index).type, True)
     solver.finish()
     solved = solver.get_solved()
-    generic_args: list[sval.Value] = []
+    generic_args: list[sval.AnyValue] = []
     for type_var in head.generic_args:
         if type_var not in solved:
             raise CompileError(
@@ -1344,9 +1344,7 @@ def _infer_struct_generic_args(
                 f'{head.name_base} from this construction; give it '
                 f'explicitly, e.g. {head.name_base}[...](...)'
             )
-        arg = solved[type_var]
-        assert isinstance(arg, sval.Value), 'a struct type argument is a value'
-        generic_args.append(arg)
+        generic_args.append(solved[type_var])
     return head.specialize(tuple(generic_args))
 
 def _struct_construction_type(
@@ -8117,9 +8115,15 @@ class HirRunner:
             args = tuple(obj.values)
         else:
             args = (self._arg_value(index),)
-        arg_values: list[sval.Value] = []
+        arg_values: list[sval.AnyValue] = []
         for arg in args:
-            if not isinstance(arg, sval.Value):
+            # a generic argument is a type or a value (the length of an
+            # ``Array``, the dimension count of an ``NDArray``): a
+            # compile-time value that is already a plain Python scalar (a
+            # value type parameter such as ``N: int``) is taken as it is
+            if not isinstance(arg, sval.Value) and not isinstance(
+                arg, (bool, int, float, complex, bytes, str)
+            ):
                 raise CompileError(f'expected a compile-time type argument, got {arg!r}')
             arg_values.append(arg)
 

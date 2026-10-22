@@ -189,7 +189,7 @@ assert low_byte(0x41) == 0x41
   a multi-pointer slice `p[a:b]` yields `SlicePtr(p+a, b-a)` (lower bound defaults to 0, upper bound to the length, step must be 1).
 - A slice is iterable (element values) and has `refs()` (element pointers); going out of bounds `panic`s.
 - `std.core.const_array(elem, length)`: an array of `length` equal elements (the element expression is evaluated only once and may be a runtime value).
-- Arrays **cannot cross the Python calling boundary** (see §10), so the examples below call indirectly through spy functions.
+- An array **returned** to Python crosses as a list; an array argument still cannot be given from Python (a tuple is taken as a multi-value spread). Multi-dimensional arrays use `std.ndarray` (see §9.4).
 
 ```python
 @func()
@@ -1677,6 +1677,7 @@ assert text_len() == 6
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`, `Writable`/`Readable` (protocols) |
 | `std.math` | `abs`, `sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sqrt`/`cbrt`/`ceil`/`pow`/`exp`/`log` (the implementation of the last thirteen is chosen at compile time by the option `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`ceil_mode`/`pow_mode`/`exp_mode`/`log_mode`: `llvm`/`libc`/`software`) |
 | `std.vec` | `Vec[T, A]` dynamic array |
+| `std.ndarray` | `NDArray[T, N]` multi-dimensional array view, `slice`/`span`, `from_ndarray` (a Python-side numpy conversion) |
 | `std.atomic` | `MemoryOrder`/`RmwOp`, `atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`, convenience wrappers |
 | `std.openmp` | `load_openmp_runtime`, `parallel_loop` |
 | `std.python` | CPython C API bindings: `GILState`, `PyError`, `PyObject` (attributes/calls/subscripts/conversions/tuple/list/dict/module operations), plus the raw extern declarations under the C names |
@@ -1878,6 +1879,34 @@ assert abs(my_acos(-1.0) - 3.141592653589793) < 1e-15
 assert abs(my_atan(1.0) - 0.7853981633974483) < 1e-15
 assert abs(my_atan2(1.0, 1.0) - 0.7853981633974483) < 1e-15
 assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
+```
+
+### 9.4 Multi-dimensional arrays (NDArray)
+
+`std.ndarray.NDArray[T, N]` is a **view** of an `N`-dimensional array: `{ptr, size, stride}`. It owns no storage, and a view
+returned by `slice` shares the elements of the original array.
+
+- `a[i, j, ...]` is the lvalue of one element; **every dimension has to be indexed** (an index is a `usize`), and going out of bounds `panic`s.
+- `a.slice(*slices)` takes one argument per dimension. A `usize` selects a single index of that dimension (the result keeps
+  the dimension with length 1), and a `std.slice` object names a range. An `a:b` literal can only appear in a subscript, so in a
+  method call it is built with `std.ndarray.span(start, end)`: `span(0, 2)` is `0:2`, `span(None, 2)` is `:2`, and
+  `span(None, None)` is the whole dimension; a step other than 1 is rejected.
+- `from_ndarray(arr)` (on the Python side, zero-copy) converts a numpy array into an `NDArray`: the dtype decides `T`
+  (`bool`/`i8`..`i64`/`u8`..`u64`/`f32`/`f64`/`c64`/`c128`), `N` is `arr.ndim`, and the strides are converted from bytes into
+  element counts; a negative stride is rejected and a non-contiguous positive stride is supported. The returned value keeps the
+  original array alive through an ordinary Python attribute.
+
+```python
+import numpy as np
+from std.ndarray import NDArray, from_ndarray, span
+
+@func()
+def sub_sum(a: NDArray[f64, 2]) -> f64:
+    b = a.slice(span(1, 3), span(None, None))
+    return b[0, 0] + b[1, 1]
+
+arr = np.arange(12, dtype=np.float64).reshape(4, 3)
+assert sub_sum(from_ndarray(arr)) == arr[1, 0] + arr[2, 1]
 ```
 
 ---

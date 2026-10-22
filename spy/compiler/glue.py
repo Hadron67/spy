@@ -323,7 +323,13 @@ def _read(type: Type, owner: Any, offset: int, context: CompileContext) -> Any:
         case StructType():
             return _StructInstance(type, owner, offset, context)
         case sval.ArrayType():
-            raise SpyError('an array cannot cross the Python boundary yet')
+            length = type.length_int
+            if length is None:
+                raise SpyError('cannot read a dynamically-sized array')
+            return [
+                _read(type.elem, owner, offset + _child_offset(type, index, cache), context)
+                for index in range(length)
+            ]
         case sval.ComplexType():
             # a complex number crosses as a Python ``complex``: read its real and
             # imaginary parts out of the two float fields of its mirror
@@ -369,7 +375,20 @@ def _write(type: Type, value: Any, owner: Any, offset: int, context: CompileCont
             assert mir_type is not None
             ctypes.memmove(address, source._data._base(), ctypes.sizeof(to_ctype(mir_type)))
         case sval.ArrayType():
-            raise SpyError('an array cannot cross the Python boundary yet')
+            length = type.length_int
+            if length is None:
+                raise SpyError('cannot write a dynamically-sized array')
+            if not isinstance(value, (list, tuple)):
+                raise SpyError(f'cannot use {value!r} as {type}: a sequence is required')
+            if len(value) != length:
+                raise SpyError(
+                    f'cannot use a sequence of {len(value)} element(s) as {type}'
+                )
+            for index, item in enumerate(value):
+                _write(
+                    type.elem, item, owner,
+                    offset + _child_offset(type, index, cache), context,
+                )
         case sval.ComplexType():
             # a complex number crosses as a Python ``complex``; a real value
             # (float or integer) has a zero imaginary part
@@ -412,7 +431,7 @@ def _as_address(value: Any) -> int | None:
             return value._data._base()
         case ctypes.c_void_p():
             return value.value
-        case None:
+        case None | sval.Null() | sval.TypedNull() | sval.Void():
             return None
         case int():
             return value

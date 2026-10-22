@@ -189,7 +189,7 @@ assert low_byte(0x41) == 0x41
   多指针切片 `p[a:b]` 得到 `SlicePtr(p+a, b-a)`（缺省下界 0、上界长度、step 必须为 1）。
 - 切片可迭代（元素值）与 `refs()`（元素指针）；越界会 `panic`。
 - `std.core.const_array(elem, length)`：`length` 个相同元素的数组（元素表达式只求值一次，可为运行时值）。
-- 数组**不能跨 Python 调用边界**（见 §10），因此下面用 spy 函数间接调用。
+- 数组作为返回值会以 Python 列表跨出边界；从 Python 传入数组参数仍不支持（元组会被当作多值展开）。多维数组用 `std.ndarray`（见 §9.4）。
 
 ```python
 @func()
@@ -1680,6 +1680,7 @@ assert text_len() == 6
 | `std.io` | `IOError`/`PartialWriteError`/`PartialReadError`、`Writable`/`Readable`（协议） |
 | `std.math` | `abs`、`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sqrt`/`cbrt`/`ceil`/`pow`/`exp`/`log`（后十三者的实现由编译期选项 `sin_mode`/`cos_mode`/`tan_mode`/`asin_mode`/`acos_mode`/`atan_mode`/`atan2_mode`/`sqrt_mode`/`cbrt_mode`/`ceil_mode`/`pow_mode`/`exp_mode`/`log_mode` 在编译期选定：`llvm`/`libc`/`software`） |
 | `std.vec` | `Vec[T, A]` 动态数组 |
+| `std.ndarray` | `NDArray[T, N]` 多维数组视图、`slice`/`span`、`from_ndarray`（Python 侧的 numpy 转换） |
 | `std.atomic` | `MemoryOrder`/`RmwOp`、`atomic_load`/`atomic_store`/`atomic_rmw`/`atomic_cmpxchg`/`atomic_fence`、便捷包装 |
 | `std.openmp` | `load_openmp_runtime`、`parallel_loop` |
 | `std.python` | CPython C API 绑定：`GILState`、`PyError`、`PyObject`（属性/调用/下标/转换/tuple/list/dict/模块操作），以及同名的原始 extern 声明 |
@@ -1845,6 +1846,31 @@ assert abs(my_acos(-1.0) - 3.141592653589793) < 1e-15
 assert abs(my_atan(1.0) - 0.7853981633974483) < 1e-15
 assert abs(my_atan2(1.0, 1.0) - 0.7853981633974483) < 1e-15
 assert abs(my_atan2(1.0, -1.0) - 2.356194490192345) < 1e-15
+```
+
+### 9.4 多维数组（NDArray）
+
+`std.ndarray.NDArray[T, N]` 是一个 `N` 维数组的**视图**：`{ptr, size, stride}`，不拥有存储，`slice` 返回的视图与原数组共享元素。
+
+- `a[i, j, ...]` 返回元素的左值，**每一维都必须给下标**（下标是 `usize`）；越界 `panic`。
+- `a.slice(*slices)`：每维一个参数。`usize` 表示该维取单个下标（结果该维长度为 1），`std.slice` 对象表示区间。
+  `a:b` 这种字面量只能出现在下标里，方法调用中用 `std.ndarray.span(start, end)` 构造：`span(0, 2)` 即 `0:2`，
+  `span(None, 2)` 即 `:2`，`span(None, None)` 即整维；step 只允许 1。
+- `from_ndarray(arr)`（Python 侧，零拷贝）把 numpy 数组转成 `NDArray`：dtype 决定 `T`（`bool`/`i8`..`i64`/`u8`..`u64`/`f32`/`f64`/`c64`/`c128`），
+  `N` 是 `arr.ndim`，strides 从字节换算成元素个数；负 stride 拒绝，非连续的正 stride 支持。
+  返回的实例通过普通 Python 属性持有原数组，防止缓冲区被释放。
+
+```python
+import numpy as np
+from std.ndarray import NDArray, from_ndarray, span
+
+@func()
+def sub_sum(a: NDArray[f64, 2]) -> f64:
+    b = a.slice(span(1, 3), span(None, None))
+    return b[0, 0] + b[1, 1]
+
+arr = np.arange(12, dtype=np.float64).reshape(4, 3)
+assert sub_sum(from_ndarray(arr)) == arr[1, 0] + arr[2, 1]
 ```
 
 ---

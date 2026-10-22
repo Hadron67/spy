@@ -10,6 +10,7 @@ from . import io as io
 from . import llvm as llvm
 from . import math as math
 from . import mem as mem
+from . import ndarray as ndarray
 from . import openmp as openmp
 from . import python as python
 from . import reflect as reflect
